@@ -7,7 +7,9 @@
 //! channel (a dialog that goes away, a closed tab) counts as "no" / "cancelled".
 //!
 //! Secrets only ever travel as [`Secret`]s. Credentials the user asked to remember are kept
-//! pending in the bridge and written to the keychain once the connection succeeded.
+//! pending in the bridge and written to the keychain once the hop they belong to authenticated.
+//! Whatever authenticated is also kept in an [`AuthMemory`] (in memory only, zeroized when it is
+//! dropped with its connection) so that an automatic reconnect does not ask again.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +19,7 @@ use async_trait::async_trait;
 use shellmate_core::{AuthMethod, FingerprintState, Host, HostId, PtyDims, Secret};
 use shellmate_ssh::{
     ChallengeRequest, ConnectEvent, ConnectOptions, Connection, HostKeyRequest, HostKeyVerifier, HostSecrets,
-    PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError,
+    PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError, WeakConnection,
 };
 use shellmate_store::{SecretKey, SecretStore};
 use tokio::sync::oneshot;
@@ -51,7 +53,7 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    fn of(host: &Host, default_user: &str) -> Self {
+    pub fn of(host: &Host, default_user: &str) -> Self {
         Self {
             host: host.addr.clone(),
             port: host.port,
@@ -62,6 +64,88 @@ impl Endpoint {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Secrets that authenticated during the life of one connection, kept in memory so that
+/// reconnecting does not ask for them again. Never written anywhere; `Secret` zeroizes on drop and
+/// the memory is dropped with the connection group (its last tab).
+#[derive(Default)]
+pub struct AuthMemory {
+    inner: Mutex<Remembered>,
+}
+
+#[derive(Default)]
+struct Remembered {
+    /// Login passwords that the password method accepted.
+    passwords: HashMap<Endpoint, Secret>,
+    /// Passwords that keyboard-interactive accepted (a single masked prompt, never a one-time code).
+    challenge: HashMap<Endpoint, Secret>,
+    /// Passphrases of the key files that authenticated.
+    passphrases: HashMap<PathBuf, Secret>,
+}
+
+impl AuthMemory {
+    /// An empty memory.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A copy for another connection to the same host (a duplicated tab that cannot reuse the
+    /// live connection reconnects without asking again).
+    pub fn duplicate(&self) -> Arc<Self> {
+        let inner = lock(&self.inner);
+        Arc::new(Self {
+            inner: Mutex::new(Remembered {
+                passwords: inner.passwords.clone(),
+                challenge: inner.challenge.clone(),
+                passphrases: inner.passphrases.clone(),
+            }),
+        })
+    }
+
+    /// Number of secrets held.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        let inner = lock(&self.inner);
+        inner.passwords.len() + inner.challenge.len() + inner.passphrases.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn remember_password(&self, hop: Endpoint, secret: Secret) {
+        lock(&self.inner).passwords.insert(hop, secret);
+    }
+
+    fn remember_challenge(&self, hop: Endpoint, secret: Secret) {
+        lock(&self.inner).challenge.insert(hop, secret);
+    }
+
+    fn remember_passphrase(&self, key: PathBuf, secret: Secret) {
+        lock(&self.inner).passphrases.insert(key, secret);
+    }
+
+    fn passphrase(&self, key: &Path) -> Option<Secret> {
+        lock(&self.inner).passphrases.get(key).cloned()
+    }
+
+    /// Puts the remembered passwords into `route` (they win over the keychain: they worked just
+    /// now) and into `known`, the passwords offered to keyboard-interactive prompts.
+    pub fn apply(&self, route: &mut Route, known: &mut HashMap<Endpoint, Secret>) {
+        let inner = lock(&self.inner);
+        for hop in route.via.iter_mut().chain(std::iter::once(&mut route.target)) {
+            let endpoint = Endpoint { host: hop.host.clone(), port: hop.port, user: hop.user.clone() };
+            if let Some(secret) = inner.passwords.get(&endpoint) {
+                hop.password = Some(secret.clone());
+                known.insert(endpoint.clone(), secret.clone());
+            }
+            if let Some(secret) = inner.challenge.get(&endpoint) {
+                known.insert(endpoint, secret.clone());
+            }
+        }
+    }
 }
 
 /// The UI side of one connection attempt.
@@ -78,6 +162,15 @@ pub struct UiBridge {
     pending: Mutex<HashMap<Candidate, Secret>>,
     /// Secrets whose method authenticated their hop: these are written to the keychain.
     confirmed: Mutex<Vec<(SecretKey, Secret)>>,
+    /// The last thing the user typed per hop and kind, saved or not: remembered in `memory` once
+    /// the hop authenticated with it.
+    typed: Mutex<HashMap<Candidate, Secret>>,
+    /// The last masked keyboard-interactive answer typed per hop.
+    typed_challenge: Mutex<HashMap<Endpoint, Secret>>,
+    /// Passphrases from `memory` already offered in this attempt (a second request must ask).
+    reused: Mutex<HashSet<PathBuf>>,
+    /// What authenticated earlier on this connection.
+    memory: Arc<AuthMemory>,
 }
 
 /// An answer that may be saved once it is known to have worked.
@@ -91,7 +184,12 @@ enum Candidate {
 
 impl UiBridge {
     /// A bridge for the hosts of one route; messages go to `tx`.
-    pub fn new(tx: async_channel::Sender<UiMsg>, chain: &[Host], default_user: &str) -> Arc<Self> {
+    pub fn new(
+        tx: async_channel::Sender<UiMsg>,
+        chain: &[Host],
+        default_user: &str,
+        memory: Arc<AuthMemory>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             tx,
             hosts: chain.iter().map(|h| (Endpoint::of(h, default_user), h.id.clone())).collect(),
@@ -99,6 +197,10 @@ impl UiBridge {
             autofilled: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             confirmed: Mutex::new(Vec::new()),
+            typed: Mutex::new(HashMap::new()),
+            typed_challenge: Mutex::new(HashMap::new()),
+            reused: Mutex::new(HashSet::new()),
+            memory,
         })
     }
 
@@ -129,6 +231,7 @@ impl UiBridge {
 
     /// `hop` authenticated with `method` (and `key_file`): commit what belongs to that, drop the rest.
     fn confirm(&self, hop: Endpoint, method: Option<AuthMethod>, key_file: Option<&Path>) {
+        self.remember_in_memory(&hop, method, key_file);
         let mut pending = lock(&self.pending);
         let password = pending.remove(&Candidate::Password(hop.clone()));
         let mut confirmed = lock(&self.confirmed);
@@ -146,12 +249,38 @@ impl UiBridge {
         }
     }
 
+    /// What the user typed for `hop` and the server accepted goes to the connection's memory,
+    /// whether or not it is to be saved in the keychain.
+    fn remember_in_memory(&self, hop: &Endpoint, method: Option<AuthMethod>, key_file: Option<&Path>) {
+        match method {
+            Some(AuthMethod::Password) => {
+                if let Some(secret) = lock(&self.typed).remove(&Candidate::Password(hop.clone())) {
+                    self.memory.remember_password(hop.clone(), secret);
+                }
+            }
+            Some(AuthMethod::PrivateKey) => {
+                if let Some(file) = key_file
+                    && let Some(secret) = lock(&self.typed).remove(&Candidate::Passphrase(file.to_path_buf()))
+                {
+                    self.memory.remember_passphrase(file.to_path_buf(), secret);
+                }
+            }
+            Some(AuthMethod::KeyboardInteractive) => {
+                if let Some(secret) = lock(&self.typed_challenge).remove(hop) {
+                    self.memory.remember_challenge(hop.clone(), secret);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn endpoint_of(&self, host: &str, port: u16, user: &str) -> Endpoint {
         Endpoint { host: host.to_string(), port, user: user.to_string() }
     }
 
     /// Notes the answer for saving, or forgets an earlier answer if this one is not to be saved.
     fn remember(&self, candidate: Candidate, answer: &Answer) {
+        lock(&self.typed).insert(candidate.clone(), answer.secret.clone());
         let mut pending = lock(&self.pending);
         if answer.save {
             pending.insert(candidate, answer.secret.clone());
@@ -184,6 +313,13 @@ impl Prompter for UiBridge {
     }
 
     async fn passphrase(&self, request: PassphraseRequest) -> Option<Secret> {
+        // The passphrase that unlocked this key earlier on the connection: offered once, silently.
+        if request.attempt == 0
+            && let Some(known) = self.memory.passphrase(&request.key_path)
+            && lock(&self.reused).insert(request.key_path.clone())
+        {
+            return Some(known);
+        }
         let key = Candidate::Passphrase(request.key_path.clone());
         let (reply, answer) = oneshot::channel();
         self.tx.send(UiMsg::Passphrase { request, reply }).await.ok()?;
@@ -199,13 +335,19 @@ impl Prompter for UiBridge {
             && !prompt.echo
             && !looks_like_otp(&prompt.text)
             && let Some(saved) = lock(&self.known_passwords).get(&endpoint).cloned()
-            && lock(&self.autofilled).insert(endpoint)
+            && lock(&self.autofilled).insert(endpoint.clone())
         {
             return Some(vec![saved]);
         }
+        let masked_password = matches!(request.prompts.as_slice(), [prompt] if !prompt.echo && !looks_like_otp(&prompt.text))
+            && request.round == 1;
         let (reply, answer) = oneshot::channel();
         self.tx.send(UiMsg::Challenge { request, reply }).await.ok()?;
-        answer.await.ok()?
+        let answers = answer.await.ok()??;
+        if masked_password && let [secret] = answers.as_slice() {
+            lock(&self.typed_challenge).insert(endpoint, secret.clone());
+        }
+        Some(answers)
     }
 }
 
@@ -257,10 +399,13 @@ pub struct SaveReport {
     pub errors: Vec<String>,
 }
 
-/// A connection with its shell channel opened but not yet attached to a terminal. The shell
-/// keeps the connection alive; the connection closes with its last channel.
+/// A connection with the shell channels of the tabs that asked for one, opened but not yet
+/// attached to their terminals. The shells keep the connection alive; the connection closes with
+/// its last channel, so `connection` does not hold it open.
 pub struct Connected {
-    pub shell: PendingShell,
+    pub connection: WeakConnection,
+    /// One shell per requested tab, in the order requested.
+    pub shells: Vec<(usize, PendingShell)>,
     pub saves: SaveReport,
 }
 
@@ -270,29 +415,40 @@ pub struct ConnectFailure {
     pub saves: SaveReport,
 }
 
-/// Runs a whole connection attempt on the SSH runtime: route, connect, open the shell, and
-/// remember the credentials the user asked to keep for the hops that authenticated with them.
-pub async fn connect_and_open(
+/// Runs a whole connection attempt on the SSH runtime: route, connect, open a shell for every tab
+/// in `tabs` (each with the size of its terminal), and remember the credentials the user asked to
+/// keep for the hops that authenticated with them. One attempt serves all the tabs of a
+/// connection: they share the single connection and each gets its own channel.
+pub async fn connect_attempt(
     chain: Vec<Host>,
     secrets: Arc<dyn SecretStore>,
     bridge: Arc<UiBridge>,
-    dims: PtyDims,
+    tabs: Vec<(usize, PtyDims)>,
 ) -> Result<Connected, ConnectFailure> {
     let attempt = async {
         let user = default_user();
-        let (route, known) = {
+        let (mut route, mut known) = {
             let (chain, secrets, user) = (chain.clone(), secrets.clone(), user.clone());
             tokio::task::spawn_blocking(move || build_route(&chain, secrets.as_ref(), &user))
                 .await
                 .map_err(|err| SshError::Unsupported(err.to_string()))??
         };
+        bridge.memory.apply(&mut route, &mut known);
         bridge.set_known_passwords(known);
 
         let events = bridge.clone();
         let options =
             ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |event| events.event(event));
-        let connection = Connection::connect(route, options).await?;
-        connection.open_shell(dims).await
+        let mut tabs = tabs.into_iter();
+        let Some((first, dims)) = tabs.next() else {
+            return Err(SshError::Unsupported("没有需要连接的标签".into()));
+        };
+        let (connection, shell) = Connection::connect_with_shell(route, options, dims).await?;
+        let mut shells = vec![(first, shell)];
+        for (id, dims) in tabs {
+            shells.push((id, connection.open_shell(dims).await?));
+        }
+        Ok((connection.downgrade(), shells))
     };
     let outcome = attempt.await;
 
@@ -314,7 +470,7 @@ pub async fn connect_and_open(
         .unwrap_or_default()
     };
     match outcome {
-        Ok(shell) => Ok(Connected { shell, saves }),
+        Ok((connection, shells)) => Ok(Connected { connection, shells, saves }),
         Err(error) => Err(ConnectFailure { error, saves }),
     }
 }
@@ -458,8 +614,12 @@ mod tests {
     // ---- the bridge, with a scripted "UI" answering on the other end of the channel ----
 
     fn bridge_for(chain: &[Host]) -> (Arc<UiBridge>, async_channel::Receiver<UiMsg>) {
+        bridge_with(chain, AuthMemory::new())
+    }
+
+    fn bridge_with(chain: &[Host], memory: Arc<AuthMemory>) -> (Arc<UiBridge>, async_channel::Receiver<UiMsg>) {
         let (tx, rx) = async_channel::unbounded();
-        (UiBridge::new(tx, chain, "me"), rx)
+        (UiBridge::new(tx, chain, "me", memory), rx)
     }
 
     fn challenge(host: &Host, round: u32, prompts: &[(&str, bool)]) -> ChallengeRequest {
@@ -770,5 +930,205 @@ mod tests {
             reply.send(None).ok().unwrap();
             assert!(asking.await.unwrap().is_none());
         }
+    }
+
+    // ---- what authenticated is remembered for the next attempt ---------------------------------
+
+    /// The route and autofill passwords of the next attempt for `chain`, with `memory` applied.
+    fn next_attempt(chain: &[Host], memory: &AuthMemory) -> (Route, HashMap<Endpoint, Secret>) {
+        let (mut route, mut known) = build_route(chain, &MemoryStore::new(), "me").unwrap();
+        memory.apply(&mut route, &mut known);
+        (route, known)
+    }
+
+    fn endpoint_of(host: &Host) -> Endpoint {
+        Endpoint { host: host.addr.clone(), port: host.port, user: user_of(host) }
+    }
+
+    #[tokio::test]
+    async fn a_password_that_worked_is_remembered_whether_or_not_it_is_saved() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+        type_password(&bridge, &rx, &web, "worked", false).await;
+        assert!(memory.is_empty(), "nothing is remembered before the server accepted it");
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert!(saved(&bridge).is_empty(), "not ticked: the keychain is left alone");
+
+        let (route, known) = next_attempt(std::slice::from_ref(&web), &memory);
+        assert_eq!(route.target.password.as_ref().map(Secret::expose), Some("worked"));
+        assert_eq!(known[&endpoint_of(&web)].expose(), "worked");
+    }
+
+    #[tokio::test]
+    async fn only_what_the_server_accepted_is_remembered() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+        type_password(&bridge, &rx, &web, "wrong", true).await;
+        authenticated(&bridge, &web, Some(AuthMethod::Agent), None);
+        authenticated(&bridge, &web, Some(AuthMethod::KeyboardInteractive), None);
+        assert!(memory.is_empty(), "a wrong password stays forgotten");
+
+        // A typo followed by the right password: the right one.
+        type_password(&bridge, &rx, &web, "right", false).await;
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert_eq!(next_attempt(std::slice::from_ref(&web), &memory).0.target.password.unwrap().expose(), "right");
+    }
+
+    #[tokio::test]
+    async fn a_remembered_password_belongs_to_its_hop_and_beats_the_keychain() {
+        let jump = host("bastion", "b.example.com", 2222, Some("ops"));
+        let target = host("db", "d.example.com", 22, Some("dba"));
+        let chain = [jump.clone(), target.clone()];
+        let memory = AuthMemory::new();
+        let (bridge, rx) = bridge_with(&chain, memory.clone());
+        type_password(&bridge, &rx, &jump, "jump-pw", false).await;
+        authenticated(&bridge, &jump, Some(AuthMethod::Password), None);
+
+        let store = MemoryStore::new();
+        store.set(&SecretKey::HostPassword(jump.id.clone()), &Secret::new("stale")).unwrap();
+        store.set(&SecretKey::HostPassword(target.id.clone()), &Secret::new("kept")).unwrap();
+        let (mut route, mut known) = build_route(&chain, &store, "me").unwrap();
+        memory.apply(&mut route, &mut known);
+        assert_eq!(route.via[0].password.as_ref().map(Secret::expose), Some("jump-pw"), "newer than the keychain");
+        assert_eq!(route.target.password.as_ref().map(Secret::expose), Some("kept"), "untouched");
+        assert_eq!(known.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_passphrase_that_unlocked_a_key_is_offered_once_without_a_dialog() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+        type_passphrase(&bridge, &rx, "/keys/work", "phrase", false).await;
+        authenticated(&bridge, &web, Some(AuthMethod::PrivateKey), Some("/keys/work"));
+
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+        let request = |attempt| PassphraseRequest { key_path: "/keys/work".into(), attempt };
+        let first = bridge.passphrase(request(0)).await.expect("answered from memory");
+        assert_eq!(first.expose(), "phrase");
+        assert!(rx.try_recv().is_err(), "no dialog");
+
+        // Wrong after all (the key changed): the next request goes to the user.
+        let asking = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.passphrase(request(0)).await }
+        });
+        let Ok(UiMsg::Passphrase { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
+        reply.send(None).ok().unwrap();
+        assert!(asking.await.unwrap().is_none());
+
+        // Another key is not covered.
+        let other = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.passphrase(PassphraseRequest { key_path: "/keys/other".into(), attempt: 0 }).await }
+        });
+        let Ok(UiMsg::Passphrase { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
+        reply.send(None).ok().unwrap();
+        assert!(other.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_keyboard_interactive_password_is_autofilled_next_time_but_one_time_codes_never() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+
+        let answer = |bridge: &Arc<UiBridge>, rx: &async_channel::Receiver<UiMsg>, round, prompt: &'static str, typed| {
+            let (bridge, rx, web) = (bridge.clone(), rx.clone(), web.clone());
+            async move {
+                let asking = tokio::spawn({
+                    let bridge = bridge.clone();
+                    async move { bridge.challenge(challenge(&web, round, &[(prompt, false)])).await }
+                });
+                let Ok(UiMsg::Challenge { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
+                reply.send(Some(vec![Secret::new(typed)])).ok().unwrap();
+                asking.await.unwrap().unwrap();
+            }
+        };
+        answer(&bridge, &rx, 1, "Password: ", "kbd-pw").await;
+        answer(&bridge, &rx, 2, "Verification code: ", "123456").await;
+        authenticated(&bridge, &web, Some(AuthMethod::KeyboardInteractive), None);
+        assert_eq!(memory.len(), 1, "the password, not the code");
+
+        let (route, known) = next_attempt(std::slice::from_ref(&web), &memory);
+        assert!(route.target.password.is_none(), "it is no login password for the password method");
+        assert_eq!(known[&endpoint_of(&web)].expose(), "kbd-pw");
+
+        let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+        bridge.set_known_passwords(known);
+        let filled = bridge.challenge(challenge(&web, 1, &[("Password: ", false)])).await.unwrap();
+        assert_eq!(filled[0].expose(), "kbd-pw");
+        assert!(rx.try_recv().is_err(), "no dialog for the password");
+        let asking = tokio::spawn({
+            let (bridge, web) = (bridge.clone(), web.clone());
+            async move { bridge.challenge(challenge(&web, 2, &[("Verification code: ", false)])).await }
+        });
+        let Ok(UiMsg::Challenge { reply, .. }) = rx.recv().await else { panic!("the code is always asked") };
+        reply.send(None).ok().unwrap();
+        assert!(asking.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_is_asked_again_on_every_attempt_whatever_is_remembered() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        memory.remember_password(endpoint_of(&web), Secret::new("pw"));
+        let request = HostKeyRequest {
+            host: "w.example.com".into(),
+            port: 22,
+            state: FingerprintState::Changed,
+            key: HostKeyInfo { algorithm: "ssh-ed25519".into(), fingerprint: "SHA256:new".into() },
+            recorded: vec![HostKeyInfo { algorithm: "ssh-ed25519".into(), fingerprint: "SHA256:old".into() }],
+        };
+        for attempt in 1..=3 {
+            let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
+            let asking = tokio::spawn({
+                let request = request.clone();
+                async move { bridge.verify(request).await }
+            });
+            let Ok(UiMsg::HostKey { request: seen, reply }) = rx.recv().await else {
+                panic!("attempt {attempt}: the user must be asked")
+            };
+            assert_eq!(seen.state, FingerprintState::Changed);
+            drop(reply);
+            assert!(!asking.await.unwrap(), "no answer is a refusal");
+        }
+    }
+
+    #[test]
+    fn a_copy_of_the_memory_is_independent() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let memory = AuthMemory::new();
+        memory.remember_password(endpoint_of(&web), Secret::new("pw"));
+        memory.remember_passphrase("/keys/a".into(), Secret::new("phrase"));
+        let copy = memory.duplicate();
+        assert_eq!(copy.len(), 2);
+        copy.remember_challenge(endpoint_of(&web), Secret::new("x"));
+        assert_eq!((memory.len(), copy.len()), (2, 3));
+        assert!(AuthMemory::new().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoning_the_attempt_cancels_the_questions_it_asked() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        let asking = tokio::spawn({
+            let bridge = bridge.clone();
+            async move {
+                bridge
+                    .password(PasswordRequest { host: web.addr.clone(), port: 22, user: "deploy".into(), attempt: 0 })
+                    .await
+            }
+        });
+        let Ok(UiMsg::Password { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
+        assert!(!reply.is_closed(), "the dialog is waiting for an answer");
+        // The tab is closed: its connection task is aborted.
+        asking.abort();
+        assert!(asking.await.unwrap_err().is_cancelled());
+        assert!(reply.is_closed(), "the dialog's reply channel reports the question as cancelled");
+        assert!(reply.send(Some(Answer { secret: Secret::new("late"), save: false })).is_err(), "a late answer goes nowhere");
+        assert!(saved(&bridge).is_empty());
     }
 }

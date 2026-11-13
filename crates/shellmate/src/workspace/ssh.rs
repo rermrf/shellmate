@@ -1,35 +1,71 @@
-//! SSH sessions: connecting a saved host, answering its questions with dialogs, session state.
+//! SSH sessions: connecting a saved host, answering its questions with dialogs, reconnecting
+//! after a loss, and opening more tabs on a connection that is already up.
+//!
+//! A tab is a [`Session`] with an [`SshSession`] (its own state); the connection behind it is a
+//! [`ConnGroup`] shared by every tab on that connection. All connecting, waiting and retrying
+//! happens per group; a tab only reacts to what its group decides.
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
-use gpui::{AppContext as _, Context, Task, Window};
-use shellmate_core::{Host, HostId};
+use gpui::{AppContext as _, Context, Entity, Task, Window};
+use shellmate_core::{Host, HostId, PtyDims};
+use shellmate_ssh::{Connection, PendingShell, SshError};
 use shellmate_store::SecretKey;
 use shellmate_term::{Terminal, TerminalView};
-use tokio::task::{AbortHandle, JoinError};
+use tokio::task::JoinError;
 
+use super::group::{AbortOnDrop, Attempt, ConnGroup, PoolKey};
 use super::{Panel, Session, SessionKind, Workspace};
-use crate::connect::{self, ConnectFailure, Connected, SaveReport, UiBridge, UiMsg};
+use crate::connect::{self, AuthMemory, ConnectFailure, Connected, SaveReport, UiBridge, UiMsg};
 use crate::dialogs::auth::{ChallengeDialog, SecretDialog};
 use crate::dialogs::hostkey::HostKeyDialog;
+use crate::reconnect::{self, Failure, Input, MAX_ATTEMPTS, Output, Phase, Reconnect, View};
 use crate::runtime;
 use crate::sidebar::LiveStatus;
 use crate::theme::{ActivePalette, CARD_RADIUS};
 
-/// Where an SSH session stands.
+/// Where an SSH tab stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SshStatus {
     /// Connecting, verifying the host key or authenticating.
     Connecting,
     /// The shell is running.
     Connected,
-    /// The connection could not be established or broke.
+    /// The connection broke; attempt `n` of 5 is waiting or running.
+    Reconnecting(u32),
+    /// The connection could not be established, or the automatic attempts ran out.
     Failed,
     /// Over: the remote shell exited, or the user cancelled.
     Ended,
+}
+
+impl SshStatus {
+    /// Whether a connection attempt is going to give this tab a shell.
+    pub fn wants_channel(self) -> bool {
+        matches!(self, Self::Connecting | Self::Reconnecting(_) | Self::Failed)
+    }
+
+    /// The status after the connection's reconnect loop moved to `view`. Ended tabs are not part
+    /// of the loop; a tab that is up stays up unless the connection was lost.
+    pub fn on_view(self, view: View) -> Self {
+        match (self, view) {
+            (Self::Ended, _) | (_, View::Connected) => self,
+            (_, View::Reconnecting(n)) => Self::Reconnecting(n),
+            (status, View::Connecting) => if status.wants_channel() { Self::Connecting } else { status },
+            (status, View::Failed) => if status.wants_channel() { Self::Failed } else { status },
+        }
+    }
+}
+
+/// A tab's connection to one thing in flight: opening a channel on a connection that is up.
+struct Opening {
+    _abort: AbortOnDrop,
+    _task: Task<()>,
 }
 
 /// The SSH side of a session.
@@ -39,32 +75,17 @@ pub struct SshSession {
     /// The route as resolved at the last connect: jump hosts, then `host`.
     pub chain: Vec<Host>,
     pub status: SshStatus,
-    /// A dialog of this session may be open (closed together with the tab).
-    prompting: bool,
-    abort: Option<AbortHandle>,
-    _tasks: Vec<Task<()>>,
+    /// The connection this tab is on ([`ConnGroup::id`]).
+    pub group: usize,
+    /// The shell channel number on the connection (the nth one opened on it).
+    pub channel: u32,
+    /// A channel is being opened for this tab on a live connection.
+    opening: Option<Opening>,
 }
 
 impl SshSession {
-    fn new(host: Host, chain: Vec<Host>) -> Self {
-        Self { host, chain, status: SshStatus::Connecting, prompting: false, abort: None, _tasks: Vec::new() }
-    }
-
-    /// Whether a dialog of this session may still be open.
-    pub fn has_open_prompt(&self) -> bool {
-        self.prompting
-    }
-
-    /// The remote program ended.
-    pub fn on_exited(&mut self) {
-        self.status = SshStatus::Ended;
-    }
-
-    /// The connection broke (after it was up) or the attempt failed.
-    pub fn on_disconnected(&mut self) {
-        if self.status == SshStatus::Connected {
-            self.status = SshStatus::Failed;
-        }
+    fn new(host: Host, chain: Vec<Host>, group: usize) -> Self {
+        Self { host, chain, status: SshStatus::Connecting, group, channel: 1, opening: None }
     }
 
     /// Names of the jump hosts, in order.
@@ -73,22 +94,32 @@ impl SshSession {
         self.chain.iter().take(jumps).map(|h| h.name.as_str()).collect()
     }
 
-    /// Sidebar dot of this session.
+    /// Sidebar dot of this session. A tab waiting to reconnect counts as connecting (yellow).
     pub fn live(&self) -> Option<LiveStatus> {
         match self.status {
-            SshStatus::Connecting => Some(LiveStatus::Connecting),
+            SshStatus::Connecting | SshStatus::Reconnecting(_) => Some(LiveStatus::Connecting),
             SshStatus::Connected => Some(LiveStatus::Ok),
             SshStatus::Failed => Some(LiveStatus::Failed),
             SshStatus::Ended => None,
         }
     }
-}
 
-impl Drop for SshSession {
-    fn drop(&mut self) {
-        // Closing a tab that is still connecting cancels the connection task.
-        if let Some(abort) = self.abort.take() {
-            abort.abort();
+    /// The badge on the tab: `重连 2/5` (yellow) or `连接失败` (red).
+    pub fn badge(&self) -> Option<String> {
+        match self.status {
+            SshStatus::Reconnecting(n) => Some(format!("重连 {n}/{MAX_ATTEMPTS}")),
+            SshStatus::Failed => Some("连接失败".to_string()),
+            SshStatus::Connecting | SshStatus::Connected | SshStatus::Ended => None,
+        }
+    }
+
+    /// What the header subtitle appends to the target: the state if it is not the usual one.
+    pub fn status_note(&self) -> Option<String> {
+        match self.status {
+            SshStatus::Reconnecting(n) => Some(format!("重连中 {n}/{MAX_ATTEMPTS}")),
+            SshStatus::Failed => Some("连接失败".to_string()),
+            SshStatus::Ended => Some("已退出".to_string()),
+            SshStatus::Connecting | SshStatus::Connected => None,
         }
     }
 }
@@ -98,7 +129,7 @@ impl Drop for SshSession {
 pub enum Existing {
     /// No tab for the host: open one.
     None,
-    /// A tab is connecting or connected: switch to it (the tab with this index).
+    /// A tab is connecting, connected or reconnecting: switch to it (the tab with this index).
     Switch(usize),
     /// A tab for the host has ended or failed: switch to it and connect again in place.
     Reconnect(usize),
@@ -110,7 +141,7 @@ pub fn existing_session<'a>(sessions: impl Iterator<Item = (usize, &'a SshSessio
     let mut ended = None;
     for (index, ssh) in sessions.filter(|(_, ssh)| &ssh.host.id == host) {
         match ssh.status {
-            SshStatus::Connecting | SshStatus::Connected => return Existing::Switch(index),
+            SshStatus::Connecting | SshStatus::Connected | SshStatus::Reconnecting(_) => return Existing::Switch(index),
             SshStatus::Failed | SshStatus::Ended => {
                 ended.get_or_insert(index);
             }
@@ -135,6 +166,11 @@ pub fn status_line(cols: u16, rows: u16) -> String {
     format!("PTY {cols}×{rows}    xterm-256color    UTF-8    保活 30s")
 }
 
+/// The line a copied tab prints when it rides on the existing connection.
+pub fn reuse_line(host: &str, channel: u32) -> String {
+    format!("\x1b[2m→ 复用到 {host} 的已有连接 · 新开 channel #{channel}")
+}
+
 /// Why a panel is unavailable in an SSH session (the later phases bring them).
 pub fn panel_hint(panel: Panel) -> &'static str {
     match panel {
@@ -146,34 +182,86 @@ pub fn panel_hint(panel: Panel) -> &'static str {
 }
 
 impl Workspace {
-    /// Opens a tab for the saved host and starts connecting; a host that already has a tab
-    /// switches to it instead (a copy of a session is a separate action).
-    pub(super) fn connect_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
-        let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
-        match existing_session(tabs, id) {
-            Existing::Switch(ix) => return self.activate(ix, window, cx),
-            Existing::Reconnect(ix) => {
-                let session_id = self.sessions[ix].id;
-                self.activate(ix, window, cx);
-                return self.reconnect(session_id, window, cx);
-            }
-            Existing::None => {}
+    // ---- lookups ---------------------------------------------------------------------------
+
+    pub(super) fn group(&self, id: usize) -> Option<&ConnGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    fn group_mut(&mut self, id: usize) -> Option<&mut ConnGroup> {
+        self.groups.iter_mut().find(|group| group.id == id)
+    }
+
+    fn ssh_mut(&mut self, session_id: usize) -> Option<&mut SshSession> {
+        self.sessions.iter_mut().find(|s| s.id == session_id).and_then(|s| match &mut s.kind {
+            SessionKind::Ssh(ssh) => Some(&mut **ssh),
+            SessionKind::Local => None,
+        })
+    }
+
+    /// The tabs of a connection that wait for a shell, with their terminals.
+    fn participants(&self, group_id: usize) -> Vec<(usize, Entity<Terminal>)> {
+        self.sessions
+            .iter()
+            .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id && ssh.status.wants_channel()))
+            .map(|s| (s.id, s.terminal.clone()))
+            .collect()
+    }
+
+    /// Prints a line in the terminal of every tab waiting on the connection.
+    fn notice_participants(&mut self, group_id: usize, line: &str, cx: &mut Context<Self>) {
+        for (_, terminal) in self.participants(group_id) {
+            terminal.update(cx, |terminal, cx| terminal.notice(line, cx));
         }
-        let resolved = self.store.borrow().resolve_route(id);
-        let chain = match resolved {
-            Ok(chain) => chain,
-            Err(err) => {
-                window.push_notification(Notification::error(err.to_string()).title("无法连接"), cx);
-                return;
+    }
+
+    /// Brings the tabs of a connection in line with where its reconnect loop stands.
+    fn sync_statuses(&mut self, group_id: usize) {
+        let Some(view) = self.group(group_id).map(|group| group.machine.view()) else { return };
+        for session in &mut self.sessions {
+            if let SessionKind::Ssh(ssh) = &mut session.kind
+                && ssh.group == group_id
+            {
+                ssh.status = ssh.status.on_view(view);
             }
-        };
-        let Some(host) = chain.last().cloned() else { return };
-        if host.protocol != shellmate_core::Protocol::Ssh {
-            let note = format!("{} 将在后续阶段（P7）实现，目前只能连接 SSH 主机。", host.protocol.label());
-            window.push_notification(Notification::info(note).title(format!("暂不能连接 {}", host.name)), cx);
+        }
+    }
+
+    /// A connection nobody is on any more goes away with whatever it was doing: the running
+    /// attempt is aborted, and a dialog it asked is closed.
+    pub(super) fn release_group(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sessions.iter().any(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id)) {
             return;
         }
+        if let Some(ix) = self.groups.iter().position(|group| group.id == group_id) {
+            let group = self.groups.remove(ix);
+            if group.has_open_prompt() {
+                window.close_all_dialogs(cx);
+            }
+            drop(group);
+        }
+    }
 
+    fn new_group(&mut self, chain: &[Host], machine: Reconnect, memory: Arc<AuthMemory>) -> usize {
+        let id = self.next_group;
+        self.next_group += 1;
+        let key = PoolKey::of(chain, &connect::default_user());
+        self.groups.push(ConnGroup::new(id, key, machine, memory));
+        id
+    }
+
+    // ---- opening tabs ----------------------------------------------------------------------
+
+    /// Adds a tab with a fresh terminal for `host` on connection `group` and makes it current.
+    fn push_ssh_tab(
+        &mut self,
+        title: String,
+        host: Host,
+        chain: Vec<Host>,
+        group: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let style = cx.terminal_style();
         let palette = style.palette.clone();
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
@@ -187,16 +275,54 @@ impl Workspace {
         let subscription = self.watch_terminal(session_id, &terminal, window, cx);
         self.sessions.push(Session {
             id: session_id,
-            title: host.name.clone().into(),
+            title: title.into(),
             view,
             terminal,
             exited: false,
             panel: Panel::Terminal,
-            kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain))),
+            kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
             _subscription: subscription,
         });
         self.activate(self.sessions.len() - 1, window, cx);
-        self.start_connect(session_id, window, cx);
+        session_id
+    }
+
+    /// Resolves the route of a saved host for connecting, or tells the user why not.
+    fn resolve_for_connect(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) -> Option<(Host, Vec<Host>)> {
+        let resolved = self.store.borrow().resolve_route(id);
+        let chain = match resolved {
+            Ok(chain) => chain,
+            Err(err) => {
+                window.push_notification(Notification::error(err.to_string()).title("无法连接"), cx);
+                return None;
+            }
+        };
+        let host = chain.last().cloned()?;
+        if host.protocol != shellmate_core::Protocol::Ssh {
+            let note = format!("{} 将在后续阶段（P7）实现，目前只能连接 SSH 主机。", host.protocol.label());
+            window.push_notification(Notification::info(note).title(format!("暂不能连接 {}", host.name)), cx);
+            return None;
+        }
+        Some((host, chain))
+    }
+
+    /// Opens a tab for the saved host and starts connecting; a host that already has a tab
+    /// switches to it instead (a copy of a session is a separate action).
+    pub(super) fn connect_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
+        match existing_session(tabs, id) {
+            Existing::Switch(ix) => return self.activate(ix, window, cx),
+            Existing::Reconnect(ix) => {
+                let session_id = self.sessions[ix].id;
+                self.activate(ix, window, cx);
+                return self.retry_tab(session_id, window, cx);
+            }
+            Existing::None => {}
+        }
+        let Some((host, chain)) = self.resolve_for_connect(id, window, cx) else { return };
+        let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new());
+        self.push_ssh_tab(host.name.clone(), host, chain, group, window, cx);
+        self.launch_attempt(group, window, cx);
     }
 
     /// Connects the saved host called `name` (debug review hook).
@@ -208,32 +334,44 @@ impl Workspace {
         }
     }
 
-    /// Starts (or restarts) the connection of an SSH session.
-    fn start_connect(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.sessions.iter().position(|s| s.id == session_id) else { return };
-        let terminal = self.sessions[ix].terminal.clone();
-        let Some(host_id) = self.sessions[ix].ssh().map(|s| s.host.id.clone()) else { return };
+    // ---- connecting ------------------------------------------------------------------------
 
+    /// Starts a connection attempt for the tabs of a group that wait for a shell: one connection,
+    /// one channel each.
+    fn launch_attempt(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let participants = self.participants(group_id);
+        let host_id = participants
+            .first()
+            .and_then(|(id, _)| self.sessions.iter().find(|s| s.id == *id))
+            .and_then(|s| s.ssh())
+            .map(|ssh| ssh.host.id.clone());
+        let Some(host_id) = host_id else {
+            return self.release_group(group_id, window, cx);
+        };
+        let fail = |this: &mut Self, reason: String, window: &mut Window, cx: &mut Context<Self>| {
+            this.attempt_failed(group_id, Failure::Stop(reason), true, window, cx)
+        };
         let Some(runtime) = runtime::get(cx) else {
-            self.fail(session_id, "SSH 运行时未能启动", window, cx);
-            return;
+            return fail(self, "SSH 运行时未能启动".into(), window, cx);
         };
         // The host may have been edited since the last attempt.
         let resolved = self.store.borrow().resolve_route(&host_id);
         let chain = match resolved {
             Ok(chain) => chain,
-            Err(err) => {
-                self.fail(session_id, &err.to_string(), window, cx);
-                return;
-            }
+            Err(err) => return fail(self, err.to_string(), window, cx),
         };
         let Some(host) = chain.last().cloned() else { return };
 
+        let tabs: Vec<(usize, PtyDims)> =
+            participants.iter().map(|(id, terminal)| (*id, terminal.read(cx).size().dims())).collect();
+        let memory = match self.group(group_id) {
+            Some(group) => group.memory.clone(),
+            None => return,
+        };
         let (tx, rx) = async_channel::unbounded();
-        let bridge = UiBridge::new(tx, &chain, &connect::default_user());
+        let bridge = UiBridge::new(tx, &chain, &connect::default_user(), memory);
         let names = Rc::new(connect::names_by_address(&chain));
-        let dims = terminal.read(cx).size().dims();
-        let join = runtime.spawn(connect::connect_and_open(chain.clone(), self.secrets.clone(), bridge, dims));
+        let join = runtime.spawn(connect::connect_attempt(chain.clone(), self.secrets.clone(), bridge, tabs));
         let abort = join.abort_handle();
 
         let pump_rx = rx.clone();
@@ -241,9 +379,7 @@ impl Workspace {
         let pump = cx.spawn_in(window, async move |this, cx| {
             while let Ok(msg) = pump_rx.recv().await {
                 let names = pump_names.clone();
-                if this
-                    .update_in(cx, |this, window, cx| this.on_ui_message(session_id, &names, msg, window, cx))
-                    .is_err()
+                if this.update_in(cx, |this, window, cx| this.on_group_message(group_id, &names, msg, window, cx)).is_err()
                 {
                     break;
                 }
@@ -255,63 +391,131 @@ impl Workspace {
             // dialogs come before the shell's own output.
             while let Ok(msg) = rx.try_recv() {
                 let names = names.clone();
-                if this
-                    .update_in(cx, |this, window, cx| this.on_ui_message(session_id, &names, msg, window, cx))
-                    .is_err()
+                if this.update_in(cx, |this, window, cx| this.on_group_message(group_id, &names, msg, window, cx)).is_err()
                 {
                     return;
                 }
             }
-            this.update_in(cx, |this, window, cx| this.on_connect_result(session_id, outcome, window, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.on_attempt_result(group_id, outcome, window, cx)).ok();
         });
 
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id)
-            && let SessionKind::Ssh(ssh) = &mut session.kind
-        {
-            ssh.host = host;
-            ssh.chain = chain;
-            ssh.status = SshStatus::Connecting;
-            ssh.prompting = false;
-            ssh.abort = Some(abort);
-            ssh._tasks = vec![pump, result];
+        let key = PoolKey::of(&chain, &connect::default_user());
+        if let Some(group) = self.group_mut(group_id) {
+            group.key = key;
+            group.prompting = false;
+            group.attempt = Some(Attempt::new(abort, vec![pump, result]));
+        }
+        for session in &mut self.sessions {
+            if let SessionKind::Ssh(ssh) = &mut session.kind
+                && ssh.group == group_id
+            {
+                ssh.host = host.clone();
+                ssh.chain = chain.clone();
+            }
         }
         self.sync_sidebar(cx);
         cx.notify();
     }
 
-    /// Enter on a session whose connection ended: connect again, in the same tab.
-    pub(super) fn reconnect(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_connect(session_id, window, cx);
-    }
-
-    fn fail(&mut self, session_id: usize, reason: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
-        if let SessionKind::Ssh(ssh) = &mut session.kind {
-            ssh.status = SshStatus::Failed;
+    /// Feeds the connection's reconnect loop and carries out what it asks for.
+    fn step_group(&mut self, group_id: usize, input: Input, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.group_mut(group_id) else { return };
+        let outputs = group.machine.step(input);
+        self.sync_statuses(group_id);
+        for output in outputs {
+            match output {
+                Output::Wait { attempt, delay } => {
+                    let last = self.group(group_id).and_then(|g| g.last_failure.clone());
+                    self.notice_participants(group_id, &reconnect::waiting_line(attempt, delay, last.as_deref()), cx);
+                    self.start_timer(group_id, delay, window, cx);
+                }
+                Output::Attempt { attempt } => {
+                    let reconnecting = match self.group_mut(group_id) {
+                        Some(group) => {
+                            group.timer = None;
+                            group.machine.has_connected()
+                        }
+                        None => return,
+                    };
+                    if reconnecting {
+                        self.notice_participants(group_id, &reconnect::attempt_line(attempt), cx);
+                    }
+                    self.launch_attempt(group_id, window, cx);
+                }
+                // A success carries the shells: see `on_attempt_result`.
+                Output::Connected { .. } => {}
+                Output::GaveUp { reason, attempts } => self.give_up(group_id, &reason, attempts, window, cx),
+            }
         }
-        session.terminal.update(cx, |terminal, cx| terminal.disconnect(reason.to_string(), cx));
         self.sync_sidebar(cx);
         cx.notify();
+    }
+
+    /// Counts down to the next attempt.
+    fn start_timer(&mut self, group_id: usize, delay: Duration, window: &mut Window, cx: &mut Context<Self>) {
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update_in(cx, |this, window, cx| this.step_group(group_id, Input::TimerElapsed, window, cx)).ok();
+        });
+        if let Some(group) = self.group_mut(group_id) {
+            group.timer = Some(task);
+        }
+    }
+
+    /// No more automatic attempts: every waiting tab shows the reason and waits for Enter.
+    fn give_up(&mut self, group_id: usize, reason: &str, attempts: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = self.group_mut(group_id) else { return };
+        let retried = group.machine.has_connected();
+        // Declining a question on a first connect is the user's choice, not a failure.
+        let ended = group.declined && !retried;
+        group.stop();
+        let text = reconnect::gave_up_text(reason, attempts, retried);
+        for (session_id, terminal) in self.participants(group_id) {
+            if let Some(ssh) = self.ssh_mut(session_id) {
+                ssh.status = if ended { SshStatus::Ended } else { SshStatus::Failed };
+            }
+            terminal.update(cx, |terminal, cx| terminal.disconnect(text.clone(), cx));
+        }
+        let _ = window;
+    }
+
+    /// An attempt failed (or could not even start): the loop decides what next.
+    fn attempt_failed(&mut self, group_id: usize, failure: Failure, declined: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(group) = self.group_mut(group_id) {
+            group.attempt = None;
+            group.prompting = false;
+            group.declined = declined;
+            group.last_failure = match &failure {
+                Failure::Retry(reason) | Failure::Stop(reason) => Some(reason.clone()),
+            };
+        }
+        self.step_group(group_id, Input::Failed(failure), window, cx);
     }
 
     /// A message from the SSH task: progress to print, or a question to answer.
-    fn on_ui_message(
+    fn on_group_message(
         &mut self,
-        session_id: usize,
+        group_id: usize,
         names: &HashMap<String, String>,
         msg: UiMsg,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
         let prompting = !matches!(msg, UiMsg::Event(_));
-        if let SessionKind::Ssh(ssh) = &mut session.kind {
-            ssh.prompting = prompting;
+        let Some(group) = self.group_mut(group_id) else { return };
+        group.prompting = prompting;
+        if prompting {
+            // The question is about this connection: show the tab it belongs to.
+            let on_group = |s: &Session| s.ssh().is_some_and(|ssh| ssh.group == group_id);
+            let showing = self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(on_group);
+            if !showing && let Some(ix) = self.sessions.iter().position(on_group) {
+                self.activate(ix, window, cx);
+            }
         }
         match msg {
             UiMsg::Event(event) => {
                 let line = connect::format_event(&event, names);
-                session.terminal.update(cx, |terminal, cx| terminal.notice(&line, cx));
+                self.notice_participants(group_id, &line, cx);
             }
             UiMsg::HostKey { request, reply } => HostKeyDialog::open(request, reply, window, cx),
             UiMsg::Password { request, reply } => SecretDialog::open_password(request, reply, window, cx),
@@ -320,47 +524,286 @@ impl Workspace {
         }
     }
 
-    /// The SSH task finished: attach the shell, or show why it failed.
-    fn on_connect_result(
+    /// The SSH task finished: attach the shells, or let the loop decide about the failure.
+    fn on_attempt_result(
+        &mut self,
+        group_id: usize,
+        outcome: Result<Result<Connected, ConnectFailure>, JoinError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(Ok(connected)) => self.on_connected(group_id, connected, window, cx),
+            Ok(Err(ConnectFailure { error, saves })) => {
+                self.announce_saved(&saves, window, cx);
+                let declined = error.is_cancelled();
+                self.attempt_failed(group_id, reconnect::classify(&error), declined, window, cx);
+            }
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => {
+                let reason = format!("连接任务异常终止：{err}");
+                self.attempt_failed(group_id, Failure::Stop(reason), false, window, cx);
+            }
+        }
+    }
+
+    /// The connection is up: every tab that was waiting gets its shell.
+    fn on_connected(&mut self, group_id: usize, connected: Connected, window: &mut Window, cx: &mut Context<Self>) {
+        let Connected { connection, shells, saves } = connected;
+        let Some(group) = self.group_mut(group_id) else { return };
+        let reconnected = matches!(group.machine.step(Input::Succeeded).first(), Some(Output::Connected { reconnected: true }));
+        let manual = std::mem::take(&mut group.manual);
+        group.stop();
+        group.last_failure = None;
+        group.declined = false;
+        group.connection = Some(connection);
+        group.channels = shells.len() as u32;
+
+        let mut first_host = None;
+        for (channel, (session_id, shell)) in (1u32..).zip(shells) {
+            let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { continue };
+            let terminal = session.terminal.clone();
+            if let SessionKind::Ssh(ssh) = &mut session.kind {
+                ssh.status = SshStatus::Connected;
+                ssh.channel = channel;
+                first_host.get_or_insert_with(|| ssh.host.id.clone());
+            }
+            if reconnected {
+                terminal.update(cx, |terminal, cx| terminal.notice(&reconnect::healed_line(manual), cx));
+            }
+            Self::attach_shell(&terminal, shell, cx);
+        }
+        // Tabs that started waiting while the attempt ran have no shell yet: they get a channel
+        // on the connection that is up now.
+        self.open_channels_for_waiting(group_id, window, cx);
+
+        if !reconnected && let Some(host_id) = first_host {
+            if let Err(err) = self.store.borrow_mut().touch_connected(&host_id) {
+                log::warn!("could not record the connection time: {err}");
+            }
+            self.reload_book(window, cx);
+        }
+        self.announce_saved(&saves, window, cx);
+        self.sync_sidebar(cx);
+        cx.notify();
+    }
+
+    fn attach_shell(terminal: &Entity<Terminal>, shell: PendingShell, cx: &mut Context<Self>) {
+        terminal.update(cx, |terminal, cx| {
+            terminal.attach(move |sink, dims| Ok(Box::new(shell.start(sink, dims))), cx);
+        });
+    }
+
+    /// Gives every tab of the group that still waits for a shell a channel on its live connection.
+    fn open_channels_for_waiting(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let waiting: Vec<usize> = self.participants(group_id).into_iter().map(|(id, _)| id).collect();
+        for session_id in waiting {
+            let Some(group) = self.group_mut(group_id) else { return };
+            let Some(connection) = group.live_connection() else { return };
+            let number = group.next_channel();
+            self.open_channel(session_id, connection, number, window, cx);
+        }
+    }
+
+    // ---- extra channels on a live connection -----------------------------------------------
+
+    /// Opens a shell channel for the tab on `connection`, which is already up: no new
+    /// connection, no authentication.
+    fn open_channel(
         &mut self,
         session_id: usize,
-        outcome: Result<Result<Connected, ConnectFailure>, JoinError>,
+        connection: Connection,
+        number: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.sessions.iter().find(|s| s.id == session_id).map(|s| s.terminal.clone()) else {
+            return;
+        };
+        let Some(runtime) = runtime::get(cx) else {
+            return self.connect_separately(session_id, "SSH 运行时未能启动", window, cx);
+        };
+        let dims = terminal.read(cx).size().dims();
+        let join = runtime.spawn(async move { connection.open_shell(dims).await });
+        let abort = join.abort_handle();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let outcome = join.await;
+            this.update_in(cx, |this, window, cx| this.on_channel_opened(session_id, number, outcome, window, cx)).ok();
+        });
+        if let Some(ssh) = self.ssh_mut(session_id) {
+            ssh.status = SshStatus::Connecting;
+            ssh.opening = Some(Opening { _abort: AbortOnDrop::new(abort), _task: task });
+        }
+        self.sync_sidebar(cx);
+        cx.notify();
+    }
+
+    fn on_channel_opened(
+        &mut self,
+        session_id: usize,
+        number: u32,
+        outcome: Result<Result<PendingShell, SshError>, JoinError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
         let terminal = session.terminal.clone();
         let SessionKind::Ssh(ssh) = &mut session.kind else { return };
-        ssh.prompting = false;
-        ssh.abort = None;
-        let host_id = ssh.host.id.clone();
-
+        ssh.opening = None;
         match outcome {
-            Ok(Ok(connected)) => {
+            Ok(Ok(shell)) => {
                 ssh.status = SshStatus::Connected;
-                let Connected { shell, saves } = connected;
-                terminal.update(cx, |terminal, cx| {
-                    terminal.attach(move |sink, dims| Ok(Box::new(shell.start(sink, dims))), cx)
-                });
-                if let Err(err) = self.store.borrow_mut().touch_connected(&host_id) {
-                    log::warn!("could not record the connection time: {err}");
-                }
-                self.reload_book(window, cx);
-                self.announce_saved(&saves, window, cx);
+                ssh.channel = number;
+                let line = reuse_line(&ssh.host.name, number);
+                terminal.update(cx, |terminal, cx| terminal.notice(&line, cx));
+                Self::attach_shell(&terminal, shell, cx);
             }
-            Ok(Err(ConnectFailure { error, saves })) => {
-                ssh.status = if error.is_cancelled() { SshStatus::Ended } else { SshStatus::Failed };
-                terminal.update(cx, |terminal, cx| terminal.disconnect(error.to_string(), cx));
-                self.announce_saved(&saves, window, cx);
-            }
+            Ok(Err(err)) => self.connect_separately(session_id, &err.to_string(), window, cx),
             Err(err) if err.is_cancelled() => {}
-            Err(err) => {
-                ssh.status = SshStatus::Failed;
-                terminal.update(cx, |terminal, cx| terminal.disconnect(format!("连接任务异常终止：{err}"), cx));
-            }
+            Err(err) => self.connect_separately(session_id, &format!("连接任务异常终止：{err}"), window, cx),
         }
         self.sync_sidebar(cx);
         cx.notify();
+    }
+
+    /// The connection could not take another channel (it died, or the server refused): the tab
+    /// connects on its own, with what authenticated so far.
+    fn connect_separately(&mut self, session_id: usize, why: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((old_group, chain, terminal)) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| {
+            s.ssh().map(|ssh| (ssh.group, ssh.chain.clone(), s.terminal.clone()))
+        }) else {
+            return;
+        };
+        let memory = self.group(old_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
+        let group = self.new_group(&chain, Reconnect::initial(), memory);
+        if let Some(ssh) = self.ssh_mut(session_id) {
+            ssh.group = group;
+            ssh.status = SshStatus::Connecting;
+            ssh.channel = 1;
+            ssh.opening = None;
+        }
+        terminal.update(cx, |terminal, cx| {
+            terminal.notice(&format!("\x1b[33m! 无法在已有连接上新开通道（{why}），改为重新连接"), cx)
+        });
+        self.release_group(old_group, window, cx);
+        self.launch_attempt(group, window, cx);
+    }
+
+    // ---- tab events ------------------------------------------------------------------------
+
+    /// The tab's terminal reported the connection lost (its shell channel ended without the
+    /// remote program exiting). The first tab of a connection to say so starts the loop; the
+    /// others on it are already covered.
+    pub(super) fn on_tab_disconnected(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ssh) = self.ssh_mut(session_id) else { return };
+        // Disconnects the app itself caused (a failed attempt) find the tab already waiting.
+        if ssh.status != SshStatus::Connected {
+            return;
+        }
+        let group_id = ssh.group;
+        if let Some(group) = self.group_mut(group_id) {
+            group.last_failure = None;
+            group.declined = false;
+            group.manual = false;
+        }
+        self.step_group(group_id, Input::Lost, window, cx);
+        if let Some(ssh) = self.ssh_mut(session_id)
+            && ssh.status == SshStatus::Connected
+        {
+            ssh.status = SshStatus::Failed;
+        }
+        self.sync_sidebar(cx);
+    }
+
+    /// The remote program ended: the tab is over, and not reconnected by itself.
+    pub(super) fn on_tab_exited(&mut self, session_id: usize, cx: &mut Context<Self>) {
+        if let Some(ssh) = self.ssh_mut(session_id) {
+            ssh.status = SshStatus::Ended;
+        }
+        self.sync_sidebar(cx);
+    }
+
+    /// Enter in a tab whose session is over, or a click on its badge: try again now.
+    pub(super) fn retry_tab(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ssh) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()) else { return };
+        let (group_id, status) = (ssh.group, ssh.status);
+        let Some(phase) = self.group(group_id).map(|group| group.machine.phase()) else { return };
+        match phase {
+            // Cut the wait short, or start over after giving up. A tab that had ended joins in.
+            Phase::Waiting { .. } | Phase::Failed => {
+                if phase == Phase::Failed
+                    && let Some(group) = self.group_mut(group_id)
+                {
+                    group.manual = true;
+                }
+                if status == SshStatus::Ended
+                    && let Some(ssh) = self.ssh_mut(session_id)
+                {
+                    ssh.status = SshStatus::Failed;
+                }
+                self.step_group(group_id, Input::RetryNow, window, cx);
+            }
+            // An attempt is already running.
+            Phase::Connecting { .. } => {}
+            // The remote shell exited: a new channel on the connection if it is still up (other
+            // tabs keep it open), else a connection of its own again.
+            Phase::Idle => {
+                if let Some(ssh) = self.ssh_mut(session_id) {
+                    ssh.status = SshStatus::Connecting;
+                }
+                let live = self.group_mut(group_id).and_then(|group| group.live_connection().map(|c| (c, group.next_channel())));
+                match live {
+                    Some((connection, number)) => self.open_channel(session_id, connection, number, window, cx),
+                    None => {
+                        if let Some(group) = self.group_mut(group_id) {
+                            group.manual = true;
+                        }
+                        self.step_group(group_id, Input::Start, window, cx)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- ⌘⇧T ---------------------------------------------------------------------------------
+
+    /// Copies the current session: an SSH tab opens a new channel on the same connection (no new
+    /// login), a local one a new shell in the directory the current one is working in.
+    pub(crate) fn duplicate_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active.filter(|ix| *ix < self.sessions.len()) else {
+            return self.open_local(window, cx);
+        };
+        let Some(ssh) = self.sessions[ix].ssh() else {
+            let terminal = self.sessions[ix].terminal.clone();
+            let cwd = terminal
+                .update(cx, |terminal, _| terminal.foreground_process())
+                .and_then(|process| process.cwd)
+                .filter(|cwd| cwd.is_dir());
+            return self.open_local_in(cwd, window, cx);
+        };
+        let (source_group, host_id) = (ssh.group, ssh.host.id.clone());
+        let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
+
+        let copies = self.sessions.iter().filter(|s| s.ssh().is_some_and(|ssh| ssh.host.id == host_id)).count();
+        let title = format!("{} · {}", host.name, copies + 1);
+        let key = PoolKey::of(&chain, &connect::default_user());
+        // Same host, same route as the connection the source tab is on, and that connection is up.
+        let reusable = self
+            .group_mut(source_group)
+            .filter(|group| group.key == key)
+            .and_then(|group| group.live_connection().map(|connection| (connection, group.next_channel())));
+        match reusable {
+            Some((connection, number)) => {
+                let session_id = self.push_ssh_tab(title, host, chain, source_group, window, cx);
+                self.open_channel(session_id, connection, number, window, cx);
+            }
+            None => {
+                let memory = self.group(source_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
+                let group = self.new_group(&chain, Reconnect::initial(), memory);
+                self.push_ssh_tab(title, host, chain, group, window, cx);
+                self.launch_attempt(group, window, cx);
+            }
+        }
     }
 
     /// Tells the user what went to the keychain (or why not) after an attempt.
@@ -407,7 +850,7 @@ mod tests {
     }
 
     fn tab(host: &Host, status: SshStatus) -> SshSession {
-        let mut session = SshSession::new(host.clone(), vec![host.clone()]);
+        let mut session = SshSession::new(host.clone(), vec![host.clone()], 1);
         session.status = status;
         session
     }
@@ -423,10 +866,12 @@ mod tests {
     }
 
     #[test]
-    fn connecting_counts_as_live() {
+    fn connecting_and_reconnecting_count_as_live() {
         let web = host("web", None);
-        let tabs = [tab(&web, SshStatus::Connecting)];
-        assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Switch(0));
+        for status in [SshStatus::Connecting, SshStatus::Reconnecting(3)] {
+            let tabs = [tab(&web, status)];
+            assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Switch(0), "{status:?}");
+        }
     }
 
     #[test]
@@ -457,6 +902,11 @@ mod tests {
     }
 
     #[test]
+    fn reuse_line_wording() {
+        assert_eq!(reuse_line("prod-web-01", 2), "\x1b[2m→ 复用到 prod-web-01 的已有连接 · 新开 channel #2");
+    }
+
+    #[test]
     fn panels_name_the_phase_that_brings_them() {
         assert_eq!(panel_hint(Panel::Files), "文件管理（P3 实现）");
         assert_eq!(panel_hint(Panel::Forward), "端口转发（P4 实现）");
@@ -464,26 +914,78 @@ mod tests {
     }
 
     #[test]
-    fn status_maps_to_sidebar_dots() {
-        let mut session = SshSession::new(host("db", None), vec![host("bastion", None), host("db", None)]);
-        assert_eq!(session.live(), Some(LiveStatus::Connecting));
+    fn status_maps_to_dots_badges_and_notes() {
+        let mut session = SshSession::new(host("db", None), vec![host("bastion", None), host("db", None)], 1);
         assert_eq!(session.via(), ["bastion"]);
-        session.status = SshStatus::Connected;
-        assert_eq!(session.live(), Some(LiveStatus::Ok));
-        session.on_disconnected();
-        assert_eq!((session.status, session.live()), (SshStatus::Failed, Some(LiveStatus::Failed)));
-        session.on_exited();
-        assert_eq!((session.status, session.live()), (SshStatus::Ended, None));
+        let cases = [
+            (SshStatus::Connecting, Some(LiveStatus::Connecting), None, None),
+            (SshStatus::Connected, Some(LiveStatus::Ok), None, None),
+            (SshStatus::Reconnecting(2), Some(LiveStatus::Connecting), Some("重连 2/5"), Some("重连中 2/5")),
+            (SshStatus::Failed, Some(LiveStatus::Failed), Some("连接失败"), Some("连接失败")),
+            (SshStatus::Ended, None, None, Some("已退出")),
+        ];
+        for (status, live, badge, note) in cases {
+            session.status = status;
+            assert_eq!(session.live(), live, "{status:?}");
+            assert_eq!(session.badge().as_deref(), badge, "{status:?}");
+            assert_eq!(session.status_note().as_deref(), note, "{status:?}");
+        }
     }
 
     #[test]
-    fn a_failed_attempt_is_not_downgraded_by_its_own_disconnect_event() {
-        let mut session = SshSession::new(host("db", None), vec![host("db", None)]);
-        session.status = SshStatus::Ended;
-        session.on_disconnected();
-        assert_eq!(session.status, SshStatus::Ended);
-        session.status = SshStatus::Connecting;
-        session.on_disconnected();
-        assert_eq!(session.status, SshStatus::Connecting);
+    fn only_waiting_tabs_take_part_in_an_attempt() {
+        assert!(SshStatus::Connecting.wants_channel());
+        assert!(SshStatus::Reconnecting(1).wants_channel());
+        assert!(SshStatus::Failed.wants_channel());
+        assert!(!SshStatus::Connected.wants_channel());
+        assert!(!SshStatus::Ended.wants_channel(), "a tab whose remote shell exited is not reconnected by itself");
+    }
+
+    #[test]
+    fn the_loop_moves_the_tabs_and_leaves_ended_ones_alone() {
+        use SshStatus::*;
+        // A loss: tabs that were up now wait, with the attempt number.
+        assert_eq!(Connected.on_view(View::Reconnecting(1)), Reconnecting(1));
+        assert_eq!(Reconnecting(1).on_view(View::Reconnecting(2)), Reconnecting(2));
+        assert_eq!(Failed.on_view(View::Reconnecting(1)), Reconnecting(1), "retrying after giving up");
+        assert_eq!(Ended.on_view(View::Reconnecting(1)), Ended);
+        // Giving up.
+        assert_eq!(Reconnecting(5).on_view(View::Failed), Failed);
+        assert_eq!(Connecting.on_view(View::Failed), Failed);
+        assert_eq!(Ended.on_view(View::Failed), Ended);
+        assert_eq!(Connected.on_view(View::Failed), Connected, "a tab that is up is not failed by someone else's attempt");
+        // First connect.
+        assert_eq!(Failed.on_view(View::Connecting), Connecting);
+        assert_eq!(Connected.on_view(View::Connecting), Connected);
+        // Success: the shells are attached one by one, not by the loop.
+        for status in [Connecting, Connected, Reconnecting(2), Failed, Ended] {
+            assert_eq!(status.on_view(View::Connected), status);
+        }
+    }
+
+    #[test]
+    fn a_status_follows_the_machine_through_a_loss_and_a_recovery() {
+        let mut machine = Reconnect::connected();
+        let mut tabs = [SshStatus::Connected, SshStatus::Connected, SshStatus::Ended];
+        fn sync(tabs: &mut [SshStatus], machine: &Reconnect) {
+            tabs.iter_mut().for_each(|status| *status = status.on_view(machine.view()));
+        }
+
+        machine.step(Input::Lost);
+        sync(&mut tabs, &machine);
+        assert_eq!(tabs, [SshStatus::Reconnecting(1), SshStatus::Reconnecting(1), SshStatus::Ended]);
+        machine.step(Input::TimerElapsed);
+        machine.step(Input::Failed(Failure::Retry("x".into())));
+        sync(&mut tabs, &machine);
+        assert_eq!(tabs, [SshStatus::Reconnecting(2), SshStatus::Reconnecting(2), SshStatus::Ended]);
+        for _ in 0..4 {
+            machine.step(Input::TimerElapsed);
+            machine.step(Input::Failed(Failure::Retry("x".into())));
+        }
+        sync(&mut tabs, &machine);
+        assert_eq!(tabs, [SshStatus::Failed, SshStatus::Failed, SshStatus::Ended]);
+        machine.step(Input::RetryNow);
+        sync(&mut tabs, &machine);
+        assert_eq!(tabs, [SshStatus::Reconnecting(1), SshStatus::Reconnecting(1), SshStatus::Ended]);
     }
 }

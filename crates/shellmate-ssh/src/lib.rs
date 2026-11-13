@@ -17,9 +17,10 @@ mod interact;
 mod known_hosts;
 mod runtime;
 mod shell;
+mod watchdog;
 
 pub use config::{ConnectEvent, ConnectOptions, EventCallback, HostSecrets, Route, SshHost};
-pub use connection::{Connection, HopInfo};
+pub use connection::{Connection, HopInfo, WeakConnection};
 pub use error::SshError;
 pub use interact::{
     ChallengePrompt, ChallengeRequest, HostKeyInfo, HostKeyRequest, HostKeyVerifier, NoInteraction, PassphraseRequest,

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -27,12 +27,23 @@ use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
+mod group;
 mod hosts;
 mod ssh;
 
 actions!(
     shellmate,
-    [NewLocalTerminal, CloseTab, NextTab, PreviousTab, ToggleSidebar, ToggleTheme, FocusHostSearch, Quit]
+    [
+        NewLocalTerminal,
+        DuplicateSession,
+        CloseTab,
+        NextTab,
+        PreviousTab,
+        ToggleSidebar,
+        ToggleTheme,
+        FocusHostSearch,
+        Quit
+    ]
 );
 
 const CONTEXT: &str = "Workspace";
@@ -40,6 +51,7 @@ const CONTEXT: &str = "Workspace";
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewLocalTerminal, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-t", DuplicateSession, Some(CONTEXT)),
         KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(CONTEXT)),
@@ -118,9 +130,12 @@ pub struct Workspace {
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
+    /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
+    groups: Vec<group::ConnGroup>,
     active: Option<usize>,
     sidebar_open: bool,
     next_id: usize,
+    next_group: usize,
     user_host: SharedString,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -145,9 +160,11 @@ impl Workspace {
             book,
             sidebar,
             sessions: Vec::new(),
+            groups: Vec::new(),
             active: None,
             sidebar_open: true,
             next_id: 1,
+            next_group: 1,
             user_host: user_at_host().into(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -203,9 +220,15 @@ impl Workspace {
     // ---- sessions ------------------------------------------------------
 
     fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_in(None, window, cx);
+    }
+
+    /// Opens a local shell tab, starting in `cwd` (the home directory if `None`).
+    fn open_local_in(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let style = cx.terminal_style();
         let palette = style.palette.clone();
-        let terminal = cx.new(|cx| Terminal::local(PtyOptions::default(), palette, cx));
+        let options = PtyOptions { cwd, ..PtyOptions::default() };
+        let terminal = cx.new(|cx| Terminal::local(options, palette, cx));
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx);
             view.top_radius = CARD_RADIUS;
@@ -231,8 +254,9 @@ impl Workspace {
         self.activate(self.sessions.len() - 1, window, cx);
     }
 
-    /// Follows a session's terminal: exits and disconnects update the session state, and Enter
-    /// on an ended SSH session reconnects it.
+    /// Follows a session's terminal: exits and disconnects update the session state. For an SSH
+    /// session a disconnect starts the reconnect loop of its connection and Enter on an ended
+    /// session retries.
     fn watch_terminal(
         &mut self,
         id: usize,
@@ -242,17 +266,13 @@ impl Workspace {
     ) -> Subscription {
         cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
             let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
-            let mut reconnect = false;
             match (&mut session.kind, event) {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
                 (SessionKind::Local, TerminalEvent::Restarted) => session.exited = false,
-                (SessionKind::Ssh(ssh), TerminalEvent::Exited(_)) => ssh.on_exited(),
-                (SessionKind::Ssh(ssh), TerminalEvent::Disconnected(_)) => ssh.on_disconnected(),
-                (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => reconnect = true,
+                (SessionKind::Ssh(_), TerminalEvent::Exited(_)) => this.on_tab_exited(id, cx),
+                (SessionKind::Ssh(_), TerminalEvent::Disconnected(_)) => this.on_tab_disconnected(id, window, cx),
+                (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => this.retry_tab(id, window, cx),
                 _ => {}
-            }
-            if reconnect {
-                this.reconnect(id, window, cx);
             }
             this.sync_sidebar(cx);
             cx.notify();
@@ -280,12 +300,13 @@ impl Workspace {
         if ix >= self.sessions.len() {
             return;
         }
-        // A tab that is still asking something takes its dialog with it; dropping the session
-        // aborts the connection task.
-        if self.sessions[ix].ssh().is_some_and(|ssh| ssh.has_open_prompt()) {
-            window.close_all_dialogs(cx);
-        }
+        // Dropping the session ends its channel; the connection closes with its last tab, and a
+        // connection that is still being made is cancelled together with the dialog it asked.
+        let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
         self.sessions.remove(ix);
+        if let Some(group) = group {
+            self.release_group(group, window, cx);
+        }
         match self.active {
             _ if self.sessions.is_empty() => {
                 self.active = None;
@@ -319,6 +340,10 @@ impl Workspace {
 
     fn new_local_terminal(&mut self, _: &NewLocalTerminal, window: &mut Window, cx: &mut Context<Self>) {
         self.open_local(window, cx);
+    }
+
+    fn duplicate_session(&mut self, _: &DuplicateSession, window: &mut Window, cx: &mut Context<Self>) {
+        self.duplicate_active(window, cx);
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -408,6 +433,28 @@ impl Workspace {
                 .when(!active, |d| d.text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
                 .child(dot(session_dot(s, &p), 7.))
                 .child(s.title.clone())
+                .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
+                    let failed = status == ssh::SshStatus::Failed;
+                    let color = if failed { p.err } else { p.warn };
+                    let id = s.id;
+                    div()
+                        .id(("tab-badge", id))
+                        .h(px(18.))
+                        .px(px(6.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(5.))
+                        .bg(color.opacity(0.14))
+                        .text_color(color)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(badge)
+                        .tooltip(|window, cx| Tooltip::new("点击或按回车立即重试").build(window, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.retry_tab(id, window, cx);
+                        }))
+                }))
                 .child(
                     div()
                         .id(("close-tab", s.id))
@@ -501,7 +548,13 @@ impl Workspace {
     /// Header subtitle: the SSH target of an SSH session, the shell of a local one.
     fn session_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
         match session.ssh() {
-            Some(ssh) => ssh::subtitle(&ssh.host, &ssh.via(), &connect::default_user()),
+            Some(ssh) => {
+                let target = ssh::subtitle(&ssh.host, &ssh.via(), &connect::default_user());
+                match ssh.status_note() {
+                    Some(note) => format!("{target} · {note}"),
+                    None => target,
+                }
+            }
             None => self.local_subtitle(session, cx),
         }
     }
@@ -639,6 +692,7 @@ impl Render for Workspace {
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::new_local_terminal))
+            .on_action(cx.listener(Self::duplicate_session))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
@@ -675,7 +729,7 @@ fn session_dot(session: &Session, p: &theme::Palette) -> gpui::Hsla {
         SessionKind::Local if session.exited => p.tx3,
         SessionKind::Local => p.ok,
         SessionKind::Ssh(ssh) => match ssh.status {
-            ssh::SshStatus::Connecting => p.warn,
+            ssh::SshStatus::Connecting | ssh::SshStatus::Reconnecting(_) => p.warn,
             ssh::SshStatus::Connected => p.ok,
             ssh::SshStatus::Failed => p.err,
             ssh::SshStatus::Ended => p.tx3,

@@ -61,6 +61,10 @@ pub struct ServerOptions {
     pub two_factor: bool,
     /// Serve `direct-tcpip` channels (jump host).
     pub forwarding: bool,
+    /// How long the server sits on a PTY request before answering.
+    pub pty_delay: Duration,
+    /// How long the server sits on a password check before answering.
+    pub auth_delay: Duration,
 }
 
 impl Default for ServerOptions {
@@ -72,6 +76,8 @@ impl Default for ServerOptions {
             methods: vec![MethodKind::Password, MethodKind::PublicKey, MethodKind::KeyboardInteractive],
             two_factor: false,
             forwarding: false,
+            pty_delay: Duration::ZERO,
+            auth_delay: Duration::ZERO,
         }
     }
 }
@@ -89,6 +95,8 @@ pub struct ServerState {
     pub forwards: Mutex<Vec<(String, u32)>>,
     /// Number of accepted TCP connections.
     pub connections: Mutex<usize>,
+    /// Connections whose SSH session has not ended yet.
+    pub open_connections: Mutex<usize>,
     /// Number of shell requests (one per shell channel).
     pub shells: Mutex<usize>,
     /// Channels the client closed.
@@ -140,16 +148,19 @@ impl TestServer {
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     *lock(&state.connections) += 1;
+                    *lock(&state.open_connections) += 1;
                     // Keep a second handle on the socket so tests can cut the connection.
                     let std_stream = stream.into_std().unwrap();
                     lock(&state.sockets).push(std_stream.try_clone().unwrap());
                     let stream = TcpStream::from_std(std_stream).unwrap();
                     let handler = FixtureHandler::new(options.clone(), state.clone());
                     let config = config.clone();
+                    let closing = state.clone();
                     tokio::spawn(async move {
                         if let Ok(session) = server::run_stream(config, stream, handler).await {
                             let _ = session.await;
                         }
+                        *lock(&closing.open_connections) -= 1;
                     });
                 }
             }
@@ -230,6 +241,7 @@ impl server::Handler for FixtureHandler {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         self.record(format!("password:{user}"));
+        tokio::time::sleep(self.options.auth_delay).await;
         let ok = self.options.passwords.iter().any(|(u, p)| *u == user && *p == password);
         Ok(if ok { Auth::Accept } else { self.reject() })
     }
@@ -329,6 +341,7 @@ impl server::Handler for FixtureHandler {
     ) -> Result<(), Self::Error> {
         lock(&self.state.ptys).push((term.to_string(), cols, rows));
         self.sizes.insert(channel, (cols, rows));
+        tokio::time::sleep(self.options.pty_delay).await;
         session.channel_success(channel)?;
         Ok(())
     }
@@ -397,6 +410,8 @@ impl server::Handler for FixtureHandler {
 /// Host key verifier with a fixed answer that remembers what it was asked.
 pub struct Verifier {
     pub accept: bool,
+    /// How long the "user" takes to decide.
+    pub delay: Duration,
     /// Ports whose keys are refused even when `accept` is true.
     pub deny_ports: Vec<u16>,
     pub requests: Mutex<Vec<HostKeyRequest>>,
@@ -404,12 +419,17 @@ pub struct Verifier {
 
 impl Verifier {
     pub fn new(accept: bool) -> Arc<Self> {
-        Arc::new(Self { accept, deny_ports: Vec::new(), requests: Mutex::new(Vec::new()) })
+        Arc::new(Self { accept, delay: Duration::ZERO, deny_ports: Vec::new(), requests: Mutex::new(Vec::new()) })
+    }
+
+    /// A verifier whose "user" thinks for `delay` before answering.
+    pub fn slow(accept: bool, delay: Duration) -> Arc<Self> {
+        Arc::new(Self { accept, delay, deny_ports: Vec::new(), requests: Mutex::new(Vec::new()) })
     }
 
     /// Trusts everything except the servers on `ports`.
     pub fn denying(ports: &[u16]) -> Arc<Self> {
-        Arc::new(Self { accept: true, deny_ports: ports.to_vec(), requests: Mutex::new(Vec::new()) })
+        Arc::new(Self { accept: true, delay: Duration::ZERO, deny_ports: ports.to_vec(), requests: Mutex::new(Vec::new()) })
     }
 
     pub fn asked(&self) -> Vec<HostKeyRequest> {
@@ -422,6 +442,7 @@ impl HostKeyVerifier for Verifier {
     async fn verify(&self, request: HostKeyRequest) -> bool {
         let port = request.port;
         lock(&self.requests).push(request);
+        tokio::time::sleep(self.delay).await;
         self.accept && !self.deny_ports.contains(&port)
     }
 }
@@ -435,11 +456,23 @@ pub struct Script {
     pub password_requests: Mutex<Vec<PasswordRequest>>,
     pub passphrase_requests: Mutex<Vec<PassphraseRequest>>,
     pub challenge_requests: Mutex<Vec<ChallengeRequest>>,
+    /// How long the "user" takes to answer any prompt.
+    pub delay: Mutex<Duration>,
 }
 
 impl Script {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_delay(self: Arc<Self>, delay: Duration) -> Arc<Self> {
+        *lock(&self.delay) = delay;
+        self
+    }
+
+    async fn think(&self) {
+        let delay = *lock(&self.delay);
+        tokio::time::sleep(delay).await;
     }
 
     pub fn with_passwords(self: Arc<Self>, answers: &[&str]) -> Arc<Self> {
@@ -462,6 +495,7 @@ impl Script {
 impl Prompter for Script {
     async fn password(&self, request: PasswordRequest) -> Option<Secret> {
         lock(&self.password_requests).push(request);
+        self.think().await;
         lock(&self.passwords).pop_front().map(Secret::new)
     }
 
@@ -580,5 +614,31 @@ pub async fn start_agent(socket: &Path, keys: &[&PrivateKey]) {
     let mut client = AgentClient::connect_uds(socket).await.unwrap();
     for key in keys {
         client.add_identity(key, &[]).await.unwrap();
+    }
+}
+
+/// A TCP server that accepts connections and never says a word (a dead SSH server).
+pub struct SilentServer {
+    pub port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SilentServer {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        Self { port, task }
+    }
+}
+
+impl Drop for SilentServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }

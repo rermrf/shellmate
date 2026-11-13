@@ -144,3 +144,84 @@ async fn e2e_two_shells_share_one_connection() {
     shell_b.write(b"echo still$((3+4))\r").unwrap();
     second.wait_for_text("still7").await;
 }
+
+/// The numbers following `marker` and ending at `end` in `text` (`SESSION-461-END` → 461).
+fn number_between(text: &str, marker: &str, end: &str) -> Option<u32> {
+    text.match_indices(marker)
+        .filter_map(|(at, _)| {
+            let rest = &text[at + marker.len()..];
+            rest[..rest.find(end)?].parse().ok()
+        })
+        .next()
+}
+
+/// Kills one sshd session process inside the server's container (`SHELLMATE_E2E_CONTAINER`,
+/// default `shellmate-e2e`) by pid: the server side drops that one connection, as a crash, a
+/// restart or a firewall would. Nothing else in the container is touched.
+fn kill_session_process(pid: u32) {
+    let container = setting("SHELLMATE_E2E_CONTAINER", "shellmate-e2e");
+    let status = std::process::Command::new("docker")
+        .args(["exec", &container, "kill", "-9", &pid.to_string()])
+        .status()
+        .expect("docker is installed");
+    assert!(status.success(), "could not kill sshd session {pid} in {container}");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the module docs)"]
+async fn e2e_closing_one_channel_keeps_the_other_and_the_last_close_ends_the_connection() {
+    let env = Env::new();
+    let target = host(AuthMethod::Password).with_password(Secret::new(password()));
+    let connection = Connection::connect(Route::direct(target), env.trusting()).await.expect("connect");
+    let weak = connection.downgrade();
+    let (first, sink_a) = Recorder::sink();
+    let (second, sink_b) = Recorder::sink();
+    let mut shell_a = connection.open_shell(DIMS).await.unwrap().start(sink_a, DIMS);
+    let mut shell_b = connection.open_shell(DIMS).await.unwrap().start(sink_b, DIMS);
+    // The pool holds weak handles: the channels alone keep the connection up.
+    drop(connection);
+    first.wait_for_text("$").await;
+    second.wait_for_text("$").await;
+
+    shell_a.close();
+    drop(shell_a);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(weak.upgrade().is_some(), "the second channel keeps the connection");
+    shell_b.write(b"echo survivor$((40+2))\r").unwrap();
+    second.wait_for_text("survivor42").await;
+
+    shell_b.close();
+    drop(shell_b);
+    crate::support::eventually("the connection to close with its last channel", || weak.upgrade().is_none().then_some(()))
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server and docker access to its container (see the module docs)"]
+async fn e2e_a_session_killed_on_the_server_is_reported_and_a_new_connection_works() {
+    let env = Env::new();
+    let target = || host(AuthMethod::Password).with_password(Secret::new(password()));
+    let connection = Connection::connect(Route::direct(target()), env.trusting()).await.expect("connect");
+    let (recorder, sink) = Recorder::sink();
+    let mut shell = connection.open_shell(DIMS).await.unwrap().start(sink, DIMS);
+    recorder.wait_for_text("$").await;
+
+    // The login shell's parent is the sshd process serving exactly this connection.
+    shell.write(b"echo SESSION-$PPID-END\r").unwrap();
+    let pid = crate::support::eventually("the session's process id", || {
+        number_between(&recorder.text(), "SESSION-", "-END")
+    })
+    .await;
+    kill_session_process(pid);
+
+    let event = recorder.wait_for_event().await;
+    assert!(matches!(event, Event::Disconnected(_)), "expected the loss to be reported, got {event:?}");
+    crate::support::eventually("the connection to be seen as closed", || connection.is_closed().then_some(())).await;
+    shell.close();
+    drop(shell);
+    drop(connection);
+
+    // The server is fine; a fresh connection (what the app's reconnect makes) works like the first.
+    let again = Connection::connect(Route::direct(target()), env.trusting()).await.expect("reconnect");
+    run_and_exit(&again, "echo back-$((50+8))-again", "back-58-again").await;
+}

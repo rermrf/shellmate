@@ -4,6 +4,7 @@ mod assets;
 mod connect;
 mod dialogs;
 mod library;
+mod reconnect;
 #[cfg(debug_assertions)]
 mod demo;
 mod runtime;
@@ -20,7 +21,7 @@ use gpui::{
 };
 
 use shellmate_store::HostStore;
-use workspace::{Quit, Workspace};
+use workspace::{CloseTab, DuplicateSession, NewLocalTerminal, Quit, Workspace};
 
 const FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
@@ -70,7 +71,15 @@ fn main() {
         };
         theme::apply(dark, cx);
 
-        cx.set_menus(vec![Menu::new("Shellmate").items(vec![MenuItem::action("退出 Shellmate", Quit)])]);
+        cx.set_menus(vec![
+            Menu::new("Shellmate").items(vec![MenuItem::action("退出 Shellmate", Quit)]),
+            Menu::new("会话").items(vec![
+                MenuItem::action("新建本机终端", NewLocalTerminal),
+                MenuItem::action("复制当前会话", DuplicateSession),
+                MenuItem::separator(),
+                MenuItem::action("关闭标签", CloseTab),
+            ]),
+        ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);

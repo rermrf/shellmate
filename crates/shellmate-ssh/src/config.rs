@@ -199,6 +199,9 @@ pub struct ConnectOptions {
     /// Limit for establishing each TCP connection (the handshake, which may
     /// wait for the user, is not covered).
     pub connect_timeout: Duration,
+    /// Budget for the non-interactive part of a whole attempt (TCP connect, handshake,
+    /// authentication, every jump hop, opening the shell); waiting for the user does not count.
+    pub connect_watchdog: Duration,
     /// Keepalive probe interval once connected.
     pub keepalive_interval: Duration,
     /// Unanswered probes before the connection is declared dead.
@@ -219,6 +222,7 @@ impl ConnectOptions {
             ssh_dir,
             agent_socket: None,
             connect_timeout: Duration::from_secs(15),
+            connect_watchdog: Duration::from_secs(20),
             keepalive_interval: Duration::from_secs(30),
             keepalive_max: 3,
             on_event: None,
@@ -240,6 +244,12 @@ impl ConnectOptions {
     /// Talks to the ssh-agent at `socket` instead of `SSH_AUTH_SOCK`.
     pub fn with_agent_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.agent_socket = Some(socket.into());
+        self
+    }
+
+    /// Sets the watchdog budget (20 s by default).
+    pub fn with_connect_watchdog(mut self, limit: Duration) -> Self {
+        self.connect_watchdog = limit;
         self
     }
 

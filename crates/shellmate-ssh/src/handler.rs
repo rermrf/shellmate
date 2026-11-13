@@ -10,6 +10,7 @@ use crate::config::{ConnectEvent, ConnectOptions};
 use crate::error::{SshError, describe_russh_error};
 use crate::interact::{HostKeyInfo, HostKeyRequest, HostKeyVerifier};
 use crate::known_hosts::{KnownHosts, Lookup};
+use crate::watchdog::Watchdog;
 
 /// State shared between a connection's handler (running in russh's session
 /// task) and the code that owns the connection.
@@ -71,6 +72,7 @@ pub(crate) struct ClientHandler {
     pub verifier: Arc<dyn HostKeyVerifier>,
     pub options: ConnectOptions,
     pub shared: Arc<Shared>,
+    pub watchdog: Watchdog,
 }
 
 pub(crate) fn host_key_info(key: &PublicKey) -> HostKeyInfo {
@@ -104,7 +106,12 @@ impl Handler for ClientHandler {
                     key: info.clone(),
                     recorded,
                 };
-                if !self.verifier.verify(request).await {
+                let trusted = {
+                    // Waiting for the user does not count against the watchdog.
+                    let _pause = self.watchdog.pause();
+                    self.verifier.verify(request).await
+                };
+                if !trusted {
                     return Err(HandlerError::Ssh(SshError::HostKeyRejected));
                 }
                 let saved = self.known_hosts.add(&self.host, self.port, key);
@@ -118,7 +125,11 @@ impl Handler for ClientHandler {
                     key: info.clone(),
                     recorded: recorded.iter().map(host_key_info).collect(),
                 };
-                if !self.verifier.verify(request).await {
+                let trusted = {
+                    let _pause = self.watchdog.pause();
+                    self.verifier.verify(request).await
+                };
+                if !trusted {
                     return Err(HandlerError::Ssh(SshError::HostKeyChanged));
                 }
                 let saved = self.known_hosts.replace(&self.host, self.port, key);

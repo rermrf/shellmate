@@ -16,7 +16,8 @@ use crate::dialogs::hostkey::HostKeyDialog;
 use crate::dialogs::import::{ImportDialog, ImportNotes};
 use crate::workspace::Workspace;
 
-/// Names accepted by `SHELLMATE_DEMO` (`connect:<host name>` also connects a saved host on startup).
+/// Names accepted by `SHELLMATE_DEMO` (`connect:<host name>` also connects a saved host on startup;
+/// `connect-dup:<host name>` does that and copies the session a few seconds later, like ⌘⇧T).
 pub const NAMES: &[&str] = &[
     "hostkey-new",
     "hostkey-changed",
@@ -51,6 +52,17 @@ fn challenge(round: u32, attempt: u32, prompts: &[(&str, bool)]) -> ChallengeReq
 pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     if let Some(host) = name.strip_prefix("connect:") {
         workspace.update(cx, |workspace, cx| workspace.connect_by_name(host, window, cx));
+        return;
+    }
+    if let Some(host) = name.strip_prefix("connect-dup:") {
+        workspace.update(cx, |workspace, cx| workspace.connect_by_name(host, window, cx));
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                workspace.update_in(cx, |workspace, window, cx| workspace.duplicate_active(window, cx)).ok();
+            })
+            .detach();
         return;
     }
     match name {

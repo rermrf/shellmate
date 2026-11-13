@@ -11,6 +11,9 @@ pub enum SshError {
     /// The TCP connection could not be established.
     #[error("无法连接 {host}:{port}：{reason}")]
     Connect { host: String, port: u16, reason: String },
+    /// The connection attempt used up its time budget (waiting for the user does not count).
+    #[error("连接超时（{}内没有响应）", describe_limit(*.limit))]
+    Timeout { limit: std::time::Duration },
     /// The TCP connection did not complete in time.
     #[error("连接 {host}:{port} 超时（{secs} 秒）")]
     ConnectTimeout { host: String, port: u16, secs: u64 },
@@ -67,6 +70,11 @@ pub enum SshError {
         #[source]
         source: Box<SshError>,
     },
+}
+
+/// `20 秒`, or milliseconds for sub-second limits.
+fn describe_limit(limit: std::time::Duration) -> String {
+    if limit.as_secs() >= 1 { format!("{} 秒", limit.as_secs()) } else { format!("{} 毫秒", limit.as_millis()) }
 }
 
 fn auth_rejected_text(method: AuthMethod) -> &'static str {

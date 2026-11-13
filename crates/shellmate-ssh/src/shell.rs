@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Pty};
 use shellmate_core::{OutputSink, PtyDims, TerminalBackend};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::connection::Connection;
 use crate::error::SshError;
@@ -61,14 +61,15 @@ impl PendingShell {
         let (read, write) = channel.split();
         let (tx, rx) = mpsc::unbounded_channel();
         let closing = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(Notify::new());
 
         if dims != opened {
             let _ = tx.send(Command::Resize(dims));
         }
         let runtime = connection.inner.runtime.clone();
-        runtime.spawn(pump_output(read, backlog, sink, connection.clone(), closing.clone()));
+        runtime.spawn(pump_output(read, backlog, sink, connection.clone(), closing.clone(), closed.clone()));
         runtime.spawn(pump_input(rx, write));
-        ShellChannel { tx, closing, _connection: connection }
+        ShellChannel { tx, closing, closed, _connection: connection }
     }
 }
 
@@ -94,6 +95,11 @@ enum Command {
     Close,
 }
 
+/// How long (ticks × tick) a channel that ended without an exit status waits for the transport
+/// to be reported closed, to tell a lost connection from a channel the server closed.
+const TRANSPORT_GRACE_TICKS: u32 = 20;
+const TRANSPORT_GRACE_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// How the remote program ended, as far as the channel told us.
 enum Ending {
     Status(u32),
@@ -107,13 +113,20 @@ async fn pump_output(
     sink: OutputSink,
     connection: Connection,
     closing: Arc<AtomicBool>,
+    closed: Arc<Notify>,
 ) {
     let mut queue: VecDeque<ChannelMsg> = backlog.into();
     let mut ending: Option<Ending> = None;
     loop {
         let msg = match queue.pop_front() {
             Some(msg) => Some(msg),
-            None => read.wait().await,
+            // After a close we asked for, the server's reply is not forwarded to us (the library
+            // treats the channel as gone already), so stop reading when closed locally: this task
+            // holds a clone of the connection, which must not outlive its channel.
+            None => tokio::select! {
+                msg = read.wait() => msg,
+                () = closed.notified() => break,
+            },
         };
         match msg {
             Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => sink.output(&data),
@@ -129,12 +142,22 @@ async fn pump_output(
     match ending {
         Some(Ending::Status(code)) => sink.exited(Some(code)),
         Some(Ending::Signal) => sink.exited(None),
-        None => match connection.disconnect_reason() {
-            Some(reason) => sink.disconnected(format!("连接已断开：{reason}")),
-            None if connection.is_closed() => sink.disconnected("连接已断开"),
-            // The server closed this channel on its own while the connection lives on.
-            None => sink.exited(None),
-        },
+        None => {
+            // A channel ends together with the transport: give the transport a moment to say so
+            // before concluding that only this channel was closed.
+            for _ in 0..TRANSPORT_GRACE_TICKS {
+                if connection.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(TRANSPORT_GRACE_TICK).await;
+            }
+            match connection.disconnect_reason() {
+                Some(reason) => sink.disconnected(format!("连接已断开：{reason}")),
+                None if connection.is_closed() => sink.disconnected("连接已断开"),
+                // The server closed this channel on its own while the connection lives on.
+                None => sink.exited(None),
+            }
+        }
     }
 }
 
@@ -171,6 +194,7 @@ async fn pump_input(mut rx: mpsc::UnboundedReceiver<Command>, write: ChannelWrit
 pub struct ShellChannel {
     tx: mpsc::UnboundedSender<Command>,
     closing: Arc<AtomicBool>,
+    closed: Arc<Notify>,
     _connection: Connection,
 }
 
@@ -186,6 +210,7 @@ impl TerminalBackend for ShellChannel {
 
     fn close(&mut self) {
         self.closing.store(true, Ordering::Release);
+        self.closed.notify_one();
         let _ = self.tx.send(Command::Close);
     }
 }

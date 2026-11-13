@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 use crate::config::SshHost;
 use crate::error::SshError;
 use crate::handler::ClientHandler;
+use crate::watchdog::Watchdog;
 use crate::interact::{ChallengePrompt, ChallengeRequest, PassphraseRequest, PasswordRequest, Prompter};
 use shellmate_core::Secret;
 
@@ -29,6 +30,15 @@ pub(crate) struct AuthContext<'a> {
     pub prompter: &'a dyn Prompter,
     pub ssh_dir: &'a Path,
     pub agent_socket: Option<&'a Path>,
+    pub watchdog: &'a Watchdog,
+}
+
+impl AuthContext<'_> {
+    /// Awaits an answer from the user with the watchdog's clock stopped.
+    async fn waiting_for_user<T>(&self, answer: impl std::future::Future<Output = T>) -> T {
+        let _pause = self.watchdog.pause();
+        answer.await
+    }
 }
 
 /// How a hop was authenticated.
@@ -138,13 +148,12 @@ async fn try_password(
         let secret = match (&host.password, attempt) {
             (Some(known), 0) => known.clone(),
             _ => ctx
-                .prompter
-                .password(PasswordRequest {
+                .waiting_for_user(ctx.prompter.password(PasswordRequest {
                     host: host.host.clone(),
                     port: host.port,
                     user: host.user.clone(),
                     attempt,
-                })
+                }))
                 .await
                 .ok_or(SshError::AuthCancelled)?,
         };
@@ -241,8 +250,7 @@ async fn load_key(path: &Path, host: &SshHost, ctx: &AuthContext<'_>) -> Result<
         let passphrase = match (&host.passphrase, attempt) {
             (Some(known), 0) => known.clone(),
             _ => ctx
-                .prompter
-                .passphrase(PassphraseRequest { key_path: path.to_path_buf(), attempt })
+                .waiting_for_user(ctx.prompter.passphrase(PassphraseRequest { key_path: path.to_path_buf(), attempt }))
                 .await
                 .ok_or(SshError::AuthCancelled)?,
         };
@@ -351,7 +359,7 @@ async fn try_keyboard_interactive(
                             attempt,
                         };
                         let expected = request.prompts.len();
-                        let answers = ctx.prompter.challenge(request).await.ok_or(SshError::AuthCancelled)?;
+                        let answers = ctx.waiting_for_user(ctx.prompter.challenge(request)).await.ok_or(SshError::AuthCancelled)?;
                         if answers.len() != expected {
                             return Err(SshError::AuthCancelled);
                         }

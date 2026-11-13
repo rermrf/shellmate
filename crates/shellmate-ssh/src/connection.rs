@@ -1,7 +1,7 @@
 //! A connection to an SSH server, directly or through ProxyJump hops.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use russh::client::{self, Handle};
@@ -19,6 +19,7 @@ use crate::handler::{ClientHandler, Shared};
 use crate::interact::HostKeyInfo;
 use crate::known_hosts::KnownHosts;
 use crate::shell::PendingShell;
+use crate::watchdog::Watchdog;
 
 /// What is known about one hop of an established connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub struct HopInfo {
 }
 
 pub(crate) struct Inner {
+    /// The watchdog budget this connection was made with, used again for opening shells.
+    watchdog_limit: Duration,
     pub handle: Handle<ClientHandler>,
     pub shared: Arc<Shared>,
     pub runtime: runtime::Handle,
@@ -62,7 +65,32 @@ impl Connection {
     /// Connects along `route`: every jump host and the target get the same
     /// host key check and authentication. Must run inside the tokio runtime
     /// (see [`SshRuntime::connect`](crate::SshRuntime::connect)).
+    ///
+    /// The whole attempt has a time budget ([`ConnectOptions::connect_watchdog`]) that does not
+    /// run while the user is being asked something; running out gives [`SshError::Timeout`].
     pub async fn connect(route: Route, options: ConnectOptions) -> Result<Connection, SshError> {
+        let watchdog = Watchdog::new(options.connect_watchdog);
+        watchdog.guard(Self::connect_hops(route, &options, &watchdog)).await
+    }
+
+    /// Like [`connect`](Self::connect), and also opens a shell channel with a PTY of size `dims`,
+    /// all within one watchdog budget.
+    pub async fn connect_with_shell(
+        route: Route,
+        options: ConnectOptions,
+        dims: PtyDims,
+    ) -> Result<(Connection, PendingShell), SshError> {
+        let watchdog = Watchdog::new(options.connect_watchdog);
+        watchdog
+            .guard(async {
+                let connection = Self::connect_hops(route, &options, &watchdog).await?;
+                let shell = PendingShell::open(connection.clone(), dims).await?;
+                Ok((connection, shell))
+            })
+            .await
+    }
+
+    async fn connect_hops(route: Route, options: &ConnectOptions, watchdog: &Watchdog) -> Result<Connection, SshError> {
         let runtime = runtime::Handle::try_current().map_err(|_| SshError::Connect {
             host: route.target.host.clone(),
             port: route.target.port,
@@ -73,7 +101,7 @@ impl Connection {
         let total = via.len() + 1;
         for (index, hop) in via.into_iter().chain(std::iter::once(target)).enumerate() {
             let is_jump = index + 1 < total;
-            previous = Some(connect_hop(&hop, previous.take(), is_jump, &options, &runtime).await?);
+            previous = Some(connect_hop(&hop, previous.take(), is_jump, options, &runtime, watchdog).await?);
         }
         previous.ok_or(SshError::NoAuthMethod)
     }
@@ -102,7 +130,13 @@ impl Connection {
     /// user's shell. Output only flows once [`PendingShell::start`] is called,
     /// so the caller can attach a sink first.
     pub async fn open_shell(&self, dims: PtyDims) -> Result<PendingShell, SshError> {
-        PendingShell::open(self.clone(), dims).await
+        Watchdog::new(self.inner.watchdog_limit).guard(PendingShell::open(self.clone(), dims)).await
+    }
+
+    /// A handle that does not keep the connection open: it closes with its last channel (and
+    /// the last [`Connection`] clone), like a pool entry.
+    pub fn downgrade(&self) -> WeakConnection {
+        WeakConnection(Arc::downgrade(&self.inner))
     }
 
     /// Sends a disconnect message and closes the transport.
@@ -116,6 +150,18 @@ impl Connection {
         while !self.is_closed() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+/// A non-owning reference to a [`Connection`], for pools and bookkeeping.
+#[derive(Clone, Debug)]
+pub struct WeakConnection(Weak<Inner>);
+
+impl WeakConnection {
+    /// The connection, if it is still open for business (some channel or clone keeps it alive
+    /// and the transport is up).
+    pub fn upgrade(&self) -> Option<Connection> {
+        self.0.upgrade().map(|inner| Connection { inner }).filter(|connection| !connection.is_closed())
     }
 }
 
@@ -134,6 +180,7 @@ async fn connect_hop(
     is_jump: bool,
     options: &ConnectOptions,
     runtime: &runtime::Handle,
+    watchdog: &Watchdog,
 ) -> Result<Connection, SshError> {
     options.emit(ConnectEvent::Connecting {
         host: host.host.clone(),
@@ -162,7 +209,7 @@ async fn connect_hop(
                 Ok(Ok(stream)) => stream,
             };
             let _ = stream.set_nodelay(true);
-            handshake(stream, host, None, options, runtime).await.map_err(|err| as_jump_error(err, host, is_jump))
+            handshake(stream, host, None, options, runtime, watchdog).await.map_err(|err| as_jump_error(err, host, is_jump))
         }
         Some(jump) => {
             let opened =
@@ -184,7 +231,7 @@ async fn connect_hop(
                 }
                 Ok(Ok(channel)) => channel,
             };
-            handshake(channel.into_stream(), host, Some(jump), options, runtime)
+            handshake(channel.into_stream(), host, Some(jump), options, runtime, watchdog)
                 .await
                 .map_err(|err| as_jump_error(err, host, is_jump))
         }
@@ -212,6 +259,7 @@ async fn handshake<S>(
     via: Option<Connection>,
     options: &ConnectOptions,
     runtime: &runtime::Handle,
+    watchdog: &Watchdog,
 ) -> Result<Connection, SshError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -235,6 +283,7 @@ where
         verifier: options.verifier.clone(),
         options: options.clone(),
         shared: shared.clone(),
+        watchdog: watchdog.clone(),
     };
 
     let mut handle = client::connect_stream(config, stream, handler).await?;
@@ -242,6 +291,7 @@ where
         prompter: options.prompter.as_ref(),
         ssh_dir: &options.ssh_dir,
         agent_socket: options.agent_socket.as_deref(),
+        watchdog,
     };
     let auth = authenticate(&mut handle, host, &ctx).await?;
     options.emit(ConnectEvent::Authenticated {
@@ -263,7 +313,7 @@ where
         auth: auth.method,
         key_file: auth.key_file,
     });
-    Ok(Connection { inner: Arc::new(Inner { handle, shared, runtime: runtime.clone(), hops, _via: via }) })
+    Ok(Connection { inner: Arc::new(Inner { watchdog_limit: options.connect_watchdog, handle, shared, runtime: runtime.clone(), hops, _via: via }) })
 }
 
 /// Moves the algorithms we already have a recorded key for to the front, so

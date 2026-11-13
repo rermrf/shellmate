@@ -5,5 +5,7 @@ mod auth;
 mod e2e;
 mod host_keys;
 mod jump;
+mod pool;
 mod shell;
 mod support;
+mod watchdog;
