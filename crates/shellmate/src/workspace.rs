@@ -157,9 +157,12 @@ impl Workspace {
         let subscription = cx.subscribe(&terminal, move |this: &mut Self, _, event: &TerminalEvent, cx| {
             let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
             match event {
-                TerminalEvent::Exited(_) => session.exited = true,
+                TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_) => session.exited = true,
                 TerminalEvent::Restarted => session.exited = false,
-                TerminalEvent::Output | TerminalEvent::TitleChanged | TerminalEvent::Bell => {}
+                TerminalEvent::Output
+                | TerminalEvent::TitleChanged
+                | TerminalEvent::Bell
+                | TerminalEvent::RestartRequested => {}
             }
             this.sync_sidebar(cx);
             cx.notify();
@@ -406,8 +409,8 @@ impl Workspace {
     fn local_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
         let terminal = session.terminal.clone();
         let (command, shell, fg) = terminal.update(cx, |t, _| {
-            let shell = shell_name(&t.options().shell_path());
-            (t.options().command_line(), shell, t.foreground_process())
+            let options = t.options().cloned().unwrap_or_default();
+            (options.command_line(), shell_name(&options.shell_path()), t.foreground_process())
         });
         let mut parts = vec![self.user_host.to_string(), command];
         if let Some(cwd) = fg.as_ref().and_then(|f| f.cwd.as_deref()) {

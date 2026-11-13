@@ -1,11 +1,13 @@
-//! Terminal model: owns the alacritty grid and the process feeding it.
+//! Terminal model: owns the alacritty grid and the backend feeding it.
 //!
-//! Output is parsed on the PTY reader thread (under the grid lock); the UI is
-//! woken through a coalescing channel so a burst of output costs one repaint.
+//! The backend is anything implementing [`TerminalBackend`]: a local PTY or an
+//! SSH shell channel. Its output is parsed on the backend's own thread or task
+//! (under the grid lock) through an [`OutputSink`]; the UI is woken through a
+//! coalescing channel so a burst of output costs one repaint.
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -17,11 +19,11 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{NamedColor, Processor};
 use gpui::{ClipboardItem, Context, EventEmitter, Pixels, SharedString, Task, px};
 use parking_lot::Mutex;
-use portable_pty::PtySize;
+use shellmate_core::io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 
 use crate::colors::TerminalPalette;
 use crate::keys::paste_payload;
-use crate::pty::{LocalPty, ProcessInfo, PtyOptions};
+use crate::pty::{LocalPty, PtyOptions};
 
 /// A search hit, in grid coordinates.
 pub type SearchMatch = RangeInclusive<Point>;
@@ -44,10 +46,10 @@ impl Default for TerminalSize {
 }
 
 impl TerminalSize {
-    fn pty_size(&self) -> PtySize {
-        PtySize {
-            rows: self.rows,
+    fn dims(&self) -> PtyDims {
+        PtyDims {
             cols: self.cols,
+            rows: self.rows,
             pixel_width: (f32::from(self.cell_width) * self.cols as f32) as u16,
             pixel_height: (f32::from(self.line_height) * self.rows as f32) as u16,
         }
@@ -82,6 +84,7 @@ enum Msg {
     Output,
     Alac(AlacEvent),
     Exited { generation: u64, code: Option<u32> },
+    Disconnected { generation: u64, reason: String },
 }
 
 /// Forwards alacritty's events (title, bell, replies to queries) to the UI.
@@ -94,27 +97,87 @@ impl EventListener for Listener {
     }
 }
 
+/// Events a [`Terminal`] emits to its owner.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalEvent {
+    /// New content was written to the grid.
     Output,
+    /// The program set (or reset) the window title.
     TitleChanged,
+    /// The program rang the bell.
     Bell,
+    /// The program behind the backend ended (local shell exit, remote shell exit).
     Exited(Option<u32>),
+    /// The transport broke or could not be established; carries the user-facing reason.
+    Disconnected(String),
+    /// Enter was pressed on an ended session whose backend is not a local PTY.
+    /// The terminal cannot recreate such a backend itself (it needs credentials,
+    /// prompts, a connection pool, ...); the owner should reconnect and call
+    /// [`Terminal::attach`].
+    RestartRequested,
+    /// A new backend was attached to a terminal whose previous session had ended.
     Restarted,
 }
 
+/// Why the attached backend is no longer running.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionEnd {
+    /// The program exited; `None` when its status is unknown.
+    Exited(Option<u32>),
+    /// The connection was lost, refused, or never established.
+    Disconnected(String),
+}
+
+/// Parses backend output into the grid and forwards lifecycle notifications.
+/// Bound to the generation of the attach that created it; output from a
+/// replaced backend is dropped.
+struct GridSink {
+    term: Arc<FairMutex<Term<Listener>>>,
+    parser: Arc<Mutex<Processor>>,
+    pending: Arc<AtomicBool>,
+    tx: async_channel::Sender<Msg>,
+    generation: u64,
+    current: Arc<AtomicU64>,
+}
+
+impl OutputHandler for GridSink {
+    fn output(&self, bytes: &[u8]) {
+        if self.current.load(Ordering::Acquire) != self.generation {
+            return;
+        }
+        {
+            let mut term = self.term.lock();
+            self.parser.lock().advance(&mut *term, bytes);
+        }
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let _ = self.tx.try_send(Msg::Output);
+        }
+    }
+
+    fn exited(&self, code: Option<u32>) {
+        let _ = self.tx.try_send(Msg::Exited { generation: self.generation, code });
+    }
+
+    fn disconnected(&self, reason: String) {
+        let _ = self.tx.try_send(Msg::Disconnected { generation: self.generation, reason });
+    }
+}
+
+/// A terminal session: the alacritty grid plus the backend feeding it. Create
+/// one with [`Terminal::local`] or [`Terminal::new`] + [`Terminal::attach`].
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
-    pty: Option<LocalPty>,
-    options: PtyOptions,
+    backend: Option<Box<dyn TerminalBackend>>,
+    /// `Some` for terminals that own a local shell: Enter restarts it in place.
+    local: Option<PtyOptions>,
     size: TerminalSize,
     palette: TerminalPalette,
     title: Option<SharedString>,
-    /// `Some(code)` once the shell has exited.
-    exit: Option<Option<u32>>,
-    /// Bumped on every (re)spawn so exits of an old process are ignored.
-    generation: u64,
+    /// `Some` once the attached session has ended.
+    ended: Option<SessionEnd>,
+    /// Bumped on every attach so notifications of a replaced backend are ignored.
+    generation: Arc<AtomicU64>,
     tx: async_channel::Sender<Msg>,
     output_pending: Arc<AtomicBool>,
     foreground: Option<(Instant, Option<ProcessInfo>)>,
@@ -124,8 +187,21 @@ pub struct Terminal {
 impl EventEmitter<TerminalEvent> for Terminal {}
 
 impl Terminal {
-    /// Starts a local shell.
+    /// Starts a local shell. Pressing Enter after it exits restarts it in place.
     pub fn local(options: PtyOptions, palette: TerminalPalette, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::build(Some(options), palette, cx);
+        this.spawn_local(cx);
+        this
+    }
+
+    /// Creates a terminal with no backend yet, e.g. for an SSH session that is
+    /// still connecting. Show progress with [`notice`](Self::notice) and wire a
+    /// backend with [`attach`](Self::attach) once it is ready.
+    pub fn new(palette: TerminalPalette, cx: &mut Context<Self>) -> Self {
+        Self::build(None, palette, cx)
+    }
+
+    fn build(local: Option<PtyOptions>, palette: TerminalPalette, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = async_channel::unbounded::<Msg>();
         let size = TerminalSize::default();
         let term = Term::new(Config::default(), &size, Listener(tx.clone()));
@@ -142,59 +218,136 @@ impl Terminal {
             }
         });
 
-        let mut this = Self {
+        Self {
             term: Arc::new(FairMutex::new(term)),
             parser: Arc::new(Mutex::new(Processor::new())),
-            pty: None,
-            options,
+            backend: None,
+            local,
             size,
             palette,
             title: None,
-            exit: None,
-            generation: 0,
+            ended: None,
+            generation: Arc::new(AtomicU64::new(0)),
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
             foreground: None,
             _io: io,
-        };
-        this.spawn_shell();
-        this
+        }
     }
 
-    fn spawn_shell(&mut self) {
-        self.generation += 1;
-        let generation = self.generation;
-        let (term, parser, pending) = (self.term.clone(), self.parser.clone(), self.output_pending.clone());
-        let (tx_out, tx_exit) = (self.tx.clone(), self.tx.clone());
-
-        let spawned = LocalPty::spawn(
-            &self.options,
-            self.size.pty_size(),
-            move |bytes| {
-                {
-                    let mut term = term.lock();
-                    parser.lock().advance(&mut *term, bytes);
-                }
-                if !pending.swap(true, Ordering::AcqRel) {
-                    let _ = tx_out.try_send(Msg::Output);
-                }
+    fn spawn_local(&mut self, cx: &mut Context<Self>) {
+        let Some(options) = self.local.clone() else { return };
+        self.attach(
+            move |sink, dims| {
+                let (out, exit) = (sink.clone(), sink);
+                let pty = LocalPty::spawn(&options, dims, move |bytes| out.output(bytes), move |code| exit.exited(code))
+                    .map_err(|err| {
+                        log::error!("failed to start shell: {err:#}");
+                        anyhow::anyhow!("无法启动 {}：{err:#}", options.command_line())
+                    })?;
+                Ok(Box::new(pty) as Box<dyn TerminalBackend>)
             },
-            move |code| {
-                let _ = tx_exit.try_send(Msg::Exited { generation, code });
-            },
+            cx,
         );
+    }
 
-        match spawned {
-            Ok(pty) => {
-                self.pty = Some(pty);
-                self.exit = None;
+    /// Replaces the backend with one built by `factory`, which receives the
+    /// [`OutputSink`] bound to the new session and the current terminal size.
+    /// The previous backend, if any, is closed and its late output discarded.
+    ///
+    /// `factory` must not block: network backends should return immediately and
+    /// open their transport in the background, reporting failures through the
+    /// sink. If it fails, the error is shown in the terminal, the session counts
+    /// as ended (Enter retries) and [`TerminalEvent::Disconnected`] is emitted.
+    /// Returns whether a backend is attached. Emits [`TerminalEvent::Restarted`]
+    /// when this replaces a session that had ended.
+    pub fn attach(
+        &mut self,
+        factory: impl FnOnce(OutputSink, PtyDims) -> anyhow::Result<Box<dyn TerminalBackend>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.close_backend();
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let sink = OutputSink::new(GridSink {
+            term: self.term.clone(),
+            parser: self.parser.clone(),
+            pending: self.output_pending.clone(),
+            tx: self.tx.clone(),
+            generation,
+            current: self.generation.clone(),
+        });
+        let was_ended = self.ended.is_some();
+        match factory(sink, self.size.dims()) {
+            Ok(backend) => {
+                self.backend = Some(backend);
+                self.ended = None;
+                self.foreground = None;
+                if was_ended {
+                    cx.emit(TerminalEvent::Restarted);
+                }
+                cx.notify();
+                true
             }
             Err(err) => {
-                log::error!("failed to start shell: {err:#}");
-                self.inject(&format!("\x1b[31m无法启动 {}：{err:#}\x1b[0m\r\n", self.options.command_line()));
-                self.exit = Some(None);
+                self.fail(format!("{err:#}"), cx);
+                false
             }
         }
+    }
+
+    /// Ends the session because the connection failed or dropped. `reason` is a
+    /// self-contained user-facing sentence; it is printed in the terminal and
+    /// carried by [`TerminalEvent::Disconnected`]. Enter then asks the owner to
+    /// reconnect ([`TerminalEvent::RestartRequested`]).
+    pub fn disconnect(&mut self, reason: impl Into<String>, cx: &mut Context<Self>) {
+        self.fail(reason.into(), cx);
+    }
+
+    fn fail(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.end_disconnected(reason, cx);
+        self.after_output(cx);
+    }
+
+    fn end_disconnected(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.close_backend();
+        self.ended = Some(SessionEnd::Disconnected(reason.clone()));
+        self.print_end(&format!("\x1b[31m[{reason}]\x1b[0m"));
+        cx.emit(TerminalEvent::Disconnected(reason));
+    }
+
+    /// Prints the "press Enter" hint line that closes an ended session.
+    fn print_end(&mut self, text: &str) {
+        let hint = if self.local.is_some() { "按回车重新启动" } else { "按回车重新连接" };
+        let column = self.term.lock().grid().cursor.point.column.0;
+        let lead = if column == 0 { "" } else { "\r\n" };
+        self.inject(&format!("{lead}\r\n{text} \x1b[2m{hint}\x1b[0m\r\n"));
+    }
+
+    fn close_backend(&mut self) {
+        if let Some(mut backend) = self.backend.take() {
+            backend.close();
+        }
+    }
+
+    /// Prints a line of text in the terminal as if the remote side had sent it,
+    /// e.g. connection progress (`→ 连接 10.0.1.21:22`). ANSI colors may be used;
+    /// the line always starts at column 0 and attributes are reset at its end.
+    pub fn notice(&mut self, text: &str, cx: &mut Context<Self>) {
+        let column = self.term.lock().grid().cursor.point.column.0;
+        let mut line = String::with_capacity(text.len() + 8);
+        if column != 0 {
+            line.push_str("\r\n");
+        }
+        line.push_str(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
+        line.push_str("\x1b[0m\r\n");
+        self.inject(&line);
+        self.after_output(cx);
+    }
+
+    fn after_output(&mut self, cx: &mut Context<Self>) {
+        self.foreground = None;
+        cx.emit(TerminalEvent::Output);
+        cx.notify();
     }
 
     fn process(&mut self, batch: Vec<Msg>, cx: &mut Context<Self>) {
@@ -206,24 +359,30 @@ impl Terminal {
                     output = true;
                 }
                 Msg::Alac(event) => self.handle_alac_event(event, cx),
-                Msg::Exited { generation, code } if generation == self.generation => {
-                    self.pty = None;
-                    self.exit = Some(code);
+                Msg::Exited { generation, code } if generation == self.current_generation() => {
+                    self.close_backend();
+                    self.ended = Some(SessionEnd::Exited(code));
                     let code_text = code.map_or_else(|| "未知".to_string(), |c| c.to_string());
-                    self.inject(&format!(
-                        "\r\n\x1b[2m[进程已退出，代码 {code_text}] 按回车重新启动\x1b[0m\r\n"
-                    ));
+                    let what = if self.local.is_some() { "进程" } else { "远程会话" };
+                    let hint = if self.local.is_some() { "按回车重新启动" } else { "按回车重新连接" };
+                    self.inject(&format!("\r\n\x1b[2m[{what}已退出，代码 {code_text}] {hint}\x1b[0m\r\n"));
                     cx.emit(TerminalEvent::Exited(code));
                     output = true;
                 }
-                Msg::Exited { .. } => {}
+                Msg::Disconnected { generation, reason } if generation == self.current_generation() => {
+                    self.end_disconnected(reason, cx);
+                    output = true;
+                }
+                Msg::Exited { .. } | Msg::Disconnected { .. } => {}
             }
         }
         if output {
-            self.foreground = None;
-            cx.emit(TerminalEvent::Output);
-            cx.notify();
+            self.after_output(cx);
         }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn handle_alac_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
@@ -263,16 +422,16 @@ impl Terminal {
     }
 
     fn write_raw(&mut self, bytes: &[u8]) {
-        if let Some(pty) = self.pty.as_mut()
-            && let Err(err) = pty.write(bytes)
+        if let Some(backend) = self.backend.as_mut()
+            && let Err(err) = backend.write(bytes)
         {
-            log::warn!("pty write failed: {err:#}");
+            log::warn!("backend write failed: {err}");
         }
     }
 
     /// Sends user input to the process, snapping the view back to the prompt.
     pub fn input(&mut self, bytes: &[u8]) {
-        if self.pty.is_none() {
+        if self.backend.is_none() {
             return;
         }
         {
@@ -288,14 +447,18 @@ impl Terminal {
         self.input(paste_payload(text, &mode).as_bytes());
     }
 
-    /// Respawns the shell after it exited, keeping the scrollback.
+    /// Called when the user presses Enter on an ended session. A local terminal
+    /// respawns its shell in place, keeping the scrollback; any other terminal
+    /// emits [`TerminalEvent::RestartRequested`] for its owner to handle.
     pub fn restart(&mut self, cx: &mut Context<Self>) {
-        if self.exit.is_none() {
+        if self.ended.is_none() {
             return;
         }
-        self.spawn_shell();
-        cx.emit(TerminalEvent::Restarted);
-        cx.notify();
+        if self.local.is_some() {
+            self.spawn_local(cx);
+        } else {
+            cx.emit(TerminalEvent::RestartRequested);
+        }
     }
 
     pub fn set_size(&mut self, size: TerminalSize) {
@@ -306,10 +469,11 @@ impl Terminal {
         self.size = size;
         if grid_changed {
             self.term.lock().resize(size);
-            if let Some(pty) = &self.pty
-                && let Err(err) = pty.resize(size.pty_size())
+            let dims = size.dims();
+            if let Some(backend) = self.backend.as_mut()
+                && let Err(err) = backend.resize(dims.cols, dims.rows, dims.pixel_width, dims.pixel_height)
             {
-                log::warn!("pty resize failed: {err:#}");
+                log::warn!("backend resize failed: {err}");
             }
         }
     }
@@ -362,7 +526,8 @@ impl Terminal {
             .collect()
     }
 
-    /// Foreground process of the PTY (cached briefly; it is polled while rendering).
+    /// Foreground process of a local PTY (cached briefly; it is polled while
+    /// rendering). Always `None` for network backends.
     pub fn foreground_process(&mut self) -> Option<ProcessInfo> {
         let fresh = |at: &Instant| at.elapsed() < Duration::from_millis(500);
         if let Some((at, info)) = &self.foreground
@@ -370,7 +535,7 @@ impl Terminal {
         {
             return info.clone();
         }
-        let info = self.pty.as_ref().and_then(LocalPty::foreground_process);
+        let info = self.backend.as_ref().and_then(|backend| backend.foreground_process());
         self.foreground = Some((Instant::now(), info.clone()));
         info
     }
@@ -391,12 +556,29 @@ impl Terminal {
         self.title.as_ref()
     }
 
-    pub fn options(&self) -> &PtyOptions {
-        &self.options
+    /// Launch options of the local shell; `None` for network terminals.
+    pub fn options(&self) -> Option<&PtyOptions> {
+        self.local.as_ref()
     }
 
+    /// Whether this terminal owns a local shell (as opposed to a network backend).
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// Whether the session has ended (Enter restarts it).
     pub fn is_exited(&self) -> bool {
-        self.exit.is_some()
+        self.ended.is_some()
+    }
+
+    /// Why the session ended, if it did.
+    pub fn session_end(&self) -> Option<&SessionEnd> {
+        self.ended.as_ref()
+    }
+
+    /// Whether a backend is currently attached and running.
+    pub fn is_attached(&self) -> bool {
+        self.backend.is_some()
     }
 }
 
@@ -421,5 +603,91 @@ mod tests {
         assert_eq!(regex_escape("a.b*c"), r"a\.b\*c");
         assert_eq!(regex_escape("[error]"), r"\[error\]");
         assert_eq!(regex_escape("中文 ok"), "中文 ok");
+    }
+}
+
+/// The sink a backend writes to: output parsing, coalescing and generation checks.
+/// (`Terminal` itself needs a running gpui app, which cannot be set up headless here.)
+#[cfg(test)]
+mod sink_tests {
+    use alacritty_terminal::index::Line;
+
+    use super::*;
+
+    struct Fixture {
+        term: Arc<FairMutex<Term<Listener>>>,
+        rx: async_channel::Receiver<Msg>,
+        current: Arc<AtomicU64>,
+        pending: Arc<AtomicBool>,
+        sink: OutputSink,
+    }
+
+    fn fixture(generation: u64) -> Fixture {
+        let (tx, rx) = async_channel::unbounded();
+        let size = TerminalSize::default();
+        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, Listener(tx.clone()))));
+        let current = Arc::new(AtomicU64::new(generation));
+        let pending = Arc::new(AtomicBool::new(false));
+        let sink = OutputSink::new(GridSink {
+            term: term.clone(),
+            parser: Arc::new(Mutex::new(Processor::new())),
+            pending: pending.clone(),
+            tx,
+            generation,
+            current: current.clone(),
+        });
+        Fixture { term, rx, current, pending, sink }
+    }
+
+    fn row(term: &Arc<FairMutex<Term<Listener>>>, line: i32) -> String {
+        let term = term.lock();
+        let row = &term.grid()[Line(line)];
+        (0..40).map(|c| row[Column(c)].c).collect::<String>().trim_end().to_string()
+    }
+
+    fn drain(rx: &async_channel::Receiver<Msg>) -> Vec<Msg> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn output_is_parsed_into_the_grid() {
+        let f = fixture(1);
+        f.sink.output(b"hello\r\nshellmate");
+        assert_eq!(row(&f.term, 0), "hello");
+        assert_eq!(row(&f.term, 1), "shellmate");
+    }
+
+    #[test]
+    fn a_burst_of_output_wakes_the_ui_once() {
+        let f = fixture(1);
+        for chunk in ["a", "b", "c"] {
+            f.sink.output(chunk.as_bytes());
+        }
+        let msgs = drain(&f.rx);
+        assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Output)).count(), 1);
+        // Once the UI consumed the notification (and reset the flag) the next output wakes it again.
+        f.pending.store(false, Ordering::Release);
+        f.sink.output(b"d");
+        assert!(matches!(drain(&f.rx).as_slice(), [Msg::Output]));
+        assert_eq!(row(&f.term, 0), "abcd");
+    }
+
+    #[test]
+    fn output_of_a_replaced_backend_is_dropped() {
+        let f = fixture(1);
+        f.sink.output(b"old");
+        f.current.store(2, Ordering::Release);
+        f.sink.output(b"stale");
+        assert_eq!(row(&f.term, 0), "old");
+    }
+
+    #[test]
+    fn lifecycle_notifications_carry_their_generation() {
+        let f = fixture(7);
+        f.sink.exited(Some(3));
+        f.sink.disconnected("连接已断开：保活超时");
+        let msgs = drain(&f.rx);
+        assert!(matches!(&msgs[0], Msg::Exited { generation: 7, code: Some(3) }));
+        assert!(matches!(&msgs[1], Msg::Disconnected { generation: 7, reason } if reason == "连接已断开：保活超时"));
     }
 }

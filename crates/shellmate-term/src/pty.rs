@@ -6,6 +6,7 @@ use std::thread;
 
 use anyhow::{Context as _, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use shellmate_core::io::{ProcessInfo, PtyDims, TerminalBackend};
 
 /// How to launch the local shell.
 #[derive(Clone, Debug)]
@@ -49,11 +50,11 @@ impl LocalPty {
     /// output; `on_exit` runs once with the exit code when the shell exits.
     pub fn spawn(
         options: &PtyOptions,
-        size: PtySize,
+        dims: PtyDims,
         mut on_output: impl FnMut(&[u8]) + Send + 'static,
         on_exit: impl FnOnce(Option<u32>) + Send + 'static,
     ) -> Result<Self> {
-        let pair = native_pty_system().openpty(size).context("openpty")?;
+        let pair = native_pty_system().openpty(pty_size(dims)).context("openpty")?;
 
         let mut cmd = CommandBuilder::new(options.shell_path());
         if options.login {
@@ -104,22 +105,33 @@ impl LocalPty {
 
         Ok(Self { master: pair.master, writer, killer })
     }
+}
 
-    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+fn pty_size(dims: PtyDims) -> PtySize {
+    PtySize { rows: dims.rows, cols: dims.cols, pixel_width: dims.pixel_width, pixel_height: dims.pixel_height }
+}
+
+impl TerminalBackend for LocalPty {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.writer.write_all(bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        self.writer.flush()
     }
 
-    pub fn resize(&self, size: PtySize) -> Result<()> {
-        self.master.resize(size)
+    fn resize(&mut self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> std::io::Result<()> {
+        self.master
+            .resize(pty_size(PtyDims { cols, rows, pixel_width, pixel_height }))
+            .map_err(std::io::Error::other)
+    }
+
+    fn close(&mut self) {
+        let _ = self.killer.kill();
     }
 
     /// The process currently in the foreground of the terminal (the shell
     /// itself when idle, `vim`/`ssh`/... while they run).
-    pub fn foreground_process(&self) -> Option<ProcessInfo> {
+    fn foreground_process(&self) -> Option<ProcessInfo> {
         let pid = self.master.process_group_leader()?;
-        ProcessInfo::of(pid)
+        process_info(pid)
     }
 }
 
@@ -129,45 +141,34 @@ impl Drop for LocalPty {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessInfo {
-    pub pid: i32,
-    pub name: String,
-    pub cwd: Option<PathBuf>,
+#[cfg(target_os = "macos")]
+fn process_info(pid: i32) -> Option<ProcessInfo> {
+    use std::ffi::CStr;
+    use std::mem::{MaybeUninit, size_of};
+
+    let mut name_buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `len` bytes and proc_name NUL-terminates.
+    let len = unsafe { libc::proc_name(pid, name_buf.as_mut_ptr().cast(), name_buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&name_buf[..len as usize]).into_owned();
+
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: `info` is a zeroed proc_vnodepathinfo of exactly `size` bytes.
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size) };
+    let cwd = (got == size).then(|| {
+        // SAFETY: proc_pidinfo filled the struct; vip_path is NUL-terminated.
+        let info = unsafe { info.assume_init() };
+        let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+        PathBuf::from(path.to_string_lossy().into_owned())
+    });
+
+    Some(ProcessInfo { pid, name, cwd })
 }
 
-impl ProcessInfo {
-    #[cfg(target_os = "macos")]
-    fn of(pid: i32) -> Option<Self> {
-        use std::ffi::CStr;
-        use std::mem::{MaybeUninit, size_of};
-
-        let mut name_buf = [0u8; 256];
-        // SAFETY: the buffer is valid for `len` bytes and proc_name NUL-terminates.
-        let len = unsafe { libc::proc_name(pid, name_buf.as_mut_ptr().cast(), name_buf.len() as u32) };
-        if len <= 0 {
-            return None;
-        }
-        let name = String::from_utf8_lossy(&name_buf[..len as usize]).into_owned();
-
-        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
-        let size = size_of::<libc::proc_vnodepathinfo>() as i32;
-        // SAFETY: `info` is a zeroed proc_vnodepathinfo of exactly `size` bytes.
-        let got = unsafe {
-            libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size)
-        };
-        let cwd = (got == size).then(|| {
-            // SAFETY: proc_pidinfo filled the struct; vip_path is NUL-terminated.
-            let info = unsafe { info.assume_init() };
-            let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
-            PathBuf::from(path.to_string_lossy().into_owned())
-        });
-
-        Some(Self { pid, name, cwd })
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn of(_pid: i32) -> Option<Self> {
-        None
-    }
+#[cfg(not(target_os = "macos"))]
+fn process_info(_pid: i32) -> Option<ProcessInfo> {
+    None
 }

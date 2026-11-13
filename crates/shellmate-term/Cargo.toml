@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+shellmate-core.workspace = true
 gpui.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
@@ -13,3 +14,9 @@ async-channel.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 libc.workspace = true
+
+# Runs the terminal model inside a real (windowless) gpui app, which must own the
+# main thread, so it brings its own `main`. Opt-in: see the test's header.
+[[test]]
+name = "terminal_session"
+harness = false

@@ -2,7 +2,9 @@
 
 pub mod filter;
 pub mod host;
+pub mod io;
 pub mod sample;
 
 pub use filter::{HostFilter, HostSection, sections};
+pub use io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 pub use host::{AuthMethod, FingerprintState, Group, GroupTone, Host, HostBook, Protocol, relative_time};

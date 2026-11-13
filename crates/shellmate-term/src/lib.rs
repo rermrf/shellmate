@@ -9,6 +9,7 @@ pub mod view;
 
 pub use colors::TerminalPalette;
 pub use element::TerminalStyle;
-pub use pty::{ProcessInfo, PtyOptions};
-pub use terminal::{Terminal, TerminalEvent, TerminalSize};
+pub use pty::PtyOptions;
+pub use shellmate_core::io::{OutputSink, ProcessInfo, PtyDims, TerminalBackend};
+pub use terminal::{SessionEnd, Terminal, TerminalEvent, TerminalSize};
 pub use view::{TerminalView, init};
