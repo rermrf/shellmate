@@ -1,7 +1,7 @@
 //! Design tokens from the prototype (`THEME` / `TERM`), plus syncing them into
 //! gpui-component's theme so its widgets match.
 
-use gpui::component::{Theme, ThemeMode};
+use gpui::component::{Theme, ThemeColor, ThemeMode};
 use gpui::{App, Global, Hsla, Pixels, Rgba, SharedString, px};
 use shellmate_core::GroupTone;
 use shellmate_term::{TerminalPalette, TerminalStyle};
@@ -32,6 +32,8 @@ pub struct Palette {
     pub errs: Hsla,
     /// Drop shadow color for raised cards.
     pub shadow: Hsla,
+    /// Backdrop behind modal dialogs (`--scrim`).
+    pub scrim: Hsla,
 }
 
 fn hex(v: u32) -> Hsla {
@@ -39,13 +41,8 @@ fn hex(v: u32) -> Hsla {
 }
 
 fn rgba(v: u32, a: f32) -> Hsla {
-    Rgba {
-        r: ((v >> 16) & 0xff) as f32 / 255.,
-        g: ((v >> 8) & 0xff) as f32 / 255.,
-        b: (v & 0xff) as f32 / 255.,
-        a,
-    }
-    .into()
+    Rgba { r: ((v >> 16) & 0xff) as f32 / 255., g: ((v >> 8) & 0xff) as f32 / 255., b: (v & 0xff) as f32 / 255., a }
+        .into()
 }
 
 impl Palette {
@@ -68,6 +65,7 @@ impl Palette {
             err: hex(0xE5484D),
             errs: rgba(0xE5484D, 0.11),
             shadow: rgba(0x101828, 0.07),
+            scrim: rgba(0x141820, 0.32),
         }
     }
 
@@ -90,6 +88,7 @@ impl Palette {
             err: hex(0xFF6369),
             errs: rgba(0xFF6369, 0.15),
             shadow: rgba(0x000000, 0.28),
+            scrim: rgba(0x000000, 0.55),
         }
     }
 
@@ -141,6 +140,155 @@ impl ActivePalette for App {
     }
 }
 
+/// Blends `a` toward `b` by `t` (0 = `a`, 1 = `b`), keeping `a`'s alpha.
+fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let (a, b) = (Rgba::from(a), Rgba::from(b));
+    Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: a.a }.into()
+}
+
+/// Mirrors the palette into every gpui-component color the app's widgets rely on, so buttons,
+/// checkboxes, switches, links, lists, tables and the dialog backdrop follow the prototype
+/// (blue `--acc` primary, `--card2` secondary, `--scrim` backdrop).
+fn sync_component_colors(c: &mut ThemeColor, p: &Palette, dark: bool) {
+    let white = hex(0xFFFFFF);
+    // Hover and pressed states move toward the opposite end of the lightness scale.
+    let (tint, hover_by, press_by) = if dark { (white, 0.14, 0.24) } else { (hex(0x000000), 0.10, 0.18) };
+    let hover = |color: Hsla| mix(color, tint, hover_by);
+    let pressed = |color: Hsla| mix(color, tint, press_by);
+
+    c.background = p.card;
+    c.foreground = p.tx;
+    c.border = p.line;
+    c.input = p.line;
+    c.ring = p.acc;
+    c.caret = p.acc;
+    c.selection = p.accs;
+    c.accent = p.card3;
+    c.accent_foreground = p.tx;
+    c.muted = p.card2;
+    c.muted_foreground = p.tx3;
+    c.popover = p.card;
+    c.popover_foreground = p.tx;
+    c.overlay = p.scrim;
+
+    c.primary = p.acc;
+    c.primary_hover = hover(p.acc);
+    c.primary_active = pressed(p.acc);
+    c.primary_foreground = white;
+    c.secondary = p.card2;
+    c.secondary_hover = p.card3;
+    c.secondary_active = p.card3;
+    c.secondary_foreground = p.tx;
+
+    // Buttons: default and secondary are the soft `--card2` pill, primary is the accent.
+    for (base, hovered, active, foreground) in [
+        (&mut c.button, &mut c.button_hover, &mut c.button_active, &mut c.button_foreground),
+        (
+            &mut c.button_secondary,
+            &mut c.button_secondary_hover,
+            &mut c.button_secondary_active,
+            &mut c.button_secondary_foreground,
+        ),
+    ] {
+        *base = p.card2;
+        *hovered = p.card3;
+        *active = mix(p.card3, tint, 0.06);
+        *foreground = p.tx;
+    }
+    for (base, hovered, active, foreground, color) in [
+        (
+            &mut c.button_primary,
+            &mut c.button_primary_hover,
+            &mut c.button_primary_active,
+            &mut c.button_primary_foreground,
+            p.acc,
+        ),
+        (&mut c.button_info, &mut c.button_info_hover, &mut c.button_info_active, &mut c.button_info_foreground, p.acc),
+        (
+            &mut c.button_danger,
+            &mut c.button_danger_hover,
+            &mut c.button_danger_active,
+            &mut c.button_danger_foreground,
+            p.err,
+        ),
+        (
+            &mut c.button_success,
+            &mut c.button_success_hover,
+            &mut c.button_success_active,
+            &mut c.button_success_foreground,
+            p.ok,
+        ),
+        (
+            &mut c.button_warning,
+            &mut c.button_warning_hover,
+            &mut c.button_warning_active,
+            &mut c.button_warning_foreground,
+            p.warn,
+        ),
+    ] {
+        *base = color;
+        *hovered = hover(color);
+        *active = pressed(color);
+        *foreground = white;
+    }
+
+    c.success = p.ok;
+    c.success_hover = hover(p.ok);
+    c.success_active = pressed(p.ok);
+    c.success_foreground = white;
+    c.warning = p.warn;
+    c.warning_hover = hover(p.warn);
+    c.warning_active = pressed(p.warn);
+    c.warning_foreground = white;
+    c.danger = p.err;
+    c.danger_hover = hover(p.err);
+    c.danger_active = pressed(p.err);
+    c.danger_foreground = white;
+    c.info = p.acc;
+    c.info_hover = hover(p.acc);
+    c.info_active = pressed(p.acc);
+    c.info_foreground = white;
+
+    c.link = p.acc;
+    c.link_hover = hover(p.acc);
+    c.link_active = pressed(p.acc);
+
+    c.switch = p.card3;
+    c.switch_thumb = white;
+
+    c.list = p.card;
+    c.list_even = p.card;
+    c.list_head = p.card2;
+    c.list_hover = p.card2;
+    c.list_active = p.accs;
+    c.list_active_border = p.acc;
+    c.table = p.card;
+    c.table_even = p.card;
+    c.table_head = p.card2;
+    c.table_head_foreground = p.tx3;
+    c.table_foot = p.card2;
+    c.table_foot_foreground = p.tx3;
+    c.table_hover = p.card2;
+    c.table_active = p.accs;
+    c.table_active_border = p.acc;
+    c.table_row_border = p.line;
+
+    c.tab_bar = p.card2;
+    c.tab_bar_segmented = p.card2;
+    c.tab = p.card2;
+    c.tab_active = p.card;
+    c.tab_foreground = p.tx2;
+    c.tab_active_foreground = p.tx;
+
+    c.scrollbar_thumb = p.tx3.opacity(0.45);
+    c.scrollbar_thumb_hover = p.tx3.opacity(0.7);
+    c.drop_target = p.accs;
+    c.drag_border = p.acc;
+    c.progress_bar = p.acc;
+    c.slider_bar = p.acc;
+    c.slider_thumb = white;
+}
+
 /// Installs the light or dark tokens and mirrors them into gpui-component.
 pub fn apply(dark: bool, cx: &mut App) {
     let palette = if dark { Palette::dark() } else { Palette::light() };
@@ -155,31 +303,7 @@ pub fn apply(dark: bool, cx: &mut App) {
         theme.radius_lg = px(12.);
         theme.shadow = true;
 
-        let c = &mut theme.colors;
-        c.background = p.card;
-        c.foreground = p.tx;
-        c.border = p.line;
-        c.input = p.line;
-        c.ring = p.acc;
-        c.primary = p.acc;
-        c.primary_hover = p.acc.opacity(0.9);
-        c.primary_active = p.acc.opacity(0.8);
-        c.primary_foreground = hex(0xFFFFFF);
-        c.secondary = p.card2;
-        c.secondary_hover = p.card3;
-        c.secondary_active = p.card3;
-        c.secondary_foreground = p.tx;
-        c.muted = p.card2;
-        c.muted_foreground = p.tx3;
-        c.accent = p.card3;
-        c.accent_foreground = p.tx;
-        c.popover = p.card;
-        c.popover_foreground = p.tx;
-        c.selection = p.accs;
-        c.caret = p.acc;
-        c.success = p.ok;
-        c.warning = p.warn;
-        c.danger = p.err;
+        sync_component_colors(&mut theme.colors, &p, dark);
     });
 
     cx.set_global(AppTheme { dark, palette, terminal });

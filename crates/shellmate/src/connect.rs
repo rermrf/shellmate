@@ -10,6 +10,7 @@
 //! pending in the bridge and written to the keychain once the connection succeeded.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -72,8 +73,20 @@ pub struct UiBridge {
     known_passwords: Mutex<HashMap<Endpoint, Secret>>,
     /// Endpoints whose saved password was already tried automatically (a retry must ask).
     autofilled: Mutex<HashSet<Endpoint>>,
-    /// Secrets to store after a successful login.
-    pending_saves: Mutex<HashMap<SecretKey, Secret>>,
+    /// Answers the user wants remembered, until the hop they belong to authenticates with them.
+    /// Only the last answer per hop and kind is kept.
+    pending: Mutex<HashMap<Candidate, Secret>>,
+    /// Secrets whose method authenticated their hop: these are written to the keychain.
+    confirmed: Mutex<Vec<(SecretKey, Secret)>>,
+}
+
+/// An answer that may be saved once it is known to have worked.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Candidate {
+    /// The login password of a hop.
+    Password(Endpoint),
+    /// The passphrase that unlocked a key file.
+    Passphrase(PathBuf),
 }
 
 impl UiBridge {
@@ -84,7 +97,8 @@ impl UiBridge {
             hosts: chain.iter().map(|h| (Endpoint::of(h, default_user), h.id.clone())).collect(),
             known_passwords: Mutex::new(HashMap::new()),
             autofilled: Mutex::new(HashSet::new()),
-            pending_saves: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            confirmed: Mutex::new(Vec::new()),
         })
     }
 
@@ -93,23 +107,56 @@ impl UiBridge {
         *lock(&self.known_passwords) = passwords;
     }
 
-    /// Sends progress to the UI.
+    /// Sends progress to the UI. A hop that authenticated also settles which of the answers the
+    /// user wanted remembered really worked.
     pub fn event(&self, event: ConnectEvent) {
+        if let ConnectEvent::Authenticated { host, port, user, method, key_file } = &event {
+            self.confirm(
+                Endpoint { host: host.clone(), port: *port, user: user.clone() },
+                *method,
+                key_file.as_deref(),
+            );
+        }
         let _ = self.tx.try_send(UiMsg::Event(event));
     }
 
-    /// The secrets the user asked to remember, to write after a successful login.
-    pub fn take_pending_saves(&self) -> Vec<(SecretKey, Secret)> {
-        lock(&self.pending_saves).drain().collect()
+    /// The secrets to write to the keychain: the answers the user asked to remember whose
+    /// method authenticated its hop (a password only if the password method worked, a passphrase
+    /// only if the key it unlocked was the one that authenticated).
+    pub fn take_confirmed_saves(&self) -> Vec<(SecretKey, Secret)> {
+        std::mem::take(&mut *lock(&self.confirmed))
+    }
+
+    /// `hop` authenticated with `method` (and `key_file`): commit what belongs to that, drop the rest.
+    fn confirm(&self, hop: Endpoint, method: Option<AuthMethod>, key_file: Option<&Path>) {
+        let mut pending = lock(&self.pending);
+        let password = pending.remove(&Candidate::Password(hop.clone()));
+        let mut confirmed = lock(&self.confirmed);
+        if method == Some(AuthMethod::Password)
+            && let Some(secret) = password
+            && let Some(id) = self.hosts.get(&hop)
+        {
+            confirmed.push((SecretKey::HostPassword(id.clone()), secret));
+        }
+        if method == Some(AuthMethod::PrivateKey)
+            && let Some(file) = key_file
+            && let Some(secret) = pending.remove(&Candidate::Passphrase(file.to_path_buf()))
+        {
+            confirmed.push((SecretKey::KeyPassphrase(file.to_path_buf()), secret));
+        }
     }
 
     fn endpoint_of(&self, host: &str, port: u16, user: &str) -> Endpoint {
         Endpoint { host: host.to_string(), port, user: user.to_string() }
     }
 
-    fn remember(&self, key: SecretKey, answer: &Answer) {
+    /// Notes the answer for saving, or forgets an earlier answer if this one is not to be saved.
+    fn remember(&self, candidate: Candidate, answer: &Answer) {
+        let mut pending = lock(&self.pending);
         if answer.save {
-            lock(&self.pending_saves).insert(key, answer.secret.clone());
+            pending.insert(candidate, answer.secret.clone());
+        } else {
+            pending.remove(&candidate);
         }
     }
 }
@@ -132,14 +179,12 @@ impl Prompter for UiBridge {
         let (reply, answer) = oneshot::channel();
         self.tx.send(UiMsg::Password { request, reply }).await.ok()?;
         let answer = answer.await.ok()??;
-        if let Some(id) = self.hosts.get(&endpoint) {
-            self.remember(SecretKey::HostPassword(id.clone()), &answer);
-        }
+        self.remember(Candidate::Password(endpoint), &answer);
         Some(answer.secret)
     }
 
     async fn passphrase(&self, request: PassphraseRequest) -> Option<Secret> {
-        let key = SecretKey::KeyPassphrase(request.key_path.clone());
+        let key = Candidate::Passphrase(request.key_path.clone());
         let (reply, answer) = oneshot::channel();
         self.tx.send(UiMsg::Passphrase { request, reply }).await.ok()?;
         let answer = answer.await.ok()??;
@@ -203,57 +248,75 @@ pub fn build_route(
     Ok((route, known))
 }
 
+/// What was written to the keychain at the end of a connection attempt.
+#[derive(Debug, Default)]
+pub struct SaveReport {
+    /// Secrets that were stored.
+    pub saved: Vec<SecretKey>,
+    /// Keychain writes that failed (the connection itself is unaffected).
+    pub errors: Vec<String>,
+}
+
 /// A connection with its shell channel opened but not yet attached to a terminal. The shell
 /// keeps the connection alive; the connection closes with its last channel.
 pub struct Connected {
     pub shell: PendingShell,
-    /// What was written to the keychain after login.
-    pub saved: Vec<SecretKey>,
-    /// Keychain writes that failed after login (the connection itself is fine).
-    pub save_errors: Vec<String>,
+    pub saves: SaveReport,
+}
+
+/// A failed attempt. Hops that authenticated before the failure still get their secrets saved.
+pub struct ConnectFailure {
+    pub error: SshError,
+    pub saves: SaveReport,
 }
 
 /// Runs a whole connection attempt on the SSH runtime: route, connect, open the shell, and
-/// remember the credentials the user asked to keep.
+/// remember the credentials the user asked to keep for the hops that authenticated with them.
 pub async fn connect_and_open(
     chain: Vec<Host>,
     secrets: Arc<dyn SecretStore>,
     bridge: Arc<UiBridge>,
     dims: PtyDims,
-) -> Result<Connected, SshError> {
-    let user = default_user();
-    let (route, known) = {
-        let (chain, secrets, user) = (chain.clone(), secrets.clone(), user.clone());
-        tokio::task::spawn_blocking(move || build_route(&chain, secrets.as_ref(), &user))
-            .await
-            .map_err(|err| SshError::Unsupported(err.to_string()))??
+) -> Result<Connected, ConnectFailure> {
+    let attempt = async {
+        let user = default_user();
+        let (route, known) = {
+            let (chain, secrets, user) = (chain.clone(), secrets.clone(), user.clone());
+            tokio::task::spawn_blocking(move || build_route(&chain, secrets.as_ref(), &user))
+                .await
+                .map_err(|err| SshError::Unsupported(err.to_string()))??
+        };
+        bridge.set_known_passwords(known);
+
+        let events = bridge.clone();
+        let options =
+            ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |event| events.event(event));
+        let connection = Connection::connect(route, options).await?;
+        connection.open_shell(dims).await
     };
-    bridge.set_known_passwords(known);
+    let outcome = attempt.await;
 
-    let events = bridge.clone();
-    let options =
-        ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |event| events.event(event));
-    let connection = Connection::connect(route, options).await?;
-    let shell = connection.open_shell(dims).await?;
-
-    let saves = bridge.take_pending_saves();
-    let (saved, save_errors) = if saves.is_empty() {
-        (Vec::new(), Vec::new())
+    let saves = bridge.take_confirmed_saves();
+    let saves = if saves.is_empty() {
+        SaveReport::default()
     } else {
         tokio::task::spawn_blocking(move || {
-            let (mut saved, mut errors) = (Vec::new(), Vec::new());
+            let mut report = SaveReport::default();
             for (key, secret) in saves {
                 match secrets.set(&key, &secret) {
-                    Ok(()) => saved.push(key),
-                    Err(err) => errors.push(err.to_string()),
+                    Ok(()) => report.saved.push(key),
+                    Err(err) => report.errors.push(err.to_string()),
                 }
             }
-            (saved, errors)
+            report
         })
         .await
         .unwrap_or_default()
     };
-    Ok(Connected { shell, saved, save_errors })
+    match outcome {
+        Ok(shell) => Ok(Connected { shell, saves }),
+        Err(error) => Err(ConnectFailure { error, saves }),
+    }
 }
 
 // ---- wording ---------------------------------------------------------------------------
@@ -380,7 +443,13 @@ mod tests {
         assert!(line(verified(FingerprintState::New, true)).contains("已写入 known_hosts"));
         assert!(line(verified(FingerprintState::Changed, true)).contains("已更新 known_hosts"));
         assert!(line(verified(FingerprintState::New, false)).contains("无法写入 known_hosts"));
-        let authed = |method| ConnectEvent::Authenticated { host: "h".into(), port: 22, user: "u".into(), method };
+        let authed = |method| ConnectEvent::Authenticated {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            method,
+            key_file: None,
+        };
         assert_eq!(line(authed(Some(AuthMethod::PrivateKey))), "\x1b[32m✓ 认证成功 · 私钥");
         assert_eq!(line(authed(Some(AuthMethod::Agent))), "\x1b[32m✓ 认证成功 · ssh-agent");
         assert_eq!(line(authed(None)), "\x1b[32m✓ 认证成功 · 无需凭据");
@@ -452,35 +521,189 @@ mod tests {
         assert!(!bridge.verify(gone).await);
     }
 
-    #[tokio::test]
-    async fn passwords_are_saved_only_when_asked_and_only_on_request() {
-        let target = host("web", "w.example.com", 22, Some("deploy"));
-        let (bridge, rx) = bridge_for(std::slice::from_ref(&target));
-        let request = PasswordRequest { host: "w.example.com".into(), port: 22, user: "deploy".into(), attempt: 0 };
+    // ---- keychain saves: only what the authenticating method used --------------------------
 
-        for (save, expect_saved) in [(false, 0usize), (true, 1)] {
-            let asking = tokio::spawn({
-                let (bridge, request) = (bridge.clone(), request.clone());
-                async move { bridge.password(request).await }
-            });
-            let Ok(UiMsg::Password { reply, .. }) = rx.recv().await else { panic!("expected a password question") };
-            reply.send(Some(Answer { secret: Secret::new("hunter2"), save })).ok().unwrap();
-            assert_eq!(asking.await.unwrap().unwrap().expose(), "hunter2");
-            let saves = bridge.take_pending_saves();
-            assert_eq!(saves.len(), expect_saved);
-            if let Some((key, secret)) = saves.first() {
-                assert_eq!(*key, SecretKey::HostPassword(target.id.clone()));
-                assert_eq!(secret.expose(), "hunter2");
+    fn user_of(host: &Host) -> String {
+        host.user.clone().unwrap_or_else(|| "me".into())
+    }
+
+    /// The user types `password` into the password dialog of `host`.
+    async fn type_password(
+        bridge: &Arc<UiBridge>,
+        rx: &async_channel::Receiver<UiMsg>,
+        host: &Host,
+        password: &str,
+        save: bool,
+    ) {
+        let request = PasswordRequest { host: host.addr.clone(), port: host.port, user: user_of(host), attempt: 0 };
+        let asking = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.password(request).await }
+        });
+        loop {
+            match rx.recv().await {
+                Ok(UiMsg::Password { reply, .. }) => {
+                    reply.send(Some(Answer { secret: Secret::new(password), save })).ok().unwrap();
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("the bridge closed"),
             }
         }
-        assert!(bridge.take_pending_saves().is_empty(), "taking the pending saves empties them");
+        asking.await.unwrap().unwrap();
+    }
+
+    /// The user types `passphrase` into the passphrase dialog of `key`.
+    async fn type_passphrase(
+        bridge: &Arc<UiBridge>,
+        rx: &async_channel::Receiver<UiMsg>,
+        key: &str,
+        passphrase: &str,
+        save: bool,
+    ) {
+        let request = PassphraseRequest { key_path: key.into(), attempt: 0 };
+        let asking = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.passphrase(request).await }
+        });
+        loop {
+            match rx.recv().await {
+                Ok(UiMsg::Passphrase { reply, .. }) => {
+                    reply.send(Some(Answer { secret: Secret::new(passphrase), save })).ok().unwrap();
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("the bridge closed"),
+            }
+        }
+        asking.await.unwrap().unwrap();
+    }
+
+    /// The SSH layer reports that `host` authenticated.
+    fn authenticated(bridge: &UiBridge, host: &Host, method: Option<AuthMethod>, key_file: Option<&str>) {
+        bridge.event(ConnectEvent::Authenticated {
+            host: host.addr.clone(),
+            port: host.port,
+            user: user_of(host),
+            method,
+            key_file: key_file.map(PathBuf::from),
+        });
+    }
+
+    fn saved(bridge: &UiBridge) -> Vec<(SecretKey, String)> {
+        bridge.take_confirmed_saves().into_iter().map(|(key, secret)| (key, secret.expose().to_string())).collect()
     }
 
     #[tokio::test]
-    async fn a_cancelled_password_prompt_saves_nothing() {
-        let target = host("web", "w.example.com", 22, Some("deploy"));
-        let (bridge, rx) = bridge_for(std::slice::from_ref(&target));
-        let request = PasswordRequest { host: "w.example.com".into(), port: 22, user: "deploy".into(), attempt: 0 };
+    async fn a_password_is_saved_once_the_password_method_authenticated() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        type_password(&bridge, &rx, &web, "oops", true).await;
+        assert!(saved(&bridge).is_empty(), "nothing is saved before the server accepted it");
+        type_password(&bridge, &rx, &web, "right", true).await;
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert_eq!(
+            saved(&bridge),
+            [(SecretKey::HostPassword(web.id.clone()), "right".to_string())],
+            "the last answer, not the wrong one"
+        );
+        assert!(saved(&bridge).is_empty(), "taking the saves empties them");
+    }
+
+    #[tokio::test]
+    async fn wrong_passwords_followed_by_a_keyboard_interactive_login_save_nothing() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        for wrong in ["a", "b", "c"] {
+            type_password(&bridge, &rx, &web, wrong, true).await;
+        }
+        authenticated(&bridge, &web, Some(AuthMethod::KeyboardInteractive), None);
+        assert!(saved(&bridge).is_empty());
+        // And the wrong password does not linger for a later confirmation either.
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert!(saved(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn not_ticking_the_box_on_the_last_answer_forgets_the_earlier_one() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        type_password(&bridge, &rx, &web, "ticked", true).await;
+        type_password(&bridge, &rx, &web, "unticked", false).await;
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert!(saved(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_jump_hosts_password_is_saved_only_for_the_hop_that_used_it() {
+        let jump = host("bastion", "b.example.com", 2222, Some("ops"));
+        let target = host("db", "d.example.com", 22, Some("dba"));
+        let chain = [jump.clone(), target.clone()];
+
+        // Both hops logged in with their passwords: each is saved under its own host.
+        let (bridge, rx) = bridge_for(&chain);
+        type_password(&bridge, &rx, &jump, "jump-pw", true).await;
+        authenticated(&bridge, &jump, Some(AuthMethod::Password), None);
+        type_password(&bridge, &rx, &target, "target-pw", true).await;
+        authenticated(&bridge, &target, Some(AuthMethod::Password), None);
+        assert_eq!(
+            saved(&bridge),
+            [
+                (SecretKey::HostPassword(jump.id.clone()), "jump-pw".to_string()),
+                (SecretKey::HostPassword(target.id.clone()), "target-pw".to_string())
+            ]
+        );
+
+        // The target ended up authenticating by other means: only the jump host's password counts.
+        let (bridge, rx) = bridge_for(&chain);
+        type_password(&bridge, &rx, &jump, "jump-pw", true).await;
+        authenticated(&bridge, &jump, Some(AuthMethod::Password), None);
+        type_password(&bridge, &rx, &target, "typo", true).await;
+        authenticated(&bridge, &target, Some(AuthMethod::Agent), None);
+        assert_eq!(saved(&bridge), [(SecretKey::HostPassword(jump.id.clone()), "jump-pw".to_string())]);
+
+        // A password typed for one hop is never credited to the other.
+        let (bridge, rx) = bridge_for(&chain);
+        type_password(&bridge, &rx, &target, "target-pw", true).await;
+        authenticated(&bridge, &jump, Some(AuthMethod::Password), None);
+        assert!(saved(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_passphrase_is_saved_only_when_that_key_authenticated() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+
+        // The key the passphrase unlocked authenticated: saved, keyed by the file.
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        type_passphrase(&bridge, &rx, "/keys/work", "phrase", true).await;
+        authenticated(&bridge, &web, Some(AuthMethod::PrivateKey), Some("/keys/work"));
+        assert_eq!(saved(&bridge), [(SecretKey::KeyPassphrase("/keys/work".into()), "phrase".to_string())]);
+
+        // The server took a different key, or the agent, or a password: not saved.
+        for (method, file) in [
+            (Some(AuthMethod::PrivateKey), Some("/keys/other")),
+            (Some(AuthMethod::Agent), None),
+            (Some(AuthMethod::Password), None),
+            (Some(AuthMethod::PrivateKey), None),
+        ] {
+            let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+            type_passphrase(&bridge, &rx, "/keys/work", "phrase", true).await;
+            authenticated(&bridge, &web, method, file);
+            assert!(saved(&bridge).is_empty(), "{method:?} {file:?}");
+        }
+
+        // Unticked: never saved.
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        type_passphrase(&bridge, &rx, "/keys/work", "phrase", false).await;
+        authenticated(&bridge, &web, Some(AuthMethod::PrivateKey), Some("/keys/work"));
+        assert!(saved(&bridge).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prompt_saves_nothing() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        let request = PasswordRequest { host: web.addr.clone(), port: 22, user: "deploy".into(), attempt: 0 };
         let asking = tokio::spawn({
             let bridge = bridge.clone();
             async move { bridge.password(request).await }
@@ -488,21 +711,16 @@ mod tests {
         let Ok(UiMsg::Password { reply, .. }) = rx.recv().await else { panic!() };
         reply.send(None).ok().unwrap();
         assert!(asking.await.unwrap().is_none());
-        assert!(bridge.take_pending_saves().is_empty());
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert!(saved(&bridge).is_empty());
     }
 
     #[tokio::test]
-    async fn passphrases_are_keyed_by_the_key_file() {
-        let (bridge, rx) = bridge_for(&[]);
-        let asking = tokio::spawn({
-            let bridge = bridge.clone();
-            async move { bridge.passphrase(PassphraseRequest { key_path: "/keys/id".into(), attempt: 1 }).await }
-        });
-        let Ok(UiMsg::Passphrase { request, reply }) = rx.recv().await else { panic!() };
-        assert_eq!(request.attempt, 1);
-        reply.send(Some(Answer { secret: Secret::new("p"), save: true })).ok().unwrap();
-        asking.await.unwrap().unwrap();
-        assert_eq!(bridge.take_pending_saves()[0].0, SecretKey::KeyPassphrase("/keys/id".into()));
+    async fn the_event_is_still_forwarded_to_the_ui() {
+        let web = host("web", "w.example.com", 22, Some("deploy"));
+        let (bridge, rx) = bridge_for(std::slice::from_ref(&web));
+        authenticated(&bridge, &web, Some(AuthMethod::Password), None);
+        assert!(matches!(rx.recv().await, Ok(UiMsg::Event(ConnectEvent::Authenticated { .. }))));
     }
 
     #[tokio::test]

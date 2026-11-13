@@ -136,7 +136,8 @@ async fn connect_events_follow_the_connection_steps() {
             host: "127.0.0.1".into(),
             port: server.port,
             user: "alice".into(),
-            method: Some(AuthMethod::Password)
+            method: Some(AuthMethod::Password),
+            key_file: None,
         }
     );
 }

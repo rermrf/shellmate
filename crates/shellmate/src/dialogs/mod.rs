@@ -61,7 +61,10 @@ pub fn open<V: DialogBody>(
         }
         let on_ok = body.clone();
         let on_cancel = body.clone();
+        // A little above the middle: clear of the tab bar and header, with the scrim over the rest.
+        let margin_top = (window.viewport_size().height * 0.17).max(px(110.));
         dialog
+            .margin_top(margin_top)
             .title(title.clone())
             .w(px(width))
             .close_button(false)

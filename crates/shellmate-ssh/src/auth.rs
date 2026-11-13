@@ -31,14 +31,21 @@ pub(crate) struct AuthContext<'a> {
     pub agent_socket: Option<&'a Path>,
 }
 
+/// How a hop was authenticated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuthOutcome {
+    /// The method that worked; `None` if the server wanted no credentials.
+    pub method: Option<AuthMethod>,
+    /// The private key file that authenticated us (key authentication only).
+    pub key_file: Option<PathBuf>,
+}
+
 enum Attempt {
-    Success,
+    /// Authenticated; `key_file` is the key file used, if the method was a key file.
+    Success { key_file: Option<PathBuf> },
     /// The server said no. `remaining` are the methods it still accepts;
     /// `partial` means it wants a further factor.
-    Rejected {
-        remaining: MethodSet,
-        partial: bool,
-    },
+    Rejected { remaining: MethodSet, partial: bool },
 }
 
 fn kind_of(method: AuthMethod) -> MethodKind {
@@ -53,16 +60,16 @@ fn method_names(set: &MethodSet) -> Vec<String> {
     set.iter().map(|kind| <&str>::from(kind).to_string()).collect()
 }
 
-/// Authenticates `host.user` on `handle`. Returns the method that worked, or
-/// `None` if the server did not ask for credentials at all.
+/// Authenticates `host.user` on `handle`. Returns how it worked (no method if the
+/// server did not ask for credentials at all).
 pub(crate) async fn authenticate(
     handle: &mut Handle<ClientHandler>,
     host: &SshHost,
     ctx: &AuthContext<'_>,
-) -> Result<Option<AuthMethod>, SshError> {
+) -> Result<AuthOutcome, SshError> {
     // Probe: learns which methods the server offers (and whether it wants any).
     let mut offered = match handle.authenticate_none(&host.user).await? {
-        AuthResult::Success => return Ok(None),
+        AuthResult::Success => return Ok(AuthOutcome::default()),
         AuthResult::Failure { remaining_methods, .. } => remaining_methods,
     };
 
@@ -88,7 +95,7 @@ pub(crate) async fn authenticate(
             AuthMethod::KeyboardInteractive => try_keyboard_interactive(handle, host, ctx).await,
         };
         match attempt {
-            Ok(Attempt::Success) => return Ok(Some(method)),
+            Ok(Attempt::Success { key_file }) => return Ok(AuthOutcome { method: Some(method), key_file }),
             Ok(Attempt::Rejected { remaining, partial }) => {
                 first_error.get_or_insert(SshError::AuthRejected(method));
                 if !remaining.is_empty() {
@@ -142,7 +149,7 @@ async fn try_password(
                 .ok_or(SshError::AuthCancelled)?,
         };
         match handle.authenticate_password(&host.user, secret.expose().to_string()).await? {
-            AuthResult::Success => return Ok(Attempt::Success),
+            AuthResult::Success => return Ok(Attempt::Success { key_file: None }),
             AuthResult::Failure { remaining_methods, partial_success } => {
                 let retry = !partial_success && remaining_methods.contains(&MethodKind::Password);
                 if !retry || attempt + 1 == MAX_ATTEMPTS {
@@ -199,7 +206,7 @@ async fn try_private_key(
             None
         };
         match handle.authenticate_publickey(&host.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await? {
-            AuthResult::Success => return Ok(Attempt::Success),
+            AuthResult::Success => return Ok(Attempt::Success { key_file: Some(path) }),
             AuthResult::Failure { remaining_methods, partial_success } => {
                 last = Attempt::Rejected { remaining: remaining_methods, partial: partial_success };
                 if partial_success {
@@ -284,7 +291,7 @@ async fn try_agent(
             None
         };
         match handle.authenticate_publickey_with(&host.user, key, hash, &mut agent).await {
-            Ok(AuthResult::Success) => return Ok(Attempt::Success),
+            Ok(AuthResult::Success) => return Ok(Attempt::Success { key_file: None }),
             Ok(AuthResult::Failure { remaining_methods, partial_success }) => {
                 last = Attempt::Rejected { remaining: remaining_methods, partial: partial_success };
                 if partial_success {
@@ -317,7 +324,7 @@ async fn try_keyboard_interactive(
         let mut response = handle.authenticate_keyboard_interactive_start(&host.user, None).await?;
         loop {
             match response {
-                KeyboardInteractiveAuthResponse::Success => return Ok(Attempt::Success),
+                KeyboardInteractiveAuthResponse::Success => return Ok(Attempt::Success { key_file: None }),
                 KeyboardInteractiveAuthResponse::Failure { remaining_methods, partial_success } => {
                     let retry = !partial_success && remaining_methods.contains(&MethodKind::KeyboardInteractive);
                     if !retry || attempt + 1 == MAX_ATTEMPTS {

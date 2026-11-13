@@ -394,3 +394,99 @@ async fn password_hosts_fall_back_to_keyboard_interactive() {
         Connection::connect(route_for(&host, None), env.options(Verifier::new(true), script)).await.unwrap();
     assert_eq!(connection.target().auth, Some(AuthMethod::KeyboardInteractive));
 }
+
+// ---- which credential authenticated (the app saves secrets only for the one that did) ----------
+
+fn authenticated_events(
+    events: &std::sync::Mutex<Vec<shellmate_ssh::ConnectEvent>>,
+) -> Vec<(Option<AuthMethod>, Option<std::path::PathBuf>)> {
+    lock(events)
+        .iter()
+        .filter_map(|event| match event {
+            shellmate_ssh::ConnectEvent::Authenticated { method, key_file, .. } => Some((*method, key_file.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn authenticated_event_names_the_key_file_that_worked() {
+    let env = Env::new();
+    let (path, key) = env.write_key("id_work");
+    let server =
+        TestServer::start(ServerOptions { authorized_keys: vec![key.public_key().clone()], ..Default::default() })
+            .await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let options = env.options(Verifier::new(true), Script::new()).with_event_handler(move |e| lock(&sink).push(e));
+    let target = host(&server, AuthMethod::PrivateKey).with_identity_file(&path);
+    let connection = Connection::connect(Route::direct(target), options).await.unwrap();
+
+    assert_eq!(authenticated_events(&events), [(Some(AuthMethod::PrivateKey), Some(path.clone()))]);
+    assert_eq!(connection.target().key_file, Some(path));
+}
+
+#[tokio::test]
+async fn a_default_key_is_reported_by_its_path() {
+    let env = Env::new();
+    let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let default_path = env.ssh_dir.join("id_ed25519");
+    std::fs::write(&default_path, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    let server =
+        TestServer::start(ServerOptions { authorized_keys: vec![key.public_key().clone()], ..Default::default() })
+            .await;
+    let connection = connect(host(&server, AuthMethod::PrivateKey), &env, Script::new()).await.unwrap();
+    assert_eq!(connection.target().key_file, Some(default_path));
+}
+
+#[tokio::test]
+async fn only_the_key_that_authenticated_is_named() {
+    // Two default keys: the server only knows the second one.
+    let env = Env::new();
+    let unknown = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let known = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    std::fs::write(env.ssh_dir.join("id_ed25519"), unknown.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    let second = env.ssh_dir.join("id_ecdsa");
+    std::fs::write(&second, known.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    let server =
+        TestServer::start(ServerOptions { authorized_keys: vec![known.public_key().clone()], ..Default::default() })
+            .await;
+    let connection = connect(host(&server, AuthMethod::PrivateKey), &env, Script::new()).await.unwrap();
+    assert_eq!(connection.target().key_file, Some(second));
+}
+
+#[tokio::test]
+async fn other_methods_report_no_key_file() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions::default()).await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let options = env.options(Verifier::new(true), Script::new()).with_event_handler(move |e| lock(&sink).push(e));
+    let target = host(&server, AuthMethod::Password).with_password(Secret::new("secret"));
+    Connection::connect(Route::direct(target), options).await.unwrap();
+    assert_eq!(authenticated_events(&events), [(Some(AuthMethod::Password), None)]);
+}
+
+#[tokio::test]
+async fn wrong_passwords_then_keyboard_interactive_authenticates_as_keyboard_interactive() {
+    // The app saves a typed password only when the password method itself authenticated: after
+    // three wrong passwords and a keyboard-interactive login the event says so.
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions {
+        kbd: Some(vec![KbdRound { prompts: vec![("Code: ", true)], expect: vec!["424242"] }]),
+        ..Default::default()
+    })
+    .await;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let script = Script::new().with_passwords(&["wrong-1", "wrong-2"]).with_challenges(&[&["424242"]]);
+    let options = env.options(Verifier::new(true), script.clone()).with_event_handler(move |e| lock(&sink).push(e));
+    let target = host(&server, AuthMethod::Password)
+        .with_password(Secret::new("stale"))
+        .with_fallback(AuthMethod::KeyboardInteractive);
+    let connection = Connection::connect(Route::direct(target), options).await.unwrap();
+
+    assert_eq!(connection.target().auth, Some(AuthMethod::KeyboardInteractive));
+    assert_eq!(authenticated_events(&events), [(Some(AuthMethod::KeyboardInteractive), None)]);
+    assert_eq!(lock(&script.password_requests).len(), 2, "the user typed two wrong passwords on top of the stale one");
+}

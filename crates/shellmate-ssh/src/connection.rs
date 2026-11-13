@@ -35,6 +35,8 @@ pub struct HopInfo {
     pub host_key_state: FingerprintState,
     /// Method that authenticated us; `None` if the server wanted no credentials.
     pub auth: Option<AuthMethod>,
+    /// The private key file that authenticated us (key authentication only).
+    pub key_file: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct Inner {
@@ -246,7 +248,8 @@ where
         host: host.host.clone(),
         port: host.port,
         user: host.user.clone(),
-        method: auth,
+        method: auth.method,
+        key_file: auth.key_file.clone(),
     });
 
     let record = shared.host_key().ok_or_else(|| SshError::Handshake("服务器没有提供主机密钥".into()))?;
@@ -257,7 +260,8 @@ where
         user: host.user.clone(),
         host_key: record.key,
         host_key_state: record.state,
-        auth,
+        auth: auth.method,
+        key_file: auth.key_file,
     });
     Ok(Connection { inner: Arc::new(Inner { handle, shared, runtime: runtime.clone(), hops, _via: via }) })
 }

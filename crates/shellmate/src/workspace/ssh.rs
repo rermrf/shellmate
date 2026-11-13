@@ -7,13 +7,12 @@ use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
 use gpui::{AppContext as _, Context, Task, Window};
 use shellmate_core::{Host, HostId};
-use shellmate_ssh::SshError;
 use shellmate_store::SecretKey;
 use shellmate_term::{Terminal, TerminalView};
 use tokio::task::{AbortHandle, JoinError};
 
 use super::{Panel, Session, SessionKind, Workspace};
-use crate::connect::{self, Connected, UiBridge, UiMsg};
+use crate::connect::{self, ConnectFailure, Connected, SaveReport, UiBridge, UiMsg};
 use crate::dialogs::auth::{ChallengeDialog, SecretDialog};
 use crate::dialogs::hostkey::HostKeyDialog;
 use crate::runtime;
@@ -94,6 +93,32 @@ impl Drop for SshSession {
     }
 }
 
+/// What connecting a host does about tabs that already exist for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Existing {
+    /// No tab for the host: open one.
+    None,
+    /// A tab is connecting or connected: switch to it (the tab with this index).
+    Switch(usize),
+    /// A tab for the host has ended or failed: switch to it and connect again in place.
+    Reconnect(usize),
+}
+
+/// Finds the tab to reuse when connecting `host`: a live one first, else one that ended.
+/// `sessions` yields the index and SSH state of every SSH tab.
+pub fn existing_session<'a>(sessions: impl Iterator<Item = (usize, &'a SshSession)>, host: &HostId) -> Existing {
+    let mut ended = None;
+    for (index, ssh) in sessions.filter(|(_, ssh)| &ssh.host.id == host) {
+        match ssh.status {
+            SshStatus::Connecting | SshStatus::Connected => return Existing::Switch(index),
+            SshStatus::Failed | SshStatus::Ended => {
+                ended.get_or_insert(index);
+            }
+        }
+    }
+    ended.map_or(Existing::None, Existing::Reconnect)
+}
+
 /// `deploy@10.0.1.21:22 · SSH · 私钥 · 经由 bastion`
 pub fn subtitle(host: &Host, via: &[&str], default_user: &str) -> String {
     let user = host.user.as_deref().unwrap_or(default_user);
@@ -121,8 +146,19 @@ pub fn panel_hint(panel: Panel) -> &'static str {
 }
 
 impl Workspace {
-    /// Opens a tab for the saved host and starts connecting.
+    /// Opens a tab for the saved host and starts connecting; a host that already has a tab
+    /// switches to it instead (a copy of a session is a separate action).
     pub(super) fn connect_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
+        match existing_session(tabs, id) {
+            Existing::Switch(ix) => return self.activate(ix, window, cx),
+            Existing::Reconnect(ix) => {
+                let session_id = self.sessions[ix].id;
+                self.activate(ix, window, cx);
+                return self.reconnect(session_id, window, cx);
+            }
+            Existing::None => {}
+        }
         let resolved = self.store.borrow().resolve_route(id);
         let chain = match resolved {
             Ok(chain) => chain,
@@ -288,7 +324,7 @@ impl Workspace {
     fn on_connect_result(
         &mut self,
         session_id: usize,
-        outcome: Result<Result<Connected, SshError>, JoinError>,
+        outcome: Result<Result<Connected, ConnectFailure>, JoinError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -302,7 +338,7 @@ impl Workspace {
         match outcome {
             Ok(Ok(connected)) => {
                 ssh.status = SshStatus::Connected;
-                let Connected { shell, saved, save_errors } = connected;
+                let Connected { shell, saves } = connected;
                 terminal.update(cx, |terminal, cx| {
                     terminal.attach(move |sink, dims| Ok(Box::new(shell.start(sink, dims))), cx)
                 });
@@ -310,11 +346,12 @@ impl Workspace {
                     log::warn!("could not record the connection time: {err}");
                 }
                 self.reload_book(window, cx);
-                self.announce_saved(&saved, &save_errors, window, cx);
+                self.announce_saved(&saves, window, cx);
             }
-            Ok(Err(err)) => {
-                ssh.status = if err.is_cancelled() { SshStatus::Ended } else { SshStatus::Failed };
-                terminal.update(cx, |terminal, cx| terminal.disconnect(err.to_string(), cx));
+            Ok(Err(ConnectFailure { error, saves })) => {
+                ssh.status = if error.is_cancelled() { SshStatus::Ended } else { SshStatus::Failed };
+                terminal.update(cx, |terminal, cx| terminal.disconnect(error.to_string(), cx));
+                self.announce_saved(&saves, window, cx);
             }
             Err(err) if err.is_cancelled() => {}
             Err(err) => {
@@ -326,18 +363,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Tells the user what went to the keychain (or why not) after a successful login.
-    fn announce_saved(&mut self, saved: &[SecretKey], errors: &[String], window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(error) = errors.first() {
+    /// Tells the user what went to the keychain (or why not) after an attempt.
+    fn announce_saved(&mut self, saves: &SaveReport, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(error) = saves.errors.first() {
+            window.push_notification(Notification::warning(format!("无法存入钥匙串：{error}")).title("钥匙串"), cx);
+        } else if !saves.saved.is_empty() {
+            let what = if saves.saved.iter().any(|k| matches!(k, SecretKey::KeyPassphrase(_))) {
+                "私钥口令"
+            } else {
+                "密码"
+            };
             window.push_notification(
-                Notification::warning(format!("已连接，但无法存入钥匙串：{error}")).title("钥匙串"),
-                cx,
-            );
-        } else if !saved.is_empty() {
-            let what =
-                if saved.iter().any(|k| matches!(k, SecretKey::KeyPassphrase(_))) { "私钥口令" } else { "密码" };
-            window.push_notification(
-                Notification::success(format!("{what}已存入 macOS 钥匙串，下次自动填写")).title("已连接"),
+                Notification::success(format!("{what}已存入 macOS 钥匙串，下次自动填写")).title("钥匙串"),
                 cx,
             );
         }
@@ -367,6 +404,51 @@ mod tests {
         db.port = 2222;
         db.auth = AuthMethod::Agent;
         assert_eq!(subtitle(&db, &[], "me"), "me@db.example.com:2222 · SSH · ssh-agent");
+    }
+
+    fn tab(host: &Host, status: SshStatus) -> SshSession {
+        let mut session = SshSession::new(host.clone(), vec![host.clone()]);
+        session.status = status;
+        session
+    }
+
+    #[test]
+    fn a_host_with_a_live_tab_switches_to_it() {
+        let (web, db) = (host("web", None), host("db", None));
+        let tabs = [tab(&db, SshStatus::Connected), tab(&web, SshStatus::Connected), tab(&web, SshStatus::Connecting)];
+        let existing = |id: &HostId| existing_session(tabs.iter().enumerate(), id);
+        assert_eq!(existing(&web.id), Existing::Switch(1), "the first live tab of the host");
+        assert_eq!(existing(&db.id), Existing::Switch(0));
+        assert_eq!(existing(&HostId::generate()), Existing::None);
+    }
+
+    #[test]
+    fn connecting_counts_as_live() {
+        let web = host("web", None);
+        let tabs = [tab(&web, SshStatus::Connecting)];
+        assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Switch(0));
+    }
+
+    #[test]
+    fn an_ended_or_failed_tab_is_reconnected_in_place() {
+        let web = host("web", None);
+        for status in [SshStatus::Failed, SshStatus::Ended] {
+            let tabs = [tab(&web, status)];
+            assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Reconnect(0), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_tab_wins_over_an_ended_one() {
+        let web = host("web", None);
+        let tabs = [tab(&web, SshStatus::Ended), tab(&web, SshStatus::Failed), tab(&web, SshStatus::Connected)];
+        assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Switch(2));
+        let only_ended = [tab(&web, SshStatus::Failed), tab(&web, SshStatus::Ended)];
+        assert_eq!(
+            existing_session(only_ended.iter().enumerate(), &web.id),
+            Existing::Reconnect(0),
+            "the first ended tab"
+        );
     }
 
     #[test]

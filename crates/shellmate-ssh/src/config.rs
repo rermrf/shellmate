@@ -175,8 +175,9 @@ pub enum ConnectEvent {
     /// The hop's host key was accepted. `saved` is false if `known_hosts`
     /// could not be written (the connection continues anyway).
     HostKeyVerified { host: String, port: u16, key: HostKeyInfo, state: FingerprintState, saved: bool },
-    /// The hop authenticated us. `method` is `None` if the server needed no credentials.
-    Authenticated { host: String, port: u16, user: String, method: Option<AuthMethod> },
+    /// The hop authenticated us. `method` is `None` if the server needed no credentials;
+    /// `key_file` is the private key file that did it (key authentication only).
+    Authenticated { host: String, port: u16, user: String, method: Option<AuthMethod>, key_file: Option<PathBuf> },
 }
 
 /// Callback receiving [`ConnectEvent`]s; may be called from any runtime thread.
