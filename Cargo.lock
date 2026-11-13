@@ -7051,13 +7051,17 @@ name = "shellmate"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
+ "async-trait",
  "env_logger",
  "gpui-kit",
  "libc",
  "log",
  "shellmate-core",
+ "shellmate-ssh",
  "shellmate-store",
  "shellmate-term",
+ "tokio",
 ]
 
 [[package]]

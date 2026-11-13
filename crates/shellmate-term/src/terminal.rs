@@ -46,7 +46,8 @@ impl Default for TerminalSize {
 }
 
 impl TerminalSize {
-    fn dims(&self) -> PtyDims {
+    /// The size as PTY dimensions (cells and pixels).
+    pub fn dims(&self) -> PtyDims {
         PtyDims {
             cols: self.cols,
             rows: self.rows,

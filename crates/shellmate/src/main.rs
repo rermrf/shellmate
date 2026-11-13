@@ -1,6 +1,11 @@
 //! Shellmate — a gpui SSH client. P0/P1: UI skeleton and local terminal; P2: host library, SSH.
 
 mod assets;
+mod connect;
+mod dialogs;
+#[cfg(debug_assertions)]
+mod demo;
+mod runtime;
 mod sidebar;
 mod theme;
 mod ui;
@@ -51,9 +56,17 @@ fn main() {
             log::error!("failed to load bundled fonts: {err:#}");
         }
         shellmate_term::init(cx);
+        runtime::init(cx);
+        sidebar::init(cx);
         workspace::init(cx);
 
         let dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        #[cfg(debug_assertions)]
+        let dark = match std::env::var("SHELLMATE_THEME").as_deref() {
+            Ok("dark") => true,
+            Ok("light") => false,
+            _ => dark,
+        };
         theme::apply(dark, cx);
 
         cx.set_menus(vec![Menu::new("Shellmate").items(vec![MenuItem::action("退出 Shellmate", Quit)])]);
@@ -72,10 +85,14 @@ fn main() {
             ..Default::default()
         };
         let (store, store_notice) = open_store();
-        gpui::open_window(options, cx, move |window, cx| {
+        let (_window, _workspace) = gpui::open_window(options, cx, move |window, cx| {
             cx.new(|cx| Workspace::new(store, store_notice, window, cx))
         })
-            .expect("failed to open the main window");
+        .expect("failed to open the main window");
+        #[cfg(debug_assertions)]
+        if let Ok(name) = std::env::var("SHELLMATE_DEMO") {
+            _window.update(cx, |_, window, cx| demo::run(&name, &_workspace, window, cx)).ok();
+        }
         cx.activate(true);
     });
 }

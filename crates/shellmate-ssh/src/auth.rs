@@ -312,8 +312,8 @@ async fn try_keyboard_interactive(
     host: &SshHost,
     ctx: &AuthContext<'_>,
 ) -> Result<Attempt, SshError> {
-    let mut round = 0;
     for attempt in 0..MAX_ATTEMPTS {
+        let mut round = 0;
         let mut response = handle.authenticate_keyboard_interactive_start(&host.user, None).await?;
         loop {
             match response {
@@ -341,6 +341,7 @@ async fn try_keyboard_interactive(
                                 .map(|p| ChallengePrompt { text: p.prompt, echo: p.echo })
                                 .collect(),
                             round,
+                            attempt,
                         };
                         let expected = request.prompts.len();
                         let answers = ctx.prompter.challenge(request).await.ok_or(SshError::AuthCancelled)?;

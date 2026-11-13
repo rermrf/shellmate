@@ -206,6 +206,7 @@ async fn keyboard_interactive_runs_several_rounds() {
     assert_eq!(requests[0].instructions, "answer the questions");
     assert_eq!((requests[0].prompts[0].text.as_str(), requests[0].prompts[0].echo), ("Password: ", false));
     assert_eq!(requests[1].round, 2);
+    assert!(requests.iter().all(|r| r.attempt == 0));
     assert!(requests[1].prompts[0].echo, "echo flag of the OTP prompt is passed through");
 }
 
@@ -219,6 +220,17 @@ async fn keyboard_interactive_wrong_answers_are_rejected() {
     assert!(matches!(err, SshError::AuthRejected(AuthMethod::KeyboardInteractive)), "{err}");
     assert_eq!(err.to_string(), "认证失败：键盘交互验证未通过");
     assert_eq!(server.attempts("keyboard-interactive"), 3);
+}
+
+#[tokio::test]
+async fn keyboard_interactive_retries_restart_the_rounds_and_count_attempts() {
+    let server = TestServer::start(ServerOptions { kbd: Some(otp_rounds()), ..Default::default() }).await;
+    let env = Env::new();
+    // First attempt: right password, wrong code. Second attempt: everything right.
+    let script = Script::new().with_challenges(&[&["secret"], &["000000"], &["secret"], &["123456"]]);
+    connect(host(&server, AuthMethod::KeyboardInteractive), &env, script.clone()).await.unwrap();
+    let seen: Vec<(u32, u32)> = lock(&script.challenge_requests).iter().map(|r| (r.attempt, r.round)).collect();
+    assert_eq!(seen, [(0, 1), (0, 2), (1, 1), (1, 2)]);
 }
 
 #[tokio::test]

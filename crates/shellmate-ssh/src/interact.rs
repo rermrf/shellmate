@@ -101,8 +101,11 @@ pub struct ChallengeRequest {
     pub instructions: String,
     /// The questions of this round, in the order answers are expected.
     pub prompts: Vec<ChallengePrompt>,
-    /// 1-based round counter.
+    /// 1-based round counter within the current attempt.
     pub round: u32,
+    /// 0 for the first attempt; greater than 0 when the previous attempt was rejected
+    /// and the server starts over.
+    pub attempt: u32,
 }
 
 /// Source of credentials the user has to type.

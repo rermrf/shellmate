@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::assets::IconName as Lucide;
 use gpui::component::button::{Button, ButtonVariants as _};
@@ -16,14 +17,17 @@ use gpui::{
     MouseButton, MouseUpEvent, SharedString, Subscription, Window, actions, div, px,
 };
 use shellmate_core::HostBook;
-use shellmate_store::HostStore;
+use shellmate_store::{HostStore, KeychainStore, SecretStore};
 use shellmate_term::colors::to_hsla;
 use shellmate_term::view::ToggleSearch;
 use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
 
-use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::connect;
+use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
+
+mod ssh;
 
 actions!(
     shellmate,
@@ -79,18 +83,37 @@ impl Panel {
     }
 }
 
+/// What a session is connected to.
+enum SessionKind {
+    Local,
+    Ssh(Box<ssh::SshSession>),
+}
+
 struct Session {
     id: usize,
     title: SharedString,
     view: Entity<TerminalView>,
     terminal: Entity<Terminal>,
+    /// The local shell exited (SSH sessions track their state in [`ssh::SshSession`]).
     exited: bool,
     panel: Panel,
+    kind: SessionKind,
     _subscription: Subscription,
+}
+
+impl Session {
+    fn ssh(&self) -> Option<&ssh::SshSession> {
+        match &self.kind {
+            SessionKind::Ssh(ssh) => Some(ssh),
+            SessionKind::Local => None,
+        }
+    }
 }
 
 pub struct Workspace {
     store: Rc<RefCell<HostStore>>,
+    /// Saved passwords and key passphrases (the macOS keychain).
+    secrets: Arc<dyn SecretStore>,
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
@@ -117,6 +140,7 @@ impl Workspace {
         let subscriptions = vec![cx.subscribe_in(&sidebar, window, Self::on_sidebar_event)];
         let mut this = Self {
             store: Rc::new(RefCell::new(store)),
+            secrets: Arc::new(KeychainStore::new()),
             book,
             sidebar,
             sessions: Vec::new(),
@@ -160,13 +184,7 @@ impl Workspace {
         match event {
             SidebarEvent::OpenLocal => self.focus_or_open_local(window, cx),
             SidebarEvent::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
-            SidebarEvent::Connect(id) => {
-                let name = self.book.host(id).map(|h| h.name.clone()).unwrap_or_default();
-                window.push_notification(
-                    Notification::info("SSH 连接界面将在下一步（M3）实现。").title(format!("暂不能连接 {name}")),
-                    cx,
-                );
-            }
+            SidebarEvent::Connect(id) => self.connect_host(id, window, cx),
         }
     }
 
@@ -184,19 +202,7 @@ impl Workspace {
 
         let id = self.next_id;
         self.next_id += 1;
-        let subscription = cx.subscribe(&terminal, move |this: &mut Self, _, event: &TerminalEvent, cx| {
-            let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
-            match event {
-                TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_) => session.exited = true,
-                TerminalEvent::Restarted => session.exited = false,
-                TerminalEvent::Output
-                | TerminalEvent::TitleChanged
-                | TerminalEvent::Bell
-                | TerminalEvent::RestartRequested => {}
-            }
-            this.sync_sidebar(cx);
-            cx.notify();
-        });
+        let subscription = self.watch_terminal(id, &terminal, window, cx);
 
         let open_locals = self.sessions.len();
         let title = if open_locals == 0 { "本机".to_string() } else { format!("本机 · {}", open_locals + 1) };
@@ -207,9 +213,38 @@ impl Workspace {
             terminal,
             exited: false,
             panel: Panel::Terminal,
+            kind: SessionKind::Local,
             _subscription: subscription,
         });
         self.activate(self.sessions.len() - 1, window, cx);
+    }
+
+    /// Follows a session's terminal: exits and disconnects update the session state, and Enter
+    /// on an ended SSH session reconnects it.
+    fn watch_terminal(
+        &mut self,
+        id: usize,
+        terminal: &Entity<Terminal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
+            let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
+            let mut reconnect = false;
+            match (&mut session.kind, event) {
+                (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
+                (SessionKind::Local, TerminalEvent::Restarted) => session.exited = false,
+                (SessionKind::Ssh(ssh), TerminalEvent::Exited(_)) => ssh.on_exited(),
+                (SessionKind::Ssh(ssh), TerminalEvent::Disconnected(_)) => ssh.on_disconnected(),
+                (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => reconnect = true,
+                _ => {}
+            }
+            if reconnect {
+                this.reconnect(id, window, cx);
+            }
+            this.sync_sidebar(cx);
+            cx.notify();
+        })
     }
 
     fn focus_or_open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -223,7 +258,8 @@ impl Workspace {
         let Some(session) = self.sessions.get(ix) else { return };
         self.active = Some(ix);
         window.focus(&session.view.focus_handle(cx), cx);
-        self.sidebar.update(cx, |s, cx| s.select(Some("local".into()), cx));
+        let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
+        self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
         self.sync_sidebar(cx);
         cx.notify();
     }
@@ -231,6 +267,11 @@ impl Workspace {
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.sessions.len() {
             return;
+        }
+        // A tab that is still asking something takes its dialog with it; dropping the session
+        // aborts the connection task.
+        if self.sessions[ix].ssh().is_some_and(|ssh| ssh.has_open_prompt()) {
+            window.close_all_dialogs(cx);
         }
         self.sessions.remove(ix);
         match self.active {
@@ -250,7 +291,16 @@ impl Workspace {
         let count = self.sessions.len();
         let shell = shell_name(&PtyOptions::default().shell_path());
         let summary = if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个标签") };
-        self.sidebar.update(cx, |s, cx| s.set_sessions(count, HashMap::new(), summary.into(), cx));
+        let mut live: HashMap<String, LiveStatus> = HashMap::new();
+        for ssh in self.sessions.iter().filter_map(Session::ssh) {
+            if let Some(status) = ssh.live() {
+                let entry = live.entry(ssh.host.id.to_string()).or_insert(status);
+                if status.rank() < entry.rank() {
+                    *entry = status;
+                }
+            }
+        }
+        self.sidebar.update(cx, |s, cx| s.set_sessions(count, live, summary.into(), cx));
     }
 
     // ---- actions -------------------------------------------------------
@@ -344,7 +394,7 @@ impl Workspace {
                 .text_size(px(13.))
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
                 .when(!active, |d| d.text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
-                .child(dot(if s.exited { p.tx3 } else { p.ok }, 7.))
+                .child(dot(session_dot(s, &p), 7.))
                 .child(s.title.clone())
                 .child(
                     div()
@@ -400,7 +450,7 @@ impl Workspace {
         let p = cx.palette().clone();
         let session = self.active.and_then(|ix| self.sessions.get(ix));
         let (title, subtitle) = match session {
-            Some(s) => (s.title.clone(), self.local_subtitle(s, cx)),
+            Some(s) => (s.title.clone(), self.session_subtitle(s, cx)),
             None => ("没有打开的会话".into(), "从左侧选择主机，或按 ⌘T 打开本机终端".to_string()),
         };
         let active_panel = session.map(|s| s.panel);
@@ -411,6 +461,7 @@ impl Workspace {
                 match (session, panel) {
                     (None, _) => item.disabled("没有打开的会话"),
                     (Some(_), Panel::Terminal) => item,
+                    (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
                     (Some(_), other) => item.disabled(other.local_hint()),
                 }
             })
@@ -433,6 +484,14 @@ impl Workspace {
                     .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.tx2).child(subtitle)),
             )
             .child(segmented("panels", items, |_, _, _| {}, cx).flex_none())
+    }
+
+    /// Header subtitle: the SSH target of an SSH session, the shell of a local one.
+    fn session_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
+        match session.ssh() {
+            Some(ssh) => ssh::subtitle(&ssh.host, &ssh.via(), &connect::default_user()),
+            None => self.local_subtitle(session, cx),
+        }
     }
 
     /// `chen@MacBook-Pro · /bin/zsh -l · ~/projects · 本机进程，不经过网络`
@@ -460,7 +519,10 @@ impl Workspace {
         let p = cx.palette().clone();
         let term_bg = to_hsla(cx.terminal_style().palette.background);
         let size = session.terminal.read(cx).size();
-        let status = format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY", size.cols, size.rows);
+        let status = match session.ssh() {
+            Some(_) => ssh::status_line(size.cols, size.rows),
+            None => format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY", size.cols, size.rows),
+        };
         let view = session.view.clone();
 
         let pill = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool| {
@@ -592,6 +654,20 @@ impl Render for Workspace {
                     .child(self.render_header(cx))
                     .child(content),
             )
+    }
+}
+
+/// Color of a tab's status dot: connecting yellow, ok green, failed red, ended grey.
+fn session_dot(session: &Session, p: &theme::Palette) -> gpui::Hsla {
+    match &session.kind {
+        SessionKind::Local if session.exited => p.tx3,
+        SessionKind::Local => p.ok,
+        SessionKind::Ssh(ssh) => match ssh.status {
+            ssh::SshStatus::Connecting => p.warn,
+            ssh::SshStatus::Connected => p.ok,
+            ssh::SshStatus::Failed => p.err,
+            ssh::SshStatus::Ended => p.tx3,
+        },
     }
 }
 

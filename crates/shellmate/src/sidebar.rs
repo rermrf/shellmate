@@ -9,8 +9,8 @@ use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, Sizable as _};
 use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription, Window,
-    div, px,
+    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, FontWeight, KeyBinding, SharedString, Subscription,
+    Window, actions, div, px,
 };
 use shellmate_core::{Host, HostBook, HostFilter, HostId, HostSection, minutes_since, relative_time, sections};
 
@@ -19,13 +19,33 @@ use crate::ui::{card_shadow, dot, item_shadow, kbd, segmented, window_drag_area,
 
 pub const SIDEBAR_WIDTH: f32 = 272.;
 
+actions!(sidebar, [ConnectSelected]);
+
+const LIST_CONTEXT: &str = "HostList";
+
+/// Key bindings of the host list (Enter connects the selected host).
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("enter", ConnectSelected, Some(LIST_CONTEXT))]);
+}
+
 /// Connection state of a host that has an open session.
-#[allow(dead_code)] // constructed once SSH sessions exist (P2)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveStatus {
     Ok,
-    Reconnecting,
+    /// Connecting (or reconnecting): yellow.
+    Connecting,
     Failed,
+}
+
+impl LiveStatus {
+    /// Which status wins when a host has several sessions (lower is better).
+    pub fn rank(self) -> u8 {
+        match self {
+            LiveStatus::Ok => 0,
+            LiveStatus::Connecting => 1,
+            LiveStatus::Failed => 2,
+        }
+    }
 }
 
 pub enum SidebarEvent {
@@ -40,6 +60,8 @@ pub struct Sidebar {
     filter: HostFilter,
     collapsed: HashSet<String>,
     selected: Option<String>,
+    /// Focus of the host list, so Enter reaches it after a click on a row.
+    list_focus: FocusHandle,
     live: HashMap<String, LiveStatus>,
     session_count: usize,
     local_summary: SharedString,
@@ -63,10 +85,18 @@ impl Sidebar {
             filter: HostFilter::All,
             collapsed: HashSet::new(),
             selected: None,
+            list_focus: cx.focus_handle(),
             live: HashMap::new(),
             session_count: 0,
             local_summary: "zsh · ~".into(),
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn connect_selected(&mut self, _: &ConnectSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let host = self.selected.as_deref().and_then(|id| self.book.host(&HostId::from_raw(id)));
+        if let Some(host) = host {
+            cx.emit(SidebarEvent::Connect(host.id.clone()));
         }
     }
 
@@ -299,7 +329,7 @@ impl Sidebar {
             .children(live.map(|status| {
                 let color = match status {
                     LiveStatus::Ok => p.ok,
-                    LiveStatus::Reconnecting => p.warn,
+                    LiveStatus::Connecting => p.warn,
                     LiveStatus::Failed => p.err,
                 };
                 div()
@@ -357,8 +387,31 @@ impl Sidebar {
                     .text_color(p.tx2)
                     .child(b)
             }))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .children(selected.then(|| {
+                let connect_id = host.id.clone();
+                div()
+                    .id(SharedString::from(format!("connect-{}", host.id)))
+                    .flex_none()
+                    .px(px(8.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.))
+                    .bg(p.accs)
+                    .text_color(p.acc)
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.acc).text_color(gpui::white()))
+                    .child("连接")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(SidebarEvent::Connect(connect_id.clone()));
+                    }))
+            }))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.selected = Some(id.to_string());
+                window.focus(&this.list_focus, cx);
                 if event.click_count() >= 2 {
                     cx.emit(SidebarEvent::Connect(id.clone()));
                 }
@@ -489,6 +542,9 @@ impl Render for Sidebar {
             .child(
                 div()
                     .id("host-list")
+                    .key_context(LIST_CONTEXT)
+                    .track_focus(&self.list_focus)
+                    .on_action(cx.listener(Self::connect_selected))
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
