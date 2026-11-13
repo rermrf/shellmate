@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+shellmate-core = { path = "crates/shellmate-core" }
+shellmate-term = { path = "crates/shellmate-term" }
+
+gpui = { package = "gpui-kit", version = "0.9.1" }
+libc = "0.2"
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+anyhow = "1"
+async-channel = "2"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"

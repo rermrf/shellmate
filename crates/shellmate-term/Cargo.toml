@@ -1,0 +1,15 @@
+[package]
+name = "shellmate-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+libc.workspace = true

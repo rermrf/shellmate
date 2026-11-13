@@ -1,0 +1,436 @@
+//! Paints a terminal grid with gpui.
+//!
+//! Cells are batched into runs of identical style and shaped once per run.
+//! Runs only contain ASCII so the monospace font guarantees the grid stays
+//! aligned; anything else (CJK, box drawing, emoji) is shaped per character and
+//! placed at its own cell origin, centered when it is narrower than its cells.
+
+use alacritty_terminal::index::{Line, Point as GridPoint};
+use alacritty_terminal::selection::SelectionRange;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{TermMode, point_to_viewport};
+use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
+use gpui::{
+    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
+    Pixels, ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun,
+    UnderlineStyle, Window, fill, outline, point, px, relative, size,
+};
+
+use crate::colors::{TerminalPalette, to_hsla};
+use crate::terminal::{SearchMatch, Terminal, TerminalSize};
+use crate::view::{Geometry, TerminalView};
+
+/// Font and colors used to draw the grid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalStyle {
+    pub font_family: SharedString,
+    pub fallbacks: Vec<String>,
+    pub font_size: Pixels,
+    /// Line height as a multiple of the font size.
+    pub line_height: f32,
+    pub palette: TerminalPalette,
+}
+
+impl TerminalStyle {
+    pub fn font(&self, bold: bool, italic: bool) -> Font {
+        let mut font = gpui::font(self.font_family.clone());
+        font.fallbacks = Some(gpui::FontFallbacks::from_fonts(self.fallbacks.clone()));
+        if bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if italic {
+            font.style = FontStyle::Italic;
+        }
+        font
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct CellStyle {
+    fg: Hsla,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    undercurl: bool,
+    strike: bool,
+}
+
+struct Batch {
+    line: usize,
+    col: usize,
+    /// Number of cells the batch covers.
+    cells: usize,
+    text: String,
+    style: CellStyle,
+    ascii: bool,
+}
+
+struct ShapedText {
+    origin: gpui::Point<Pixels>,
+    line: ShapedLine,
+}
+
+struct CursorLayout {
+    bounds: Bounds<Pixels>,
+    shape: CursorShape,
+    color: Hsla,
+    /// Character under a block cursor, re-drawn in the background color.
+    text: Option<ShapedText>,
+}
+
+pub struct LayoutState {
+    background: Hsla,
+    rects: Vec<(Bounds<Pixels>, Hsla)>,
+    highlights: Vec<(Bounds<Pixels>, Hsla)>,
+    texts: Vec<ShapedText>,
+    cursor: Option<CursorLayout>,
+    marked: Option<(ShapedText, Bounds<Pixels>)>,
+    line_height: Pixels,
+}
+
+pub struct TerminalElement {
+    view: Entity<TerminalView>,
+    terminal: Entity<Terminal>,
+    focus: FocusHandle,
+    focused: bool,
+    style: TerminalStyle,
+    marked_text: Option<String>,
+    matches: Vec<SearchMatch>,
+    active_match: Option<usize>,
+}
+
+impl TerminalElement {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        view: Entity<TerminalView>,
+        terminal: Entity<Terminal>,
+        focus: FocusHandle,
+        focused: bool,
+        style: TerminalStyle,
+        marked_text: Option<String>,
+        matches: Vec<SearchMatch>,
+        active_match: Option<usize>,
+    ) -> Self {
+        Self { view, terminal, focus, focused, style, marked_text, matches, active_match }
+    }
+
+    fn cell_metrics(&self, window: &mut Window) -> (Pixels, Pixels) {
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&self.style.font(false, false));
+        let cell_width = text_system
+            .advance(font_id, self.style.font_size, 'm')
+            .map(|s| s.width)
+            .unwrap_or(px(8.));
+        let line_height = (self.style.font_size * self.style.line_height).round();
+        (cell_width, line_height)
+    }
+
+    fn shape(&self, text: String, style: CellStyle, window: &mut Window) -> ShapedLine {
+        let run = TextRun {
+            len: text.len(),
+            font: self.style.font(style.bold, style.italic),
+            color: style.fg,
+            background_color: None,
+            underline: (style.underline || style.undercurl).then_some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(style.fg),
+                wavy: style.undercurl,
+            }),
+            strikethrough: style
+                .strike
+                .then_some(StrikethroughStyle { thickness: px(1.), color: Some(style.fg) }),
+        };
+        window.text_system().shape_line(text.into(), self.style.font_size, &[run], None)
+    }
+}
+
+impl IntoElement for TerminalElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TerminalElement {
+    type RequestLayoutState = ();
+    type PrepaintState = LayoutState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let (cell_width, line_height) = self.cell_metrics(window);
+        let cols = ((bounds.size.width / cell_width).floor() as u16).max(2);
+        let rows = ((bounds.size.height / line_height).floor() as u16).max(1);
+        let grid = TerminalSize { cols, rows, cell_width, line_height };
+        self.terminal.update(cx, |t, _| t.set_size(grid));
+        self.view.update(cx, |v, _| v.geometry = Some(Geometry { origin: bounds.origin, size: grid }));
+
+        let palette = &self.style.palette;
+        let origin = bounds.origin;
+        let cell_origin =
+            |line: usize, col: usize| point(origin.x + cell_width * col as f32, origin.y + line_height * line as f32);
+        let cell_bounds = |line: usize, col: usize, cells: usize| {
+            Bounds::new(cell_origin(line, col), size(cell_width * cells as f32, line_height))
+        };
+
+        let term_arc = self.terminal.read(cx).term().clone();
+        let term = term_arc.lock();
+        let content = term.renderable_content();
+        let display_offset = content.display_offset;
+        let overrides = content.colors;
+        let mode = content.mode;
+        let default_bg: Rgb = palette.rgb(&alacritty_terminal::vte::ansi::Color::Named(NamedColor::Background), overrides);
+        let background = to_hsla(default_bg);
+
+        let mut rects: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
+        let mut open_rect: Option<(usize, usize, usize, Hsla)> = None; // line, col, cells, color
+        let mut batches: Vec<Batch> = Vec::new();
+        let mut current: Option<Batch> = None;
+
+        for indexed in content.display_iter {
+            let Some(vp) = point_to_viewport(display_offset, indexed.point) else { continue };
+            let (line, col) = (vp.line, vp.column.0);
+            let cell = &indexed.cell;
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let cells = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+
+            let mut fg = palette.rgb(&cell.fg, overrides);
+            let mut bg = palette.rgb(&cell.bg, overrides);
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            // Background runs.
+            if bg != default_bg {
+                let color = to_hsla(bg);
+                match &mut open_rect {
+                    Some((l, c, n, col_color)) if *l == line && *c + *n == col && *col_color == color => *n += cells,
+                    _ => {
+                        if let Some((l, c, n, color)) = open_rect.take() {
+                            rects.push((cell_bounds(l, c, n), color));
+                        }
+                        open_rect = Some((line, col, cells, color));
+                    }
+                }
+            } else if let Some((l, c, n, color)) = open_rect.take() {
+                rects.push((cell_bounds(l, c, n), color));
+            }
+
+            // Text runs.
+            let ch = cell.c;
+            if ch == ' ' || ch == '\t' || ch == '\0' || cell.flags.contains(Flags::HIDDEN) {
+                if let Some(b) = current.take() {
+                    batches.push(b);
+                }
+                continue;
+            }
+            let mut fg_hsla = to_hsla(fg);
+            if cell.flags.contains(Flags::DIM) {
+                fg_hsla.a *= 0.66;
+            }
+            let style = CellStyle {
+                fg: fg_hsla,
+                bold: cell.flags.contains(Flags::BOLD),
+                italic: cell.flags.contains(Flags::ITALIC),
+                underline: cell.flags.intersects(Flags::ALL_UNDERLINES) && !cell.flags.contains(Flags::UNDERCURL),
+                undercurl: cell.flags.contains(Flags::UNDERCURL),
+                strike: cell.flags.contains(Flags::STRIKEOUT),
+            };
+            let ascii = ch.is_ascii() && cells == 1 && cell.zerowidth().is_none();
+            let extends = matches!(&current, Some(b) if b.ascii && ascii && b.line == line
+                && b.col + b.cells == col && b.style == style);
+            if extends {
+                let b = current.as_mut().expect("checked above");
+                b.text.push(ch);
+                b.cells += 1;
+            } else {
+                if let Some(b) = current.take() {
+                    batches.push(b);
+                }
+                let mut text = String::from(ch);
+                if let Some(extra) = cell.zerowidth() {
+                    text.extend(extra.iter());
+                }
+                current = Some(Batch { line, col, cells, text, style, ascii });
+            }
+        }
+        if let Some(b) = current.take() {
+            batches.push(b);
+        }
+        if let Some((l, c, n, color)) = open_rect.take() {
+            rects.push((cell_bounds(l, c, n), color));
+        }
+
+        // Selection and search highlights.
+        let rows_usize = rows as usize;
+        let last_col = cols as usize - 1;
+        let mut highlights = Vec::new();
+        let mut highlight_range = |start: GridPoint, end: GridPoint, block: bool, color: Hsla| {
+            for vline in 0..rows_usize {
+                let gline = Line(vline as i32 - display_offset as i32);
+                if gline < start.line || gline > end.line {
+                    continue;
+                }
+                let c0 = if block || gline == start.line { start.column.0 } else { 0 };
+                let c1 = if block || gline == end.line { end.column.0 } else { last_col };
+                if c1 >= c0 {
+                    highlights.push((cell_bounds(vline, c0, c1.min(last_col) - c0 + 1), color));
+                }
+            }
+        };
+        for (i, m) in self.matches.iter().enumerate() {
+            let color = if Some(i) == self.active_match { palette.search_active } else { palette.search_match };
+            highlight_range(*m.start(), *m.end(), false, color);
+        }
+        if let Some(SelectionRange { start, end, is_block }) = content.selection {
+            highlight_range(start, end, is_block, palette.selection);
+        }
+
+        // Cursor.
+        let cursor_rgb = overrides[NamedColor::Cursor as usize].unwrap_or(palette.cursor);
+        let cursor_point = content.cursor.point;
+        let cursor_vp = point_to_viewport(display_offset, cursor_point);
+        let cursor_cell = &term.grid()[cursor_point];
+        let cursor_wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
+        let cursor_char = cursor_cell.c;
+        let show_cursor = mode.contains(TermMode::SHOW_CURSOR) && content.cursor.shape != CursorShape::Hidden;
+        let cursor_shape = if self.focused { content.cursor.shape } else { CursorShape::HollowBlock };
+        drop(term);
+
+        let texts = batches
+            .into_iter()
+            .map(|b| {
+                let (line, col, cells) = (b.line, b.col, b.cells);
+                let shaped = self.shape(b.text, b.style, window);
+                let mut origin = cell_origin(line, col);
+                let slot = cell_width * cells as f32;
+                if !b.ascii && shaped.width < slot {
+                    origin.x += (slot - shaped.width) / 2.;
+                }
+                ShapedText { origin, line: shaped }
+            })
+            .collect();
+
+        let marked = self.marked_text.as_ref().filter(|t| !t.is_empty()).and_then(|text| {
+            let vp = cursor_vp?;
+            let style = CellStyle {
+                fg: to_hsla(palette.foreground),
+                bold: false,
+                italic: false,
+                underline: true,
+                undercurl: false,
+                strike: false,
+            };
+            let shaped = self.shape(text.clone(), style, window);
+            let origin = cell_origin(vp.line, vp.column.0);
+            let bg = Bounds::new(origin, size(shaped.width, line_height));
+            Some((ShapedText { origin, line: shaped }, bg))
+        });
+
+        let cursor = cursor_vp.filter(|_| show_cursor && marked.is_none()).map(|vp| {
+            let cells = if cursor_wide { 2 } else { 1 };
+            let full = cell_bounds(vp.line, vp.column.0, cells);
+            let color = to_hsla(cursor_rgb);
+            let bounds = match cursor_shape {
+                CursorShape::Beam => Bounds::new(full.origin, size(px(2.), line_height)),
+                CursorShape::Underline => Bounds::new(
+                    point(full.origin.x, full.origin.y + line_height - px(2.)),
+                    size(full.size.width, px(2.)),
+                ),
+                _ => full,
+            };
+            let text = (cursor_shape == CursorShape::Block && !cursor_char.is_whitespace()).then(|| {
+                let style = CellStyle {
+                    fg: background,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    undercurl: false,
+                    strike: false,
+                };
+                let shaped = self.shape(cursor_char.to_string(), style, window);
+                let mut origin = full.origin;
+                if shaped.width < full.size.width {
+                    origin.x += (full.size.width - shaped.width) / 2.;
+                }
+                ShapedText { origin, line: shaped }
+            });
+            CursorLayout { bounds, shape: cursor_shape, color, text }
+        });
+
+        LayoutState { background, rects, highlights, texts, cursor, marked, line_height }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        layout: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
+
+        // Let wide glyphs and the cursor bleed into the padding instead of clipping them.
+        let mask = ContentMask { bounds: bounds.dilate(px(8.)) };
+        window.with_content_mask(Some(mask), |window| {
+            for (rect, color) in &layout.rects {
+                window.paint_quad(fill(*rect, *color));
+            }
+            for (rect, color) in &layout.highlights {
+                window.paint_quad(fill(*rect, *color));
+            }
+            for text in &layout.texts {
+                text.line.paint(text.origin, layout.line_height, TextAlign::Left, None, window, cx).ok();
+            }
+            if let Some(cursor) = &layout.cursor {
+                if cursor.shape == CursorShape::HollowBlock {
+                    window.paint_quad(outline(cursor.bounds, cursor.color, gpui::BorderStyle::Solid));
+                } else {
+                    window.paint_quad(fill(cursor.bounds, cursor.color));
+                }
+                if let Some(text) = &cursor.text {
+                    text.line.paint(text.origin, layout.line_height, TextAlign::Left, None, window, cx).ok();
+                }
+            }
+            if let Some((text, bg)) = &layout.marked {
+                window.paint_quad(fill(*bg, layout.background));
+                text.line.paint(text.origin, layout.line_height, TextAlign::Left, None, window, cx).ok();
+            }
+        });
+    }
+}
+

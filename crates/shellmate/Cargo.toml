@@ -1,0 +1,14 @@
+[package]
+name = "shellmate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shellmate-core.workspace = true
+shellmate-term.workspace = true
+gpui.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc.workspace = true
