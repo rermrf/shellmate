@@ -2,9 +2,19 @@
 
 pub mod filter;
 pub mod host;
+pub mod import;
 pub mod io;
+#[cfg(any(test, feature = "test-support"))]
 pub mod sample;
+pub mod secret;
+pub mod ssh_config;
 
 pub use filter::{HostFilter, HostSection, sections};
+pub use host::{
+    AuthMethod, FingerprintState, Group, GroupId, GroupTone, Host, HostBook, HostId, Protocol, minutes_since,
+    relative_time,
+};
+pub use import::{ImportCandidate, ImportPlan, candidates, plan_import};
 pub use io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
-pub use host::{AuthMethod, FingerprintState, Group, GroupTone, Host, HostBook, Protocol, relative_time};
+pub use secret::Secret;
+pub use ssh_config::{ParsedConfig, SshConfigEntry, parse_ssh_config};

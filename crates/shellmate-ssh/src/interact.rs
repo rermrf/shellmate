@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use shellmate_core::FingerprintState;
 
-use crate::secret::Secret;
+use shellmate_core::Secret;
 
 /// Algorithm and SHA-256 fingerprint of a host key.
 #[derive(Clone, Debug, PartialEq, Eq)]

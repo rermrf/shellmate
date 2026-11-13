@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use shellmate_core::{AuthMethod, FingerprintState};
+use shellmate_core::{AuthMethod, FingerprintState, Host, Protocol};
 
+use crate::error::SshError;
 use crate::interact::{HostKeyInfo, HostKeyVerifier, Prompter};
 use crate::known_hosts::KnownHosts;
-use crate::secret::Secret;
+use shellmate_core::Secret;
 
 /// One SSH server and how to authenticate to it.
 #[derive(Clone, Debug)]
@@ -73,6 +74,38 @@ impl SshHost {
     }
 }
 
+/// Secrets known for one host, e.g. read from the keychain.
+#[derive(Clone, Debug, Default)]
+pub struct HostSecrets {
+    /// Saved login password.
+    pub password: Option<Secret>,
+    /// Saved passphrase of the host's private key.
+    pub passphrase: Option<Secret>,
+}
+
+impl SshHost {
+    /// Connection settings of a saved host. `default_user` is used when the
+    /// host has no user (OpenSSH uses the local user name then).
+    pub fn from_host(host: &Host, default_user: &str, secrets: HostSecrets) -> Result<Self, SshError> {
+        if host.protocol != Protocol::Ssh {
+            return Err(SshError::Unsupported(format!(
+                "主机「{}」使用 {} 协议，目前只能连接 SSH 主机",
+                host.name,
+                host.protocol.label()
+            )));
+        }
+        Ok(Self {
+            host: host.addr.clone(),
+            port: host.port,
+            user: host.user.clone().unwrap_or_else(|| default_user.to_string()),
+            auth: vec![host.auth],
+            identity_file: host.identity_file.clone(),
+            password: secrets.password,
+            passphrase: secrets.passphrase,
+        })
+    }
+}
+
 /// The path to a server: optional jump hosts (ProxyJump) and the target.
 #[derive(Clone, Debug)]
 pub struct Route {
@@ -86,6 +119,20 @@ impl Route {
     /// Connects to `target` directly.
     pub fn direct(target: SshHost) -> Self {
         Self { via: Vec::new(), target }
+    }
+
+    /// Builds the route from a resolved connection chain (jump hosts first, the
+    /// target last), as returned by the host store's `resolve_route`.
+    /// `secrets` is asked once per host for its saved password / passphrase.
+    pub fn from_hosts(
+        hosts: &[Host],
+        default_user: &str,
+        mut secrets: impl FnMut(&Host) -> HostSecrets,
+    ) -> Result<Self, SshError> {
+        let (target, via) = hosts.split_last().ok_or_else(|| SshError::Unsupported("没有可连接的主机".into()))?;
+        let mut convert = |host: &Host| SshHost::from_host(host, default_user, secrets(host));
+        let via = via.iter().map(&mut convert).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { via, target: convert(target)? })
     }
 
     /// Goes through `jump` first (appended after earlier jump hosts).
@@ -193,5 +240,83 @@ impl std::fmt::Debug for ConnectOptions {
             .field("agent_socket", &self.agent_socket)
             .field("connect_timeout", &self.connect_timeout)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn host(name: &str, port: u16, user: Option<&str>, auth: AuthMethod) -> Host {
+        let mut host = Host::new(name, format!("{name}.example.com"));
+        host.port = port;
+        host.user = user.map(String::from);
+        host.auth = auth;
+        host
+    }
+
+    #[test]
+    fn route_follows_the_chain_order_and_maps_every_field() {
+        let mut target = host("db", 22, Some("dba"), AuthMethod::PrivateKey);
+        target.identity_file = Some(PathBuf::from("/keys/db"));
+        let chain = [
+            host("outer", 2222, None, AuthMethod::Agent),
+            host("inner", 22, Some("ops"), AuthMethod::Password),
+            target,
+        ];
+
+        let mut asked = Vec::new();
+        let route = Route::from_hosts(&chain, "me", |h| {
+            asked.push(h.name.clone());
+            HostSecrets {
+                password: (h.name == "inner").then(|| Secret::new("pw")),
+                passphrase: (h.name == "db").then(|| Secret::new("phrase")),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(asked, ["outer", "inner", "db"], "secrets are requested once per host, in connection order");
+        assert_eq!(route.via.len(), 2);
+        let (outer, inner, db) = (&route.via[0], &route.via[1], &route.target);
+        assert_eq!((outer.host.as_str(), outer.port, outer.user.as_str()), ("outer.example.com", 2222, "me"));
+        assert_eq!(outer.auth, [AuthMethod::Agent]);
+        assert_eq!((inner.user.as_str(), inner.auth.clone()), ("ops", vec![AuthMethod::Password]));
+        assert_eq!(inner.password.as_ref().map(Secret::expose), Some("pw"));
+        assert!(outer.password.is_none() && inner.passphrase.is_none());
+        assert_eq!((db.user.as_str(), db.identity_file.as_deref()), ("dba", Some(std::path::Path::new("/keys/db"))));
+        assert_eq!(db.passphrase.as_ref().map(Secret::expose), Some("phrase"));
+    }
+
+    #[test]
+    fn single_host_is_a_direct_route() {
+        let route = Route::from_hosts(&[host("web", 22, Some("deploy"), AuthMethod::Password)], "me", |_| {
+            HostSecrets::default()
+        })
+        .unwrap();
+        assert!(route.via.is_empty());
+        assert_eq!(route.target.host, "web.example.com");
+    }
+
+    #[test]
+    fn empty_chain_is_an_error() {
+        let err = Route::from_hosts(&[], "me", |_| HostSecrets::default()).unwrap_err();
+        assert!(matches!(err, SshError::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn only_ssh_hosts_can_be_connected() {
+        let mut serial = host("esp", 0, None, AuthMethod::PrivateKey);
+        serial.protocol = Protocol::Serial;
+        let mut mosh = host("dev", 22, None, AuthMethod::Agent);
+        mosh.protocol = Protocol::Mosh;
+
+        let err = Route::from_hosts(&[serial], "me", |_| HostSecrets::default()).unwrap_err();
+        assert_eq!(err.to_string(), "无法连接：主机「esp」使用 串口 协议，目前只能连接 SSH 主机");
+        let jump_err =
+            Route::from_hosts(&[mosh, host("web", 22, None, AuthMethod::Agent)], "me", |_| HostSecrets::default())
+                .unwrap_err();
+        assert!(jump_err.to_string().contains("「dev」"), "{jump_err}");
     }
 }

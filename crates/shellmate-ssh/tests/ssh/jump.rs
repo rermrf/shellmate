@@ -136,3 +136,35 @@ async fn jump_host_that_refuses_forwarding_fails_the_connection() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn route_built_from_saved_hosts_connects_through_the_jump_host() {
+    use shellmate_core::Host;
+    use shellmate_ssh::HostSecrets;
+
+    let jump = TestServer::start(jump_options()).await;
+    let target =
+        TestServer::start(ServerOptions { passwords: vec![("deploy", "t0ps3cret")], ..Default::default() }).await;
+    let env = Env::new();
+
+    let saved = |name: &str, port: u16, user: &str, auth: AuthMethod| {
+        let mut host = Host::new(name, "127.0.0.1");
+        host.port = port;
+        host.user = Some(user.to_string());
+        host.auth = auth;
+        host
+    };
+    let chain = [
+        saved("bastion", jump.port, "alice", AuthMethod::Password),
+        saved("app", target.port, "deploy", AuthMethod::Password),
+    ];
+    let route = Route::from_hosts(&chain, "unused", |host| HostSecrets {
+        password: Some(Secret::new(if host.name == "bastion" { "secret" } else { "t0ps3cret" })),
+        passphrase: None,
+    })
+    .unwrap();
+
+    let connection = Connection::connect(route, env.trusting()).await.unwrap();
+    assert_eq!(connection.hops().iter().map(|h| h.user.as_str()).collect::<Vec<_>>(), ["alice", "deploy"]);
+    assert_eq!(lock(&jump.state.forwards).len(), 1);
+}

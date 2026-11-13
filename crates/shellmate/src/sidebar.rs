@@ -12,7 +12,7 @@ use gpui::{
     ClickEvent, Context, Entity, EventEmitter, FontWeight, SharedString, Subscription, Window,
     div, px,
 };
-use shellmate_core::{Host, HostBook, HostFilter, HostSection, relative_time, sections};
+use shellmate_core::{Host, HostBook, HostFilter, HostId, HostSection, minutes_since, relative_time, sections};
 
 use crate::theme::{ActivePalette, Palette};
 use crate::ui::{card_shadow, dot, item_shadow, kbd, segmented, window_drag_area, SegmentItem};
@@ -30,7 +30,7 @@ pub enum LiveStatus {
 
 pub enum SidebarEvent {
     OpenLocal,
-    Connect(String),
+    Connect(HostId),
     ToggleSidebar,
 }
 
@@ -48,6 +48,11 @@ pub struct Sidebar {
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
+/// Current unix time in seconds, for "x minutes ago" labels.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
 impl Sidebar {
     pub fn new(book: Rc<HostBook>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称、地址、标签"));
@@ -63,6 +68,12 @@ impl Sidebar {
             local_summary: "zsh · ~".into(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Replaces the host list (after loading or editing the library).
+    pub fn set_book(&mut self, book: Rc<HostBook>, cx: &mut Context<Self>) {
+        self.book = book;
+        cx.notify();
     }
 
     pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -114,7 +125,7 @@ impl Sidebar {
                 icon_button("toggle-sidebar", Lucide::PanelLeft, "隐藏侧栏 ⌃⌘S")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))),
             )
-            .child(icon_button("new-host", Lucide::Plus, "新建主机（P2 实现）").opacity(0.45));
+            .child(icon_button("new-host", Lucide::Plus, "新建主机（M3 实现）").opacity(0.45));
 
         let host_count = self.book.hosts.len();
         div()
@@ -216,10 +227,10 @@ impl Sidebar {
     fn render_section(&self, section: &HostSection, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let title: SharedString = section.title.clone().into();
-        let open = !self.collapsed.contains(&section.title);
-        let toggle_title = section.title.clone();
+        let key = section.key();
+        let open = !self.collapsed.contains(&key);
         let header = div()
-            .id(SharedString::from(format!("group-{}", section.title)))
+            .id(SharedString::from(format!("group-{key}")))
             .flex()
             .items_center()
             .gap(px(4.))
@@ -237,8 +248,8 @@ impl Sidebar {
             .child(div().flex_1().child(title))
             .child(div().text_size(px(11.5)).text_color(p.tx3).child(section.hosts.len().to_string()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.collapsed.remove(&toggle_title) {
-                    this.collapsed.insert(toggle_title.clone());
+                if !this.collapsed.remove(&key) {
+                    this.collapsed.insert(key.clone());
                 }
                 cx.notify();
             }));
@@ -263,9 +274,11 @@ impl Sidebar {
     ) -> impl IntoElement {
         let selected = self.selected.as_deref() == Some(host.id.as_str());
         let (tone_bg, tone_fg) = p.tone(tone);
-        let live = self.live.get(&host.id).copied();
-        let sub = match (self.filter, host.last_connected_mins) {
-            (HostFilter::Recent, Some(mins)) => format!("{} · {}", relative_time(mins), host.addr),
+        let live = self.live.get(host.id.as_str()).copied();
+        let sub = match (self.filter, host.last_connected_at) {
+            (HostFilter::Recent, Some(at)) => {
+                format!("{} · {}", relative_time(minutes_since(unix_now(), at)), host.addr)
+            }
             _ => host.address_line(),
         };
         let id = host.id.clone();
@@ -345,12 +358,67 @@ impl Sidebar {
                     .child(b)
             }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.selected = Some(id.clone());
+                this.selected = Some(id.to_string());
                 if event.click_count() >= 2 {
                     cx.emit(SidebarEvent::Connect(id.clone()));
                 }
                 cx.notify();
             }))
+    }
+
+    /// Shown when the library has no hosts at all. Both actions arrive with the editor (M3).
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = cx.palette().clone();
+        let button = |id: &'static str, label: &'static str, icon: Option<Lucide>| {
+            div()
+                .id(id)
+                .w_full()
+                .h(px(34.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .rounded(px(10.))
+                .bg(p.card)
+                .border_1()
+                .border_color(p.line)
+                .text_size(px(12.5))
+                .text_color(p.tx)
+                .opacity(0.5)
+                .children(icon.map(|icon| Icon::new(icon).size(px(14.)).text_color(p.tx2)))
+                .child(label)
+                .tooltip(|window, cx| Tooltip::new("下一步（M3）实现").build(window, cx))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.))
+            .pt(px(36.))
+            .px(px(10.))
+            .child(
+                div()
+                    .size(px(44.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.line)
+                    .child(Icon::new(Lucide::RadioTower).size(px(20.)).text_color(p.tx3)),
+            )
+            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx).child("还没有主机"))
+            .child(
+                div()
+                    .mb(px(6.))
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(p.tx3)
+                    .child("添加第一台服务器，或从 ~/.ssh/config 导入已有的主机。"),
+            )
+            .child(button("empty-new-host", "新建主机", Some(Lucide::Plus)))
+            .child(button("empty-import", "从 ~/.ssh/config 导入", None))
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -389,7 +457,9 @@ impl Render for Sidebar {
         let sections = sections(&book, self.filter, &query);
         let p = cx.palette().clone();
 
-        let list = if sections.is_empty() {
+        let list = if book.hosts.is_empty() {
+            vec![self.render_empty(cx).into_any_element()]
+        } else if sections.is_empty() {
             vec![
                 div()
                     .py(px(28.))

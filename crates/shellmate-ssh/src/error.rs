@@ -56,6 +56,9 @@ pub enum SshError {
     /// The connection dropped.
     #[error("连接已断开：{0}")]
     Disconnected(String),
+    /// The saved host cannot be connected (wrong protocol, empty route).
+    #[error("无法连接：{0}")]
+    Unsupported(String),
     /// A hop of a ProxyJump chain failed.
     #[error("跳板机 {host}:{port}：{source}")]
     Jump {

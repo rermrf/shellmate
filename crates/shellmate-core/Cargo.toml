@@ -4,4 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `sample::sample_book` (prototype data) to other crates' tests.
+test-support = []
+
 [dependencies]
+uuid = { workspace = true }
+zeroize.workspace = true

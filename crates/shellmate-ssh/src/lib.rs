@@ -16,10 +16,9 @@ mod handler;
 mod interact;
 mod known_hosts;
 mod runtime;
-mod secret;
 mod shell;
 
-pub use config::{ConnectEvent, ConnectOptions, EventCallback, Route, SshHost};
+pub use config::{ConnectEvent, ConnectOptions, EventCallback, HostSecrets, Route, SshHost};
 pub use connection::{Connection, HopInfo};
 pub use error::SshError;
 pub use interact::{
@@ -28,5 +27,5 @@ pub use interact::{
 };
 pub use known_hosts::{KnownHosts, Lookup};
 pub use runtime::SshRuntime;
-pub use secret::Secret;
 pub use shell::{PendingShell, ShellChannel, TERM};
+pub use shellmate_core::Secret;

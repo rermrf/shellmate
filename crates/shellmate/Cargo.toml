@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 shellmate-core.workspace = true
 shellmate-term.workspace = true
+shellmate-store.workspace = true
 gpui.workspace = true
 anyhow.workspace = true
 log.workspace = true

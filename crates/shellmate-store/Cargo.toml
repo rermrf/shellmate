@@ -1,0 +1,15 @@
+[package]
+name = "shellmate-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shellmate-core.workspace = true
+rusqlite.workspace = true
+keyring.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+shellmate-core = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

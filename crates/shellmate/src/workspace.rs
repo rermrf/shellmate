@@ -1,5 +1,6 @@
 //! Root view: sidebar + session tabs + active session panel.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -15,7 +16,7 @@ use gpui::{
     MouseButton, MouseUpEvent, SharedString, Subscription, Window, actions, div, px,
 };
 use shellmate_core::HostBook;
-use shellmate_core::sample::sample_book;
+use shellmate_store::HostStore;
 use shellmate_term::colors::to_hsla;
 use shellmate_term::view::ToggleSearch;
 use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
@@ -89,6 +90,7 @@ struct Session {
 }
 
 pub struct Workspace {
+    store: Rc<RefCell<HostStore>>,
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
@@ -100,12 +102,21 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Shows a notification once the window's root view exists: notifications cannot be pushed
+/// while the root view is still being built (`Workspace::new`).
+fn push_notification_later(window: &mut Window, cx: &mut App, notification: Notification) {
+    window.defer(cx, move |window, cx| window.push_notification(notification, cx));
+}
+
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let book = Rc::new(sample_book());
+    /// `store_notice` is shown once when the host library could not be opened and
+    /// `store` is a temporary in-memory fallback.
+    pub fn new(store: HostStore, store_notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let book = Rc::new(HostBook::default());
         let sidebar = cx.new(|cx| Sidebar::new(book.clone(), window, cx));
         let subscriptions = vec![cx.subscribe_in(&sidebar, window, Self::on_sidebar_event)];
         let mut this = Self {
+            store: Rc::new(RefCell::new(store)),
             book,
             sidebar,
             sessions: Vec::new(),
@@ -116,8 +127,27 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         };
+        if let Some(message) = store_notice {
+            push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
+        }
+        this.reload_book(window, cx);
         this.open_local(window, cx);
         this
+    }
+
+    /// Re-reads hosts and groups from the store into the sidebar.
+    fn reload_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let loaded = self.store.borrow().book();
+        match loaded {
+            Ok(book) => {
+                self.book = Rc::new(book);
+                self.sidebar.update(cx, |sidebar, cx| sidebar.set_book(self.book.clone(), cx));
+            }
+            Err(err) => {
+                log::error!("failed to load hosts: {err}");
+                push_notification_later(window, cx, Notification::error(err.to_string()).title("无法读取主机列表"));
+            }
+        }
     }
 
     fn on_sidebar_event(
@@ -133,7 +163,7 @@ impl Workspace {
             SidebarEvent::Connect(id) => {
                 let name = self.book.host(id).map(|h| h.name.clone()).unwrap_or_default();
                 window.push_notification(
-                    Notification::info("SSH 连接将在 P2 实现，当前主机列表是原型里的示例数据。").title(format!("暂不能连接 {name}")),
+                    Notification::info("SSH 连接界面将在下一步（M3）实现。").title(format!("暂不能连接 {name}")),
                     cx,
                 );
             }

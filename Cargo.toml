@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }
+shellmate-store = { path = "crates/shellmate-store" }
 
 gpui = { package = "gpui-kit", version = "0.9.1" }
 libc = "0.2"
@@ -31,3 +32,6 @@ sha1 = "0.11"
 data-encoding = "2"
 tempfile = "3"
 futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
+keyring = "4.2"

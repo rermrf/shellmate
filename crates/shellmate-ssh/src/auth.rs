@@ -17,7 +17,7 @@ use crate::config::SshHost;
 use crate::error::SshError;
 use crate::handler::ClientHandler;
 use crate::interact::{ChallengePrompt, ChallengeRequest, PassphraseRequest, PasswordRequest, Prompter};
-use crate::secret::Secret;
+use shellmate_core::Secret;
 
 /// Wrong password / passphrase / challenge answers allowed before giving up.
 const MAX_ATTEMPTS: u32 = 3;

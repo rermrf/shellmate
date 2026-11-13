@@ -1,4 +1,4 @@
-//! Shellmate — a gpui SSH client. P0/P1: UI skeleton and local terminal.
+//! Shellmate — a gpui SSH client. P0/P1: UI skeleton and local terminal; P2: host library, SSH.
 
 mod assets;
 mod sidebar;
@@ -13,6 +13,7 @@ use gpui::{
     WindowOptions, point, px, size,
 };
 
+use shellmate_store::HostStore;
 use workspace::{Quit, Workspace};
 
 const FONTS: [&[u8]; 4] = [
@@ -21,6 +22,25 @@ const FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Italic.ttf"),
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf"),
 ];
+
+/// Opens the host library: `$SHELLMATE_DB` if set (handy for trying the app with a scratch
+/// database), else `~/Library/Application Support/Shellmate/shellmate.db`. If that fails the
+/// app runs on a temporary in-memory library and returns the reason to show to the user.
+fn open_store() -> (HostStore, Option<String>) {
+    let path = std::env::var_os("SHELLMATE_DB").map(std::path::PathBuf::from).or_else(HostStore::default_path);
+    let opened = match &path {
+        Some(path) => HostStore::open(path),
+        None => Err(shellmate_store::StoreError::Corrupt("找不到用户目录".into())),
+    };
+    match opened {
+        Ok(store) => (store, None),
+        Err(err) => {
+            log::error!("failed to open the host library: {err}");
+            let store = HostStore::open_in_memory().expect("an in-memory SQLite database always opens");
+            (store, Some(format!("{err}。本次运行使用临时主机库，新建的主机不会被保存。")))
+        }
+    }
+}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -51,7 +71,10 @@ fn main() {
             window_min_size: Some(size(px(980.), px(620.))),
             ..Default::default()
         };
-        gpui::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(window, cx)))
+        let (store, store_notice) = open_store();
+        gpui::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| Workspace::new(store, store_notice, window, cx))
+        })
             .expect("failed to open the main window");
         cx.activate(true);
     });
