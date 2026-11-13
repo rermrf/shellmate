@@ -1,0 +1,8 @@
+//! Integration tests against an in-process SSH server on 127.0.0.1.
+
+mod agent;
+mod auth;
+mod host_keys;
+mod jump;
+mod shell;
+mod support;

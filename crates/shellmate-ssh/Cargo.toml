@@ -1,0 +1,21 @@
+[package]
+name = "shellmate-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shellmate-core.workspace = true
+russh.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+log.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+data-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+futures.workspace = true
