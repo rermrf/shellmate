@@ -20,8 +20,10 @@ pub struct SshHost {
     pub port: u16,
     /// Login name.
     pub user: String,
-    /// Authentication methods in the order they are tried. The server's
-    /// supported methods are respected: methods it does not offer are skipped.
+    /// Authentication methods in the order they are tried; the first is the configured
+    /// one, the rest are fallbacks (a failing fallback never replaces the configured
+    /// method's error, and cancelling a fallback prompt just stops trying). The
+    /// server's supported methods are respected: methods it does not offer are skipped.
     pub auth: Vec<AuthMethod>,
     /// Private key file for [`AuthMethod::PrivateKey`]. Without it the
     /// default keys of the SSH directory (`id_ed25519`, `id_ecdsa`, `id_rsa`) are tried.
@@ -98,12 +100,33 @@ impl SshHost {
             host: host.addr.clone(),
             port: host.port,
             user: host.user.clone().unwrap_or_else(|| default_user.to_string()),
-            auth: vec![host.auth],
+            auth: auth_chain(host.auth),
             identity_file: host.identity_file.clone(),
             password: secrets.password,
             passphrase: secrets.passphrase,
         })
     }
+}
+
+/// The methods to try for a host configured with `configured`, in OpenSSH's default order:
+/// the configured one, the other public-key source (ssh-agent and the default key files
+/// stand in for each other), then keyboard-interactive and password. Methods the server
+/// does not offer are skipped at connect time, and a failure is always reported for the
+/// configured method.
+fn auth_chain(configured: AuthMethod) -> Vec<AuthMethod> {
+    let other_key_source = match configured {
+        AuthMethod::Agent => Some(AuthMethod::PrivateKey),
+        AuthMethod::PrivateKey => Some(AuthMethod::Agent),
+        AuthMethod::Password | AuthMethod::KeyboardInteractive => None,
+    };
+    let mut chain = vec![configured];
+    chain.extend(other_key_source);
+    for method in [AuthMethod::KeyboardInteractive, AuthMethod::Password] {
+        if !chain.contains(&method) {
+            chain.push(method);
+        }
+    }
+    chain
 }
 
 /// The path to a server: optional jump hosts (ProxyJump) and the target.
@@ -281,12 +304,21 @@ mod tests {
         assert_eq!(route.via.len(), 2);
         let (outer, inner, db) = (&route.via[0], &route.via[1], &route.target);
         assert_eq!((outer.host.as_str(), outer.port, outer.user.as_str()), ("outer.example.com", 2222, "me"));
-        assert_eq!(outer.auth, [AuthMethod::Agent]);
-        assert_eq!((inner.user.as_str(), inner.auth.clone()), ("ops", vec![AuthMethod::Password]));
+        assert_eq!(outer.auth[0], AuthMethod::Agent);
+        assert_eq!((inner.user.as_str(), inner.auth[0]), ("ops", AuthMethod::Password));
         assert_eq!(inner.password.as_ref().map(Secret::expose), Some("pw"));
         assert!(outer.password.is_none() && inner.passphrase.is_none());
         assert_eq!((db.user.as_str(), db.identity_file.as_deref()), ("dba", Some(std::path::Path::new("/keys/db"))));
         assert_eq!(db.passphrase.as_ref().map(Secret::expose), Some("phrase"));
+    }
+
+    #[test]
+    fn fallbacks_follow_openssh_order() {
+        use AuthMethod::*;
+        assert_eq!(auth_chain(Agent), [Agent, PrivateKey, KeyboardInteractive, Password]);
+        assert_eq!(auth_chain(PrivateKey), [PrivateKey, Agent, KeyboardInteractive, Password]);
+        assert_eq!(auth_chain(Password), [Password, KeyboardInteractive], "no key sources for a password host");
+        assert_eq!(auth_chain(KeyboardInteractive), [KeyboardInteractive, Password]);
     }
 
     #[test]

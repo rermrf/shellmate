@@ -75,6 +75,8 @@ pub(crate) async fn authenticate(
             continue;
         }
         tried.push(method);
+        // The first configured method is the primary one; the others are fallbacks.
+        let primary = host.auth.first() == Some(&method);
         if !offered.is_empty() && !offered.contains(&kind_of(method)) {
             first_error.get_or_insert(SshError::AuthMethodUnavailable { method, offered: method_names(&offered) });
             continue;
@@ -104,8 +106,14 @@ pub(crate) async fn authenticate(
                     }
                 }
             }
-            // A cancelled prompt aborts everything; so does a broken key file.
-            Err(err @ (SshError::AuthCancelled | SshError::KeyUnreadable { .. })) => return Err(err),
+            // The user cancelled a prompt of the configured method: stop. Cancelling the prompt of a
+            // fallback only stops trying; what is reported is how the configured method failed.
+            Err(SshError::AuthCancelled) => {
+                return Err(first_error.filter(|_| !primary).unwrap_or(SshError::AuthCancelled));
+            }
+            // A key file the user configured explicitly must be usable; a broken default key must not
+            // get in the way of the fallbacks.
+            Err(err @ SshError::KeyUnreadable { .. }) if primary => return Err(err),
             Err(err) => {
                 first_error.get_or_insert(err);
             }

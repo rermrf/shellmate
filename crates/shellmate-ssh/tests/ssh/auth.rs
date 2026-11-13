@@ -272,3 +272,113 @@ async fn two_factor_publickey_then_keyboard_interactive() {
     assert_eq!(connection.target().auth, Some(AuthMethod::KeyboardInteractive), "last factor is reported");
     assert_eq!(server.attempts("publickey"), 1);
 }
+
+// ---- fallback methods (hosts built the way the app builds them) --------------------
+
+fn saved_host(server: &TestServer, auth: AuthMethod) -> shellmate_core::Host {
+    let mut host = shellmate_core::Host::new("saved", "127.0.0.1");
+    host.port = server.port;
+    host.user = Some("alice".into());
+    host.auth = auth;
+    host
+}
+
+fn route_for(host: &shellmate_core::Host, password: Option<&str>) -> Route {
+    Route::from_hosts(std::slice::from_ref(host), "unused", |_| shellmate_ssh::HostSecrets {
+        password: password.map(Secret::new),
+        passphrase: None,
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_rejected_key_falls_back_to_the_agent() {
+    use crate::support::start_agent;
+
+    let env = Env::new();
+    let (unauthorized_path, _) = env.write_key("id_unauthorized");
+    let agent_key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let server = TestServer::start(ServerOptions {
+        authorized_keys: vec![agent_key.public_key().clone()],
+        ..Default::default()
+    })
+    .await;
+    let socket = env.dir.path().join("agent.sock");
+    start_agent(&socket, &[&agent_key]).await;
+
+    let mut host = saved_host(&server, AuthMethod::PrivateKey);
+    host.identity_file = Some(unauthorized_path);
+    let options = env.options(Verifier::new(true), Script::new()).with_agent_socket(&socket);
+    let connection = Connection::connect(route_for(&host, None), options).await.unwrap();
+    assert_eq!(connection.target().auth, Some(AuthMethod::Agent), "configured key rejected, the agent's key worked");
+}
+
+#[tokio::test]
+async fn the_configured_agent_failing_falls_back_to_the_password() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions::default()).await;
+    // No agent at all (the options point at a missing socket) and no default keys.
+    let host = saved_host(&server, AuthMethod::Agent);
+    let connection = Connection::connect(route_for(&host, Some("secret")), env.trusting()).await.unwrap();
+    assert_eq!(connection.target().auth, Some(AuthMethod::Password));
+}
+
+#[tokio::test]
+async fn the_error_describes_the_configured_method_not_the_last_fallback() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions::default()).await;
+    let host = saved_host(&server, AuthMethod::Agent);
+    // Agent unavailable; fallbacks: no key files, keyboard-interactive rejected, wrong password.
+    let script = Script::new().with_passwords(&["no", "nope"]);
+    let err = Connection::connect(route_for(&host, Some("wrong")), env.options(Verifier::new(true), script))
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, SshError::Agent(reason) if reason.starts_with("无法连接 ssh-agent")), "{err}");
+}
+
+#[tokio::test]
+async fn cancelling_a_fallback_prompt_reports_the_configured_failure() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions::default()).await;
+    let host = saved_host(&server, AuthMethod::Agent);
+    // No stored password, nothing scripted: the password fallback prompt is cancelled.
+    let err = Connection::connect(route_for(&host, None), env.trusting()).await.unwrap_err();
+    assert!(matches!(&err, SshError::Agent(_)), "not AuthCancelled: {err}");
+    assert!(!err.is_cancelled());
+}
+
+#[tokio::test]
+async fn cancelling_the_configured_methods_prompt_is_still_a_cancel() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions::default()).await;
+    let host = saved_host(&server, AuthMethod::Password);
+    let err = Connection::connect(route_for(&host, None), env.trusting()).await.unwrap_err();
+    assert!(matches!(err, SshError::AuthCancelled), "{err}");
+}
+
+#[tokio::test]
+async fn a_broken_default_key_does_not_stop_the_fallbacks() {
+    let env = Env::new();
+    std::fs::write(env.ssh_dir.join("id_ed25519"), "this is not a private key").unwrap();
+    let server = TestServer::start(ServerOptions::default()).await;
+    // Agent configured and absent; the PrivateKey fallback finds a broken default key; the password still works.
+    let host = saved_host(&server, AuthMethod::Agent);
+    let connection = Connection::connect(route_for(&host, Some("secret")), env.trusting()).await.unwrap();
+    assert_eq!(connection.target().auth, Some(AuthMethod::Password));
+}
+
+#[tokio::test]
+async fn password_hosts_fall_back_to_keyboard_interactive() {
+    let env = Env::new();
+    let server = TestServer::start(ServerOptions {
+        methods: vec![MethodKind::KeyboardInteractive],
+        kbd: Some(vec![KbdRound { prompts: vec![("Password: ", false)], expect: vec!["secret"] }]),
+        ..Default::default()
+    })
+    .await;
+    let host = saved_host(&server, AuthMethod::Password);
+    let script = Script::new().with_challenges(&[&["secret"]]);
+    let connection =
+        Connection::connect(route_for(&host, None), env.options(Verifier::new(true), script)).await.unwrap();
+    assert_eq!(connection.target().auth, Some(AuthMethod::KeyboardInteractive));
+}

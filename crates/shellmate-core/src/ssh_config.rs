@@ -7,16 +7,19 @@
 //! `User`, `Port`, `IdentityFile`, `ProxyJump` (comma list, `none`); keywords are
 //! case-insensitive; `Key Value` and `Key=Value`; double-quoted values; comments.
 //!
+//! Settings follow OpenSSH: for each alias, all `Host` blocks are walked in file
+//! order; a block applies if one of its patterns (`*` and `?` wildcards) matches
+//! the alias and none of its `!negated` patterns does, and every keyword takes the
+//! **first** value found. Settings before the first `Host` apply to everyone, and
+//! so does `Host *`, wherever it is (so a `Host *` at the top beats the specific
+//! blocks below it, exactly as in `ssh`).
+//!
 //! Handling of everything else:
-//! - `Host *` (and settings before the first `Host`) act as defaults for all
-//!   entries. Unlike OpenSSH, which uses the first value it meets, a specific
-//!   entry always wins over the defaults, wherever `Host *` appears.
-//! - Host patterns with `*`, `?` or a leading `!` are skipped (reported in
-//!   [`ParsedConfig::skipped_patterns`]); so are the settings of blocks that only
-//!   have such patterns.
+//! - Only plain names after `Host` become entries. Wildcard and negated patterns
+//!   are reported in [`ParsedConfig::skipped_patterns`] (a bare `*` is not), but
+//!   their settings still apply to the aliases they match.
 //! - `Match` blocks are skipped up to the next `Host` ([`ParsedConfig::match_blocks`]).
 //! - `Include` is not followed; its arguments are reported in [`ParsedConfig::includes`].
-//! - If an alias appears in several blocks, the first value of each keyword wins.
 
 use std::path::{Path, PathBuf};
 
@@ -71,12 +74,31 @@ impl Settings {
     }
 }
 
+/// A `Host` block (or the global section, whose single pattern is `*`).
+struct HostBlock {
+    patterns: Vec<String>,
+    settings: Settings,
+}
+
+impl HostBlock {
+    /// Whether the block applies to `alias`: some pattern matches and no `!pattern` does.
+    fn applies_to(&self, alias: &str) -> bool {
+        let mut matched = false;
+        for pattern in &self.patterns {
+            match pattern.strip_prefix('!') {
+                Some(negated) if glob_match(negated, alias) => return false,
+                Some(_) => {}
+                None => matched |= glob_match(pattern, alias),
+            }
+        }
+        matched
+    }
+}
+
 /// Where the settings of the current line go.
-enum Block {
-    /// Before the first `Host`: applies to everything, like `Host *`.
-    Global,
-    /// A `Host` block: indexes into the entry list, plus whether `*` was one of its patterns.
-    Host { targets: Vec<usize>, defaults: bool },
+enum Current {
+    /// Index of the block being filled.
+    Block(usize),
     /// A `Match` block: ignored.
     Match,
 }
@@ -85,71 +107,91 @@ enum Block {
 /// (left as is when `None`).
 pub fn parse_ssh_config(text: &str, home: Option<&Path>) -> ParsedConfig {
     let mut parsed = ParsedConfig::default();
-    let mut settings: Vec<Settings> = Vec::new();
-    let mut defaults = Settings::default();
-    let mut block = Block::Global;
+    let mut aliases: Vec<String> = Vec::new();
+    // Block 0 is the global section: it comes before every `Host` and matches everything.
+    let mut blocks = vec![HostBlock { patterns: vec!["*".to_string()], settings: Settings::default() }];
+    let mut current = Current::Block(0);
 
     for raw in text.lines() {
         let Some((keyword, args)) = split_line(raw) else { continue };
         match keyword.to_ascii_lowercase().as_str() {
             "host" => {
-                let mut targets = Vec::new();
-                let mut is_defaults = false;
-                for pattern in args {
-                    if pattern == "*" {
-                        is_defaults = true;
-                    } else if pattern.contains(['*', '?']) || pattern.starts_with('!') {
-                        parsed.skipped_patterns.push(pattern);
-                    } else {
-                        let index = match parsed.entries.iter().position(|e| e.alias == pattern) {
-                            Some(index) => index,
-                            None => {
-                                parsed.entries.push(SshConfigEntry { alias: pattern, ..Default::default() });
-                                settings.push(Settings::default());
-                                settings.len() - 1
-                            }
-                        };
-                        targets.push(index);
+                for pattern in &args {
+                    if pattern.contains(['*', '?']) || pattern.starts_with('!') {
+                        if pattern != "*" && !parsed.skipped_patterns.contains(pattern) {
+                            parsed.skipped_patterns.push(pattern.clone());
+                        }
+                    } else if !aliases.contains(pattern) {
+                        aliases.push(pattern.clone());
                     }
                 }
-                block = Block::Host { targets, defaults: is_defaults };
+                blocks.push(HostBlock { patterns: args, settings: Settings::default() });
+                current = Current::Block(blocks.len() - 1);
             }
             "match" => {
                 parsed.match_blocks += 1;
-                block = Block::Match;
+                current = Current::Match;
             }
             "include" => parsed.includes.extend(args),
             key @ ("hostname" | "user" | "port" | "identityfile" | "proxyjump") => {
                 // A jump list may be written with spaces around the commas: take it whole.
                 let value = if key == "proxyjump" { Some(args.join(",")) } else { args.into_iter().next() };
                 let Some(value) = value.filter(|v| !v.is_empty()) else { continue };
-                let apply = |target: &mut Settings| apply_setting(target, key, &value, home);
-                match &block {
-                    Block::Global => apply(&mut defaults),
-                    Block::Host { targets, defaults: is_defaults } => {
-                        for &index in targets {
-                            apply(&mut settings[index]);
-                        }
-                        if *is_defaults {
-                            apply(&mut defaults);
-                        }
-                    }
-                    Block::Match => {}
+                if let Current::Block(index) = current {
+                    apply_setting(&mut blocks[index].settings, key, &value, home);
                 }
             }
             _ => {}
         }
     }
 
-    for (entry, mut own) in parsed.entries.iter_mut().zip(settings) {
-        own.fill_from(&defaults);
-        entry.hostname = own.hostname;
-        entry.user = own.user;
-        entry.port = own.port;
-        entry.identity_file = own.identity_file;
-        entry.proxy_jump = own.proxy_jump.unwrap_or_default();
-    }
+    parsed.entries = aliases
+        .into_iter()
+        .map(|alias| {
+            let mut resolved = Settings::default();
+            for block in blocks.iter().filter(|b| b.applies_to(&alias)) {
+                resolved.fill_from(&block.settings);
+            }
+            SshConfigEntry {
+                alias,
+                hostname: resolved.hostname,
+                user: resolved.user,
+                port: resolved.port,
+                identity_file: resolved.identity_file,
+                proxy_jump: resolved.proxy_jump.unwrap_or_default(),
+            }
+        })
+        .collect();
     parsed
+}
+
+/// Case-insensitive `*` / `?` wildcard match, as used for host patterns.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (pattern, text) = (pattern.to_ascii_lowercase(), text.to_ascii_lowercase());
+    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == b'?' || c == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((star_p, star_t)) => {
+                    p = star_p + 1;
+                    t = star_t + 1;
+                    star = Some((star_p, star_t + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 /// Sets one keyword unless it already has a value (first value wins).
@@ -301,18 +343,89 @@ mod tests {
     }
 
     #[test]
-    fn star_block_provides_defaults_wherever_it_is() {
+    fn host_star_first_wins_like_openssh() {
         let parsed = parse(
-            "Host *\n  User admin\n  Port 2200\n  IdentityFile ~/.ssh/default\nHost web\n  User deploy\n  HostName w.example.com\nHost db\n  HostName d.example.com\n  Port 5432\nHost *\n  ProxyJump hop\n",
+            "Host *\n  User admin\n  Port 2200\n  IdentityFile ~/.ssh/default\nHost web\n  User deploy\n  HostName w.example.com\n  Port 22\n",
         );
         let web = entry(&parsed, "web");
-        assert_eq!(web.user.as_deref(), Some("deploy"), "own value beats the default");
-        assert_eq!(web.port, Some(2200), "gaps are filled from Host *");
+        assert_eq!(web.user.as_deref(), Some("admin"), "the first value wins, and Host * came first");
+        assert_eq!(web.port, Some(2200));
+        assert_eq!(
+            web.hostname.as_deref(),
+            Some("w.example.com"),
+            "what Host * does not set comes from the block below"
+        );
         assert_eq!(web.identity_file, Some(PathBuf::from("/Users/me/.ssh/default")));
-        assert_eq!(web.proxy_jump, ["hop"], "a later Host * block counts as well");
+        assert_eq!(parsed.entries.len(), 1, "Host * itself is not an entry");
+        assert!(parsed.skipped_patterns.is_empty(), "a bare * is not reported as skipped");
+    }
+
+    #[test]
+    fn host_star_last_only_fills_the_gaps() {
+        let parsed = parse(
+            "Host web\n  User deploy\n  HostName w.example.com\nHost db\n  HostName d.example.com\n  Port 5432\nHost *\n  User admin\n  Port 2200\n  ProxyJump hop\n",
+        );
+        let web = entry(&parsed, "web");
+        assert_eq!((web.user.as_deref(), web.port), (Some("deploy"), Some(2200)));
+        assert_eq!(web.proxy_jump, ["hop"]);
         let db = entry(&parsed, "db");
         assert_eq!((db.user.as_deref(), db.port), (Some("admin"), Some(5432)));
-        assert_eq!(parsed.entries.len(), 2, "Host * itself is not an entry");
+    }
+
+    #[test]
+    fn wildcard_blocks_apply_to_the_aliases_they_match() {
+        let parsed = parse(
+            "Host db.corp.io\n  HostName 10.0.0.1\nHost other.example.com\n  HostName 10.0.0.2\nHost *.corp.io\n  User corp\n  ProxyJump gateway\n",
+        );
+        let db = entry(&parsed, "db.corp.io");
+        assert_eq!((db.user.as_deref(), db.proxy_jump.as_slice()), (Some("corp"), &["gateway".to_string()][..]));
+        assert_eq!(entry(&parsed, "other.example.com").user, None);
+        assert_eq!(parsed.skipped_patterns, ["*.corp.io"], "the wildcard block itself is not an import candidate");
+        assert_eq!(parsed.entries.len(), 2);
+    }
+
+    #[test]
+    fn negated_patterns_exclude_aliases() {
+        let parsed = parse("Host bastion\n  HostName b\nHost web\n  HostName w\nHost * !bastion\n  User common\n");
+        assert_eq!(entry(&parsed, "web").user.as_deref(), Some("common"));
+        assert_eq!(entry(&parsed, "bastion").user, None, "!bastion keeps the block away from bastion");
+        assert_eq!(parsed.skipped_patterns, ["!bastion"]);
+    }
+
+    #[test]
+    fn a_negated_pattern_alone_matches_nothing() {
+        let parsed = parse("Host web\n  HostName w\nHost !web\n  User nobody\n");
+        assert_eq!(entry(&parsed, "web").user, None);
+    }
+
+    #[test]
+    fn several_matching_blocks_combine_in_file_order() {
+        let parsed = parse(
+            "Host web\n  HostName w.example.com\nHost w*\n  User wuser\n  Port 2201\nHost *\n  User everyone\n  Port 2200\n  IdentityFile /keys/all\nHost web\n  IdentityFile /keys/late\n  ProxyJump j\n",
+        );
+        let web = entry(&parsed, "web");
+        assert_eq!(web.hostname.as_deref(), Some("w.example.com"));
+        assert_eq!(web.user.as_deref(), Some("wuser"), "w* came before Host *");
+        assert_eq!(web.port, Some(2201));
+        assert_eq!(web.identity_file, Some(PathBuf::from("/keys/all")), "the later Host web block loses to Host *");
+        assert_eq!(web.proxy_jump, ["j"], "but still contributes what nothing before it set");
+    }
+
+    #[test]
+    fn patterns_match_case_insensitively_and_with_question_marks() {
+        let parsed = parse("Host Web01 web2\n  HostName x\nHost WEB0?\n  User q\n");
+        assert_eq!(entry(&parsed, "Web01").user.as_deref(), Some("q"));
+        assert_eq!(entry(&parsed, "web2").user, None);
+    }
+
+    #[test]
+    fn glob_matching() {
+        assert!(glob_match("*.example.com", "A.Example.COM"));
+        assert!(glob_match("10.0.?.*", "10.0.1.99"));
+        assert!(!glob_match("*.example.com", "example.org"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
     }
 
     #[test]

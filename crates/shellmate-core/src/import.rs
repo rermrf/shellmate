@@ -121,7 +121,7 @@ impl Planner<'_> {
         host.port = candidate.port;
         host.user = candidate.user.clone();
         host.identity_file = candidate.identity_file.clone();
-        host.auth = AuthMethod::PrivateKey;
+        host.auth = import_auth(host.identity_file.is_some());
         host.group = self.group.cloned();
         let id = host.id.clone();
         self.by_alias.insert(candidate.alias.clone(), self.created.len());
@@ -159,6 +159,7 @@ impl Planner<'_> {
             return Some(found.id.clone());
         }
         let mut jump = Host::new(host, host);
+        jump.auth = import_auth(false);
         jump.port = port;
         jump.user = user.map(String::from);
         jump.group = self.group.cloned();
@@ -171,6 +172,12 @@ impl Planner<'_> {
     fn alias_link(&self, alias: &str, id: HostId) -> Option<HostId> {
         (!self.in_progress.iter().any(|a| a == alias)).then_some(id)
     }
+}
+
+/// Authentication of an imported host: its `IdentityFile` if it has one, otherwise
+/// ssh-agent (what OpenSSH would try first).
+fn import_auth(has_identity_file: bool) -> AuthMethod {
+    if has_identity_file { AuthMethod::PrivateKey } else { AuthMethod::Agent }
 }
 
 /// Splits `[user@]host[:port]` (a bracketed `[v6]` host is supported).
@@ -266,6 +273,14 @@ mod tests {
     }
 
     #[test]
+    fn hosts_without_an_identity_file_use_the_agent() {
+        let rows = rows("Host plain\n  HostName p\nHost keyed\n  HostName k\n  IdentityFile /keys/k\n", &[]);
+        let plan = plan_import(&rows, &rows, &[], None);
+        assert_eq!(by_name(&plan, "plain").auth, AuthMethod::Agent);
+        assert_eq!(by_name(&plan, "keyed").auth, AuthMethod::PrivateKey);
+    }
+
+    #[test]
     fn jump_alias_imported_in_the_same_batch_is_linked() {
         let rows =
             rows("Host bastion\n  HostName b.example.com\nHost db\n  HostName 10.0.2.8\n  ProxyJump bastion\n", &[]);
@@ -326,7 +341,7 @@ mod tests {
         assert_eq!(plan.jump_hosts, 1);
         let jump = plan.hosts.iter().find(|h| h.addr == "jump.example.com").unwrap();
         assert_eq!((jump.name.as_str(), jump.port, jump.user.as_deref()), ("jump.example.com", 2222, Some("ops")));
-        assert_eq!((jump.auth, jump.group.as_ref()), (AuthMethod::PrivateKey, Some(&group)));
+        assert_eq!((jump.auth, jump.group.as_ref()), (AuthMethod::Agent, Some(&group)), "no key file known: ssh-agent");
         assert_eq!(by_name(&plan, "db").jump, std::slice::from_ref(&jump.id));
     }
 

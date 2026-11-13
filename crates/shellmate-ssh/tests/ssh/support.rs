@@ -4,11 +4,13 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use russh::keys::agent::client::AgentClient;
 use russh::keys::key::safe_rng;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Response, Session, VerifiedPublicKey};
@@ -18,7 +20,7 @@ use shellmate_ssh::{
     ChallengeRequest, ConnectOptions, HostKeyRequest, HostKeyVerifier, PassphraseRequest, PasswordRequest, Prompter,
     Secret,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -563,5 +565,20 @@ impl Recorder {
 
     pub async fn wait_for_event(&self) -> Event {
         eventually("a terminal event", || lock(&self.events).first().cloned()).await
+    }
+}
+
+/// Starts an agent serving `socket` and loads `keys` into it.
+pub async fn start_agent(socket: &Path, keys: &[&PrivateKey]) {
+    let listener = UnixListener::bind(socket).unwrap();
+    let incoming = futures::stream::unfold(listener, |listener| async move {
+        let accepted = listener.accept().await.map(|(stream, _)| stream);
+        Some((accepted, listener))
+    })
+    .boxed();
+    tokio::spawn(russh::keys::agent::server::serve(incoming, ()));
+    let mut client = AgentClient::connect_uds(socket).await.unwrap();
+    for key in keys {
+        client.add_identity(key, &[]).await.unwrap();
     }
 }

@@ -2,30 +2,12 @@
 
 use std::path::Path;
 
-use futures::StreamExt;
-use russh::keys::agent::client::AgentClient;
 use russh::keys::key::safe_rng;
 use russh::keys::{Algorithm, PrivateKey};
 use shellmate_core::AuthMethod;
 use shellmate_ssh::{Connection, Route, SshError, SshHost};
-use tokio::net::UnixListener;
 
-use crate::support::{Env, Script, ServerOptions, TestServer, Verifier};
-
-/// Starts an agent serving `socket` and loads `keys` into it.
-async fn start_agent(socket: &Path, keys: &[&PrivateKey]) {
-    let listener = UnixListener::bind(socket).unwrap();
-    let incoming = futures::stream::unfold(listener, |listener| async move {
-        let accepted = listener.accept().await.map(|(stream, _)| stream);
-        Some((accepted, listener))
-    })
-    .boxed();
-    tokio::spawn(russh::keys::agent::server::serve(incoming, ()));
-    let mut client = AgentClient::connect_uds(socket).await.unwrap();
-    for key in keys {
-        client.add_identity(key, &[]).await.unwrap();
-    }
-}
+use crate::support::{Env, Script, ServerOptions, TestServer, Verifier, start_agent};
 
 async fn connect(server: &TestServer, env: &Env, socket: &Path) -> Result<Connection, SshError> {
     let host = SshHost::new("127.0.0.1", server.port, "alice", AuthMethod::Agent);

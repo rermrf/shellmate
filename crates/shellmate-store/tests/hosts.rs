@@ -357,8 +357,6 @@ fn the_sample_book_round_trips() {
 fn import_end_to_end_dedupes_and_links_jumps() {
     let mut store = store();
     let config = "\
-Host *
-  User admin
 Host bastion
   HostName bastion.corp.io
   Port 2222
@@ -371,6 +369,8 @@ Host web
   ProxyJump ops@gateway.example.com:2200
 Host stuff-*
   User nobody
+Host *
+  User admin
 ";
     let parsed = parse_ssh_config(config, Some(std::path::Path::new("/Users/me")));
     let rows = candidates(&parsed, &store.hosts().unwrap());
