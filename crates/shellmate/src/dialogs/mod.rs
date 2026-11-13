@@ -6,7 +6,10 @@
 //! the dialog layer.
 
 pub mod auth;
+pub mod confirm;
+pub mod host_editor;
 pub mod hostkey;
+pub mod import;
 
 use std::cell::Cell;
 

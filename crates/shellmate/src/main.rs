@@ -3,6 +3,7 @@
 mod assets;
 mod connect;
 mod dialogs;
+mod library;
 #[cfg(debug_assertions)]
 mod demo;
 mod runtime;

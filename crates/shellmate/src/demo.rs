@@ -10,11 +10,25 @@ use shellmate_ssh::{
 use tokio::sync::oneshot;
 
 use crate::dialogs::auth::{ChallengeDialog, SecretDialog};
+use crate::dialogs::confirm::ConfirmDialog;
+use crate::dialogs::host_editor::{EditorMode, HostEditor};
 use crate::dialogs::hostkey::HostKeyDialog;
+use crate::dialogs::import::{ImportDialog, ImportNotes};
 use crate::workspace::Workspace;
 
 /// Names accepted by `SHELLMATE_DEMO` (`connect:<host name>` also connects a saved host on startup).
-pub const NAMES: &[&str] = &["hostkey-new", "hostkey-changed", "password", "passphrase", "otp", "kbd"];
+pub const NAMES: &[&str] = &[
+    "hostkey-new",
+    "hostkey-changed",
+    "password",
+    "passphrase",
+    "otp",
+    "kbd",
+    "host-editor",
+    "host-editor-edit",
+    "import",
+    "delete",
+];
 
 fn key(algorithm: &str, fingerprint: &str) -> HostKeyInfo {
     HostKeyInfo { algorithm: algorithm.into(), fingerprint: fingerprint.into() }
@@ -83,6 +97,38 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             request.instructions = "请输入密码，并按需填写账号。".into();
             ChallengeDialog::open(request, reply, window, cx);
         }
+        "host-editor" => {
+            let book = workspace.read(cx).book();
+            HostEditor::open(workspace.downgrade(), EditorMode::New, &book, window, cx);
+        }
+        "host-editor-edit" => {
+            let book = workspace.read(cx).book();
+            if let Some(host) = book.hosts.iter().find(|h| h.name == "prod-db-01").cloned() {
+                HostEditor::open(workspace.downgrade(), EditorMode::Edit(host), &book, window, cx);
+            }
+        }
+        "import" => {
+            let book = workspace.read(cx).book();
+            let text = "Host *\n  User admin\nHost prod-web-01\n  HostName 10.0.1.21\n  User deploy\nHost build\n  HostName build.corp.io\n  IdentityFile ~/.ssh/id_work\nHost db-replica\n  HostName 10.0.2.9\n  User dba\n  ProxyJump bastion\nHost bastion\n  HostName bastion.corp.io\n  Port 2222\n  User ops\nHost *.corp.io !build.corp.io\n  ForwardAgent yes\nInclude ~/.ssh/config.d/*\n";
+            let parsed = shellmate_core::parse_ssh_config(text, std::env::home_dir().as_deref());
+            let rows = shellmate_core::candidates(&parsed, &book.hosts);
+            let notes = ImportNotes {
+                includes: parsed.includes,
+                skipped_patterns: parsed.skipped_patterns,
+                match_blocks: parsed.match_blocks,
+            };
+            let groups = book.groups.iter().map(|g| g.name.clone()).collect();
+            ImportDialog::open(workspace.downgrade(), rows, notes, None, groups, window, cx);
+        }
+        "delete" => ConfirmDialog::open(
+            "删除主机 prod-web-02？",
+            "已打开的会话不受影响。保存在钥匙串里的此主机的密码会一并移除。",
+            "删除主机",
+            true,
+            |_, _| Ok(()),
+            window,
+            cx,
+        ),
         other => log::warn!("unknown SHELLMATE_DEMO {other:?}; available: {}", NAMES.join(", ")),
     }
 }

@@ -10,6 +10,13 @@ const EXTRA_ICONS: &[(&str, &[u8])] = &[
     ("icons/radio-tower.svg", include_bytes!("../assets/icons/radio-tower.svg")),
     ("icons/sparkles.svg", include_bytes!("../assets/icons/sparkles.svg")),
     ("icons/zap.svg", include_bytes!("../assets/icons/zap.svg")),
+    ("icons/ellipsis.svg", include_bytes!("../assets/icons/ellipsis.svg")),
+    ("icons/pencil.svg", include_bytes!("../assets/icons/pencil.svg")),
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
+    ("icons/trash.svg", include_bytes!("../assets/icons/trash.svg")),
+    ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/folder-open.svg", include_bytes!("../assets/icons/folder-open.svg")),
+    ("icons/arrow-up.svg", include_bytes!("../assets/icons/arrow-up.svg")),
 ];
 
 pub struct AppAssets;
@@ -60,6 +67,14 @@ mod tests {
             IconName::Sun,
             IconName::Moon,
             IconName::Close,
+            IconName::Ellipsis,
+            IconName::Pencil,
+            IconName::Copy,
+            IconName::Trash,
+            IconName::Play,
+            IconName::FolderOpen,
+            IconName::ArrowUp,
+            IconName::ArrowDown,
         ];
         for icon in used {
             let path = icon.path();

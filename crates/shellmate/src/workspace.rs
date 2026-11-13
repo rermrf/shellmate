@@ -27,6 +27,7 @@ use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
+mod hosts;
 mod ssh;
 
 actions!(
@@ -185,7 +186,18 @@ impl Workspace {
             SidebarEvent::OpenLocal => self.focus_or_open_local(window, cx),
             SidebarEvent::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             SidebarEvent::Connect(id) => self.connect_host(id, window, cx),
+            SidebarEvent::NewHost => self.new_host(window, cx),
+            SidebarEvent::EditHost(id) => self.edit_host(id, false, window, cx),
+            SidebarEvent::DuplicateHost(id) => self.edit_host(id, true, window, cx),
+            SidebarEvent::DeleteHost(id) => self.confirm_delete_host(id, window, cx),
+            SidebarEvent::ImportConfig => self.open_import(window, cx),
         }
+    }
+
+    /// The loaded host book (debug review hook).
+    #[cfg(debug_assertions)]
+    pub(crate) fn book(&self) -> Rc<HostBook> {
+        self.book.clone()
     }
 
     // ---- sessions ------------------------------------------------------

@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::assets::IconName as Lucide;
+use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputState};
+use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, Sizable as _};
 use gpui::prelude::*;
@@ -52,6 +54,14 @@ pub enum SidebarEvent {
     OpenLocal,
     Connect(HostId),
     ToggleSidebar,
+    /// Open the editor for a new host.
+    NewHost,
+    EditHost(HostId),
+    /// Open the editor for a new host prefilled from this one.
+    DuplicateHost(HostId),
+    DeleteHost(HostId),
+    /// Open the ssh config importer.
+    ImportConfig,
 }
 
 pub struct Sidebar {
@@ -155,7 +165,10 @@ impl Sidebar {
                 icon_button("toggle-sidebar", Lucide::PanelLeft, "隐藏侧栏 ⌃⌘S")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))),
             )
-            .child(icon_button("new-host", Lucide::Plus, "新建主机（M3 实现）").opacity(0.45));
+            .child(
+                icon_button("new-host", Lucide::Plus, "新建主机")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
+            );
 
         let host_count = self.book.hosts.len();
         div()
@@ -409,6 +422,28 @@ impl Sidebar {
                         cx.emit(SidebarEvent::Connect(connect_id.clone()));
                     }))
             }))
+            .children(selected.then(|| {
+                let sidebar = cx.entity().downgrade();
+                let host_id = host.id.clone();
+                Button::new(SharedString::from(format!("menu-{}", host.id)))
+                    .ghost()
+                    .compact()
+                    .icon(Icon::new(Lucide::Ellipsis).size(px(15.)))
+                    .tooltip("更多")
+                    .dropdown_menu(move |menu, _, _| {
+                        let item = |label: &'static str, icon: Lucide, event: fn(HostId) -> SidebarEvent| {
+                            let (sidebar, host_id) = (sidebar.clone(), host_id.clone());
+                            PopupMenuItem::new(label).icon(Icon::new(icon)).on_click(move |_, _, cx| {
+                                sidebar.update(cx, |_, cx| cx.emit(event(host_id.clone()))).ok();
+                            })
+                        };
+                        menu.item(item("连接", Lucide::Play, SidebarEvent::Connect))
+                            .item(item("编辑", Lucide::Pencil, SidebarEvent::EditHost))
+                            .item(item("复制为新主机", Lucide::Copy, SidebarEvent::DuplicateHost))
+                            .separator()
+                            .item(item("删除", Lucide::Trash, SidebarEvent::DeleteHost))
+                    })
+            }))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.selected = Some(id.to_string());
                 window.focus(&this.list_focus, cx);
@@ -419,7 +454,7 @@ impl Sidebar {
             }))
     }
 
-    /// Shown when the library has no hosts at all. Both actions arrive with the editor (M3).
+    /// Shown when the library has no hosts at all.
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let button = |id: &'static str, label: &'static str, icon: Option<Lucide>| {
@@ -437,10 +472,10 @@ impl Sidebar {
                 .border_color(p.line)
                 .text_size(px(12.5))
                 .text_color(p.tx)
-                .opacity(0.5)
+                .cursor_pointer()
+                .hover(|d| d.bg(p.card2))
                 .children(icon.map(|icon| Icon::new(icon).size(px(14.)).text_color(p.tx2)))
                 .child(label)
-                .tooltip(|window, cx| Tooltip::new("下一步（M3）实现").build(window, cx))
         };
         div()
             .flex()
@@ -470,8 +505,14 @@ impl Sidebar {
                     .text_color(p.tx3)
                     .child("添加第一台服务器，或从 ~/.ssh/config 导入已有的主机。"),
             )
-            .child(button("empty-new-host", "新建主机", Some(Lucide::Plus)))
-            .child(button("empty-import", "从 ~/.ssh/config 导入", None))
+            .child(
+                button("empty-new-host", "新建主机", Some(Lucide::Plus))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
+            )
+            .child(
+                button("empty-import", "从 ~/.ssh/config 导入", None)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ImportConfig))),
+            )
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
