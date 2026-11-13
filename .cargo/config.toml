@@ -1,0 +1,7 @@
+# Keep debug builds small: gpui and friends with full debug info take >10 GB.
+# Workspace crates keep line tables (usable backtraces); dependencies get none.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
