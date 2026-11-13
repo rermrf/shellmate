@@ -56,6 +56,13 @@ Mosh / Telnet / 串口属于 P7，主机编辑器里可见但不可选。
 - 连接池：按主机复用连接，最后一个通道关闭后断开。
 - 关闭仍在连接中的标签会取消连接任务。
 
+## M1 review 结论（2026-11-13，已通过）
+- M2：`Secret` 移到 `shellmate-core`（`shellmate-ssh` 再导出），凭据层直接返回它。
+- M2：主机库与钥匙串放新 crate `shellmate-store`（依赖 core；`rusqlite` + `keyring`），ssh_config 解析放 core（纯文本解析，可单测）。
+- M3：很多服务器（PAM、跳板机）通过键盘交互要密码：钥匙串里有该主机密码时，第一轮 echo=false 的单个提示自动填入，失败后再弹框。
+- M4：SSH 握手没有超时。加"连接看门狗"：不计等待用户输入（指纹/认证对话框）的时间，累计超过 20 秒即中止并提示。
+- 已知限制（暂不处理）：ssh-agent 中密钥很多时可能触发服务器 MaxAuthTries；agent 证书与服务器主机证书暂不支持。
+
 ## 通用要求
 - 界面文案用中文，措辞参考原型（`app_logic.js` 中的 `authSteps`、`openSession`、`healed` 等）。
 - 不打日志输出密码、口令、私钥内容；内存中的密码用完即丢（可用 `zeroize`）。
