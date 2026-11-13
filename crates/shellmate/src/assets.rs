@@ -37,7 +37,7 @@ impl AssetSource for AppAssets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::assets::{IconName, IconNamed};
+    use gpui::assets::IconName;
 
     /// Every Lucide icon referenced by the app must resolve, otherwise it
     /// silently renders as an empty box.
