@@ -18,6 +18,6 @@ pub use error::SftpError;
 pub use session::{POSIX_RENAME, ServerInfo, SftpSession};
 pub use shellmate_ssh::Connection;
 pub use text::{
-    LineEnding, MAX_TEXT_SIZE, SaveFormat, SaveOutcome, TextFile, WriteMode, decode_text, detect_line_ending,
-    encode_text, save_temp_path,
+    InPlaceReason, LineEnding, MAX_TEXT_SIZE, SaveFormat, SaveOutcome, TextFile, WriteMode, decode_text,
+    detect_line_ending, encode_text, save_temp_path,
 };

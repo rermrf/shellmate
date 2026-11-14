@@ -6,7 +6,7 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use crate::entry::{Entry, EntryKind, Revision};
 use crate::error::SftpError;
 use crate::path;
-use crate::session::SftpSession;
+use crate::session::{MAX_LINK_HOPS, SftpSession};
 
 /// The biggest file the editor opens.
 pub const MAX_TEXT_SIZE: u64 = 5 * 1024 * 1024;
@@ -76,8 +76,28 @@ impl From<&TextFile> for SaveFormat {
 pub enum WriteMode {
     /// Temporary file, then replace: readers never see half a file.
     Atomic,
-    /// The directory does not allow new files: the file itself was rewritten in place.
-    InPlace,
+    /// The file itself was rewritten in place (not atomic), for the given reason.
+    InPlace(InPlaceReason),
+}
+
+/// Why a save rewrote the file in place instead of swapping in a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InPlaceReason {
+    /// The directory does not allow new files (or the temporary name could not be cleared).
+    DirNotWritable,
+    /// A new file would have a different owner or group than the original, and only root may
+    /// change that; rewriting keeps them.
+    KeepOwner,
+}
+
+impl InPlaceReason {
+    /// The reason as the status line says it: 「已直接写回（目录不可写）」 / 「已直接写回（保留属主）」.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DirNotWritable => "目录不可写",
+            Self::KeepOwner => "保留属主",
+        }
+    }
 }
 
 /// What came of a save.
@@ -193,7 +213,8 @@ impl SftpSession {
     ) -> Result<SaveOutcome, SftpError> {
         let (target, current) = match self.resolve(path).await {
             Ok((target, entry)) => (target, Some(entry)),
-            Err(SftpError::NotFound { .. }) if expected.is_none() => (path.to_string(), None),
+            // Nothing there yet (or a link to nothing): create the file where the path leads.
+            Err(SftpError::NotFound { .. }) if expected.is_none() => (self.creation_target(path).await?, None),
             Err(err) => return Err(err),
         };
         if let Some(entry) = &current {
@@ -207,12 +228,15 @@ impl SftpSession {
             {
                 return Ok(self.conflict(&target, entry).await);
             }
+            // Swapping a new file in would bypass the file's own permissions: only save what we
+            // could write.
+            self.ensure_writable(&target).await?;
         }
 
         let bytes = encode_text(text, format);
         let temp = save_temp_path(&target);
-        match self.write_temp(&temp, &bytes, current.as_ref()).await {
-            Ok(()) => {
+        match self.write_temp(&temp, &bytes, current.as_ref()).await.map_err(|err| err.at(&target))? {
+            Temp::Ready => {
                 if let Err(err) = self.replace_file(&temp, &target).await {
                     let _ = self.remove_file(&temp).await;
                     return Err(err.at(&target));
@@ -221,17 +245,44 @@ impl SftpSession {
                 Ok(SaveOutcome::Saved { revision, mode: WriteMode::Atomic })
             }
             // No room for a temporary file next to the target: rewrite the target itself.
-            Err(SftpError::PermissionDenied { .. }) if current.is_some() => {
-                let _ = self.remove_file(&temp).await;
-                self.write_in_place(&target, &bytes).await?;
-                let revision = self.stat(&target).await?.revision();
-                Ok(SaveOutcome::Saved { revision, mode: WriteMode::InPlace })
+            Temp::DirNotWritable if current.is_some() => {
+                self.rewrite_in_place(&target, &bytes, InPlaceReason::DirNotWritable).await
             }
-            Err(err) => {
-                let _ = self.remove_file(&temp).await;
-                Err(err.at(&target))
+            Temp::DirNotWritable => Err(SftpError::PermissionDenied { path: target.clone() }),
+            // The new file would belong to somebody else: rewrite the original, which keeps its owner.
+            Temp::OwnerDiffers => self.rewrite_in_place(&target, &bytes, InPlaceReason::KeepOwner).await,
+        }
+    }
+
+    /// Where a file saved to `path` has to be created when nothing is there: `path` itself, unless
+    /// it is a (dangling) symlink, in which case the link must stay a link and the file goes where
+    /// it points. Follows the chain of links, each one relative to the directory of the previous.
+    async fn creation_target(&self, start: &str) -> Result<String, SftpError> {
+        let mut current = start.to_string();
+        for _ in 0..MAX_LINK_HOPS {
+            match self.lstat_plain(&current).await {
+                Ok(entry) if entry.kind == EntryKind::Symlink => {
+                    let target = self.read_link(&current).await?;
+                    let base = path::parent(&current).unwrap_or_else(|| "/".to_string());
+                    current = path::normalize(&path::join(&base, &target));
+                }
+                Ok(_) | Err(SftpError::NotFound { .. }) => return Ok(current),
+                Err(err) => return Err(err),
             }
         }
+        Err(SftpError::Failed { path: start.to_string(), message: "符号链接层数过多".into() })
+    }
+
+    /// Rewrites the file at `target` itself and reports the new revision.
+    async fn rewrite_in_place(
+        &self,
+        target: &str,
+        bytes: &[u8],
+        reason: InPlaceReason,
+    ) -> Result<SaveOutcome, SftpError> {
+        self.write_in_place(target, bytes).await?;
+        let revision = self.stat(target).await?.revision();
+        Ok(SaveOutcome::Saved { revision, mode: WriteMode::InPlace(reason) })
     }
 
     async fn conflict(&self, target: &str, entry: &Entry) -> SaveOutcome {
@@ -247,23 +298,51 @@ impl SftpSession {
     }
 
     /// Creates `temp` with `bytes`, carrying over the permissions and owner of `original`.
-    async fn write_temp(&self, temp: &str, bytes: &[u8], original: Option<&Entry>) -> Result<(), SftpError> {
+    ///
+    /// The file is created exclusively (see [`SftpSession::create_exclusive`]). Whatever is
+    /// reported other than [`Temp::Ready`] leaves no temporary file behind.
+    async fn write_temp(&self, temp: &str, bytes: &[u8], original: Option<&Entry>) -> Result<Temp, SftpError> {
         let mode = original.and_then(|entry| entry.mode);
         let create = FileAttributes { permissions: mode, ..FileAttributes::empty() };
-        let handle = self.open_handle(temp, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE, create).await?;
+        let handle = match self.create_exclusive(temp, create).await {
+            Ok(handle) => handle,
+            // We could not create it (nor clear the name): nothing of ours to clean up.
+            Err(SftpError::PermissionDenied { .. }) => return Ok(Temp::DirNotWritable),
+            Err(err) => return Err(err),
+        };
         let written = async {
             self.write_all(&handle, bytes, temp).await?;
+            // Changing the owner can drop setuid/setgid bits: do it before the final chmod.
+            if !self.owner_kept(&handle, original, temp).await? {
+                return Ok(Temp::OwnerDiffers);
+            }
             if let Some(mode) = mode {
                 // The server's umask applies to the mode given at creation: set it for real.
                 self.set_handle_mode(&handle, mode, temp).await?;
             }
-            self.try_set_handle_owner(&handle, original).await;
             self.sync_handle(&handle).await;
-            Ok(())
+            Ok(Temp::Ready)
         }
         .await;
         let closed = self.close_handle(&handle, temp).await;
-        written.and(closed)
+        match (written, closed) {
+            (Ok(Temp::Ready), Ok(())) => Ok(Temp::Ready),
+            (written, closed) => {
+                // The temporary file is ours and is not going to be used.
+                let _ = self.remove_file(temp).await;
+                written.and_then(|outcome| closed.map(|()| outcome))
+            }
+        }
+    }
+
+    /// Gives the new file the owner and group of `original` and checks that it worked. Only root
+    /// may chown, so for anybody else this holds exactly when the original is already theirs
+    /// (or in a group of theirs and owned by them).
+    async fn owner_kept(&self, handle: &str, original: Option<&Entry>, path: &str) -> Result<bool, SftpError> {
+        let Some(Entry { uid: Some(uid), gid: Some(gid), .. }) = original else { return Ok(true) };
+        self.try_set_handle_owner(handle, original).await;
+        let attrs = self.raw.fstat(handle).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
+        Ok(attrs.uid.is_none_or(|actual| actual == *uid) && attrs.gid.is_none_or(|actual| actual == *gid))
     }
 
     async fn write_in_place(&self, target: &str, bytes: &[u8]) -> Result<(), SftpError> {
@@ -272,6 +351,16 @@ impl SftpSession {
         let closed = self.close_handle(&handle, target).await;
         written.and(closed)
     }
+}
+
+/// How writing the temporary file of a save went.
+enum Temp {
+    /// Written, with the original's permissions and owner.
+    Ready,
+    /// It could not be created next to the target.
+    DirNotWritable,
+    /// It was written, but it would not have the original's owner: it has been removed.
+    OwnerDiffers,
 }
 
 #[cfg(test)]
@@ -327,6 +416,12 @@ mod tests {
         assert_eq!(decode_text(b"caf\xE9 latin-1"), Err(SftpError::NotUtf8));
         assert_eq!(decode_text(&[0xE4, 0xB8]), Err(SftpError::NotUtf8), "a Chinese character cut in half");
         assert!(decode_text("GBK 之外的 UTF-8 中文".as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn in_place_reasons_have_status_texts() {
+        assert_eq!(InPlaceReason::DirNotWritable.label(), "目录不可写");
+        assert_eq!(InPlaceReason::KeepOwner.label(), "保留属主");
     }
 
     #[test]

@@ -20,6 +20,8 @@ const CHUNK: usize = 32 * 1024;
 const WINDOW: usize = 8;
 /// Seconds a request may wait for its answer.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Links followed before giving up (a loop of links).
+pub(crate) const MAX_LINK_HOPS: usize = 16;
 /// Links resolved at the same time when listing a directory.
 const LINK_PARALLELISM: usize = 16;
 
@@ -113,9 +115,15 @@ impl SftpSession {
         Ok(entry)
     }
 
-    async fn lstat_plain(&self, path: &str) -> Result<Entry, SftpError> {
+    pub(crate) async fn lstat_plain(&self, path: &str) -> Result<Entry, SftpError> {
         let attrs = self.raw.lstat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         Ok(entry_at(path, "", &attrs))
+    }
+
+    /// The text of the symlink at `path`.
+    pub(crate) async fn read_link(&self, path: &str) -> Result<String, SftpError> {
+        let name = self.raw.readlink(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+        Ok(name.files.into_iter().next().map(|file| file.filename).unwrap_or_default())
     }
 
     /// Where the link at `path` points and what is there.
@@ -140,7 +148,7 @@ impl SftpSession {
         // Let the server resolve it; if it hands back another link (servers that only normalize
         // paths), follow the links ourselves.
         let mut target = self.canonicalize(path).await?;
-        for _ in 0..16 {
+        for _ in 0..MAX_LINK_HOPS {
             let entry = self.stat(&target).await?;
             let here = self.lstat_plain(&target).await?;
             if here.kind != EntryKind::Symlink {
@@ -333,6 +341,38 @@ impl SftpSession {
     }
 
     // ---- file contents -------------------------------------------------------------------------
+
+    /// Checks that we may write to the existing file at `path`, without changing it: opens it for
+    /// writing (no create, no truncate) and closes it again. Replacing a file by renaming another
+    /// over it needs no permission on the file itself, so anything that replaces files has to ask
+    /// this first, or it would write through a read-only file's back.
+    ///
+    /// Fails with [`SftpError::PermissionDenied`] if the server refuses.
+    pub async fn ensure_writable(&self, path: &str) -> Result<(), SftpError> {
+        let handle = self.open_handle(path, OpenFlags::WRITE, FileAttributes::empty()).await?;
+        self.close_handle(&handle, path).await
+    }
+
+    /// Creates a new file at `path` and opens it for writing. The name must not be in use: the
+    /// file is created exclusively, so an existing file is never truncated and a symlink planted
+    /// at the name is never followed (which would send our write to another file).
+    ///
+    /// If something is there, it is unlinked (unlinking does not follow links) and the creation
+    /// retried once. If that is refused (a sticky directory with someone else's file), the error is
+    /// [`SftpError::PermissionDenied`], as for a directory that does not allow new files.
+    pub(crate) async fn create_exclusive(&self, path: &str, attrs: FileAttributes) -> Result<String, SftpError> {
+        let flags = OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE;
+        let first = match self.open_handle(path, flags, attrs.clone()).await {
+            Ok(handle) => return Ok(handle),
+            Err(error) => error,
+        };
+        // SFTP v3 has no "already exists" status (OpenSSH says "failure"): look.
+        if !matches!(first, SftpError::Failed { .. }) || self.lstat_plain(path).await.is_err() {
+            return Err(first);
+        }
+        self.remove_file(path).await?;
+        self.open_handle(path, flags, attrs).await
+    }
 
     pub(crate) async fn open_handle(
         &self,

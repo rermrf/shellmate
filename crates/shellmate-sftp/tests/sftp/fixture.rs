@@ -48,6 +48,8 @@ pub struct SftpOptions {
     pub fail_rename_from: Option<&'static str>,
     /// Changing the owner of a file is refused (as for any user but root).
     pub deny_chown: bool,
+    /// Paths ending with this report the given uid and gid (a file somebody else owns).
+    pub fake_owner: Option<(&'static str, u32, u32)>,
     /// Entries per `readdir` reply.
     pub page: usize,
     /// The format of the `longname` of directory entries.
@@ -64,6 +66,7 @@ impl Default for SftpOptions {
             plain_rename_replaces: false,
             fail_rename_from: None,
             deny_chown: false,
+            fake_owner: None,
             page: 7,
             longnames: Longnames::Names,
             home: "/home/tester",
@@ -94,7 +97,8 @@ fn reply(error: std::io::Error) -> StatusReply {
         NotFound | NotADirectory => StatusCode::NoSuchFile.into(),
         PermissionDenied => StatusCode::PermissionDenied.into(),
         _ => match error.raw_os_error() {
-            Some(1) => StatusCode::PermissionDenied.into(),
+            Some(libc::EPERM) => StatusCode::PermissionDenied.into(),
+            Some(libc::ELOOP | libc::EBADF) => StatusCode::NoSuchFile.into(),
             _ => StatusCode::Failure.into(),
         },
     }
@@ -141,8 +145,19 @@ impl FsHandler {
         format!("/{}", relative.display())
     }
 
-    fn entry(&self, name: &str, metadata: &Metadata) -> SftpFile {
-        let attrs = attrs_of(metadata);
+    /// The attributes of the file at `path`, with the pretend owner if one is configured for it.
+    fn attrs(&self, path: &Path, metadata: &Metadata) -> FileAttributes {
+        let mut attrs = attrs_of(metadata);
+        if let Some((suffix, uid, gid)) = self.options.fake_owner
+            && path.to_string_lossy().ends_with(suffix)
+        {
+            (attrs.uid, attrs.gid) = (Some(uid), Some(gid));
+        }
+        attrs
+    }
+
+    fn entry(&self, path: &Path, name: &str, metadata: &Metadata) -> SftpFile {
+        let attrs = self.attrs(path, metadata);
         let longname = match self.options.longnames {
             Longnames::Names => {
                 format!("{} 1 tester staff {} Nov 12 08:55 {name}", mode_text(metadata.mode()), metadata.len())
@@ -258,18 +273,20 @@ impl Handler for FsHandler {
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let metadata = fs::symlink_metadata(self.host(&path)).map_err(reply)?;
-        Ok(Attrs { id, attrs: attrs_of(&metadata) })
+        let host = self.host(&path);
+        let metadata = fs::symlink_metadata(&host).map_err(reply)?;
+        Ok(Attrs { id, attrs: self.attrs(&host, &metadata) })
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let metadata = fs::metadata(self.host(&path)).map_err(reply)?;
-        Ok(Attrs { id, attrs: attrs_of(&metadata) })
+        let host = self.host(&path);
+        let metadata = fs::metadata(&host).map_err(reply)?;
+        Ok(Attrs { id, attrs: self.attrs(&host, &metadata) })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
-        let Some(Open::File { file, .. }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
-        Ok(Attrs { id, attrs: attrs_of(&file.metadata().map_err(reply)?) })
+        let Some(Open::File { file, path }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
+        Ok(Attrs { id, attrs: self.attrs(path, &file.metadata().map_err(reply)?) })
     }
 
     async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, Self::Error> {
@@ -287,12 +304,12 @@ impl Handler for FsHandler {
         let dir = self.host(&path);
         let mut entries = Vec::new();
         for name in [".", ".."] {
-            entries.push(self.entry(name, &fs::metadata(&dir).map_err(reply)?));
+            entries.push(self.entry(&dir, name, &fs::metadata(&dir).map_err(reply)?));
         }
         for item in fs::read_dir(&dir).map_err(reply)? {
             let item = item.map_err(reply)?;
             let metadata = fs::symlink_metadata(item.path()).map_err(reply)?;
-            entries.push(self.entry(&item.file_name().to_string_lossy(), &metadata));
+            entries.push(self.entry(&item.path(), &item.file_name().to_string_lossy(), &metadata));
         }
         let handle = self.new_handle(Open::Dir { entries, sent: 0 });
         Ok(Handle { id, handle })

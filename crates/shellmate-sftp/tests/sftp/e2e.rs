@@ -9,7 +9,9 @@
 use std::process::Command;
 
 use shellmate_core::AuthMethod;
-use shellmate_sftp::{EntryKind, LineEnding, SaveFormat, SaveOutcome, SftpError, SftpSession, WriteMode};
+use shellmate_sftp::{
+    EntryKind, InPlaceReason, LineEnding, SaveFormat, SaveOutcome, SftpError, SftpSession, WriteMode,
+};
 use shellmate_ssh::{Connection, Route, SshHost};
 
 use crate::support::Env;
@@ -28,6 +30,16 @@ fn docker(script: &str) -> String {
     let user = setting("SHELLMATE_E2E_USER", "tester");
     let output = Command::new("docker")
         .args(["exec", "-u", &user, &container(), "sh", "-c", script])
+        .output()
+        .expect("docker is installed");
+    assert!(output.status.success(), "docker exec failed: {script}\n{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Runs a shell snippet in the container as root (to set up files owned by somebody else).
+fn docker_root(script: &str) -> String {
+    let output = Command::new("docker")
+        .args(["exec", "-u", "root", &container(), "sh", "-c", script])
         .output()
         .expect("docker is installed");
     assert!(output.status.success(), "docker exec failed: {script}\n{}", String::from_utf8_lossy(&output.stderr));
@@ -55,6 +67,11 @@ impl Scratch {
     /// Runs a snippet with `$D` set to the scratch directory.
     fn sh(&self, script: &str) -> String {
         docker(&format!("D='{}'; {script}", self.path))
+    }
+
+    /// Like [`sh`](Self::sh), as root.
+    fn sh_root(&self, script: &str) -> String {
+        docker_root(&format!("D='{}'; {script}", self.path))
     }
 }
 
@@ -167,10 +184,9 @@ async fn e2e_saving_keeps_permissions_owner_and_line_endings() {
     assert_eq!(scratch.sh(r#"cat "$D/notes.txt""#), "one\r\ntwo\r\nthree 中文\r\n");
 
     // Several modes, including ones the server's umask would change on creation.
-    for mode in ["600", "664", "755", "400"] {
+    for mode in ["600", "664", "755"] {
         scratch.sh(&format!(r#"chmod {mode} "$D/notes.txt""#));
         let current = sftp.open_text(&file).await.unwrap();
-        // A 400 file is read-only for its owner, but the directory allows replacing it.
         sftp.save_text(&file, "x\n", SaveFormat::from(&current), Some(current.revision)).await.unwrap();
         assert_eq!(scratch.sh(r#"stat -c '%a' "$D/notes.txt""#).trim(), mode);
     }
@@ -210,7 +226,10 @@ async fn e2e_a_directory_that_does_not_allow_new_files_falls_back_to_in_place() 
     let inode_before = scratch.sh(r#"stat -c '%i' "$D/ro/file.txt""#);
     let opened = sftp.open_text(&file).await.unwrap();
     let outcome = sftp.save_text(&file, "rewritten in place\n", LF, Some(opened.revision)).await.unwrap();
-    assert!(matches!(outcome, SaveOutcome::Saved { mode: WriteMode::InPlace, .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, SaveOutcome::Saved { mode: WriteMode::InPlace(InPlaceReason::DirNotWritable), .. }),
+        "{outcome:?}"
+    );
     assert_eq!(scratch.sh(r#"cat "$D/ro/file.txt""#), "rewritten in place\n");
     assert_eq!(scratch.sh(r#"stat -c '%i' "$D/ro/file.txt""#), inode_before);
     assert_eq!(scratch.sh(r#"ls -A "$D/ro""#).trim(), "file.txt");
@@ -269,4 +288,71 @@ async fn e2e_directory_operations_work_on_a_real_server() {
     assert_eq!(scratch.sh(r#"stat -c '%a' "$D/renamed""#).trim(), "750");
     sftp.remove(&b).await.unwrap();
     assert_eq!(scratch.sh(r#"ls -A "$D""#).trim(), "other.txt");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_a_group_writable_file_of_somebody_else_keeps_its_owner() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    // A shared directory and file belonging to root, writable by the group tester is in.
+    let group = docker("id -gn").trim().to_string();
+    scratch.sh_root(&format!(
+        r#"mkdir "$D/shared"; chown root:{group} "$D/shared"; chmod 775 "$D/shared";
+           echo old > "$D/shared/file.txt"; chown root:{group} "$D/shared/file.txt"; chmod 664 "$D/shared/file.txt""#
+    ));
+    let file = scratch.at("shared/file.txt");
+    let inode = scratch.sh(r#"stat -c '%i' "$D/shared/file.txt""#);
+    let opened = sftp.open_text(&file).await.unwrap();
+    let outcome = sftp.save_text(&file, "edited by tester\n", LF, Some(opened.revision)).await.unwrap();
+    assert!(
+        matches!(outcome, SaveOutcome::Saved { mode: WriteMode::InPlace(InPlaceReason::KeepOwner), .. }),
+        "a new file would have been tester's: {outcome:?}"
+    );
+    assert_eq!(scratch.sh(r#"stat -c '%U:%G %a' "$D/shared/file.txt""#).trim(), format!("root:{group} 664"));
+    assert_eq!(scratch.sh(r#"cat "$D/shared/file.txt""#), "edited by tester\n");
+    assert_eq!(scratch.sh(r#"stat -c '%i' "$D/shared/file.txt""#), inode, "the same file");
+    assert_eq!(scratch.sh(r#"ls -A "$D/shared""#).trim(), "file.txt", "the unused temporary file is gone");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_a_read_only_file_in_a_writable_directory_is_not_replaced() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    scratch.sh(r#"echo "do not touch" > "$D/readonly.txt"; chmod 444 "$D/readonly.txt""#);
+    let file = scratch.at("readonly.txt");
+    let opened = sftp.open_text(&file).await.unwrap();
+    let error = sftp.save_text(&file, "overwritten\n", LF, Some(opened.revision)).await.unwrap_err();
+    assert_eq!(error, SftpError::PermissionDenied { path: file.clone() });
+    assert_eq!(
+        scratch.sh(r#"cat "$D/readonly.txt"; stat -c '%a' "$D/readonly.txt"; ls -A "$D""#),
+        "do not touch\n444\nreadonly.txt\n"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_a_symlink_planted_at_the_temporary_name_is_not_followed() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    scratch.sh(r#"echo mine > "$D/doc.txt"; echo "victim content" > "$D/victim.txt"; ln -s victim.txt "$D/.doc.txt.shellmate-edit""#);
+    let outcome = sftp.save_text(&scratch.at("doc.txt"), "saved\n", LF, None).await.unwrap();
+    assert!(matches!(outcome, SaveOutcome::Saved { mode: WriteMode::Atomic, .. }), "{outcome:?}");
+    assert_eq!(scratch.sh(r#"cat "$D/doc.txt" "$D/victim.txt""#), "saved\nvictim content\n");
+    assert_eq!(scratch.sh(r#"ls -A "$D""#), "doc.txt\nvictim.txt\n");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_overwriting_through_a_dangling_link_keeps_the_link() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    scratch.sh(r#"mkdir "$D/links" "$D/targets"; ln -s ../targets/new.txt "$D/links/hop"; ln -s links/hop "$D/entry""#);
+    let outcome = sftp.save_text(&scratch.at("entry"), "created\n", LF, None).await.unwrap();
+    assert!(matches!(outcome, SaveOutcome::Saved { mode: WriteMode::Atomic, .. }), "{outcome:?}");
+    assert_eq!(
+        scratch.sh(r#"readlink "$D/entry"; readlink "$D/links/hop"; cat "$D/targets/new.txt""#),
+        "links/hop\n../targets/new.txt\ncreated\n"
+    );
 }
