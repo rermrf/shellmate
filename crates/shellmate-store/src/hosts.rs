@@ -49,6 +49,13 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX host_jumps_by_jump ON host_jumps(jump_id);
     ",
+    // v2: small preferences of the app itself (whether the sidebar is collapsed, …), by name.
+    "
+    CREATE TABLE settings (
+        key    TEXT PRIMARY KEY NOT NULL,
+        value  TEXT NOT NULL
+    );
+    ",
 ];
 
 /// The host library.
@@ -85,6 +92,23 @@ impl HostStore {
     /// The schema version of the open database.
     pub fn schema_version(&self) -> Result<i64> {
         user_version(&self.conn)
+    }
+
+    // ---- settings --------------------------------------------------------
+
+    /// The value saved under `key`, if any.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0)).optional()?)
+    }
+
+    /// Saves `value` under `key`, replacing what was there.
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 
     // ---- groups ----------------------------------------------------------
@@ -548,7 +572,7 @@ mod tests {
     fn fresh_database_gets_every_migration() {
         let store = HostStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        for table in ["groups", "hosts", "host_tags", "host_jumps"] {
+        for table in ["groups", "hosts", "host_tags", "host_jumps", "settings"] {
             let exists: bool = store
                 .conn
                 .query_row(
@@ -559,6 +583,50 @@ mod tests {
                 .unwrap();
             assert!(exists, "table {table}");
         }
+    }
+
+    #[test]
+    fn a_v1_library_is_upgraded_keeping_its_hosts_and_gets_the_settings_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, &MIGRATIONS[..1]).unwrap();
+        assert_eq!(version(&conn), 1);
+        conn.execute(
+            "INSERT INTO hosts (id, name, addr, port, protocol, auth) VALUES ('h1', 'prod', '10.0.0.1', 22, 'ssh', 'agent')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn, MIGRATIONS).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+        let hosts: i64 = conn.query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0)).unwrap();
+        assert_eq!(hosts, 1, "the library of the old version is untouched");
+        conn.execute("INSERT INTO settings (key, value) VALUES ('k', 'v')", []).unwrap();
+        // Opening the upgraded file again changes nothing.
+        migrate(&mut conn, MIGRATIONS).unwrap();
+        let kept: String = conn.query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "v");
+    }
+
+    #[test]
+    fn settings_are_kept_by_name_and_replaced_on_save() {
+        let mut store = HostStore::open_in_memory().unwrap();
+        assert_eq!(store.setting("sidebar_collapsed").unwrap(), None, "nothing saved yet");
+        store.set_setting("sidebar_collapsed", "1").unwrap();
+        assert_eq!(store.setting("sidebar_collapsed").unwrap().as_deref(), Some("1"));
+        store.set_setting("sidebar_collapsed", "0").unwrap();
+        store.set_setting("other", "x").unwrap();
+        assert_eq!(store.setting("sidebar_collapsed").unwrap().as_deref(), Some("0"), "replaced, not added");
+        assert_eq!(store.setting("other").unwrap().as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn settings_survive_reopening_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shellmate.db");
+        HostStore::open(&path).unwrap().set_setting("sidebar_collapsed", "1").unwrap();
+        let reopened = HostStore::open(&path).unwrap();
+        assert_eq!(reopened.setting("sidebar_collapsed").unwrap().as_deref(), Some("1"));
     }
 
     #[test]
@@ -592,7 +660,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", 5).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 5, supported: 1 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v5），当前 Shellmate 只支持到 v1，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 5, supported: 2 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v5），当前 Shellmate 只支持到 v2，请升级后再试");
     }
 }

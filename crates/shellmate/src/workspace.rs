@@ -16,7 +16,7 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent,
     MouseButton, MouseUpEvent, SharedString, Subscription, Window, actions, div, px,
 };
-use shellmate_core::HostBook;
+use shellmate_core::{HostBook, HostId};
 use shellmate_store::{HostStore, KeychainStore, SecretStore};
 use shellmate_term::colors::to_hsla;
 use shellmate_term::view::ToggleSearch;
@@ -24,7 +24,7 @@ use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
 
 use crate::connect;
 use crate::editor::view::FileEditor;
-use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
+use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
@@ -49,6 +49,9 @@ actions!(
 );
 
 const CONTEXT: &str = "Workspace";
+
+/// The setting that remembers the sidebar collapsed to its rail (`1`) across restarts.
+const SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -159,7 +162,16 @@ impl Workspace {
     /// `store` is a temporary in-memory fallback.
     pub fn new(store: HostStore, store_notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let book = Rc::new(HostBook::default());
+        // The sidebar comes back the way it was left.
+        let collapsed = match store.setting(SIDEBAR_COLLAPSED) {
+            Ok(value) => value.as_deref() == Some("1"),
+            Err(err) => {
+                log::warn!("could not read the sidebar setting: {err}");
+                false
+            }
+        };
         let sidebar = cx.new(|cx| Sidebar::new(book.clone(), window, cx));
+        sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(collapsed, cx));
         let subscriptions = vec![cx.subscribe_in(&sidebar, window, Self::on_sidebar_event)];
         let mut this = Self {
             store: Rc::new(RefCell::new(store)),
@@ -169,7 +181,7 @@ impl Workspace {
             sessions: Vec::new(),
             groups: Vec::new(),
             active: None,
-            sidebar_open: true,
+            sidebar_open: !collapsed,
             next_id: 1,
             next_group: 1,
             user_host: user_at_host().into(),
@@ -184,6 +196,30 @@ impl Workspace {
         this.reload_book(window, cx);
         this.open_local(window, cx);
         this
+    }
+
+    /// Debug review hook: one step of a rail scenario (see `demo::run`, `rail:`).
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_rail_step(&mut self, step: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match step {
+            "collapse" => self.set_sidebar_open(false, cx),
+            "expand" => self.set_sidebar_open(true, cx),
+            "search" => self.focus_host_search(&FocusHostSearch, window, cx),
+            "local" => self.focus_or_open_local(window, cx),
+            other if other.starts_with("log:") => {
+                // The size every terminal has just now (the status bar of a tab shows the same).
+                let sizes: Vec<String> = self
+                    .sessions
+                    .iter()
+                    .map(|s| {
+                        let size = s.terminal.read(cx).size();
+                        format!("{}={}×{}", s.title, size.cols, size.rows)
+                    })
+                    .collect();
+                log::info!("终端尺寸 [{}] {}", &other[4..], sizes.join(" "));
+            }
+            other => log::warn!("unknown rail step {other:?}"),
+        }
     }
 
     /// Re-reads hosts and groups from the store into the sidebar.
@@ -212,6 +248,8 @@ impl Workspace {
             SidebarEvent::OpenLocal => self.focus_or_open_local(window, cx),
             SidebarEvent::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             SidebarEvent::Connect(id) => self.connect_host(id, window, cx),
+            SidebarEvent::ActivateHost(id) => self.activate_host(id, window, cx),
+            SidebarEvent::SearchHosts => self.focus_host_search(&FocusHostSearch, window, cx),
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::EditHost(id) => self.edit_host(id, false, window, cx),
             SidebarEvent::DuplicateHost(id) => self.edit_host(id, true, window, cx),
@@ -289,8 +327,10 @@ impl Workspace {
         })
     }
 
+    /// 本机终端 in the sidebar or on the rail: the local tab comes to the front (the first one, if there
+    /// are several), or one is opened when there is none.
     fn focus_or_open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active.or((!self.sessions.is_empty()).then_some(0)) {
+        match self.sessions.iter().position(|s| matches!(s.kind, SessionKind::Local)) {
             Some(ix) => self.activate(ix, window, cx),
             None => self.open_local(window, cx),
         }
@@ -344,7 +384,24 @@ impl Workspace {
                 }
             }
         }
-        self.sidebar.update(cx, |s, cx| s.set_sessions(count, live, summary.into(), cx));
+        let local_alive = self.sessions.iter().any(|s| matches!(s.kind, SessionKind::Local) && !s.exited);
+        let active = match self.active.and_then(|ix| self.sessions.get(ix)) {
+            None => Active::None,
+            Some(session) => session.ssh().map_or(Active::Local, |ssh| Active::Host(ssh.host.id.to_string())),
+        };
+        self.sidebar.update(cx, |s, cx| {
+            s.set_sessions(count, live, summary.into(), cx);
+            s.set_rail_state(local_alive, active, cx);
+        });
+    }
+
+    /// A click on a host of the rail: its tab comes to the front; with no tab the host is just selected.
+    fn activate_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
+        match ssh::existing_session(tabs, id) {
+            ssh::Existing::Switch(ix) | ssh::Existing::Reconnect(ix) => self.activate(ix, window, cx),
+            ssh::Existing::None => self.sidebar.update(cx, |s, cx| s.select(Some(id.to_string()), cx)),
+        }
     }
 
     // ---- actions -------------------------------------------------------
@@ -376,16 +433,28 @@ impl Workspace {
         }
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_open = !self.sidebar_open;
+    /// Shows the whole sidebar or only its rail, and remembers which.
+    fn set_sidebar_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.sidebar_open == open {
+            return;
+        }
+        self.sidebar_open = open;
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(!open, cx));
+        if let Err(err) = self.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
+            log::warn!("could not save the sidebar setting: {err}");
+        }
         cx.notify();
     }
 
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_sidebar_open(!self.sidebar_open, cx);
+    }
+
     fn focus_host_search(&mut self, _: &FocusHostSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_open = true;
+        self.set_sidebar_open(true, cx);
+        // From the rail the search field does not exist yet: it gets the cursor once the sidebar is open.
         let sidebar = self.sidebar.clone();
-        sidebar.update(cx, |s, cx| s.focus_search(window, cx));
-        cx.notify();
+        window.defer(cx, move |window, cx| sidebar.update(cx, |s, cx| s.focus_search(window, cx)));
     }
 
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
@@ -731,7 +800,7 @@ impl Render for Workspace {
             .flex()
             .bg(p.win)
             .text_color(p.tx)
-            .when(self.sidebar_open, |d| d.child(self.sidebar.clone()))
+            .child(self.sidebar.clone())
             .child(
                 div()
                     .flex_1()
@@ -741,7 +810,8 @@ impl Render for Workspace {
                     .flex_col()
                     .pr(px(12.))
                     .pb(px(12.))
-                    .pl(px(if self.sidebar_open { 8. } else { 86. }))
+                    // Beside the sidebar there is a gap; beside the rail the tabs start right after it.
+                    .pl(px(if self.sidebar_open { 8. } else { 0. }))
                     .child(self.render_tab_bar(cx))
                     .child(self.render_header(cx))
                     .child(content),

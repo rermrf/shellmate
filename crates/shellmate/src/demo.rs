@@ -83,6 +83,41 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `rail:<host>:<scenario>` connects the host and plays a scenario on the sidebar (`collapsed`,
+    // `collapsed-local`, `search`, `reflow`; anything else leaves it as the saved setting has it). `reflow` logs the size
+    // of every terminal before and after the sidebar is collapsed and opened again.
+    if let Some(args) = name.strip_prefix("rail:") {
+        let (host, scenario) = args.split_once(':').unwrap_or((args, ""));
+        // `-` as the host: only the local tab.
+        if host != "-" {
+            workspace.update(cx, |workspace, cx| workspace.connect_by_name(host, window, cx));
+        }
+        let steps: &[(u64, &str)] = match scenario {
+            "collapsed" => &[(500, "collapse")],
+            "collapsed-local" => &[(500, "collapse"), (3500, "local")],
+            "search" => &[(500, "collapse"), (3500, "search")],
+            "reflow" => &[
+                (3500, "log:sidebar open"),
+                (3800, "collapse"),
+                (5500, "log:rail"),
+                (5800, "expand"),
+                (7500, "log:sidebar open again"),
+            ],
+            _ => &[],
+        };
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let mut last = 0;
+                for &(at_ms, step) in steps {
+                    cx.background_executor().timer(std::time::Duration::from_millis(at_ms - last)).await;
+                    last = at_ms;
+                    workspace.update_in(cx, |workspace, window, cx| workspace.demo_rail_step(step, window, cx)).ok();
+                }
+            })
+            .detach();
+        return;
+    }
     // `editor:<host>:<path>:<scenario>` opens the file in the built-in editor and plays the scenario
     // (`clean`, `modified`, `saved`, `conflict[-load|-overwrite|-third]`, `unsaved[-save|-discard]`, `refusal`, `perf`) by calling the editor,
     // not by typing: the review script changes the file on the server between the steps of `conflict`.

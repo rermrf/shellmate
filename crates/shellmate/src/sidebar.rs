@@ -1,4 +1,7 @@
-//! Left column: host search, filter, grouped host list, local terminal entry.
+//! Left column: host search, filter, grouped host list, local terminal entry; or, collapsed, the
+//! narrow rail of the same things ([`rail`]).
+
+mod rail;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -20,6 +23,9 @@ use crate::theme::{ActivePalette, Palette};
 use crate::ui::{card_shadow, dot, item_shadow, kbd, segmented, window_drag_area, SegmentItem};
 
 pub const SIDEBAR_WIDTH: f32 = 272.;
+
+/// What the sidebar and the rail say about the connection state of the footer: no sync yet.
+pub const SYNC_STATUS: &str = "本地配置 · 未开启同步";
 
 actions!(sidebar, [ConnectSelected]);
 
@@ -50,9 +56,24 @@ impl LiveStatus {
     }
 }
 
+/// The tab on screen, as far as the sidebar and the rail are concerned.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Active {
+    #[default]
+    None,
+    /// A local terminal.
+    Local,
+    /// A tab of this saved host.
+    Host(String),
+}
+
 pub enum SidebarEvent {
     OpenLocal,
     Connect(HostId),
+    /// A click on a host of the rail that has a tab: show it.
+    ActivateHost(HostId),
+    /// 搜索主机 on the rail: show the sidebar and put the cursor in its search field.
+    SearchHosts,
     ToggleSidebar,
     /// Open the editor for a new host.
     NewHost,
@@ -75,6 +96,11 @@ pub struct Sidebar {
     live: HashMap<String, LiveStatus>,
     session_count: usize,
     local_summary: SharedString,
+    /// Collapsed to the rail.
+    rail: bool,
+    /// A local terminal is running.
+    local_alive: bool,
+    active: Active,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -99,6 +125,9 @@ impl Sidebar {
             live: HashMap::new(),
             session_count: 0,
             local_summary: "zsh · ~".into(),
+            rail: false,
+            local_alive: false,
+            active: Active::None,
             _subscriptions: subscriptions,
         }
     }
@@ -131,6 +160,21 @@ impl Sidebar {
         self.session_count = count;
         self.live = live;
         self.local_summary = local_summary;
+        cx.notify();
+    }
+
+    /// Shows the sidebar (`false`) or only its rail (`true`).
+    pub fn set_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.rail != collapsed {
+            self.rail = collapsed;
+            cx.notify();
+        }
+    }
+
+    /// What the rail shows besides the hosts: whether a local terminal is running and which tab is on screen.
+    pub fn set_rail_state(&mut self, local_alive: bool, active: Active, cx: &mut Context<Self>) {
+        self.local_alive = local_alive;
+        self.active = active;
         cx.notify();
     }
 
@@ -316,7 +360,6 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.selected.as_deref() == Some(host.id.as_str());
-        let (tone_bg, tone_fg) = p.tone(tone);
         let live = self.live.get(host.id.as_str()).copied();
         let sub = match (self.filter, host.last_connected_at) {
             (HostFilter::Recent, Some(at)) => {
@@ -326,35 +369,7 @@ impl Sidebar {
         };
         let id = host.id.clone();
 
-        let avatar = div()
-            .relative()
-            .size(px(32.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(9.))
-            .bg(tone_bg)
-            .text_color(tone_fg)
-            .text_size(px(11.))
-            .font_weight(FontWeight::BOLD)
-            .child(host.monogram())
-            .children(live.map(|status| {
-                let color = match status {
-                    LiveStatus::Ok => p.ok,
-                    LiveStatus::Connecting => p.warn,
-                    LiveStatus::Failed => p.err,
-                };
-                div()
-                    .absolute()
-                    .right(px(-2.))
-                    .bottom(px(-2.))
-                    .size(px(10.))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(p.win)
-                    .bg(color)
-            }));
+        let avatar = host_avatar(host, tone, live, Avatar { size: 32., radius: 9., dot: 10. }, p);
 
         let name_line = div()
             .flex()
@@ -528,7 +543,7 @@ impl Sidebar {
             .bg(p.card)
             .shadow(card_shadow(&p))
             .child(dot(p.tx3, 7.))
-            .child(div().flex_1().text_size(px(12.)).text_color(p.tx2).child("本地配置 · 未开启同步"))
+            .child(div().flex_1().text_size(px(12.)).text_color(p.tx2).child(SYNC_STATUS))
             .child(
                 div()
                     .id("settings")
@@ -544,8 +559,60 @@ impl Sidebar {
     }
 }
 
+/// The measures of a host's avatar: the list's and the rail's differ a little.
+#[derive(Clone, Copy)]
+pub(crate) struct Avatar {
+    pub size: f32,
+    pub radius: f32,
+    /// The status dot's diameter.
+    pub dot: f32,
+}
+
+/// The tinted square with the host's initials and, when it has a tab, the dot that says how that tab is.
+pub(crate) fn host_avatar(
+    host: &Host,
+    tone: shellmate_core::GroupTone,
+    live: Option<LiveStatus>,
+    avatar: Avatar,
+    p: &Palette,
+) -> gpui::Div {
+    let (tone_bg, tone_fg) = p.tone(tone);
+    div()
+        .relative()
+        .size(px(avatar.size))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(avatar.radius))
+        .bg(tone_bg)
+        .text_color(tone_fg)
+        .text_size(px(11.))
+        .font_weight(FontWeight::BOLD)
+        .child(host.monogram())
+        .children(live.map(|status| {
+            let color = match status {
+                LiveStatus::Ok => p.ok,
+                LiveStatus::Connecting => p.warn,
+                LiveStatus::Failed => p.err,
+            };
+            div()
+                .absolute()
+                .right(px(-2.))
+                .bottom(px(-2.))
+                .size(px(avatar.dot))
+                .rounded_full()
+                .border_2()
+                .border_color(p.win)
+                .bg(color)
+        }))
+}
+
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.rail {
+            return self.render_rail(cx).into_any_element();
+        }
         let query = self.search.read(cx).value();
         let book = self.book.clone();
         let sections = sections(&book, self.filter, &query);
@@ -593,5 +660,6 @@ impl Render for Sidebar {
                     .children(list),
             )
             .child(self.render_footer(cx))
+            .into_any_element()
     }
 }

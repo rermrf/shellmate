@@ -19,3 +19,6 @@ log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
 similar.workspace = true
+
+[dev-dependencies]
+shellmate-core = { workspace = true, features = ["test-support"] }
