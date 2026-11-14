@@ -67,15 +67,7 @@ async fn entries_carry_type_size_time_permissions_and_owner() {
     assert_eq!(notes.modified, Some(host_meta.mtime()));
     assert_eq!((notes.uid, notes.gid), (Some(host_meta.uid()), Some(host_meta.gid())));
     let sub = entries.iter().find(|e| e.name == "sub").unwrap();
-    assert_eq!((sub.kind, sub.mode), (EntryKind::Dir, Some(0o777 & !current_umask())));
-}
-
-fn current_umask() -> u32 {
-    // The test process's umask shows in the mode of a directory it makes.
-    let dir = tempfile::tempdir().unwrap();
-    let probe = dir.path().join("probe");
-    std::fs::create_dir(&probe).unwrap();
-    0o777 & !std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&probe).unwrap().permissions()) & 0o777
+    assert_eq!((sub.kind, sub.mode), (EntryKind::Dir, Some(0o777 & !crate::fixture::umask())));
 }
 
 #[tokio::test]

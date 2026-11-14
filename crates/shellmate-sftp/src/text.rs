@@ -6,7 +6,7 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use crate::entry::{Entry, EntryKind, Revision};
 use crate::error::SftpError;
 use crate::path;
-use crate::session::{MAX_LINK_HOPS, SftpSession};
+use crate::session::SftpSession;
 
 /// The biggest file the editor opens.
 pub const MAX_TEXT_SIZE: u64 = 5 * 1024 * 1024;
@@ -214,7 +214,7 @@ impl SftpSession {
         let (target, current) = match self.resolve(path).await {
             Ok((target, entry)) => (target, Some(entry)),
             // Nothing there yet (or a link to nothing): create the file where the path leads.
-            Err(SftpError::NotFound { .. }) if expected.is_none() => (self.creation_target(path).await?, None),
+            Err(SftpError::NotFound { .. }) if expected.is_none() => self.resolve_for_write(path).await?,
             Err(err) => return Err(err),
         };
         if let Some(entry) = &current {
@@ -252,25 +252,6 @@ impl SftpSession {
             // The new file would belong to somebody else: rewrite the original, which keeps its owner.
             Temp::OwnerDiffers => self.rewrite_in_place(&target, &bytes, InPlaceReason::KeepOwner).await,
         }
-    }
-
-    /// Where a file saved to `path` has to be created when nothing is there: `path` itself, unless
-    /// it is a (dangling) symlink, in which case the link must stay a link and the file goes where
-    /// it points. Follows the chain of links, each one relative to the directory of the previous.
-    async fn creation_target(&self, start: &str) -> Result<String, SftpError> {
-        let mut current = start.to_string();
-        for _ in 0..MAX_LINK_HOPS {
-            match self.lstat_plain(&current).await {
-                Ok(entry) if entry.kind == EntryKind::Symlink => {
-                    let target = self.read_link(&current).await?;
-                    let base = path::parent(&current).unwrap_or_else(|| "/".to_string());
-                    current = path::normalize(&path::join(&base, &target));
-                }
-                Ok(_) | Err(SftpError::NotFound { .. }) => return Ok(current),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(SftpError::Failed { path: start.to_string(), message: "符号链接层数过多".into() })
     }
 
     /// Rewrites the file at `target` itself and reports the new revision.

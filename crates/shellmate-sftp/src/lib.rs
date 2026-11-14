@@ -12,10 +12,11 @@ mod error;
 pub mod path;
 mod session;
 mod text;
+pub mod transfer;
 
 pub use entry::{Entry, EntryKind, Link, Revision, natural_cmp, sort_entries};
 pub use error::SftpError;
-pub use session::{POSIX_RENAME, ServerInfo, SftpSession};
+pub use session::{POSIX_RENAME, ServerInfo, ServerLimits, SftpSession};
 pub use shellmate_ssh::Connection;
 pub use text::{
     InPlaceReason, LineEnding, MAX_TEXT_SIZE, SaveFormat, SaveOutcome, TextFile, WriteMode, decode_text,

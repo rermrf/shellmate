@@ -11,3 +11,4 @@ mod e2e;
 mod lifecycle;
 mod ops;
 mod text;
+mod transfer;

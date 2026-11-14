@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::fs::{self, Metadata, OpenOptions};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh_sftp::protocol::{
-    Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
+    Attrs, Data, ExtendedReply, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode,
+    Version,
 };
 use russh_sftp::server::{Handler, StatusReply};
 use shellmate_core::AuthMethod;
@@ -54,6 +56,14 @@ pub struct SftpOptions {
     pub page: usize,
     /// The format of the `longname` of directory entries.
     pub longnames: Longnames,
+    /// Every read request waits this long (a slow server, so that transfers can be interrupted).
+    pub read_delay: Duration,
+    /// Every write request waits this long.
+    pub write_delay: Duration,
+    /// Advertise `limits@openssh.com` with (max packet, max read, max write).
+    pub limits: Option<(u64, u64, u64)>,
+    /// Answer reads with at most this many bytes (short reads are allowed by the protocol).
+    pub max_read: Option<u32>,
     /// Where `realpath(".")` leads, relative to the root.
     pub home: &'static str,
 }
@@ -69,6 +79,10 @@ impl Default for SftpOptions {
             fake_owner: None,
             page: 7,
             longnames: Longnames::Names,
+            read_delay: Duration::ZERO,
+            write_delay: Duration::ZERO,
+            limits: None,
+            max_read: None,
             home: "/home/tester",
         }
     }
@@ -79,11 +93,21 @@ enum Open {
     Dir { entries: Vec<SftpFile>, sent: usize },
 }
 
+/// What the server was asked to move, in order: (path of the file on the host, offset, length).
+pub type RequestLog = Arc<Mutex<Vec<(PathBuf, u64, usize)>>>;
+
+#[derive(Clone, Default)]
+pub struct Logs {
+    pub reads: RequestLog,
+    pub writes: RequestLog,
+}
+
 struct FsHandler {
     root: PathBuf,
     options: SftpOptions,
     handles: HashMap<String, Open>,
     next: u64,
+    logs: Logs,
 }
 
 fn status(id: u32) -> Status {
@@ -128,8 +152,8 @@ fn mode_text(mode: u32) -> String {
 }
 
 impl FsHandler {
-    fn new(root: PathBuf, options: SftpOptions) -> Self {
-        Self { root, options, handles: HashMap::new(), next: 0 }
+    fn new(root: PathBuf, options: SftpOptions, logs: Logs) -> Self {
+        Self { root, options, handles: HashMap::new(), next: 0, logs }
     }
 
     /// The path on the host for a path asked for by the client; `..` cannot climb out of the root.
@@ -230,6 +254,9 @@ impl Handler for FsHandler {
         if self.options.posix_rename {
             version.extensions.insert("posix-rename@openssh.com".into(), "1".into());
         }
+        if self.options.limits.is_some() {
+            version.extensions.insert("limits@openssh.com".into(), "1".into());
+        }
         Ok(version)
     }
 
@@ -256,9 +283,12 @@ impl Handler for FsHandler {
     }
 
     async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
-        let Some(Open::File { file, .. }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
+        tokio::time::sleep(self.options.read_delay).await;
+        let Some(Open::File { file, path }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
+        let len = self.options.max_read.map_or(len, |max| len.min(max));
         let mut buf = vec![0; len as usize];
         let got = file.read_at(&mut buf, offset).map_err(reply)?;
+        self.logs.reads.lock().unwrap().push((path.clone(), offset, got));
         if got == 0 && len > 0 {
             return Err(StatusCode::Eof.into());
         }
@@ -267,8 +297,10 @@ impl Handler for FsHandler {
     }
 
     async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
-        let Some(Open::File { file, .. }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
+        tokio::time::sleep(self.options.write_delay).await;
+        let Some(Open::File { file, path }) = self.handles.get(&handle) else { return Err(StatusCode::Failure.into()) };
         file.write_all_at(&data, offset).map_err(reply)?;
+        self.logs.writes.lock().unwrap().push((path.clone(), offset, data.len()));
         Ok(status(id))
     }
 
@@ -387,6 +419,14 @@ impl Handler for FsHandler {
                 self.rename_to(&from, &to, true)?;
                 Ok(Packet::Status(status(id)))
             }
+            "limits@openssh.com" if self.options.limits.is_some() => {
+                let (packet, read, write) = self.options.limits.unwrap_or_default();
+                let mut data = Vec::new();
+                for value in [packet, read, write, 0] {
+                    data.extend_from_slice(&value.to_be_bytes());
+                }
+                Ok(Packet::ExtendedReply(ExtendedReply { id, data }))
+            }
             "fsync@openssh.com" => {
                 let handle = String::from_utf8_lossy(data.get(4..).unwrap_or_default()).into_owned();
                 match self.handles.get(&handle) {
@@ -401,11 +441,32 @@ impl Handler for FsHandler {
 }
 
 /// The `sftp` subsystem over `root`.
-pub fn runner(root: PathBuf, options: SftpOptions) -> SubsystemRunner {
+pub fn runner(root: PathBuf, options: SftpOptions, logs: Logs) -> SubsystemRunner {
     Arc::new(move |stream| {
-        let handler = FsHandler::new(root.clone(), options.clone());
+        let handler = FsHandler::new(root.clone(), options.clone(), logs.clone());
         tokio::spawn(russh_sftp::server::run(stream, handler));
     })
+}
+
+/// Reproducible bytes that do not repeat on the scale of a chunk.
+pub fn pattern(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// The test process's umask (the mode of what the server creates shows it).
+pub fn umask() -> u32 {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    std::fs::create_dir(&probe).unwrap();
+    0o777 & !std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&probe).unwrap().permissions()) & 0o777
 }
 
 /// A running server, a connection to it and an SFTP session, with the directory the server serves.
@@ -415,6 +476,8 @@ pub struct Fixture {
     pub server: TestServer,
     /// The server's root on the host (canonical).
     pub root: PathBuf,
+    /// What the server was asked to read and write.
+    pub logs: Logs,
     _env: Env,
     _dir: tempfile::TempDir,
 }
@@ -424,8 +487,9 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(options.home.trim_start_matches('/'))).unwrap();
+        let logs = Logs::default();
         let server = TestServer::start(ServerOptions {
-            subsystems: vec![("sftp", runner(root.clone(), options))],
+            subsystems: vec![("sftp", runner(root.clone(), options, logs.clone()))],
             ..Default::default()
         })
         .await;
@@ -434,7 +498,15 @@ impl Fixture {
             SshHost::new("127.0.0.1", server.port, "alice", AuthMethod::Password).with_password(Secret::new("secret"));
         let connection = Connection::connect(Route::direct(host), env.trusting()).await.expect("connect");
         let session = SftpSession::open(&connection).await.expect("sftp session");
-        Self { session, connection, server, root, _env: env, _dir: dir }
+        Self { session, connection, server, root, logs, _env: env, _dir: dir }
+    }
+
+    /// A fresh connection and SFTP session to the same server: what a reconnect makes.
+    pub async fn new_session(&self) -> SftpSession {
+        let host = SshHost::new("127.0.0.1", self.server.port, "alice", AuthMethod::Password)
+            .with_password(Secret::new("secret"));
+        let connection = Connection::connect(Route::direct(host), self._env.trusting()).await.expect("reconnect");
+        SftpSession::open(&connection).await.expect("sftp session")
     }
 
     pub async fn default() -> Self {

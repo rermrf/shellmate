@@ -362,3 +362,258 @@ async fn e2e_overwriting_through_a_dangling_link_keeps_the_link() {
         "links/hop\n../targets/new.txt\ncreated\n"
     );
 }
+
+// ---- transfers ------------------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use shellmate_core::{PtyDims, TerminalBackend};
+use shellmate_sftp::transfer::{PauseReason, TransferQueue, TransferState, TransferView};
+
+use crate::fixture::pattern;
+use crate::support::Recorder;
+
+/// `sha256` of a file on this machine.
+fn local_sha256(path: &Path) -> String {
+    let output = Command::new("shasum").args(["-a", "256"]).arg(path).output().expect("shasum is installed");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).split_whitespace().next().unwrap_or_default().to_string()
+}
+
+/// `sha256` of a file in the container.
+fn remote_sha256(scratch: &Scratch, remote: &str) -> String {
+    scratch.sh(&format!("sha256sum '{remote}'")).split_whitespace().next().unwrap_or_default().to_string()
+}
+
+/// Writes `megabytes` MiB of reproducible data.
+fn big_file(dir: &Path, name: &str, megabytes: usize, seed: u64) -> PathBuf {
+    let path = dir.join(name);
+    let mut data = Vec::with_capacity(megabytes << 20);
+    for part in 0..megabytes as u64 {
+        data.extend(pattern(1 << 20, seed * 1000 + part));
+    }
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
+async fn wait_for(
+    queue: &TransferQueue,
+    id: shellmate_sftp::transfer::ItemId,
+    what: &str,
+    check: impl Fn(&TransferView) -> bool,
+) -> TransferView {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let view = queue.view(id).expect("the item exists");
+        if check(&view) {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}: {:?}", view.state);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn megabytes_per_second(bytes: u64, took: Duration) -> f64 {
+    bytes as f64 / (1 << 20) as f64 / took.as_secs_f64()
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_a_50_mb_file_goes_up_and_down_with_matching_checksums() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    let local = tempfile::tempdir().unwrap();
+    let downloads = local.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let big = big_file(local.path(), "big.bin", 50, 1);
+    let expected = local_sha256(&big);
+
+    let (queue, _events) = TransferQueue::new(tokio::runtime::Handle::current());
+    queue.set_session(Some(Arc::new(sftp)));
+
+    let began = Instant::now();
+    let id = queue.enqueue_upload(vec![big.clone()], &scratch.path);
+    let view = wait_for(&queue, id, "the upload", |v| v.state.is_finished()).await;
+    let up = megabytes_per_second(view.bytes_total, began.elapsed());
+    assert_eq!(view.state, TransferState::Done, "{view:?}");
+    assert_eq!(remote_sha256(&scratch, &scratch.at("big.bin")), expected, "the uploaded file is intact");
+    assert_eq!(scratch.sh(r#"ls -A "$D""#).trim(), "big.bin", "no temporary file left");
+
+    let began = Instant::now();
+    let id = queue.enqueue_download(vec![scratch.at("big.bin")], downloads.clone());
+    let view = wait_for(&queue, id, "the download", |v| v.state.is_finished()).await;
+    let down = megabytes_per_second(view.bytes_total, began.elapsed());
+    assert_eq!(view.state, TransferState::Done, "{view:?}");
+    assert_eq!(local_sha256(&downloads.join("big.bin")), expected, "the downloaded file is intact");
+    eprintln!("THROUGHPUT 50 MB file over loopback to the container: upload {up:.1} MB/s, download {down:.1} MB/s");
+    assert!(up >= 10.0 && down >= 10.0, "slower than 10 MB/s: up {up:.1}, down {down:.1}");
+}
+
+/// 1000 small files in 20 directories.
+fn many_small_files(dir: &Path) {
+    for d in 0..20u64 {
+        let sub = dir.join(format!("d{d:02}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in 0..50u64 {
+            std::fs::write(
+                sub.join(format!("file{f:02}.dat")),
+                pattern(500 + ((d * 50 + f) as usize % 3000), d * 100 + f),
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn local_tree_sum(dir: &Path) -> String {
+    let script = r#"cd "$1" && find . -type f | LC_ALL=C sort | xargs cat | shasum -a 256 | cut -d' ' -f1"#;
+    let output = Command::new("sh").args(["-c", script, "sh"]).arg(dir).output().unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_a_directory_of_a_thousand_small_files_goes_up_and_down() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    let local = tempfile::tempdir().unwrap();
+    let downloads = local.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    many_small_files(&local.path().join("many"));
+    let expected = local_tree_sum(&local.path().join("many"));
+
+    let (queue, _events) = TransferQueue::new(tokio::runtime::Handle::current());
+    queue.set_session(Some(Arc::new(sftp)));
+
+    let began = Instant::now();
+    let id = queue.enqueue_upload(vec![local.path().join("many")], &scratch.path);
+    let view = wait_for(&queue, id, "the upload", |v| v.state.is_finished()).await;
+    let up = began.elapsed();
+    assert_eq!((view.state.clone(), view.files_done, view.files_total), (TransferState::Done, 1000, 1000), "{view:?}");
+    assert_eq!(scratch.sh(r#"find "$D/many" -type f | wc -l"#).trim(), "1000");
+    assert_eq!(scratch.sh(r#"find "$D/many" -name '*.shellmate-*' | wc -l"#).trim(), "0", "no temporary files");
+    let remote_sum =
+        scratch.sh(r#"cd "$D/many" && find . -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -d' ' -f1"#);
+    assert_eq!(remote_sum.trim(), expected, "every file arrived intact");
+
+    let began = Instant::now();
+    let id = queue.enqueue_download(vec![scratch.at("many")], downloads.clone());
+    let view = wait_for(&queue, id, "the download", |v| v.state.is_finished()).await;
+    let down = began.elapsed();
+    assert_eq!((view.state.clone(), view.files_done), (TransferState::Done, 1000), "{view:?}");
+    assert_eq!(local_tree_sum(&downloads.join("many")), expected);
+    eprintln!(
+        "THROUGHPUT 1000 small files over loopback to the container: upload {:.1} s ({:.0} files/s), download {:.1} s ({:.0} files/s)",
+        up.as_secs_f64(),
+        1000.0 / up.as_secs_f64(),
+        down.as_secs_f64(),
+        1000.0 / down.as_secs_f64()
+    );
+}
+
+/// The pid of the process serving this connection (the parent of its shell), found from inside a shell on it.
+async fn session_process(connection: &Connection) -> u32 {
+    let dims = PtyDims::default();
+    let (recorder, sink) = Recorder::sink();
+    let mut shell = connection.open_shell(dims).await.unwrap().start(sink, dims);
+    recorder.wait_for_text("$").await;
+    shell.write(b"echo SESSION-$PPID-END\r").unwrap();
+    let pid =
+        crate::support::eventually("the session's process id", || number_between(&recorder.text(), "SESSION-", "-END"))
+            .await;
+    // Leave the shell open: it keeps the connection busy like a terminal tab would.
+    std::mem::forget(shell);
+    pid
+}
+
+/// Kills the SFTP server process (`internal-sftp`) of the connection served by `session_pid`, and nothing else.
+fn kill_sftp_server(session_pid: u32) {
+    let script = format!(
+        r#"for p in /proc/[0-9]*; do pid=${{p#/proc/}}; parent=$(awk '/^PPid:/{{print $2}}' $p/status 2>/dev/null);
+           if [ "$parent" = "{session_pid}" ]; then case "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" in *internal-sftp*) kill -9 $pid; echo killed $pid;; esac; fi; done"#
+    );
+    let killed = docker_root(&script);
+    assert!(killed.contains("killed"), "no SFTP server process under session {session_pid}: {killed:?}");
+}
+
+fn number_between(text: &str, marker: &str, end: &str) -> Option<u32> {
+    text.match_indices(marker)
+        .filter_map(|(at, _)| {
+            let rest = &text[at + marker.len()..];
+            rest[..rest.find(end)?].parse().ok()
+        })
+        .next()
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server and docker access to its container (see the SSH crate's e2e docs)"]
+async fn e2e_transfers_resume_after_the_servers_sftp_process_is_killed() {
+    let (sftp, connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    let local = tempfile::tempdir().unwrap();
+    let downloads = local.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let big = big_file(local.path(), "up.bin", 120, 2);
+    let expected_up = local_sha256(&big);
+    scratch.sh(r#"head -c 125829120 /dev/urandom > "$D/down.bin""#);
+    let expected_down = remote_sha256(&scratch, &scratch.at("down.bin"));
+    let session_pid = session_process(&connection).await;
+
+    let (queue, _events) = TransferQueue::new(tokio::runtime::Handle::current());
+    queue.set_session(Some(Arc::new(sftp)));
+    let up = queue.enqueue_upload(vec![big], &scratch.path);
+    let down = queue.enqueue_download(vec![scratch.at("down.bin")], downloads.clone());
+    let total = 120u64 << 20;
+    wait_for(&queue, up, "a bit of the upload", |v| v.bytes_done > total / 10 && v.state == TransferState::Running)
+        .await;
+    wait_for(&queue, down, "a bit of the download", |v| v.bytes_done > total / 10 && v.state == TransferState::Running)
+        .await;
+
+    // The server side of the SFTP session dies while both transfers are under way.
+    kill_sftp_server(session_pid);
+    let paused_up =
+        wait_for(&queue, up, "the upload to notice", |v| v.state == TransferState::Paused(PauseReason::Disconnected))
+            .await;
+    let paused_down = wait_for(&queue, down, "the download to notice", |v| {
+        v.state == TransferState::Paused(PauseReason::Disconnected)
+    })
+    .await;
+    assert!(paused_up.bytes_done < total && paused_down.bytes_done < total, "they were interrupted, not finished");
+    eprintln!(
+        "interrupted at {} MB (upload) and {} MB (download) of 120",
+        paused_up.bytes_done >> 20,
+        paused_down.bytes_done >> 20
+    );
+
+    // A new SFTP session on the same connection; the queue carries on by itself.
+    queue.set_session(Some(Arc::new(SftpSession::open(&connection).await.expect("a new sftp session"))));
+    let done_up = wait_for(&queue, up, "the upload to finish", |v| v.state.is_finished()).await;
+    let done_down = wait_for(&queue, down, "the download to finish", |v| v.state.is_finished()).await;
+    assert_eq!((done_up.state, done_down.state), (TransferState::Done, TransferState::Done));
+    assert_eq!(remote_sha256(&scratch, &scratch.at("up.bin")), expected_up, "the resumed upload is intact");
+    assert_eq!(local_sha256(&downloads.join("down.bin")), expected_down, "the resumed download is intact");
+    assert_eq!(scratch.sh(r#"ls -A "$D""#).split_whitespace().filter(|n| n.contains("shellmate")).count(), 0);
+    assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1, "no temporary file in the download directory");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_an_overwriting_upload_into_an_unwritable_directory_goes_in_place() {
+    let (sftp, _connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    scratch.sh(r#"mkdir "$D/ro"; echo "old and longer content" > "$D/ro/file.txt"; chmod 644 "$D/ro/file.txt"; chmod 555 "$D/ro""#);
+    let inode = scratch.sh(r#"stat -c '%i' "$D/ro/file.txt""#);
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(local.path().join("file.txt"), "new\n").unwrap();
+    let (queue, _events) = TransferQueue::new(tokio::runtime::Handle::current());
+    queue.set_session(Some(Arc::new(sftp)));
+    let id = queue.enqueue_upload(vec![local.path().join("file.txt")], &scratch.at("ro"));
+    wait_for(&queue, id, "the question", |v| v.state == TransferState::AwaitingClash).await;
+    queue.answer_clash(id, shellmate_sftp::transfer::Choice::Overwrite);
+    let view = wait_for(&queue, id, "the upload", |v| v.state.is_finished()).await;
+    assert_eq!((view.state.clone(), view.in_place), (TransferState::Done, 1), "{view:?}");
+    assert_eq!(scratch.sh(r#"cat "$D/ro/file.txt""#), "new\n");
+    assert_eq!(scratch.sh(r#"stat -c '%i' "$D/ro/file.txt""#), inode);
+    assert_eq!(scratch.sh(r#"ls -A "$D/ro""#).trim(), "file.txt");
+}

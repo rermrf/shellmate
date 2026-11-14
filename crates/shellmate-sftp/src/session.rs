@@ -6,6 +6,7 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt as _};
 use russh_sftp::client::RawSftpSession;
 use russh_sftp::client::error::Error as RawError;
+use russh_sftp::client::rawsession::Limits;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use shellmate_ssh::Connection;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -14,8 +15,15 @@ use crate::entry::{Entry, EntryKind, Link, Revision, sort_entries};
 use crate::error::SftpError;
 use crate::path;
 
-/// Size of one read or write request.
-const CHUNK: usize = 32 * 1024;
+/// Size of one read or write request when the server names no limit.
+const DEFAULT_CHUNK: usize = 32 * 1024;
+/// Largest request we send, whatever the server allows.
+const MAX_CHUNK: usize = 255 * 1024;
+/// Roughly how many bytes of requests are in flight at once for one file: enough to keep a fast
+/// link with some delay busy, little enough that a pause or cancel takes effect soon.
+const IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;
+/// Size of one read or write request for small files (text for the editor).
+const CHUNK: usize = DEFAULT_CHUNK;
 /// Requests in flight at once for one file.
 const WINDOW: usize = 8;
 /// Seconds a request may wait for its answer.
@@ -28,6 +36,18 @@ const LINK_PARALLELISM: usize = 16;
 /// `posix-rename@openssh.com`: rename that replaces an existing target atomically.
 pub const POSIX_RENAME: &str = "posix-rename@openssh.com";
 const FSYNC: &str = "fsync@openssh.com";
+const LIMITS: &str = "limits@openssh.com";
+
+/// Request size limits of the server (`limits@openssh.com`); `None` where it names none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerLimits {
+    /// Largest packet.
+    pub packet_len: Option<u64>,
+    /// Largest read request.
+    pub read_len: Option<u64>,
+    /// Largest write request.
+    pub write_len: Option<u64>,
+}
 
 /// What the server told us in its version reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +56,21 @@ pub struct ServerInfo {
     pub version: u32,
     /// Advertised extensions with their versions (`posix-rename@openssh.com` → `1`).
     pub extensions: BTreeMap<String, String>,
+    /// The server's request size limits, if it advertises them.
+    pub limits: Option<ServerLimits>,
+}
+
+/// How big and how many requests to keep in flight when moving file contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tuning {
+    /// Bytes per read request.
+    pub read_chunk: usize,
+    /// Bytes per write request.
+    pub write_chunk: usize,
+    /// Read requests in flight.
+    pub read_window: usize,
+    /// Write requests in flight.
+    pub write_window: usize,
 }
 
 impl ServerInfo {
@@ -47,6 +82,16 @@ impl ServerInfo {
     /// Whether the server can replace a file by renaming over it.
     pub fn posix_rename(&self) -> bool {
         self.extensions.get(POSIX_RENAME).is_some_and(|version| version == "1")
+    }
+
+    /// Request sizes for moving file contents: as large as the server allows (but no more than
+    /// 255 KB, what OpenSSH allows), 32 KB when it names no limit, with about 2 MB in flight.
+    pub(crate) fn tuning(&self) -> Tuning {
+        let limits = self.limits.unwrap_or_default();
+        let size = |limit: Option<u64>| limit.map_or(DEFAULT_CHUNK, |limit| limit.clamp(1, MAX_CHUNK as u64) as usize);
+        let window = |chunk: usize| (IN_FLIGHT_BYTES / chunk).clamp(8, 32);
+        let (read_chunk, write_chunk) = (size(limits.read_len), size(limits.write_len));
+        Tuning { read_chunk, write_chunk, read_window: window(read_chunk), write_window: window(write_chunk) }
     }
 }
 
@@ -73,8 +118,26 @@ impl SftpSession {
     {
         let raw = RawSftpSession::new(stream);
         raw.set_timeout(REQUEST_TIMEOUT_SECS);
+        let mut raw = raw;
         let version = raw.init().await.map_err(|err| SftpError::from_raw(err, ""))?;
-        let info = ServerInfo { version: version.version, extensions: version.extensions.into_iter().collect() };
+        let extensions: BTreeMap<String, String> = version.extensions.into_iter().collect();
+        let mut limits = None;
+        if extensions.get(LIMITS).is_some_and(|version| version == "1") {
+            match raw.limits().await {
+                Ok(found) => {
+                    let known = Limits::from(found);
+                    limits = Some(ServerLimits {
+                        packet_len: known.packet_len,
+                        read_len: known.read_len,
+                        write_len: known.write_len,
+                    });
+                    raw.set_limits(known);
+                }
+                // Not fatal: without limits we send modest requests.
+                Err(err) => log::warn!("limits@openssh.com failed: {err}"),
+            }
+        }
+        let info = ServerInfo { version: version.version, extensions, limits };
         Ok(Self { raw: Arc::new(raw), info })
     }
 
@@ -161,6 +224,37 @@ impl SftpSession {
         Err(SftpError::Failed { path: path.to_string(), message: "符号链接层数过多".into() })
     }
 
+    /// The file a write to `path` goes to and what is there now: a symlink is followed to its
+    /// target, a dangling one to the place it points at (so the link stays a link); a path with
+    /// nothing at it is its own destination. The entry is `None` when nothing is there yet.
+    pub(crate) async fn resolve_for_write(&self, path: &str) -> Result<(String, Option<Entry>), SftpError> {
+        match self.resolve(path).await {
+            Ok((target, entry)) => Ok((target, Some(entry))),
+            Err(SftpError::NotFound { .. }) => Ok((self.creation_target(path).await?, None)),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Where a file written to `start` has to be created when nothing is there: `start` itself,
+    /// unless it is a (dangling) symlink, in which case the link must stay a link and the file goes
+    /// where it points. Follows the chain of links, each one relative to the directory of the
+    /// previous.
+    pub(crate) async fn creation_target(&self, start: &str) -> Result<String, SftpError> {
+        let mut current = start.to_string();
+        for _ in 0..MAX_LINK_HOPS {
+            match self.lstat_plain(&current).await {
+                Ok(entry) if entry.kind == EntryKind::Symlink => {
+                    let target = self.read_link(&current).await?;
+                    let base = path::parent(&current).unwrap_or_else(|| "/".to_string());
+                    current = path::normalize(&path::join(&base, &target));
+                }
+                Ok(_) | Err(SftpError::NotFound { .. }) => return Ok(current),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(SftpError::Failed { path: start.to_string(), message: "符号链接层数过多".into() })
+    }
+
     // ---- directories -------------------------------------------------------------------------
 
     /// The entries of a directory, directories first and then by name (case-insensitive, numbers
@@ -222,6 +316,16 @@ impl SftpSession {
         self.ensure_absent(dir).await?;
         self.raw.mkdir(dir, FileAttributes::empty()).await.map_err(|err| SftpError::from_raw(err, dir))?;
         Ok(())
+    }
+
+    /// Creates a directory with the given permission bits (`0o755`; applied for real after
+    /// creation, because the server's umask applies to the mode given at creation). Fails if
+    /// something is there already.
+    pub async fn mkdir_with_mode(&self, dir: &str, mode: u32) -> Result<(), SftpError> {
+        self.ensure_absent(dir).await?;
+        let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
+        self.raw.mkdir(dir, attrs).await.map_err(|err| SftpError::from_raw(err, dir))?;
+        self.chmod(dir, mode).await
     }
 
     /// Renames `from` to `to`. Never overwrites: if `to` exists, fails with
@@ -451,6 +555,17 @@ impl SftpSession {
         Ok(())
     }
 
+    /// Sets attributes (mode, times, ...) on an open file.
+    pub(crate) async fn set_handle_attrs(
+        &self,
+        handle: &str,
+        attrs: FileAttributes,
+        path: &str,
+    ) -> Result<(), SftpError> {
+        self.raw.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        Ok(())
+    }
+
     pub(crate) async fn set_handle_mode(&self, handle: &str, mode: u32, path: &str) -> Result<(), SftpError> {
         let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
         self.raw.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
@@ -479,4 +594,41 @@ fn entry_at(path: &str, longname: &str, attrs: &FileAttributes) -> Entry {
     let mut entry = Entry::from_attrs(&dir, name, longname, attrs);
     entry.path = path.to_string();
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(limits: Option<ServerLimits>) -> ServerInfo {
+        ServerInfo { version: 3, extensions: BTreeMap::new(), limits }
+    }
+
+    #[test]
+    fn without_limits_requests_are_32_kb_with_a_wide_window() {
+        let tuning = info(None).tuning();
+        assert_eq!((tuning.read_chunk, tuning.write_chunk), (32 * 1024, 32 * 1024));
+        assert_eq!((tuning.read_window, tuning.write_window), (32, 32));
+    }
+
+    #[test]
+    fn requests_are_as_large_as_the_server_allows_up_to_255_kb() {
+        let openssh = ServerLimits { packet_len: Some(262_144), read_len: Some(261_120), write_len: Some(261_120) };
+        let tuning = info(Some(openssh)).tuning();
+        assert_eq!((tuning.read_chunk, tuning.write_chunk), (255 * 1024, 255 * 1024), "capped at 255 KB");
+        assert_eq!((tuning.read_window, tuning.write_window), (8, 8), "about 2 MB in flight");
+        let huge = ServerLimits { packet_len: None, read_len: Some(10_000_000), write_len: Some(10_000_000) };
+        assert_eq!(info(Some(huge)).tuning().read_chunk, 255 * 1024);
+    }
+
+    #[test]
+    fn small_limits_are_respected_and_reads_and_writes_are_separate() {
+        let limits = ServerLimits { packet_len: None, read_len: Some(16_384), write_len: Some(4_096) };
+        let tuning = info(Some(limits)).tuning();
+        assert_eq!((tuning.read_chunk, tuning.write_chunk), (16_384, 4_096));
+        assert_eq!((tuning.read_window, tuning.write_window), (32, 32), "never more than 32 requests");
+        let only_reads = ServerLimits { packet_len: None, read_len: Some(65_536), write_len: None };
+        let tuning = info(Some(only_reads)).tuning();
+        assert_eq!((tuning.read_chunk, tuning.write_chunk), (65_536, 32 * 1024));
+    }
 }

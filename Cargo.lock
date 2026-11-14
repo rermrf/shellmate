@@ -7122,6 +7122,7 @@ dependencies = [
 name = "shellmate-sftp"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-trait",
  "futures",
  "libc",
