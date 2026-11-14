@@ -164,6 +164,27 @@ async fn e2e_the_server_lists_its_extensions_and_a_directory() {
 
 #[tokio::test]
 #[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
+async fn e2e_stat_of_a_directory_can_name_its_owner() {
+    let (sftp, _connection, _env) = session().await;
+    assert!(sftp.info().has("users-groups-by-id@openssh.com"), "OpenSSH offers the id lookup");
+    let home = sftp.home().await.unwrap();
+    let user = setting("SHELLMATE_E2E_USER", "tester");
+    // A bare stat has only numbers ...
+    let bare = sftp.stat(&home).await.unwrap();
+    assert!(bare.owner.chars().all(|c| c.is_ascii_digit()), "{:?}", bare.owner);
+    // ... the named one asks the server what they stand for.
+    let named = sftp.stat_named(&home).await.unwrap();
+    assert_eq!(named.owner, user);
+    assert!(!named.group.is_empty() && !named.group.chars().all(|c| c.is_ascii_digit()), "{:?}", named.group);
+    assert_eq!((named.uid, named.mode, named.kind), (bare.uid, bare.mode, bare.kind), "nothing else changes");
+    // root's home is not ours to list, but its owner can be named.
+    let root = sftp.stat_named("/root").await.unwrap();
+    assert_eq!((root.owner.as_str(), root.group.as_str()), ("root", "root"));
+    assert!(sftp.list("/root").await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
 async fn e2e_saving_keeps_permissions_owner_and_line_endings() {
     let (sftp, _connection, _env) = session().await;
     let scratch = Scratch::new(&sftp.home().await.unwrap());
@@ -595,6 +616,43 @@ async fn e2e_transfers_resume_after_the_servers_sftp_process_is_killed() {
     assert_eq!(local_sha256(&downloads.join("down.bin")), expected_down, "the resumed download is intact");
     assert_eq!(scratch.sh(r#"ls -A "$D""#).split_whitespace().filter(|n| n.contains("shellmate")).count(), 0);
     assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1, "no temporary file in the download directory");
+}
+
+#[tokio::test]
+#[ignore = "needs a real OpenSSH server and docker access to its container (see the SSH crate's e2e docs)"]
+async fn e2e_a_killed_sftp_server_process_is_found_by_a_plain_request_and_the_session_replaced() {
+    use std::sync::Arc;
+
+    use shellmate_sftp::link::{LinkState, SftpLink};
+
+    let (sftp, connection, _env) = session().await;
+    let scratch = Scratch::new(&sftp.home().await.unwrap());
+    scratch.sh(r#"echo hi > "$D/a.txt""#);
+    let session_pid = session_process(&connection).await;
+
+    // The link's session, with no transfer anywhere.
+    let (link, _changes, _events) = SftpLink::new(tokio::runtime::Handle::current());
+    link.open(&connection);
+    let first = crate::support::eventually("the session", || link.state().session().cloned()).await;
+    assert_eq!(first.list(&scratch.path).await.unwrap().len(), 1);
+
+    // The SFTP server process dies; the SSH connection lives on.
+    kill_sftp_server(session_pid);
+    let error = first.list(&scratch.path).await.expect_err("the session is dead");
+    assert!(error.is_session_lost(), "{error:?}");
+    assert!(
+        matches!(link.state(), LinkState::Ready(ref current) if Arc::ptr_eq(current, &first)),
+        "nothing told the link: {:?}",
+        link.state()
+    );
+
+    // What the panel does with that error.
+    link.session_lost(&first);
+    let second = crate::support::eventually("a new session", || {
+        link.state().session().filter(|s| !Arc::ptr_eq(s, &first)).cloned()
+    })
+    .await;
+    assert_eq!(second.list(&scratch.path).await.unwrap().len(), 1, "the new session works");
 }
 
 #[tokio::test]

@@ -201,3 +201,76 @@ async fn a_closed_link_ignores_everything() {
     assert!(matches!(link.state(), LinkState::Closed));
     assert_eq!(requests(&fx), before);
 }
+
+#[tokio::test]
+async fn a_session_reported_lost_with_no_transfer_running_is_replaced() {
+    let fx = Fixture::default().await;
+    let link = new_link();
+    link.open(&fx.connection);
+    let first = ready(&link, None).await;
+    let before = requests(&fx);
+    // No transfer is running, so the queue says nothing: a plain request found the session dead.
+    link.session_lost(&first);
+    assert!(matches!(link.state(), LinkState::Opening), "{:?}", link.state());
+    let second = ready(&link, Some(&first)).await;
+    assert_eq!(requests(&fx) - before, 1, "one new session");
+    fx.file("/x/a.txt", "a", 0o644);
+    assert_eq!(second.list("/x").await.unwrap().len(), 1, "and it works");
+}
+
+#[tokio::test]
+async fn a_report_about_a_session_that_is_not_the_current_one_is_ignored() {
+    let fx = Fixture::default().await;
+    let link = new_link();
+    link.open(&fx.connection);
+    let first = ready(&link, None).await;
+    link.session_lost(&first);
+    let second = ready(&link, Some(&first)).await;
+    let before = requests(&fx);
+    // A panel that was still working with the first session reports it late; nothing to do.
+    link.session_lost(&first);
+    link.session_lost(&first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(Arc::ptr_eq(&second, link.state().session().expect("still ready")), "{:?}", link.state());
+    assert_eq!(requests(&fx), before, "no second reopen for the same loss");
+    // Neither does a session of some other link count.
+    let other = Arc::new(fx.new_session().await);
+    link.session_lost(&other);
+    assert!(Arc::ptr_eq(&second, link.state().session().unwrap()));
+}
+
+#[tokio::test]
+async fn reports_and_queue_events_share_the_reopen_limit() {
+    let fx = Fixture::default().await;
+    let link = new_link();
+    link.open(&fx.connection);
+    let mut last = ready(&link, None).await;
+    link.session_lost(&last);
+    last = ready(&link, Some(&last)).await;
+    link.handle_event(&TransferEvent::SessionLost);
+    last = ready(&link, Some(&last)).await;
+    link.session_lost(&last);
+    last = ready(&link, Some(&last)).await;
+    link.session_lost(&last);
+    let LinkState::Failed(reason) = link.state() else { panic!("{:?}", link.state()) };
+    assert!(reason.contains("反复中断"), "{reason}");
+    // The panel's refresh button asks again.
+    link.open(&fx.connection);
+    ready(&link, None).await;
+}
+
+#[tokio::test]
+async fn a_report_while_the_connection_is_gone_too_is_left_to_the_reconnect() {
+    let fx = Fixture::default().await;
+    let link = new_link();
+    link.open(&fx.connection);
+    let first = ready(&link, None).await;
+    fx.server.state.kill_connections();
+    eventually("the connection to be seen as closed", || fx.connection.is_closed().then_some(())).await;
+    link.session_lost(&first);
+    assert!(matches!(link.state(), LinkState::Disconnected), "{:?}", link.state());
+    // The next connection brings the session back (it had been open).
+    let connection = fx.new_connection().await;
+    link.connection_restored(&connection);
+    ready(&link, Some(&first)).await;
+}

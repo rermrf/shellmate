@@ -38,6 +38,7 @@ const LINK_PARALLELISM: usize = 16;
 pub const POSIX_RENAME: &str = "posix-rename@openssh.com";
 const FSYNC: &str = "fsync@openssh.com";
 const LIMITS: &str = "limits@openssh.com";
+const USERS_GROUPS_BY_ID: &str = "users-groups-by-id@openssh.com";
 
 /// Request size limits of the server (`limits@openssh.com`); `None` where it names none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +182,35 @@ impl SftpSession {
     pub async fn stat(&self, path: &str) -> Result<Entry, SftpError> {
         let attrs = self.raw.stat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         Ok(entry_at(path, "", &attrs))
+    }
+
+    /// Like [`stat`](Self::stat), with the user and group *names* where the server can say them.
+    /// A directory listing carries names in its `ls -l` lines, but a bare `stat` of SFTP v3 has only
+    /// numbers; OpenSSH servers translate them on request (`users-groups-by-id@openssh.com`). Without
+    /// that, or when the ids are unknown to the server, the numbers stay.
+    pub async fn stat_named(&self, path: &str) -> Result<Entry, SftpError> {
+        let mut entry = self.stat(path).await?;
+        if let (Some(uid), Some(gid)) = (entry.uid, entry.gid)
+            && self.info.has(USERS_GROUPS_BY_ID)
+        {
+            let (user, group) = self.names_of(uid, gid).await;
+            entry.owner = user.unwrap_or_else(|| uid.to_string());
+            entry.group = group.unwrap_or_else(|| gid.to_string());
+        }
+        Ok(entry)
+    }
+
+    /// The names the server knows for a user id and a group id (either may be unknown).
+    async fn names_of(&self, uid: u32, gid: u32) -> (Option<String>, Option<String>) {
+        let mut data = Vec::with_capacity(16);
+        for id in [uid, gid] {
+            data.extend_from_slice(&4u32.to_be_bytes());
+            data.extend_from_slice(&id.to_be_bytes());
+        }
+        match self.raw.extended(USERS_GROUPS_BY_ID, data).await {
+            Ok(Packet::ExtendedReply(reply)) => parse_names(&reply.data).unwrap_or_default(),
+            _ => (None, None),
+        }
     }
 
     /// Metadata of `path` itself; for a symlink, the link (with its target filled in).
@@ -601,6 +631,25 @@ impl SftpSession {
     }
 }
 
+/// Takes an SSH `string` off the front of `data`.
+fn take_string(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    let length = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let end = 4usize.checked_add(length)?;
+    Some((data.get(4..end)?, data.get(end..)?))
+}
+
+/// The answer of `users-groups-by-id@openssh.com` for one user id and one group id: two strings,
+/// each holding one name string (empty where the server does not know the id).
+fn parse_names(data: &[u8]) -> Option<(Option<String>, Option<String>)> {
+    let (users, rest) = take_string(data)?;
+    let (groups, _) = take_string(rest)?;
+    let name = |packed: &[u8]| {
+        let (name, _) = take_string(packed)?;
+        (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
+    };
+    Some((name(users), name(groups)))
+}
+
 /// The entry for `path`, named by its last component.
 fn entry_at(path: &str, longname: &str, attrs: &FileAttributes) -> Entry {
     let name = path::file_name(path).unwrap_or("/");
@@ -616,6 +665,29 @@ mod tests {
 
     fn info(limits: Option<ServerLimits>) -> ServerInfo {
         ServerInfo { version: 3, extensions: BTreeMap::new(), limits }
+    }
+
+    fn packed(names: &[&str]) -> Vec<u8> {
+        let inner: Vec<u8> =
+            names.iter().flat_map(|n| (n.len() as u32).to_be_bytes().into_iter().chain(n.bytes())).collect();
+        let mut out = (inner.len() as u32).to_be_bytes().to_vec();
+        out.extend(inner);
+        out
+    }
+
+    #[test]
+    fn the_names_of_an_id_lookup_come_out_of_the_reply() {
+        let mut reply = packed(&["root"]);
+        reply.extend(packed(&["wheel"]));
+        assert_eq!(parse_names(&reply), Some((Some("root".to_string()), Some("wheel".to_string()))));
+        // An id the server does not know comes back as an empty name.
+        let mut reply = packed(&[""]);
+        reply.extend(packed(&["users"]));
+        assert_eq!(parse_names(&reply), Some((None, Some("users".to_string()))));
+        // Anything cut short is no answer rather than a panic.
+        assert_eq!(parse_names(&reply[..reply.len() - 3]), None);
+        assert_eq!(parse_names(&[]), None);
+        assert_eq!(parse_names(&[0, 0, 0, 9, 1]), None);
     }
 
     #[test]

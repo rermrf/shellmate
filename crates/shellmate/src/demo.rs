@@ -66,6 +66,23 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `files-refresh:<host>:<dir>` shows the panel there and refreshes it 9 seconds later (as a click
+    // on 刷新 would), so that a script can kill the server's SFTP process in between.
+    if let Some(args) = name.strip_prefix("files-refresh:") {
+        let (host, dir) = args.split_once(':').map_or((args, None), |(host, dir)| (host, Some(dir)));
+        workspace.update(cx, |workspace, cx| {
+            workspace.connect_by_name(host, window, cx);
+            workspace.demo_files(dir, None, false, window, cx);
+        });
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(9)).await;
+                workspace.update_in(cx, |workspace, _, cx| workspace.demo_refresh_files(cx)).ok();
+            })
+            .detach();
+        return;
+    }
     // `files:<host>[:<dir>[:<name to select>]]` connects the host and shows its files panel there;
     // `files-hint:<host>` shows it with the OSC 7 hint open.
     if let Some(args) = name.strip_prefix("files:").or_else(|| name.strip_prefix("files-hint:")) {

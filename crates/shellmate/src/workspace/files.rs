@@ -7,7 +7,10 @@
 //! is [`SftpLink`]'s job; this module opens it, tells it what happens to the connection and hands
 //! what it says to the panels.
 
+use std::sync::Arc;
+
 use gpui::{AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
+use shellmate_sftp::SftpSession;
 use shellmate_sftp::link::{LinkState, SftpLink};
 use shellmate_sftp::transfer::TransferEvent;
 use shellmate_ssh::Connection;
@@ -30,6 +33,10 @@ pub fn link_status(state: &LinkState, tab: SshStatus) -> LinkStatus {
         LinkState::Ready(_) => LinkStatus::Ready,
         LinkState::Opening => LinkStatus::Connecting,
         LinkState::Failed(reason) => LinkStatus::Failed(reason.clone()),
+        // The link thinks the connection is gone, but the tab has not said so (yet): it will, and a
+        // reconnect follows. Until then the session is being replaced, not waiting for a reconnect
+        // that may never come.
+        LinkState::Disconnected if tab == SshStatus::Connected => LinkStatus::Connecting,
         LinkState::Disconnected | LinkState::Closed => LinkStatus::Disconnected,
         // Nothing has asked for a session yet: it is on its way if the connection is up (or coming),
         // and not coming while the connection is being re-made or is given up.
@@ -162,9 +169,25 @@ impl Workspace {
         let panel = cx.new(|cx| FilesPanel::new(&terminal, runtime, window, cx));
         let subscription = cx.subscribe(&panel, move |this: &mut Self, _, event: &FilesEvent, cx| match event {
             FilesEvent::RetrySession => this.retry_sftp(session_id, cx),
+            FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
         });
         self.sessions[ix].files = Some(FilesTab { panel, _subscription: subscription });
         true
+    }
+
+    /// A panel found its session unusable. The link reopens it if it is still the current one; either
+    /// way every panel of the connection hears where the link stands (a panel that used an older
+    /// session picks up the newer one).
+    fn session_lost(&mut self, session_id: usize, session: &Arc<SftpSession>, cx: &mut Context<Self>) {
+        let Some(group_id) =
+            self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group)
+        else {
+            return;
+        };
+        if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
+            link.session_lost(session);
+        }
+        self.sync_files(group_id, cx);
     }
 
     /// The panel asked for a new session after the last attempt failed.
@@ -184,6 +207,15 @@ impl Workspace {
             _ => session.view.focus_handle(cx),
         };
         window.focus(&handle, cx);
+    }
+
+    /// Debug review hook: refreshes the active tab's files panel.
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_refresh_files(&mut self, cx: &mut Context<Self>) {
+        let panel = self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.files.as_ref());
+        if let Some(panel) = panel.map(|files| files.panel.clone()) {
+            panel.update(cx, |panel, cx| panel.demo_refresh(cx));
+        }
     }
 
     /// Debug review hook: connects `host`, shows its files panel, goes to `dir` and selects `select`.
@@ -234,6 +266,14 @@ mod tests {
         }
         assert_eq!(link_status(&LinkState::Disconnected, SshStatus::Reconnecting(1)), LinkStatus::Disconnected);
         assert_eq!(link_status(&LinkState::Closed, SshStatus::Connected), LinkStatus::Disconnected);
+    }
+
+    #[test]
+    fn a_connection_the_tab_still_thinks_is_up_means_a_new_session_not_a_reconnect() {
+        // The link lost its session while the tab says Connected (a dead SFTP subsystem, say):
+        // "连接已断开，重连后自动刷新" would promise a reconnect that never comes.
+        assert_eq!(link_status(&LinkState::Disconnected, SshStatus::Connected), LinkStatus::Connecting);
+        assert_eq!(link_status(&LinkState::Disconnected, SshStatus::Reconnecting(1)), LinkStatus::Disconnected);
     }
 
     #[test]

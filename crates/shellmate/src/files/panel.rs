@@ -21,7 +21,7 @@ use shellmate_term::{Terminal, TerminalEvent};
 use tokio::task::AbortHandle;
 
 use super::format::mtime_text;
-use super::model::{FilesModel, LinkStatus, Request, Row, View};
+use super::model::{Applied, FilesModel, LinkStatus, Listed, Request, Row, Subject, View};
 use crate::theme::{ActivePalette, MONO_FONT, Palette};
 use crate::ui::card_shadow;
 
@@ -47,6 +47,9 @@ pub fn init(cx: &mut App) {
 pub enum FilesEvent {
     /// The session could not be opened and the user asked again (刷新).
     RetrySession,
+    /// An operation found this session unusable (the connection is gone, or the server stopped
+    /// answering): the owner has to tell the link, which opens a new one.
+    SessionLost(Arc<SftpSession>),
 }
 
 impl EventEmitter<FilesEvent> for FilesPanel {}
@@ -148,6 +151,12 @@ impl FilesPanel {
         self.demo_select = Some(name.to_string());
     }
 
+    /// Debug review hook: a click on 刷新.
+    #[cfg(debug_assertions)]
+    pub fn demo_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+    }
+
     /// Debug review hook: opens the OSC 7 hint.
     #[cfg(debug_assertions)]
     pub fn demo_hint(&mut self, cx: &mut Context<Self>) {
@@ -165,21 +174,34 @@ impl FilesPanel {
         if let Some(previous) = self.listing_abort.take() {
             previous.abort();
         }
+        let used = session.clone();
         let join = self.runtime.spawn(async move {
             // `.` is the home directory: ask the server where that is.
-            let dir = if request.dir == "." { session.home().await? } else { request.dir.clone() };
-            let entries = session.list(&dir).await?;
-            Ok::<_, SftpError>((dir, entries))
+            let dir = if request.dir == "." {
+                match session.home().await {
+                    Ok(home) => home,
+                    Err(err) => return Listed::failed(err),
+                }
+            } else {
+                request.dir.clone()
+            };
+            // The directory's own attributes come even when listing it is refused (`/root`).
+            let (entries, stat) = tokio::join!(session.list(&dir), session.stat_named(&dir));
+            Listed { dir: Some(dir), entries, stat: stat.ok() }
         });
         self.listing_abort = Some(join.abort_handle());
         self.listing = Some(cx.spawn(async move |this, cx| {
-            let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
+            let result =
+                join.await.unwrap_or_else(|err| Listed::failed(SftpError::Protocol(format!("任务异常终止：{err}"))));
             this.update(cx, |this, cx| {
                 let listed = began.elapsed();
-                let summary = result.as_ref().ok().map(|(dir, entries)| (dir.clone(), entries.len()));
+                let summary =
+                    result.entries.as_ref().ok().zip(result.dir.clone()).map(|(entries, dir)| (dir, entries.len()));
                 let before = this.model.cwd().to_string();
                 let applying = Instant::now();
-                this.model.apply(id, result);
+                if this.model.apply_listed(id, result) == Applied::SessionLost {
+                    cx.emit(FilesEvent::SessionLost(used));
+                }
                 if let Some((dir, count)) = summary {
                     log::info!(
                         "文件面板：{dir} 共 {count} 项，列目录 {} ms，整理 {} ms",
@@ -246,17 +268,30 @@ impl FilesPanel {
 
     fn apply_chmod(&mut self, cx: &mut Context<Self>) {
         let (Some((path, mode)), Some(session)) = (self.model.chmod_request(), self.session.clone()) else { return };
+        let used = session.clone();
         let join = self.runtime.spawn(async move { session.chmod(&path, mode).await });
         self.chmod_abort = Some(join.abort_handle());
         self.chmod = Some(cx.spawn(async move |this, cx| {
             let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
             this.update(cx, |this, cx| {
+                if result.as_ref().is_err_and(SftpError::is_session_lost) {
+                    this.lose_session(used, cx);
+                    return;
+                }
                 let request = this.model.chmod_done(result);
                 this.start(request, cx);
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// An operation found `session` unusable: the panel waits for a new one, and the owner is asked
+    /// to open it.
+    fn lose_session(&mut self, session: Arc<SftpSession>, cx: &mut Context<Self>) {
+        self.model.session_lost();
+        cx.emit(FilesEvent::SessionLost(session));
+        cx.notify();
     }
 
     // ---- actions -----------------------------------------------------------------------------------------
@@ -725,9 +760,14 @@ impl FilesPanel {
     }
 
     fn render_details(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let entry = self.model.selected_entry();
-        let (title, kind, size, time, owner) = match entry {
-            Some(entry) => {
+        let subject = self.model.subject();
+        let dash = || "—".to_string();
+        let attributes = |entry: &Entry| {
+            let owner = if entry.owner_display().is_empty() { dash() } else { entry.owner_display() };
+            (mtime_text(entry.modified), owner)
+        };
+        let (title, kind, size, time, owner) = match subject {
+            Subject::Entry(entry) => {
                 let kind = match (&entry.kind, &entry.link) {
                     (EntryKind::Dir, _) => "目录".to_string(),
                     (EntryKind::File, _) => "文件".to_string(),
@@ -738,15 +778,20 @@ impl FilesPanel {
                     (EntryKind::Symlink, None) => "符号链接".to_string(),
                     (EntryKind::Other, _) => "特殊文件".to_string(),
                 };
-                let size = if entry.kind == EntryKind::File { format_size(entry.size) } else { "—".to_string() };
-                let owner = if entry.owner_display().is_empty() { "—".to_string() } else { entry.owner_display() };
-                (entry.name.clone(), kind, size, mtime_text(entry.modified), owner)
+                let size = if entry.kind == EntryKind::File { format_size(entry.size) } else { dash() };
+                let (time, owner) = attributes(entry);
+                (entry.name.clone(), kind, size, time, owner)
             }
-            None => {
-                let dir = path::file_name(self.model.cwd()).unwrap_or("/").to_string();
-                (dir, "目录".into(), "—".into(), "—".into(), "—".into())
+            // Nothing selected: the directory itself, with what `stat` said about it.
+            Subject::Dir(stat) => {
+                let name = path::file_name(self.model.cwd()).unwrap_or("/").to_string();
+                let (time, owner) = stat.map_or_else(|| (dash(), dash()), attributes);
+                (name, "目录".into(), dash(), time, owner)
             }
+            Subject::Parent => ("..".into(), "上级目录".into(), dash(), dash(), dash()),
         };
+        let editable_file = matches!(subject, Subject::Entry(entry) if entry.kind == EntryKind::File);
+        let grid_enabled = self.model.chmod_enabled();
         let draft = self.model.draft();
         let can_apply = self.model.chmod_request().is_some();
         let rows = ["所有者", "用户组", "其他"];
@@ -786,36 +831,42 @@ impl FilesPanel {
                         ),
                     ),
             )
-            .child(div().flex().flex_col().gap(px(6.)).opacity(if draft.is_some() { 1.0 } else { 0.45 }).children(
-                rows.iter().enumerate().map(|(row, label)| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(div().w(px(48.)).text_size(px(12.)).text_color(p.tx2).child(*label))
-                        .children(columns.iter().enumerate().map(|(column, name)| {
-                            let on = draft.is_some_and(|d| d.is_set(row, column));
-                            div()
-                                .id(("perm", row * 3 + column))
-                                .flex()
-                                .flex_1()
-                                .items_center()
-                                .justify_center()
-                                .h(px(30.))
-                                .rounded(px(9.))
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .bg(if on { p.acc } else { p.card2 })
-                                .text_color(if on { white() } else { p.tx2 })
-                                .when(draft.is_some(), |d| d.cursor_pointer())
-                                .child(*name)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.model.toggle_perm(row, column);
-                                    cx.notify();
-                                }))
-                        }))
-                }),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .opacity(if draft.is_some() && grid_enabled { 1.0 } else { 0.45 })
+                    .children(rows.iter().enumerate().map(|(row, label)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().w(px(48.)).text_size(px(12.)).text_color(p.tx2).child(*label))
+                            .children(columns.iter().enumerate().map(|(column, name)| {
+                                let on = draft.is_some_and(|d| d.is_set(row, column));
+                                div()
+                                    .id(("perm", row * 3 + column))
+                                    .flex()
+                                    .flex_1()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(30.))
+                                    .rounded(px(9.))
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .bg(if on { p.acc } else { p.card2 })
+                                    .text_color(if on { white() } else { p.tx2 })
+                                    .when(draft.is_some() && grid_enabled, |d| {
+                                        d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                                            this.model.toggle_perm(row, column);
+                                            cx.notify();
+                                        }))
+                                    })
+                                    .child(*name)
+                            }))
+                    })),
+            )
             .child(
                 Self::button("apply-chmod", "应用 chmod", false, p)
                     .h(px(34.))
@@ -831,7 +882,7 @@ impl FilesPanel {
                     .map(|error| div().text_size(px(12.)).text_color(p.err).child(error.to_string())),
             )
             .child(div().flex_1())
-            .children((entry.is_some_and(|e| e.kind == EntryKind::File)).then(|| {
+            .children(editable_file.then(|| {
                 Self::button("open-editor", "用内置编辑器打开", true, p)
                     .h(px(38.))
                     .rounded(px(12.))

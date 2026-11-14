@@ -18,6 +18,47 @@ pub enum LinkStatus {
     Disconnected,
 }
 
+/// What a listing task found.
+#[derive(Debug)]
+pub struct Listed {
+    /// The directory as the server spells it (`.` asks for the home directory); `None` if even that failed.
+    pub dir: Option<String>,
+    /// The entries, or why the directory cannot be listed.
+    pub entries: Result<Vec<Entry>, SftpError>,
+    /// `stat` of the directory itself. Known even when listing it is refused (`/root`).
+    pub stat: Option<Entry>,
+}
+
+impl Listed {
+    /// A listing that could not even start.
+    pub fn failed(error: SftpError) -> Self {
+        Self { dir: None, entries: Err(error), stat: None }
+    }
+}
+
+/// What an answer from a listing task did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The listing (or its error) is on screen.
+    Shown,
+    /// The answer was for a listing that is no longer the one in flight.
+    Stale,
+    /// The session behind it is unusable: the owner has to say so ([`FilesModel::session_lost`]
+    /// was done already).
+    SessionLost,
+}
+
+/// What the details panel is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subject<'a> {
+    /// The selected entry.
+    Entry(&'a Entry),
+    /// Nothing is selected: the directory itself, as far as it is known.
+    Dir(Option<&'a Entry>),
+    /// The `..` row.
+    Parent,
+}
+
 /// What the list area shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
@@ -123,6 +164,8 @@ pub struct FilesModel {
     /// The directory the list is of (or that failed to list: see [`View::Error`]).
     cwd: String,
     entries: Vec<Entry>,
+    /// `stat` of `cwd` itself (its size, time, owner and permissions for the details panel).
+    dir_entry: Option<Entry>,
     view: View,
     selection: Option<Selection>,
     follow: bool,
@@ -151,6 +194,7 @@ impl FilesModel {
             link: LinkStatus::Connecting,
             cwd: String::new(),
             entries: Vec::new(),
+            dir_entry: None,
             view: View::Loading,
             selection: None,
             follow: true,
@@ -257,6 +301,17 @@ impl FilesModel {
         }
     }
 
+    /// What the details panel shows: the selected entry, else the directory itself.
+    pub fn subject(&self) -> Subject<'_> {
+        match &self.selection {
+            Some(Selection::Parent) => Subject::Parent,
+            Some(Selection::Name(_)) => {
+                self.selected_entry().map_or(Subject::Dir(self.dir_entry.as_ref()), Subject::Entry)
+            }
+            None => Subject::Dir(self.dir_entry.as_ref()),
+        }
+    }
+
     // ---- the session -------------------------------------------------------------------------------
 
     /// The session changed: a ready one makes the panel load (again); losing it keeps the listing
@@ -279,6 +334,18 @@ impl FilesModel {
                 None
             }
             LinkStatus::Connecting => None,
+        }
+    }
+
+    /// An operation found the session unusable (the connection is gone, or the server stopped
+    /// answering) while the connection may live on. The panel waits for a new session as it does
+    /// while one is being opened: the owner reports the loss to the link, which reopens it, and
+    /// the new session makes the panel refresh by itself. It does not say "disconnected": no
+    /// reconnect is coming if the SSH connection is fine.
+    pub fn session_lost(&mut self) {
+        self.pending = None;
+        if self.link == LinkStatus::Ready {
+            self.link = LinkStatus::Connecting;
         }
     }
 
@@ -321,18 +388,32 @@ impl FilesModel {
         self.navigate(&dir, Cause::Refresh)
     }
 
+    /// The answer to a [`Request`] (see [`apply_listed`](Self::apply_listed)) without the directory's own `stat`.
+    #[cfg(test)]
+    pub fn apply(&mut self, id: u64, result: Result<(String, Vec<Entry>), SftpError>) -> Applied {
+        let listed = match result {
+            Ok((dir, entries)) => Listed { dir: Some(dir), entries: Ok(entries), stat: None },
+            Err(error) => Listed::failed(error),
+        };
+        self.apply_listed(id, listed)
+    }
+
     /// The answer to a [`Request`]: the directory that was listed (the server's absolute form: the
-    /// home directory for `.`) and its entries. Answers to listings that are no longer the one in
-    /// flight are ignored. A directory that cannot be listed leaves an older listing on screen (with the
-    /// reason above it) when the panel got there by following the terminal or by refreshing, and
-    /// is shown as an error with a way back when the user went there.
-    pub fn apply(&mut self, id: u64, result: Result<(String, Vec<Entry>), SftpError>) {
-        let Some(request) = self.pending.take_if(|pending| pending.id == id) else { return };
-        match result {
-            Ok((dir, mut entries)) => {
+    /// home directory for `.`), its entries and its own attributes. Answers to listings that are
+    /// no longer the one in flight are ignored. A directory that cannot be listed leaves an older
+    /// listing on screen (with the reason above it) when the panel got there by following the
+    /// terminal or by refreshing, and is shown as an error with a way back when the user went there.
+    /// An unusable session is not the directory's fault: see [`Applied::SessionLost`].
+    pub fn apply_listed(&mut self, id: u64, listed: Listed) -> Applied {
+        let Some(request) = self.pending.take_if(|pending| pending.id == id) else { return Applied::Stale };
+        let Listed { dir, entries, stat } = listed;
+        match entries {
+            Ok(mut entries) => {
+                let dir = dir.unwrap_or_else(|| request.dir.clone());
                 let keep = matches!(request.cause, Cause::Refresh) && dir == self.cwd;
                 let previous = self.selection.clone();
                 self.cwd = dir;
+                self.dir_entry = stat;
                 // The server lists directories in a sorted order already; keep it as it is.
                 std::mem::swap(&mut self.entries, &mut entries);
                 self.view = View::List;
@@ -340,14 +421,17 @@ impl FilesModel {
                 self.selection = previous.filter(|_| keep).filter(|sel| self.selection_exists(sel));
                 self.reset_draft();
             }
-            Err(err) if err.is_disconnected() => {
-                self.link = LinkStatus::Disconnected;
+            Err(err) if err.is_session_lost() => {
+                self.session_lost();
+                return Applied::SessionLost;
             }
             Err(err) => {
                 let reason = err.to_string();
+                let dir = dir.unwrap_or_else(|| request.dir.clone());
                 match request.cause {
                     Cause::Hand | Cause::Initial => {
-                        self.cwd = request.dir;
+                        self.cwd = dir;
+                        self.dir_entry = stat;
                         self.entries.clear();
                         self.view = View::Error(reason);
                         self.banner = None;
@@ -357,8 +441,10 @@ impl FilesModel {
                     Cause::Follow | Cause::Refresh => {
                         // Keep what is on screen: never a blank panel.
                         if matches!(self.view, View::Loading) {
-                            self.cwd = request.dir;
+                            self.cwd = dir;
+                            self.dir_entry = stat;
                             self.view = View::Error(reason);
+                            self.reset_draft();
                         } else {
                             self.banner = Some(match request.cause {
                                 Cause::Follow => format!("无法打开终端当前目录 {}：{reason}", request.dir),
@@ -369,6 +455,7 @@ impl FilesModel {
                 }
             }
         }
+        Applied::Shown
     }
 
     fn selection_exists(&self, selection: &Selection) -> bool {
@@ -475,10 +562,21 @@ impl FilesModel {
 
     // ---- permissions ------------------------------------------------------------------------------------------
 
+    /// What the permission grid is about: the selected entry, or the directory itself while
+    /// nothing is selected. A link's own mode means nothing, and `..` has no attributes at hand.
+    fn grid_target(&self) -> Option<(String, &Entry)> {
+        match &self.selection {
+            None => self.dir_entry.as_ref().map(|entry| (self.cwd.clone(), entry)),
+            Some(Selection::Parent) => None,
+            Some(Selection::Name(_)) => self.selected_entry().map(|entry| (entry.path.clone(), entry)),
+        }
+    }
+
     fn reset_draft(&mut self) {
         self.chmod_error = None;
         self.draft = self
-            .selected_entry()
+            .grid_target()
+            .map(|(_, entry)| entry)
             .filter(|entry| matches!(entry.kind, EntryKind::File | EntryKind::Dir))
             .and_then(|entry| entry.mode)
             .map(PermDraft::new);
@@ -488,7 +586,15 @@ impl FilesModel {
         self.draft.as_ref()
     }
 
+    /// Whether the grid and "应用 chmod" can be used: there has to be a session to apply it on.
+    pub fn chmod_enabled(&self) -> bool {
+        self.link == LinkStatus::Ready
+    }
+
     pub fn toggle_perm(&mut self, row: usize, column: usize) {
+        if !self.chmod_enabled() {
+            return;
+        }
         if let Some(draft) = &mut self.draft {
             draft.toggle(row, column);
             self.chmod_error = None;
@@ -497,9 +603,12 @@ impl FilesModel {
 
     /// "应用 chmod": the path and mode to set, if there is a draft that differs.
     pub fn chmod_request(&self) -> Option<(String, u32)> {
-        let entry = self.selected_entry()?;
+        if !self.chmod_enabled() {
+            return None;
+        }
+        let (path, _) = self.grid_target()?;
         let draft = self.draft.as_ref().filter(|d| d.is_dirty())?;
-        Some((entry.path.clone(), draft.mode()))
+        Some((path, draft.mode()))
     }
 
     pub fn chmod_error(&self) -> Option<&str> {
@@ -827,12 +936,45 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_that_meets_a_dead_connection_turns_into_the_disconnected_state() {
+    fn a_listing_that_meets_a_dead_session_waits_for_a_new_one_instead_of_claiming_a_disconnect() {
+        // A dead SFTP subsystem under a live SSH connection: no reconnect is coming, so the panel
+        // must not say "连接已断开，重连后自动刷新".
+        for error in [SftpError::Disconnected(String::new()), SftpError::Timeout] {
+            let mut model = at_app();
+            let request = model.refresh().unwrap();
+            assert_eq!(model.apply(request.id, Err(error)), Applied::SessionLost);
+            assert_eq!(model.link(), &LinkStatus::Connecting, "waiting for the session to be reopened");
+            assert!(!model.is_loading());
+            assert_eq!(model.row_count(), 5, "the old listing stays on screen");
+            // The reopened session arrives: the panel refreshes by itself, where it was.
+            let request = model.set_link(LinkStatus::Ready).expect("an automatic refresh");
+            assert_eq!((request.dir.as_str(), request.cause), ("/srv/app", Cause::Refresh));
+            assert_eq!(model.apply(request.id, ok(&request, listing())), Applied::Shown);
+            assert_eq!(model.link(), &LinkStatus::Ready);
+        }
+    }
+
+    #[test]
+    fn other_errors_and_stale_answers_are_not_a_lost_session() {
         let mut model = at_app();
         let request = model.refresh().unwrap();
-        model.apply(request.id, Err(SftpError::Disconnected(String::new())));
-        assert_eq!(model.link(), &LinkStatus::Disconnected);
-        assert_eq!(model.row_count(), 5, "the old listing is kept for when it is back");
+        let denied = SftpError::PermissionDenied { path: "/srv/app".into() };
+        assert_eq!(model.apply(request.id, Err(denied)), Applied::Shown);
+        assert_eq!(model.link(), &LinkStatus::Ready);
+        // An answer for a listing that is not the one in flight is dropped, lost session or not.
+        assert_eq!(model.apply(request.id, Err(SftpError::Timeout)), Applied::Stale);
+        assert_eq!(model.link(), &LinkStatus::Ready);
+    }
+
+    #[test]
+    fn an_operation_that_loses_the_session_makes_the_panel_wait_too() {
+        let mut model = at_app();
+        model.session_lost();
+        assert_eq!(model.link(), &LinkStatus::Connecting);
+        // A session that is not ready already is left as it is (the link's state wins).
+        model.set_link(LinkStatus::Failed("x".into()));
+        model.session_lost();
+        assert_eq!(model.link(), &LinkStatus::Failed("x".into()));
     }
 
     #[test]
@@ -919,5 +1061,88 @@ mod tests {
         assert_eq!(model.selected_entry().and_then(|e| e.mode), Some(0o740), "the selection stayed");
         assert!(!model.draft().unwrap().is_dirty());
         assert_eq!(model.draft().unwrap().octal(), "740");
+    }
+
+    // ---- the directory itself ----
+
+    fn stat_of(path: &str, mode: u32) -> Entry {
+        let mut entry = entry("app", EntryKind::Dir, mode);
+        entry.path = path.to_string();
+        entry.size = 4096;
+        entry.owner = "deploy".into();
+        entry.group = "www".into();
+        entry
+    }
+
+    #[test]
+    fn with_nothing_selected_the_details_are_those_of_the_directory() {
+        let mut model = FilesModel::new();
+        model.navigate("/srv/app", Cause::Hand);
+        let request = model.set_link(LinkStatus::Ready).unwrap();
+        model.apply_listed(
+            request.id,
+            Listed { dir: Some("/srv/app".into()), entries: Ok(listing()), stat: Some(stat_of("/srv/app", 0o750)) },
+        );
+        let Subject::Dir(Some(stat)) = model.subject() else { panic!("{:?}", model.subject()) };
+        assert_eq!((stat.owner.as_str(), stat.modified), ("deploy", Some(1_700_000_000)));
+        assert_eq!(model.draft().map(PermDraft::octal).as_deref(), Some("750"), "its permissions are on the grid");
+
+        // chmod works on it.
+        model.toggle_perm(1, 1);
+        assert_eq!(model.chmod_request(), Some(("/srv/app".to_string(), 0o770)));
+
+        // A selection takes over, and `..` is none of the directory's business.
+        model.select_row(4);
+        assert!(matches!(model.subject(), Subject::Entry(e) if e.name == "nginx.conf"));
+        model.select_row(0);
+        assert_eq!(model.subject(), Subject::Parent);
+        assert!(model.draft().is_none() && model.chmod_request().is_none());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_listed_still_shows_its_own_details() {
+        let mut model = FilesModel::new();
+        let request = model.set_link(LinkStatus::Ready).unwrap();
+        model.apply_listed(request.id, Listed { dir: Some("/srv/app".into()), entries: Ok(listing()), stat: None });
+        let request = model.navigate("/root", Cause::Hand).unwrap();
+        let denied = SftpError::PermissionDenied { path: "/root".into() };
+        model.apply_listed(
+            request.id,
+            Listed { dir: Some("/root".into()), entries: Err(denied), stat: Some(stat_of("/root", 0o700)) },
+        );
+        assert_eq!((model.cwd(), model.view()), ("/root", &View::Error("权限不足：/root".into())));
+        assert!(matches!(model.subject(), Subject::Dir(Some(stat)) if stat.owner == "deploy"));
+        assert_eq!(model.draft().map(PermDraft::octal).as_deref(), Some("700"));
+    }
+
+    #[test]
+    fn a_followed_directory_that_fails_keeps_the_old_details() {
+        let mut model = FilesModel::new();
+        let request = model.set_link(LinkStatus::Ready).unwrap();
+        model.apply_listed(
+            request.id,
+            Listed { dir: Some("/srv/app".into()), entries: Ok(listing()), stat: Some(stat_of("/srv/app", 0o755)) },
+        );
+        let request = model.on_terminal_cwd("/elsewhere").expect("follows");
+        let missing = SftpError::NotFound { path: "/elsewhere".into() };
+        model.apply_listed(request.id, Listed { dir: None, entries: Err(missing), stat: None });
+        assert_eq!(model.cwd(), "/srv/app");
+        assert_eq!(model.draft().map(PermDraft::octal).as_deref(), Some("755"), "still the old directory's");
+    }
+
+    #[test]
+    fn the_grid_and_apply_are_off_while_there_is_no_ready_session() {
+        let mut model = at_app();
+        model.select_row(4);
+        model.toggle_perm(0, 2);
+        assert!(model.chmod_enabled() && model.chmod_request().is_some());
+        for link in [LinkStatus::Disconnected, LinkStatus::Connecting, LinkStatus::Failed("x".into())] {
+            model.set_link(link.clone());
+            assert!(!model.chmod_enabled(), "{link:?}");
+            assert_eq!(model.chmod_request(), None, "{link:?}: nothing can be applied");
+            let before = model.draft().cloned();
+            model.toggle_perm(1, 1);
+            assert_eq!(model.draft().cloned(), before, "{link:?}: the grid does not move");
+        }
     }
 }

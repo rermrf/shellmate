@@ -238,10 +238,32 @@ impl SftpLink {
         if !matches!(event, TransferEvent::SessionLost) {
             return;
         }
-        let mut inner = self.shared.lock();
-        if !matches!(inner.state, LinkState::Ready(_)) {
-            return;
+        let inner = self.shared.lock();
+        if matches!(inner.state, LinkState::Ready(_)) {
+            self.reopen(inner);
         }
+    }
+
+    /// Something other than a transfer found `session` unusable (a request to list a directory,
+    /// say, came back with the connection gone or a timeout: see
+    /// [`SftpError::is_session_lost`](crate::SftpError::is_session_lost)). Nothing else would
+    /// notice: with no transfer running the queue says nothing, and the SFTP subsystem can die
+    /// while the SSH connection lives on.
+    ///
+    /// Acts only if `session` is still the current one (a late report about a session that was
+    /// replaced already is ignored). Then it is handled like [`TransferEvent::SessionLost`]: the
+    /// session is reopened, subject to the same rate limit and ending in the same
+    /// [`LinkState::Failed`] when it keeps dying.
+    pub fn session_lost(&self, session: &Arc<SftpSession>) {
+        let inner = self.shared.lock();
+        if matches!(&inner.state, LinkState::Ready(current) if Arc::ptr_eq(current, session)) {
+            self.reopen(inner);
+        }
+    }
+
+    /// Replaces the current (dead) session with a new one, unless that happens too often or the
+    /// connection is gone as well.
+    fn reopen(&self, mut inner: MutexGuard<'_, Inner>) {
         if !reopen_allowed(&mut inner.reopens, Instant::now()) {
             inner.state = LinkState::Failed("SFTP 会话反复中断，请稍后点刷新重试".into());
             drop(inner);
