@@ -2,6 +2,7 @@
 //! from its events, and what each row says (status line, bar, sizes, buttons). No gpui here, so
 //! all of it is tested without a window.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use shellmate_sftp::format_size;
@@ -60,6 +61,16 @@ impl TransferList {
     /// Items that finished well.
     pub fn done(&self) -> usize {
         self.items.iter().filter(|item| item.state == TransferState::Done).count()
+    }
+
+    /// The temporary files on the server that this connection's unfinished uploads are writing
+    /// (a panel leaves them out of its listing; a crash leaves others behind, and those stay visible).
+    pub fn hidden_temps(&self) -> HashSet<String> {
+        self.items
+            .iter()
+            .filter(|item| item.direction == Direction::Upload && !item.state.is_finished())
+            .filter_map(|item| item.temp.clone())
+            .collect()
     }
 
     /// `2 个进行中 · 1 个完成`
@@ -237,6 +248,7 @@ mod tests {
             failure_total: 0,
             clash: None,
             result: None,
+            temp: None,
         }
     }
 
@@ -293,6 +305,46 @@ mod tests {
         list.apply(&TransferEvent::Removed(vec![ItemId(5), ItemId(6), ItemId(7), ItemId(8)]));
         assert!(!list.has_finished());
         assert_eq!(list.summary(), "4 个进行中 · 0 个完成");
+    }
+
+    #[test]
+    fn only_the_temporary_files_of_unfinished_uploads_are_hidden() {
+        let mut list = TransferList::new();
+        let with_temp = |id, state, temp: &str| {
+            let mut item = up(id, state);
+            item.temp = Some(temp.to_string());
+            item
+        };
+        list.apply(&TransferEvent::Added(with_temp(1, TransferState::Running, "/srv/.a.shellmate-upload")));
+        list.apply(&TransferEvent::Added(with_temp(
+            2,
+            TransferState::Paused(PauseReason::User),
+            "/srv/.b.shellmate-upload",
+        )));
+        list.apply(&TransferEvent::Added(with_temp(
+            3,
+            TransferState::Paused(PauseReason::Disconnected),
+            "/srv/.c.shellmate-upload",
+        )));
+        list.apply(&TransferEvent::Added(with_temp(4, TransferState::Done, "/srv/.d.shellmate-upload")));
+        list.apply(&TransferEvent::Added(with_temp(5, TransferState::Failed("x".into()), "/srv/.e.shellmate-upload")));
+        let mut download = view(6, Direction::Download, TransferState::Running);
+        download.temp = Some("/tmp/.f.shellmate-download".into());
+        list.apply(&TransferEvent::Added(download));
+        list.apply(&TransferEvent::Added(up(7, TransferState::Queued)));
+        let hidden = list.hidden_temps();
+        assert_eq!(
+            hidden,
+            HashSet::from([
+                "/srv/.a.shellmate-upload".to_string(),
+                "/srv/.b.shellmate-upload".to_string(),
+                "/srv/.c.shellmate-upload".to_string()
+            ]),
+            "running and paused uploads: yes; finished ones, downloads and items with nothing in progress: no"
+        );
+        // When the item is over its temporary file is gone (or is a leftover the user should see).
+        list.apply(&TransferEvent::State(with_temp(1, TransferState::Cancelled, "/srv/.a.shellmate-upload")));
+        assert!(!list.hidden_temps().contains("/srv/.a.shellmate-upload"));
     }
 
     #[test]

@@ -382,9 +382,12 @@ const BIG: usize = 4 * 1024 * 1024;
 async fn paused_upload(rig: &Rig, content: &[u8]) -> (ItemId, PathBuf, u64, usize) {
     let src = rig.source("big.bin", content, 0o644);
     let id = rig.queue.enqueue_upload(vec![src.clone()], "/up");
-    rig.wait(id, "a quarter of the file", |v| v.bytes_done > (content.len() / 4) as u64).await;
+    let running = rig.wait(id, "a quarter of the file", |v| v.bytes_done > (content.len() / 4) as u64).await;
+    // The view says which file on the server is the upload's own temporary file (a panel hides it).
+    assert_eq!(running.temp.as_deref(), Some("/up/.big.bin.shellmate-upload"));
     rig.queue.pause(id);
     let paused = rig.state(id, TransferState::Paused(PauseReason::User)).await;
+    assert_eq!(paused.temp.as_deref(), Some("/up/.big.bin.shellmate-upload"), "a paused upload keeps it");
     let len = std::fs::metadata(rig.fx.host("/up/.big.bin.shellmate-upload")).unwrap().len();
     assert!(len > 0 && len < content.len() as u64, "the temporary file holds part of the file: {len}");
     assert_eq!(paused.bytes_done, len, "what is shown is what is on the server");
@@ -406,6 +409,7 @@ async fn pausing_an_upload_keeps_the_temporary_file_and_resuming_continues_from_
     rig.queue.resume(id);
     let view = rig.finished(id).await;
     assert_eq!(view.state, TransferState::Done);
+    assert_eq!(view.temp, None, "the file is in place: no temporary file to hide any more");
     assert!(rig.fx.read("/up/big.bin") == content, "the checksum matches");
     assert_eq!(rig.fx.names("/up"), ["big.bin"]);
     let log = rig.fx.logs.writes.lock().unwrap()[log_len..].to_vec();

@@ -485,8 +485,34 @@ impl FilesPanel {
         // Something dragged in from Finder over the card: it lights up, and a drop uploads here.
         let (hot_bg, hot_border) = (p.accs, p.acc);
         let dragging = self.demo_dragging();
+        let (accent, card_bg, cwd) = (p.acc, p.card, self.model.cwd().to_string());
+        let label = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .opacity(0.)
+            .when(dragging, |d| d.opacity(1.))
+            .group_drag_over::<ExternalPaths>("files-card", |style| style.opacity(1.))
+            .child(
+                div()
+                    .px(px(18.))
+                    .py(px(10.))
+                    .rounded(px(12.))
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(accent)
+                    .text_color(accent)
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .shadow(card_shadow(p))
+                    .child(format!("松开即可上传到 {cwd}")),
+            );
         div()
             .id("files-card")
+            .group("files-card")
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
@@ -501,6 +527,7 @@ impl FilesPanel {
             .shadow(card_shadow(p))
             .overflow_hidden()
             .child(self.render_top_bar(p, cx))
+            .child(label)
             .children(banner)
             .child(self.render_header(p))
             .child(self.render_list_area(p, cx))

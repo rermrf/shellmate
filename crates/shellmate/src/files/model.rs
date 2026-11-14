@@ -2,6 +2,8 @@
 //! selected, whether it follows the terminal, and the permission draft. Pure, so it is tested
 //! without a window; the panel only draws it and feeds it what happens.
 
+use std::collections::HashSet;
+
 use shellmate_sftp::path;
 use shellmate_sftp::{Entry, EntryKind, SftpError, mode_octal, mode_string};
 
@@ -252,6 +254,8 @@ pub struct FilesModel {
     reveal: bool,
     /// A message that has to survive the listing that follows the operation which failed.
     banner_after: Option<String>,
+    /// Paths left out of the listing: the temporary files of this connection's unfinished uploads.
+    hidden: HashSet<String>,
 }
 
 impl Default for FilesModel {
@@ -281,6 +285,7 @@ impl FilesModel {
             after: None,
             reveal: false,
             banner_after: None,
+            hidden: HashSet::new(),
         }
     }
 
@@ -367,6 +372,27 @@ impl FilesModel {
         match self.selection.as_ref()? {
             Selection::Parent => (offset == 1).then_some(0),
             Selection::Name(name) => self.entries.iter().position(|e| &e.name == name).map(|i| i + offset),
+        }
+    }
+
+    /// Leaves `paths` out of the listing (now and in the listings to come): the temporary files an
+    /// upload of this connection is writing. A file nobody here is writing stays visible, so that
+    /// what a crash left behind can be deleted.
+    pub fn set_hidden(&mut self, paths: HashSet<String>) {
+        if self.hidden == paths {
+            return;
+        }
+        self.hidden = paths;
+        let before = self.entries.len();
+        self.entries.retain(|entry| !self.hidden.contains(&entry.path));
+        if self.entries.len() != before {
+            if self.selection.as_ref().is_some_and(|selection| !self.selection_exists(selection)) {
+                self.selection = None;
+            }
+            if self.edit.as_ref().is_some_and(|edit| !self.entries.iter().any(|e| e.name == edit.name)) {
+                self.edit = None;
+            }
+            self.reset_draft();
         }
     }
 
@@ -500,6 +526,7 @@ impl FilesModel {
                 let previous = self.selection.clone();
                 self.cwd = dir;
                 self.dir_entry = stat;
+                entries.retain(|entry| !self.hidden.contains(&entry.path));
                 // The server lists directories in a sorted order already; keep it as it is.
                 std::mem::swap(&mut self.entries, &mut entries);
                 self.view = View::List;
@@ -1621,5 +1648,44 @@ mod tests {
         let list = model.refresh().unwrap();
         model.apply(list.id, ok(&list, listing()));
         assert_eq!(model.banner(), None);
+    }
+
+    // ---- temporary files of our own uploads ----
+
+    #[test]
+    fn the_temporary_files_of_unfinished_uploads_are_left_out_of_the_list_and_crash_leftovers_stay() {
+        let mut model = at_app();
+        let mut with_temps = listing();
+        with_temps.push(file(".nginx.conf.shellmate-upload"));
+        with_temps.push(file(".crashed.bin.shellmate-upload"));
+        model.set_hidden(HashSet::from(["/srv/app/.nginx.conf.shellmate-upload".to_string()]));
+        let list = model.refresh().unwrap();
+        model.apply(list.id, ok(&list, with_temps));
+        let names: Vec<_> = model.entries().iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&".nginx.conf.shellmate-upload"), "an upload of ours is writing it: {names:?}");
+        assert!(names.contains(&".crashed.bin.shellmate-upload"), "nobody is writing this one: {names:?}");
+        assert_eq!(model.row_count(), 1 + 5, "`..` and the entries that are shown");
+    }
+
+    #[test]
+    fn a_file_that_starts_being_written_while_listed_disappears_and_the_selection_survives_or_clears() {
+        let mut model = at_app();
+        let list = model.refresh().unwrap();
+        let mut entries = listing();
+        entries.push(file(".late.bin.shellmate-upload"));
+        model.apply(list.id, ok(&list, entries));
+        assert_eq!(model.row_count(), 1 + 5);
+        model.select_name(".late.bin.shellmate-upload");
+        model.set_hidden(HashSet::from(["/srv/app/.late.bin.shellmate-upload".to_string()]));
+        assert_eq!(model.row_count(), 1 + 4);
+        assert_eq!(model.selected_entry(), None, "what was selected is gone");
+        // The same set again changes nothing; an empty one lets later listings show everything.
+        model.set_hidden(HashSet::from(["/srv/app/.late.bin.shellmate-upload".to_string()]));
+        model.set_hidden(HashSet::new());
+        let list = model.refresh().unwrap();
+        let mut entries = listing();
+        entries.push(file(".late.bin.shellmate-upload"));
+        model.apply(list.id, ok(&list, entries));
+        assert_eq!(model.row_count(), 1 + 5);
     }
 }

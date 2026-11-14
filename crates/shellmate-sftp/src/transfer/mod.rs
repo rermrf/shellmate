@@ -234,6 +234,10 @@ pub struct TransferView {
     pub clash: Option<Clash>,
     /// For a finished download: where the (first) thing ended up, to show in Finder.
     pub result: Option<PathBuf>,
+    /// For an upload: the temporary file on the server that the file in progress is being written
+    /// to (or, while paused, was), so that a file panel can leave it out of the listing. `None`
+    /// when nothing is in progress, and after the file is in place.
+    pub temp: Option<String>,
 }
 
 impl TransferView {
@@ -347,6 +351,7 @@ mod tests {
             failure_total: 0,
             clash: None,
             result: None,
+            temp: None,
         };
         assert_eq!(view.fraction(), 0.0);
         assert_eq!(view.in_place_note(), None);

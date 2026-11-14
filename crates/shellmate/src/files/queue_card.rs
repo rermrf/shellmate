@@ -78,9 +78,11 @@ impl FilesPanel {
                 },
             ))
         });
+        // Rows keep their height: with many items the list scrolls instead of squeezing them.
         div()
             .id(("tq-row", id.0))
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(12.))
             .h(px(44.))

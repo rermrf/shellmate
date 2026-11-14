@@ -129,6 +129,7 @@ impl Item {
             failure_total: self.failure_total,
             clash: self.clash.clone(),
             result: self.result.clone(),
+            temp: self.partial.as_ref().and_then(|partial| partial.temp_remote.clone()),
         }
     }
 }

@@ -211,10 +211,25 @@ impl FilesPanel {
         self.queue = queue;
         let id = transfers.as_ref().map(Entity::entity_id);
         if self.watching.as_ref().map(|(watched, _)| *watched) != id {
-            self.watching = transfers.as_ref().map(|list| (list.entity_id(), cx.observe(list, |_, _, cx| cx.notify())));
+            self.watching = transfers.as_ref().map(|list| {
+                (
+                    list.entity_id(),
+                    cx.observe(list, |this, _, cx| {
+                        this.sync_hidden(cx);
+                        cx.notify();
+                    }),
+                )
+            });
             cx.notify();
         }
         self.transfers = transfers;
+        self.sync_hidden(cx);
+    }
+
+    /// Leaves the temporary files of this connection's unfinished uploads out of the listing.
+    fn sync_hidden(&mut self, cx: &mut Context<Self>) {
+        let hidden = self.transfers.as_ref().map(|list| list.read(cx).hidden_temps()).unwrap_or_default();
+        self.model.set_hidden(hidden);
     }
 
     /// Something changed in `dir` on the server (an upload finished there, say): a panel that shows
