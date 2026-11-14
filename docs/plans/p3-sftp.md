@@ -76,3 +76,32 @@
 - SFTP 路径一律按远端 POSIX 路径处理（不要用 `std::path::Path` 拼远端路径）。
 - 删除、覆盖等破坏性操作必须二次确认或有明确的同名处理选择；测试中只在临时目录和 `shellmate-e2e` 容器里操作。
 - 每个里程碑：`cargo build`、`cargo test --workspace`、`cargo clippy --workspace --all-targets` 零警告。
+
+## M1 review 结论（2026-11-14，通过）
+
+提交：`2cbe35b`（实现）、`cf44210`（review 修正）、`31ac99b`（e2e 临时目录名冲突）。
+
+验证：`cargo test --workspace` 全过、clippy 零警告；真实服务器（OpenSSH 10.3，`shellmate-e2e`）上 SFTP e2e 11 项连续 3 轮全过，SSH e2e 8 项仍全过，容器内无残留。
+
+确认的事实与取舍：
+- `russh-sftp` 3.0.1 可用，但高层 `SftpSession` 不暴露服务器扩展、也发不了 `posix-rename`，所以建在 `RawSftpSession` 上（`init()` 拿扩展，`extended()` 发 posix-rename）。容器 OpenSSH 通告：`posix-rename`、`fsync`、`limits`、`lsetstat`、`copy-data`、`expand-path`、`hardlink`、`home-directory`、`statvfs`、`fstatvfs`、`users-groups-by-id`（SFTP v3）。
+- 请求超时设为 30 秒（库默认 10 秒）。
+- API：`save_text(.., expected: Option<Revision>)`，`None` 即"覆盖远端"；打开后被删除的文件返回"不存在"而不是悄悄重建。`Conflict.remote_text` 为 `Option`（远端可能已不是文本）。编辑器保存的临时名为 `.<名称>.shellmate-edit`，与上传的 `.shellmate-upload` 区分。
+- OSC 7：alacritty 0.26 不处理 OSC 7，改为在 IO 线程上、送给解析器之前扫描字节流（只看不改，跨读块保持状态，只报告变化）。
+
+review 修正（`cf44210`）：
+1. 可写目录中的只读文件（如 0444）原先会被改名替换"写穿"——保存前先以只写方式探测原文件，不可写报"权限不足"、什么都不写（`ensure_writable`，M2 覆盖上传共用）。
+2. 属主保不住时（非 root 编辑组可写、属主是别人的文件）原先会悄悄变成自己的文件——改为原地写入，`WriteMode::InPlace(KeepOwner)`；chown 放在最终 chmod 之前，避免清掉 setuid/setgid。
+3. 临时文件改为独占创建（CREATE|EXCLUDE，不截断），防止预置的符号链接把写入引到别的文件；顺带修了退回原地写入时会删掉不是自己创建的临时名的问题。
+4. "覆盖远端"时目标是悬空符号链接，原先会把链接替换成普通文件——改为沿链接逐跳在最终位置创建，链接保持为链接。
+
+已知限制（接受）：
+- SFTP v3 修改时间精度为 1 秒：同一秒内、大小不变的他人修改检测不到冲突。
+- 混合换行的文件按多数风格处理：以 CRLF 为主时保存会把零星的 LF 行也写成 CRLF；以 LF 为主时文本中保留 `\r`。
+- 非 UTF-8 的文件名有损解码（显示替换字符，对其操作会失败）。
+- 大小写不敏感的服务器上，只改大小写的重命名会被"目标已存在"拒绝。
+
+留给后续里程碑：
+- M3：`SubsystemStream` 持有 `Connection`，`SftpSession` 必须随 `ConnGroup`（最后一个标签关闭）一起释放，否则连接不会关闭（P2 M4 修过同类泄漏）。
+- M3：OSC 7 不区分主机——终端里再 ssh 到别的机器时，上报的目录可能在本机不存在；跟随时进入失败要显示错误并保留原列表，不能把面板弄空。
+- M4：状态栏用 `InPlaceReason::label()` 显示"已直接写回（目录不可写 / 保留属主）"。
