@@ -16,7 +16,8 @@ use crate::dialogs::hostkey::HostKeyDialog;
 use crate::dialogs::import::{ImportDialog, ImportNotes};
 use crate::workspace::Workspace;
 
-/// Names accepted by `SHELLMATE_DEMO` (`connect:<host name>` also connects a saved host on startup;
+/// Names accepted by `SHELLMATE_DEMO` (`connect:<host name>` also connects a saved host on startup; `files:<host name>[:<dir>[:<name>]]` and
+/// `files-hint:<host name>` connect one and show its files panel;
 /// `connect-dup:<host name>` does that and copies the session a few seconds later, like ⌘⇧T).
 pub const NAMES: &[&str] = &[
     "hostkey-new",
@@ -63,6 +64,19 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
                 workspace.update_in(cx, |workspace, window, cx| workspace.duplicate_active(window, cx)).ok();
             })
             .detach();
+        return;
+    }
+    // `files:<host>[:<dir>[:<name to select>]]` connects the host and shows its files panel there;
+    // `files-hint:<host>` shows it with the OSC 7 hint open.
+    if let Some(args) = name.strip_prefix("files:").or_else(|| name.strip_prefix("files-hint:")) {
+        let hint = name.starts_with("files-hint:");
+        let mut parts = args.splitn(3, ':');
+        let host = parts.next().unwrap_or_default().to_string();
+        let (dir, select) = (parts.next().map(str::to_string), parts.next().map(str::to_string));
+        workspace.update(cx, |workspace, cx| {
+            workspace.connect_by_name(&host, window, cx);
+            workspace.demo_files(dir.as_deref(), select.as_deref(), hint, window, cx);
+        });
         return;
     }
     match name {

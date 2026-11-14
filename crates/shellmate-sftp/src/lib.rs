@@ -9,6 +9,8 @@
 
 mod entry;
 mod error;
+mod format;
+pub mod link;
 pub mod path;
 mod session;
 mod text;
@@ -16,6 +18,7 @@ pub mod transfer;
 
 pub use entry::{Entry, EntryKind, Link, Revision, natural_cmp, sort_entries};
 pub use error::SftpError;
+pub use format::{format_size, mode_octal, mode_string};
 pub use session::{POSIX_RENAME, ServerInfo, ServerLimits, SftpSession};
 pub use shellmate_ssh::Connection;
 pub use text::{

@@ -192,6 +192,9 @@ pub struct Terminal {
     ended: Option<SessionEnd>,
     /// The working directory the shell last reported with OSC 7.
     cwd: Option<String>,
+    /// The owner reconnects by itself when the transport drops: the line that reports the loss
+    /// does not tell the user to press Enter (the owner prints its own countdown instead).
+    auto_reconnect: bool,
     /// Bumped on every attach so notifications of a replaced backend are ignored.
     generation: Arc<AtomicU64>,
     tx: async_channel::Sender<Msg>,
@@ -244,6 +247,7 @@ impl Terminal {
             title: None,
             ended: None,
             cwd: None,
+            auto_reconnect: false,
             generation: Arc::new(AtomicU64::new(0)),
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
@@ -334,12 +338,20 @@ impl Terminal {
         cx.emit(TerminalEvent::Disconnected(reason));
     }
 
-    /// Prints the "press Enter" hint line that closes an ended session.
+    /// Whether the owner reconnects by itself when the transport drops (see the field); the owner
+    /// sets it while the connection is up and clears it when it stops trying.
+    pub fn set_auto_reconnect(&mut self, on: bool) {
+        self.auto_reconnect = on;
+    }
+
+    /// Prints the line that closes an ended session, with the "press Enter" hint unless an automatic
+    /// reconnect is about to follow.
     fn print_end(&mut self, text: &str) {
-        let hint = if self.local.is_some() { "按回车重新启动" } else { "按回车重新连接" };
+        let hint = end_hint(self.local.is_some(), self.auto_reconnect);
+        let tail = if hint.is_empty() { String::new() } else { format!(" \x1b[2m{hint}\x1b[0m") };
         let column = self.term.lock().grid().cursor.point.column.0;
         let lead = if column == 0 { "" } else { "\r\n" };
-        self.inject(&format!("{lead}\r\n{text} \x1b[2m{hint}\x1b[0m\r\n"));
+        self.inject(&format!("{lead}\r\n{text}{tail}\r\n"));
     }
 
     fn close_backend(&mut self) {
@@ -613,6 +625,17 @@ impl Terminal {
     }
 }
 
+/// The hint at the end of the line that closes an ended session: Enter restarts a local shell and
+/// reconnects an SSH one, and says nothing when the owner is about to reconnect by itself (its own
+/// countdown line follows, with its own hint).
+fn end_hint(local: bool, auto_reconnect: bool) -> &'static str {
+    match (local, auto_reconnect) {
+        (true, _) => "按回车重新启动",
+        (false, true) => "",
+        (false, false) => "按回车重新连接",
+    }
+}
+
 /// Escapes regex metacharacters so user input is searched literally.
 fn regex_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -627,7 +650,15 @@ fn regex_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::regex_escape;
+    use super::{end_hint, regex_escape};
+
+    #[test]
+    fn the_enter_hint_is_left_out_when_a_reconnect_follows() {
+        assert_eq!(end_hint(false, false), "按回车重新连接");
+        assert_eq!(end_hint(false, true), "", "the countdown line says what happens next");
+        assert_eq!(end_hint(true, false), "按回车重新启动");
+        assert_eq!(end_hint(true, true), "按回车重新启动", "a local shell never reconnects by itself");
+    }
 
     #[test]
     fn escapes_metacharacters() {

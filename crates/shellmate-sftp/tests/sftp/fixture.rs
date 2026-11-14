@@ -578,16 +578,21 @@ impl Fixture {
         Self { session, connection, server, root, logs, _env: env, _dir: dir }
     }
 
-    /// A fresh connection and SFTP session to the same server: what a reconnect makes.
-    pub async fn new_session(&self) -> SftpSession {
-        let host = SshHost::new("127.0.0.1", self.server.port, "alice", AuthMethod::Password)
-            .with_password(Secret::new("secret"));
-        let connection = Connection::connect(Route::direct(host), self._env.trusting()).await.expect("reconnect");
-        SftpSession::open(&connection).await.expect("sftp session")
-    }
-
     pub async fn default() -> Self {
         Self::start(SftpOptions::default()).await
+    }
+
+    /// A fresh connection to the same server.
+    pub async fn new_connection(&self) -> Connection {
+        let host = SshHost::new("127.0.0.1", self.server.port, "alice", AuthMethod::Password)
+            .with_password(Secret::new("secret"));
+        Connection::connect(Route::direct(host), self._env.trusting()).await.expect("reconnect")
+    }
+
+    /// A fresh connection and SFTP session to the same server: what a reconnect makes.
+    pub async fn new_session(&self) -> SftpSession {
+        let connection = self.new_connection().await;
+        SftpSession::open(&connection).await.expect("sftp session")
     }
 
     /// The host path of a remote path.

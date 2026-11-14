@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use gpui::Task;
 use shellmate_core::{Host, HostId};
+use shellmate_sftp::link::SftpLink;
 use shellmate_ssh::{Connection, WeakConnection};
 use tokio::task::AbortHandle;
 
@@ -94,6 +95,12 @@ pub struct ConnGroup {
     pub attempt: Option<Attempt>,
     /// The countdown before the next attempt.
     pub timer: Option<Task<()>>,
+    /// The SFTP session and transfer queue of the connection, shared by its tabs (`None` only if the
+    /// SSH runtime could not be started). Dropping the group shuts it down, which lets the
+    /// connection close with its last tab.
+    pub link: Option<SftpLink>,
+    /// The UI tasks that follow the link; they end with the group.
+    pub link_tasks: Vec<Task<()>>,
 }
 
 impl ConnGroup {
@@ -111,6 +118,8 @@ impl ConnGroup {
             prompting: false,
             attempt: None,
             timer: None,
+            link: None,
+            link_tasks: Vec::new(),
         }
     }
 
@@ -202,6 +211,18 @@ mod tests {
         assert!(group.has_open_prompt());
         drop(group);
         assert!(task.await.unwrap_err().is_cancelled(), "closing the last tab cancels the connection task");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_group_shuts_its_sftp_link_down() {
+        let (link, changes, _events) = SftpLink::new(tokio::runtime::Handle::current());
+        let mut group = ConnGroup::new(1, PoolKey::of(&[host("db")], "me"), Reconnect::connected(), AuthMemory::new());
+        group.link = Some(link);
+        assert!(!changes.is_closed(), "the link is alive while the group is");
+        drop(group);
+        // Closing the last tab drops the group; with the link gone nothing holds the SFTP session
+        // (and through it the connection) open any more.
+        assert!(changes.recv().await.is_err(), "nobody is left to report changes");
     }
 
     #[tokio::test]

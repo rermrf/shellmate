@@ -9,6 +9,7 @@ shellmate-core.workspace = true
 shellmate-term.workspace = true
 shellmate-store.workspace = true
 shellmate-ssh.workspace = true
+shellmate-sftp.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

@@ -175,7 +175,7 @@ pub fn reuse_line(host: &str, channel: u32) -> String {
 pub fn panel_hint(panel: Panel) -> &'static str {
     match panel {
         Panel::Terminal => "",
-        Panel::Files => "文件管理（P3 实现）",
+        Panel::Files => "",
         Panel::Forward => "端口转发（P4 实现）",
         Panel::Monitor => "服务器监控（P5 实现）",
     }
@@ -188,7 +188,7 @@ impl Workspace {
         self.groups.iter().find(|group| group.id == id)
     }
 
-    fn group_mut(&mut self, id: usize) -> Option<&mut ConnGroup> {
+    pub(super) fn group_mut(&mut self, id: usize) -> Option<&mut ConnGroup> {
         self.groups.iter_mut().find(|group| group.id == id)
     }
 
@@ -242,11 +242,19 @@ impl Workspace {
         }
     }
 
-    fn new_group(&mut self, chain: &[Host], machine: Reconnect, memory: Arc<AuthMemory>) -> usize {
+    fn new_group(
+        &mut self,
+        chain: &[Host],
+        machine: Reconnect,
+        memory: Arc<AuthMemory>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let id = self.next_group;
         self.next_group += 1;
         let key = PoolKey::of(chain, &connect::default_user());
         self.groups.push(ConnGroup::new(id, key, machine, memory));
+        self.attach_link(id, window, cx);
         id
     }
 
@@ -280,6 +288,7 @@ impl Workspace {
             terminal,
             exited: false,
             panel: Panel::Terminal,
+            files: None,
             kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
             _subscription: subscription,
         });
@@ -320,7 +329,7 @@ impl Workspace {
             Existing::None => {}
         }
         let Some((host, chain)) = self.resolve_for_connect(id, window, cx) else { return };
-        let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new());
+        let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new(), window, cx);
         self.push_ssh_tab(host.name.clone(), host, chain, group, window, cx);
         self.launch_attempt(group, window, cx);
     }
@@ -447,6 +456,7 @@ impl Workspace {
                 Output::GaveUp { reason, attempts } => self.give_up(group_id, &reason, attempts, window, cx),
             }
         }
+        self.sync_files(group_id, cx);
         self.sync_sidebar(cx);
         cx.notify();
     }
@@ -474,7 +484,11 @@ impl Workspace {
             if let Some(ssh) = self.ssh_mut(session_id) {
                 ssh.status = if ended { SshStatus::Ended } else { SshStatus::Failed };
             }
-            terminal.update(cx, |terminal, cx| terminal.disconnect(text.clone(), cx));
+            terminal.update(cx, |terminal, cx| {
+                // Nothing reconnects by itself any more: the line says to press Enter.
+                terminal.set_auto_reconnect(false);
+                terminal.disconnect(text.clone(), cx)
+            });
         }
         let _ = window;
     }
@@ -550,6 +564,9 @@ impl Workspace {
     /// The connection is up: every tab that was waiting gets its shell.
     fn on_connected(&mut self, group_id: usize, connected: Connected, window: &mut Window, cx: &mut Context<Self>) {
         let Connected { connection, shells, saves } = connected;
+        // The shells keep the connection open while they are being started; the link only gets to
+        // see it for the moment (it never holds it).
+        let live = connection.upgrade();
         let Some(group) = self.group_mut(group_id) else { return };
         let reconnected = matches!(group.machine.step(Input::Succeeded).first(), Some(Output::Connected { reconnected: true }));
         let manual = std::mem::take(&mut group.manual);
@@ -576,6 +593,9 @@ impl Workspace {
         // Tabs that started waiting while the attempt ran have no shell yet: they get a channel
         // on the connection that is up now.
         self.open_channels_for_waiting(group_id, window, cx);
+        if let Some(live) = live {
+            self.link_connected(group_id, &live, cx);
+        }
 
         if !reconnected && let Some(host_id) = first_host {
             if let Err(err) = self.store.borrow_mut().touch_connected(&host_id) {
@@ -590,6 +610,8 @@ impl Workspace {
 
     fn attach_shell(terminal: &Entity<Terminal>, shell: PendingShell, cx: &mut Context<Self>) {
         terminal.update(cx, |terminal, cx| {
+            // With a shell running, losing the connection starts the automatic reconnect.
+            terminal.set_auto_reconnect(true);
             terminal.attach(move |sink, dims| Ok(Box::new(shell.start(sink, dims))), cx);
         });
     }
@@ -675,7 +697,7 @@ impl Workspace {
             return;
         };
         let memory = self.group(old_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
-        let group = self.new_group(&chain, Reconnect::initial(), memory);
+        let group = self.new_group(&chain, Reconnect::initial(), memory, window, cx);
         if let Some(ssh) = self.ssh_mut(session_id) {
             ssh.group = group;
             ssh.status = SshStatus::Connecting;
@@ -686,6 +708,7 @@ impl Workspace {
             terminal.notice(&format!("\x1b[33m! 无法在已有连接上新开通道（{why}），改为重新连接"), cx)
         });
         self.release_group(old_group, window, cx);
+        self.sync_files(group, cx);
         self.launch_attempt(group, window, cx);
     }
 
@@ -706,6 +729,8 @@ impl Workspace {
             group.declined = false;
             group.manual = false;
         }
+        // The SFTP session went with the connection; its transfers wait for the next one.
+        self.link_lost(group_id, cx);
         self.step_group(group_id, Input::Lost, window, cx);
         if let Some(ssh) = self.ssh_mut(session_id)
             && ssh.status == SshStatus::Connected
@@ -799,7 +824,7 @@ impl Workspace {
             }
             None => {
                 let memory = self.group(source_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
-                let group = self.new_group(&chain, Reconnect::initial(), memory);
+                let group = self.new_group(&chain, Reconnect::initial(), memory, window, cx);
                 self.push_ssh_tab(title, host, chain, group, window, cx);
                 self.launch_attempt(group, window, cx);
             }
@@ -908,7 +933,7 @@ mod tests {
 
     #[test]
     fn panels_name_the_phase_that_brings_them() {
-        assert_eq!(panel_hint(Panel::Files), "文件管理（P3 实现）");
+        assert_eq!(panel_hint(Panel::Files), "", "the files panel is there for SSH sessions");
         assert_eq!(panel_hint(Panel::Forward), "端口转发（P4 实现）");
         assert_eq!(panel_hint(Panel::Monitor), "服务器监控（P5 实现）");
     }

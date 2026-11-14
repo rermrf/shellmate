@@ -4,6 +4,7 @@ use russh_sftp::client::error::Error as RawError;
 use russh_sftp::protocol::StatusCode;
 use shellmate_ssh::SshError;
 
+use crate::format::format_size;
 use crate::text::MAX_TEXT_SIZE;
 
 /// Why an SFTP operation failed.
@@ -62,21 +63,6 @@ pub enum SftpError {
 
 fn detail(text: &str) -> String {
     if text.is_empty() { String::new() } else { format!("（{text}）") }
-}
-
-/// `612 B`, `2.3 KB`, `1.8 MB`, `1.21 GB`.
-pub(crate) fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    let b = bytes as f64;
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if b < KB * KB {
-        format!("{:.1} KB", b / KB)
-    } else if b < KB * KB * KB {
-        format!("{:.1} MB", b / (KB * KB))
-    } else {
-        format!("{:.2} GB", b / (KB * KB * KB))
-    }
 }
 
 impl SftpError {
@@ -231,11 +217,4 @@ mod tests {
         assert!(SftpError::NotUtf8.to_string().contains("UTF-8"));
     }
 
-    #[test]
-    fn sizes_use_the_prototype_format() {
-        assert_eq!(format_size(612), "612 B");
-        assert_eq!(format_size(2355), "2.3 KB");
-        assert_eq!(format_size(1_887_437), "1.8 MB");
-        assert_eq!(format_size(1_298_000_000), "1.21 GB");
-    }
 }

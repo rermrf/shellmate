@@ -9,6 +9,7 @@ mod fixture;
 mod browse;
 mod e2e;
 mod lifecycle;
+mod link;
 mod ops;
 mod text;
 mod transfer;

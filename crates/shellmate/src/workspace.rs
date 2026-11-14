@@ -27,6 +27,7 @@ use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
+mod files;
 mod group;
 mod hosts;
 mod ssh;
@@ -110,6 +111,8 @@ struct Session {
     /// The local shell exited (SSH sessions track their state in [`ssh::SshSession`]).
     exited: bool,
     panel: Panel,
+    /// The file panel, made the first time the tab shows it (SSH tabs only).
+    files: Option<files::FilesTab>,
     kind: SessionKind,
     _subscription: Subscription,
 }
@@ -248,6 +251,7 @@ impl Workspace {
             terminal,
             exited: false,
             panel: Panel::Terminal,
+            files: None,
             kind: SessionKind::Local,
             _subscription: subscription,
         });
@@ -289,9 +293,9 @@ impl Workspace {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(ix) else { return };
         self.active = Some(ix);
-        window.focus(&session.view.focus_handle(cx), cx);
         let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
+        self.focus_active(window, cx);
         self.sync_sidebar(cx);
         cx.notify();
     }
@@ -389,10 +393,8 @@ impl Workspace {
     /// Clicking non-focusable chrome (toolbar, header, empty space) moves focus
     /// to the workspace root; hand it back to the terminal so typing keeps working.
     fn restore_terminal_focus(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focus_handle.is_focused(window)
-            && let Some(session) = self.active.and_then(|ix| self.sessions.get(ix))
-        {
-            window.focus(&session.view.focus_handle(cx), cx);
+        if self.focus_handle.is_focused(window) {
+            self.focus_active(window, cx);
         }
     }
 
@@ -520,6 +522,7 @@ impl Workspace {
                 match (session, panel) {
                     (None, _) => item.disabled("没有打开的会话"),
                     (Some(_), Panel::Terminal) => item,
+                    (Some(s), Panel::Files) if s.ssh().is_some() => item,
                     (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
                     (Some(_), other) => item.disabled(other.local_hint()),
                 }
@@ -542,7 +545,20 @@ impl Workspace {
                     .child(div().flex_none().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(p.tx).child(title))
                     .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.tx2).child(subtitle)),
             )
-            .child(segmented("panels", items, |_, _, _| {}, cx).flex_none())
+            .child(
+                segmented(
+                    "panels",
+                    items,
+                    {
+                        let this = cx.entity();
+                        move |ix, window, cx| {
+                            this.update(cx, |this, cx| this.show_panel(Panel::ALL[ix], window, cx));
+                        }
+                    },
+                    cx,
+                )
+                .flex_none(),
+            )
     }
 
     /// Header subtitle: the SSH target of an SSH session, the shell of a local one.
@@ -683,6 +699,9 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
+            Some(Session { panel: Panel::Files, files: Some(files), .. }) => {
+                div().flex_1().min_h_0().flex().child(files.panel.clone()).into_any_element()
+            }
             Some(session) => self.render_terminal_card(session, cx).into_any_element(),
             None => self.render_empty(cx).into_any_element(),
         };

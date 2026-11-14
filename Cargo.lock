@@ -7104,6 +7104,7 @@ dependencies = [
  "libc",
  "log",
  "shellmate-core",
+ "shellmate-sftp",
  "shellmate-ssh",
  "shellmate-store",
  "shellmate-term",
