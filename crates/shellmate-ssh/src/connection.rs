@@ -42,7 +42,7 @@ pub struct HopInfo {
 
 pub(crate) struct Inner {
     /// The watchdog budget this connection was made with, used again for opening shells.
-    watchdog_limit: Duration,
+    pub(crate) watchdog_limit: Duration,
     pub handle: Handle<ClientHandler>,
     pub shared: Arc<Shared>,
     pub runtime: runtime::Handle,

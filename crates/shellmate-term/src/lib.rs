@@ -3,6 +3,7 @@
 pub mod colors;
 mod element;
 mod keys;
+mod osc7;
 mod pty;
 pub mod terminal;
 pub mod view;

@@ -75,7 +75,7 @@ impl PendingShell {
 
 /// Waits for the server's answer to a channel request, setting aside any
 /// output that shows up in between.
-async fn expect_reply(channel: &mut Channel<Msg>, backlog: &mut Vec<ChannelMsg>, what: &str) -> Result<(), SshError> {
+pub(crate) async fn expect_reply(channel: &mut Channel<Msg>, backlog: &mut Vec<ChannelMsg>, what: &str) -> Result<(), SshError> {
     loop {
         match channel.wait().await {
             Some(ChannelMsg::Success) => return Ok(()),

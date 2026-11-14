@@ -14,7 +14,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::key::safe_rng;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Response, Session, VerifiedPublicKey};
-use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodKind, MethodSet};
+use russh::{Channel, ChannelId, ChannelOpenFailure, ChannelStream, Disconnect, MethodKind, MethodSet};
 use shellmate_core::{OutputHandler, OutputSink};
 use shellmate_ssh::{
     ChallengeRequest, ConnectOptions, HostKeyRequest, HostKeyVerifier, PassphraseRequest, PasswordRequest, Prompter,
@@ -47,6 +47,9 @@ pub struct KbdRound {
     pub expect: Vec<&'static str>,
 }
 
+/// Runs a subsystem (`sftp`) on the byte stream of the channel that requested it.
+pub type SubsystemRunner = Arc<dyn Fn(ChannelStream<Msg>) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ServerOptions {
     /// (user, password) pairs accepted by `password` auth.
@@ -65,6 +68,8 @@ pub struct ServerOptions {
     pub pty_delay: Duration,
     /// How long the server sits on a password check before answering.
     pub auth_delay: Duration,
+    /// Subsystems served on session channels, by name; others are refused.
+    pub subsystems: Vec<(&'static str, SubsystemRunner)>,
 }
 
 impl Default for ServerOptions {
@@ -78,6 +83,7 @@ impl Default for ServerOptions {
             forwarding: false,
             pty_delay: Duration::ZERO,
             auth_delay: Duration::ZERO,
+            subsystems: Vec::new(),
         }
     }
 }
@@ -99,6 +105,8 @@ pub struct ServerState {
     pub open_connections: Mutex<usize>,
     /// Number of shell requests (one per shell channel).
     pub shells: Mutex<usize>,
+    /// Names of the subsystems requested (`sftp`).
+    pub subsystem_requests: Mutex<Vec<String>>,
     /// Channels the client closed.
     pub closed_channels: Mutex<usize>,
     sockets: Mutex<Vec<std::net::TcpStream>>,
@@ -199,6 +207,8 @@ struct FixtureHandler {
     shells: HashSet<ChannelId>,
     lines: HashMap<ChannelId, Vec<u8>>,
     sizes: HashMap<ChannelId, (u32, u32)>,
+    /// Session channels kept until they ask for a subsystem (only when the server has any).
+    channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
 impl FixtureHandler {
@@ -211,6 +221,7 @@ impl FixtureHandler {
             shells: HashSet::new(),
             lines: HashMap::new(),
             sizes: HashMap::new(),
+            channels: HashMap::new(),
         }
     }
 
@@ -292,11 +303,32 @@ impl server::Handler for FixtureHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self.options.subsystems.is_empty() {
+            self.channels.insert(channel.id(), channel);
+        }
         reply.accept().await;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        lock(&self.state.subsystem_requests).push(name.to_string());
+        let runner = self.options.subsystems.iter().find(|(known, _)| *known == name).map(|(_, run)| run.clone());
+        match (runner, self.channels.remove(&channel)) {
+            (Some(run), Some(chan)) => {
+                session.channel_success(channel)?;
+                run(chan.into_stream());
+            }
+            _ => session.channel_failure(channel)?,
+        }
         Ok(())
     }
 

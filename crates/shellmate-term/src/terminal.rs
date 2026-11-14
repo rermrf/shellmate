@@ -23,6 +23,7 @@ use shellmate_core::io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, Termin
 
 use crate::colors::TerminalPalette;
 use crate::keys::paste_payload;
+use crate::osc7::Osc7Scanner;
 use crate::pty::{LocalPty, PtyOptions};
 
 /// A search hit, in grid coordinates.
@@ -86,6 +87,8 @@ enum Msg {
     Alac(AlacEvent),
     Exited { generation: u64, code: Option<u32> },
     Disconnected { generation: u64, reason: String },
+    /// The shell reported its working directory (OSC 7).
+    Cwd { generation: u64, path: String },
 }
 
 /// Forwards alacritty's events (title, bell, replies to queries) to the UI.
@@ -118,6 +121,9 @@ pub enum TerminalEvent {
     RestartRequested,
     /// A new backend was attached to a terminal whose previous session had ended.
     Restarted,
+    /// The shell reported a new working directory with OSC 7 (`ESC ] 7 ; file://host/path BEL`);
+    /// the path is percent-decoded. Only changes are reported. Shells do not do this by default.
+    CwdChanged(String),
 }
 
 /// Why the attached backend is no longer running.
@@ -135,6 +141,9 @@ pub enum SessionEnd {
 struct GridSink {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
+    /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
+    /// parser does and changes nothing about them.
+    osc7: Mutex<Osc7Scanner>,
     pending: Arc<AtomicBool>,
     tx: async_channel::Sender<Msg>,
     generation: u64,
@@ -146,9 +155,13 @@ impl OutputHandler for GridSink {
         if self.current.load(Ordering::Acquire) != self.generation {
             return;
         }
+        let reported = self.osc7.lock().feed(bytes);
         {
             let mut term = self.term.lock();
             self.parser.lock().advance(&mut *term, bytes);
+        }
+        for path in reported {
+            let _ = self.tx.try_send(Msg::Cwd { generation: self.generation, path });
         }
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.tx.try_send(Msg::Output);
@@ -177,6 +190,8 @@ pub struct Terminal {
     title: Option<SharedString>,
     /// `Some` once the attached session has ended.
     ended: Option<SessionEnd>,
+    /// The working directory the shell last reported with OSC 7.
+    cwd: Option<String>,
     /// Bumped on every attach so notifications of a replaced backend are ignored.
     generation: Arc<AtomicU64>,
     tx: async_channel::Sender<Msg>,
@@ -228,6 +243,7 @@ impl Terminal {
             palette,
             title: None,
             ended: None,
+            cwd: None,
             generation: Arc::new(AtomicU64::new(0)),
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
@@ -272,6 +288,7 @@ impl Terminal {
         let sink = OutputSink::new(GridSink {
             term: self.term.clone(),
             parser: self.parser.clone(),
+            osc7: Mutex::new(Osc7Scanner::new()),
             pending: self.output_pending.clone(),
             tx: self.tx.clone(),
             generation,
@@ -282,6 +299,7 @@ impl Terminal {
             Ok(backend) => {
                 self.backend = Some(backend);
                 self.ended = None;
+                self.cwd = None;
                 self.foreground = None;
                 if was_ended {
                     cx.emit(TerminalEvent::Restarted);
@@ -374,7 +392,13 @@ impl Terminal {
                     self.end_disconnected(reason, cx);
                     output = true;
                 }
-                Msg::Exited { .. } | Msg::Disconnected { .. } => {}
+                Msg::Cwd { generation, path } if generation == self.current_generation() => {
+                    if self.cwd.as_deref() != Some(path.as_str()) {
+                        self.cwd = Some(path.clone());
+                        cx.emit(TerminalEvent::CwdChanged(path));
+                    }
+                }
+                Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } => {}
             }
         }
         if output {
@@ -541,6 +565,12 @@ impl Terminal {
         info
     }
 
+    /// The working directory the shell last reported with OSC 7, if it ever did since the
+    /// current backend was attached.
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
     }
@@ -632,6 +662,7 @@ mod sink_tests {
         let sink = OutputSink::new(GridSink {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
+            osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,
             generation,
@@ -690,5 +721,42 @@ mod sink_tests {
         let msgs = drain(&f.rx);
         assert!(matches!(&msgs[0], Msg::Exited { generation: 7, code: Some(3) }));
         assert!(matches!(&msgs[1], Msg::Disconnected { generation: 7, reason } if reason == "连接已断开：保活超时"));
+    }
+
+    #[test]
+    fn a_reported_directory_reaches_the_ui_and_the_grid_is_unchanged() {
+        let f = fixture(3);
+        f.sink.output(b"before\x1b]7;file://h/home/%E7%94%A8%E6%88%B7\x07after");
+        let msgs = drain(&f.rx);
+        let cwds: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Cwd { generation, path } => Some((*generation, path.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cwds, [(3, "/home/用户")]);
+        // The parser still saw everything, exactly as without the scanner.
+        assert_eq!(row(&f.term, 0), "beforeafter");
+    }
+
+    #[test]
+    fn a_report_cut_between_reads_is_still_reported_once() {
+        let f = fixture(1);
+        f.sink.output(b"x\x1b]7;file://h/va");
+        f.sink.output(b"r/log\x1b");
+        assert!(!drain(&f.rx).iter().any(|m| matches!(m, Msg::Cwd { .. })), "not complete yet");
+        f.sink.output(b"\\y");
+        let msgs = drain(&f.rx);
+        assert!(matches!(msgs.iter().find(|m| matches!(m, Msg::Cwd { .. })), Some(Msg::Cwd { path, .. }) if path == "/var/log"));
+        assert_eq!(row(&f.term, 0), "xy");
+    }
+
+    #[test]
+    fn output_of_a_replaced_backend_reports_no_directory() {
+        let f = fixture(1);
+        f.current.store(2, Ordering::Release);
+        f.sink.output(b"\x1b]7;file://h/stale\x07");
+        assert!(drain(&f.rx).is_empty());
     }
 }

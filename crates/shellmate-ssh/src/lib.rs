@@ -17,6 +17,7 @@ mod interact;
 mod known_hosts;
 mod runtime;
 mod shell;
+mod subsystem;
 mod watchdog;
 
 pub use config::{ConnectEvent, ConnectOptions, EventCallback, HostSecrets, Route, SshHost};
@@ -29,4 +30,5 @@ pub use interact::{
 pub use known_hosts::{KnownHosts, Lookup};
 pub use runtime::SshRuntime;
 pub use shell::{PendingShell, ShellChannel, TERM};
+pub use subsystem::SubsystemStream;
 pub use shellmate_core::Secret;

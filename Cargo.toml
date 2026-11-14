@@ -12,6 +12,7 @@ shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }
 shellmate-store = { path = "crates/shellmate-store" }
+shellmate-sftp = { path = "crates/shellmate-sftp" }
 
 gpui = { package = "gpui-kit", version = "0.9.1" }
 libc = "0.2"
@@ -23,6 +24,7 @@ log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
 russh = "0.65"
+russh-sftp = "3.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "fs"] }
 async-trait = "0.1"
 thiserror = "2"
