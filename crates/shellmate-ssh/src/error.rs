@@ -59,6 +59,12 @@ pub enum SshError {
     /// The connection dropped.
     #[error("连接已断开：{0}")]
     Disconnected(String),
+    /// The server did not open a `direct-tcpip` channel to `host:port`.
+    #[error("{}", tcpip_text(host, *port, *reason))]
+    Tcpip { host: String, port: u16, reason: TcpipFailure },
+    /// The server refused to listen for a remote forward.
+    #[error("服务器拒绝了远程转发（可能禁用了 AllowTcpForwarding）")]
+    RemoteForwardDenied,
     /// The saved host cannot be connected (wrong protocol, empty route).
     #[error("无法连接：{0}")]
     Unsupported(String),
@@ -70,6 +76,35 @@ pub enum SshError {
         #[source]
         source: Box<SshError>,
     },
+}
+
+/// Why the server did not open a `direct-tcpip` channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpipFailure {
+    /// The server forbids forwarding to this target (`AllowTcpForwarding`, `PermitOpen`).
+    Prohibited,
+    /// The server could not connect to the target (refused, unreachable, unknown name; SSH
+    /// reports all of these with the same code).
+    ConnectFailed,
+    /// The server has no channels left.
+    ResourceShortage,
+    /// The server did not answer in time.
+    Timeout,
+    /// The SSH connection is gone.
+    Disconnected,
+    /// Any other refusal.
+    Other,
+}
+
+fn tcpip_text(host: &str, port: u16, reason: TcpipFailure) -> String {
+    match reason {
+        TcpipFailure::Prohibited => format!("服务器不允许转发到 {host}:{port}（AllowTcpForwarding / PermitOpen 限制）"),
+        TcpipFailure::ConnectFailed => format!("服务器无法连接 {host}:{port}"),
+        TcpipFailure::ResourceShortage => "服务器上的转发通道已用完".into(),
+        TcpipFailure::Timeout => format!("经服务器连接 {host}:{port} 超时"),
+        TcpipFailure::Disconnected => "SSH 连接已断开".into(),
+        TcpipFailure::Other => format!("服务器无法打开到 {host}:{port} 的转发通道"),
+    }
 }
 
 /// `20 秒`, or milliseconds for sub-second limits.

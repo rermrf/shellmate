@@ -13,6 +13,7 @@ shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }
 shellmate-store = { path = "crates/shellmate-store" }
 shellmate-sftp = { path = "crates/shellmate-sftp" }
+shellmate-forward = { path = "crates/shellmate-forward" }
 
 gpui = { package = "gpui-kit", version = "0.9.1", features = ["syntect"] }
 libc = "0.2"

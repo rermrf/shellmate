@@ -2,12 +2,16 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use russh::client::{DisconnectReason, Handler};
+use tokio::sync::watch;
+
+use russh::Channel;
+use russh::client::{ChannelOpenHandle, DisconnectReason, Handler, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 use shellmate_core::FingerprintState;
 
 use crate::config::{ConnectEvent, ConnectOptions};
 use crate::error::{SshError, describe_russh_error};
+use crate::forward::RemoteRegistry;
 use crate::interact::{HostKeyInfo, HostKeyRequest, HostKeyVerifier};
 use crate::known_hosts::{KnownHosts, Lookup};
 use crate::watchdog::Watchdog;
@@ -18,6 +22,29 @@ use crate::watchdog::Watchdog;
 pub(crate) struct Shared {
     host_key: Mutex<Option<HostKeyRecord>>,
     disconnect: Mutex<Option<String>>,
+    /// Who the server's `forwarded-tcpip` channels go to.
+    pub remote: RemoteRegistry,
+    /// Set once the transport has ended.
+    pub closed: ClosedFlag,
+}
+
+/// A flag that goes up once, when the transport ends, and that anybody can wait for.
+pub(crate) struct ClosedFlag(watch::Sender<bool>);
+
+impl Default for ClosedFlag {
+    fn default() -> Self {
+        Self(watch::channel(false).0)
+    }
+}
+
+impl ClosedFlag {
+    fn raise(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn watch(&self) -> watch::Receiver<bool> {
+        self.0.subscribe()
+    }
 }
 
 /// What was decided about the host key of a hop.
@@ -148,6 +175,23 @@ impl Handler for ClientHandler {
         Ok(true)
     }
 
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.shared
+            .remote
+            .dispatch(channel, connected_address, connected_port, originator_address, originator_port, reply)
+            .await;
+        Ok(())
+    }
+
     async fn disconnected(&mut self, reason: DisconnectReason<Self::Error>) -> Result<(), Self::Error> {
         let text = match &reason {
             DisconnectReason::ReceivedDisconnect(info) if info.message.trim().is_empty() => {
@@ -158,6 +202,8 @@ impl Handler for ClientHandler {
             DisconnectReason::Error(HandlerError::Ssh(err)) => err.to_string(),
         };
         *lock(&self.shared.disconnect) = Some(text);
+        self.shared.remote.close();
+        self.shared.closed.raise();
         match reason {
             DisconnectReason::ReceivedDisconnect(_) => Ok(()),
             DisconnectReason::Error(err) => Err(err),

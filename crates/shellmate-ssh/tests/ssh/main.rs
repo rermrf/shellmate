@@ -3,6 +3,7 @@
 mod agent;
 mod auth;
 mod e2e;
+mod forward;
 mod host_keys;
 mod jump;
 mod pool;

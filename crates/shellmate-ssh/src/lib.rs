@@ -12,6 +12,7 @@ mod auth;
 mod config;
 mod connection;
 mod error;
+mod forward;
 mod handler;
 mod interact;
 mod known_hosts;
@@ -22,7 +23,8 @@ mod watchdog;
 
 pub use config::{ConnectEvent, ConnectOptions, EventCallback, HostSecrets, Route, SshHost};
 pub use connection::{Connection, HopInfo, WeakConnection};
-pub use error::SshError;
+pub use error::{SshError, TcpipFailure};
+pub use forward::{ForwardedStream, RemoteForward, TcpipStream};
 pub use interact::{
     ChallengePrompt, ChallengeRequest, HostKeyInfo, HostKeyRequest, HostKeyVerifier, NoInteraction, PassphraseRequest,
     PasswordRequest, Prompter,

@@ -64,6 +64,13 @@ pub struct ServerOptions {
     pub two_factor: bool,
     /// Serve `direct-tcpip` channels (jump host).
     pub forwarding: bool,
+    /// Serve `tcpip-forward` requests: listen on 127.0.0.1 and open `forwarded-tcpip` channels.
+    pub remote_forwarding: bool,
+    /// Never answer `direct-tcpip` requests (a target that does not respond).
+    pub stall_direct_tcpip: bool,
+    /// The address announced in `forwarded-tcpip` channels instead of the one that was asked
+    /// for (OpenSSH may answer `127.0.0.1` for `localhost`).
+    pub announce_address: Option<&'static str>,
     /// How long the server sits on a PTY request before answering.
     pub pty_delay: Duration,
     /// How long the server sits on a password check before answering.
@@ -81,6 +88,9 @@ impl Default for ServerOptions {
             methods: vec![MethodKind::Password, MethodKind::PublicKey, MethodKind::KeyboardInteractive],
             two_factor: false,
             forwarding: false,
+            remote_forwarding: false,
+            stall_direct_tcpip: false,
+            announce_address: None,
             pty_delay: Duration::ZERO,
             auth_delay: Duration::ZERO,
             subsystems: Vec::new(),
@@ -99,6 +109,10 @@ pub struct ServerState {
     pub resizes: Mutex<Vec<(u32, u32)>>,
     /// (host, port) of every direct-tcpip request.
     pub forwards: Mutex<Vec<(String, u32)>>,
+    /// (address, port) of every `tcpip-forward` request, as sent (port 0 stays 0).
+    pub remote_forwards: Mutex<Vec<(String, u32)>>,
+    /// (address, port) of every `cancel-tcpip-forward` request.
+    pub cancelled_forwards: Mutex<Vec<(String, u32)>>,
     /// Number of accepted TCP connections.
     pub connections: Mutex<usize>,
     /// Connections whose SSH session has not ended yet.
@@ -209,6 +223,16 @@ struct FixtureHandler {
     sizes: HashMap<ChannelId, (u32, u32)>,
     /// Session channels kept until they ask for a subsystem (only when the server has any).
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Listeners of remote forwards, by (address, actual port); stopped with the connection.
+    listeners: HashMap<(String, u32), tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for FixtureHandler {
+    fn drop(&mut self) {
+        for (_, listener) in self.listeners.drain() {
+            listener.abort();
+        }
+    }
 }
 
 impl FixtureHandler {
@@ -222,6 +246,7 @@ impl FixtureHandler {
             lines: HashMap::new(),
             sizes: HashMap::new(),
             channels: HashMap::new(),
+            listeners: HashMap::new(),
         }
     }
 
@@ -343,6 +368,14 @@ impl server::Handler for FixtureHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         lock(&self.state.forwards).push((host.to_string(), port));
+        if self.options.stall_direct_tcpip {
+            // Keep the request open for good without holding up the session.
+            tokio::spawn(async move {
+                let _held = (channel, reply);
+                std::future::pending::<()>().await;
+            });
+            return Ok(());
+        }
         if !self.options.forwarding {
             reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
             return Ok(());
@@ -358,6 +391,53 @@ impl server::Handler for FixtureHandler {
             Err(_) => reply.reject(ChannelOpenFailure::ConnectFailed).await,
         }
         Ok(())
+    }
+
+    async fn tcpip_forward(&mut self, address: &str, port: &mut u32, session: &mut Session) -> Result<bool, Self::Error> {
+        lock(&self.state.remote_forwards).push((address.to_string(), *port));
+        if !self.options.remote_forwarding {
+            return Ok(false);
+        }
+        let Ok(listener) = TcpListener::bind(("127.0.0.1", *port as u16)).await else { return Ok(false) };
+        let actual = u32::from(listener.local_addr().unwrap().port());
+        *port = actual;
+        let announced = self.options.announce_address.map_or_else(|| address.to_string(), str::to_string);
+        let handle = session.handle();
+        let task = tokio::spawn(async move {
+            while let Ok((socket, peer)) = listener.accept().await {
+                let handle = handle.clone();
+                let announced = announced.clone();
+                tokio::spawn(async move {
+                    let opened = handle
+                        .channel_open_forwarded_tcpip(announced, actual, peer.ip().to_string(), u32::from(peer.port()))
+                        .await;
+                    if let Ok(channel) = opened {
+                        let (mut socket, mut stream) = (socket, channel.into_stream());
+                        let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                    }
+                });
+            }
+        });
+        if let Some(old) = self.listeners.insert((address.to_string(), actual), task) {
+            old.abort();
+        }
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        lock(&self.state.cancelled_forwards).push((address.to_string(), port));
+        match self.listeners.remove(&(address.to_string(), port)) {
+            Some(listener) => {
+                listener.abort();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn pty_request(
@@ -673,4 +753,61 @@ impl Drop for SilentServer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// A TCP echo server on a loopback port: sends back everything it receives and, after the
+/// client's end-of-file, closes its side (so half-closing works).
+pub struct EchoServer {
+    pub port: u16,
+    /// Number of connections accepted so far.
+    pub accepted: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EchoServer {
+    /// On `127.0.0.1`, any free port.
+    pub async fn start() -> Self {
+        Self::start_on("127.0.0.1").await.expect("loopback is available")
+    }
+
+    /// On `::1`; `None` if this machine has no IPv6 loopback.
+    pub async fn start_v6() -> Option<Self> {
+        Self::start_on("::1").await
+    }
+
+    async fn start_on(address: &str) -> Option<Self> {
+        let listener = TcpListener::bind((address, 0)).await.ok()?;
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = socket.into_split();
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+                    });
+                }
+            }
+        });
+        Some(Self { port, accepted, task })
+    }
+
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for EchoServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A port nothing listens on (it was free a moment ago).
+pub fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
 }

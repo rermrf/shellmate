@@ -41,7 +41,8 @@ pub struct HopInfo {
 }
 
 pub(crate) struct Inner {
-    /// The watchdog budget this connection was made with, used again for opening shells.
+    /// The watchdog budget this connection was made with, used again for opening shells, subsystems
+    /// and forwarding channels.
     pub(crate) watchdog_limit: Duration,
     pub handle: Handle<ClientHandler>,
     pub shared: Arc<Shared>,
@@ -144,11 +145,16 @@ impl Connection {
         let _ = self.inner.handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
 
-    /// Resolves once the transport is closed. Polls, so it is meant for tests
-    /// and shutdown paths rather than hot loops.
+    /// Resolves once the transport is closed: at once when the session reports its end, and
+    /// otherwise within a quarter of a second (the transport is also looked at from time to time).
     pub async fn closed(&self) {
+        let mut ended = self.inner.shared.closed.watch();
         while !self.is_closed() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                // An error means the flag is gone with the connection, which is as good as closed.
+                _ = ended.wait_for(|ended| *ended) => return,
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
         }
     }
 }
