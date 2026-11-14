@@ -14,7 +14,7 @@ shellmate-ssh = { path = "crates/shellmate-ssh" }
 shellmate-store = { path = "crates/shellmate-store" }
 shellmate-sftp = { path = "crates/shellmate-sftp" }
 
-gpui = { package = "gpui-kit", version = "0.9.1" }
+gpui = { package = "gpui-kit", version = "0.9.1", features = ["syntect"] }
 libc = "0.2"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
@@ -34,6 +34,7 @@ sha1 = "0.11"
 data-encoding = "2"
 tempfile = "3"
 futures = "0.3"
+similar = "2"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
 keyring = "4.2"

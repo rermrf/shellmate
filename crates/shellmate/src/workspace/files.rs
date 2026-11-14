@@ -10,15 +10,20 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui::component::WindowExt as _;
+use gpui::component::notification::Notification;
 use gpui::{AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
-use shellmate_sftp::SftpSession;
 use shellmate_sftp::link::{LinkState, SftpLink};
 use shellmate_sftp::transfer::{Choice, Clash, ItemId, TransferEvent, TransferState};
+use shellmate_sftp::{SftpError, SftpSession, TextFile};
 use shellmate_ssh::Connection;
 
 use super::ssh::SshStatus;
 use super::{Panel, Workspace};
 use crate::dialogs::clash::{Answer, ClashDialog};
+use crate::dialogs::confirm::ConfirmDialog;
+use crate::editor::refusal::offers_download;
+use crate::editor::view::{EditorEvent, FileEditor};
 use crate::files::model::LinkStatus;
 use crate::files::panel::{FilesEvent, FilesPanel};
 use crate::files::transfers::TransferList;
@@ -315,6 +320,10 @@ impl Workspace {
                 FilesEvent::RetrySession => this.retry_sftp(session_id, cx),
                 FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
                 FilesEvent::HandleClash(id) => this.handle_clash(session_id, *id, window, cx),
+                FilesEvent::OpenEditor(file) => this.open_editor(session_id, (**file).clone(), window, cx),
+                FilesEvent::EditorRefused { path, error } => {
+                    this.refuse_editor(session_id, path.clone(), error, window, cx)
+                }
             });
         self.sessions[ix].files = Some(FilesTab { panel, _subscription: subscription });
         true
@@ -333,6 +342,73 @@ impl Workspace {
             link.session_lost(session);
         }
         self.sync_files(group_id, cx);
+    }
+
+    // ---- the editor ---------------------------------------------------------------------------------
+
+    /// Opens the editor modal on `file`, read by the panel of tab `session_id` (one editor at a time).
+    fn open_editor(&mut self, session_id: usize, file: TextFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            return;
+        }
+        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else { return };
+        let (Some(files), Some(ssh)) = (session.files.as_ref(), session.ssh()) else { return };
+        let (panel, host, group_id) = (files.panel.downgrade(), ssh.host.name.clone(), ssh.group);
+        let began = std::time::Instant::now();
+        let editor = cx.new(|cx| FileEditor::new(file, &host, panel, window, cx));
+        // How long until the modal is on screen: two frames after it is asked for.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| log::info!("编辑器：打开到出现 {} ms", began.elapsed().as_millis()));
+        });
+        let subscription =
+            cx.subscribe_in(&editor, window, move |this: &mut Self, _, event: &EditorEvent, window, cx| match event {
+                // The upload changed the directory: every panel of the connection that shows it lists it again.
+                EditorEvent::Saved(dir) => this.remote_changed(group_id, dir, cx),
+                EditorEvent::Closed => {
+                    this.editor = None;
+                    this._editor_subscription = None;
+                    this.focus_active(window, cx);
+                }
+            });
+        self.editor = Some(editor.clone());
+        self._editor_subscription = Some(subscription);
+        FileEditor::open(editor, window, cx);
+    }
+
+    /// The editor will not open `path`: say why, and offer the download where there is a file to download.
+    fn refuse_editor(
+        &mut self,
+        session_id: usize,
+        path: String,
+        error: &SftpError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = shellmate_sftp::path::file_name(&path).unwrap_or(&path).to_string();
+        let Some(panel) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.files.as_ref()) else {
+            return;
+        };
+        if offers_download(error) {
+            let panel = panel.panel.downgrade();
+            ConfirmDialog::open(
+                format!("无法用内置编辑器打开 {name}"),
+                error.to_string(),
+                "下载",
+                false,
+                move |_, cx| {
+                    let path = path.clone();
+                    panel.update(cx, |panel, cx| panel.download(path, cx)).ok();
+                    Ok(())
+                },
+                window,
+                cx,
+            );
+        } else {
+            window.push_notification(
+                Notification::warning(error.to_string()).title(format!("无法用内置编辑器打开 {name}")),
+                cx,
+            );
+        }
     }
 
     /// The panel asked for a new session after the last attempt failed.
@@ -454,6 +530,30 @@ impl Workspace {
             // 处理 on the row that is still waiting.
             6 => panel.update(cx, |panel, cx| panel.demo_handle_clash(cx)),
             other => log::warn!("unknown queue step {other}"),
+        }
+    }
+
+    /// Debug review hook: one step of an editor scenario on `path` (see `demo::run`, `editor:`).
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_editor_step(&mut self, step: &str, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match step {
+            "open" => {
+                if let Some(panel) = self.demo_panel() {
+                    panel.update(cx, |panel, cx| panel.open_in_editor(path.to_string(), cx));
+                }
+            }
+            other => {
+                let Some(editor) = self.editor.clone() else { return log::warn!("no editor open for step {other:?}") };
+                editor.update(cx, |editor, cx| match other {
+                    "type" => editor.demo_type("\n# 由演示脚本在编辑器里加的一行\n", window, cx),
+                    "save" => editor.demo_save(window, cx),
+                    "close" => editor.demo_close(window, cx),
+                    "timed" => editor.demo_type_timed(60, window, cx),
+                    choice @ ("load" | "overwrite" | "cancel" | "unsaved-save" | "unsaved-discard"
+                    | "unsaved-cancel") => editor.demo_choose(choice, window, cx),
+                    unknown => log::warn!("unknown editor step {unknown:?}"),
+                });
+            }
         }
     }
 

@@ -583,7 +583,12 @@ impl FilesPanel {
             }
             Subject::Parent => ("..".into(), "上级目录".into(), dash(), dash(), dash()),
         };
-        let editable_file = matches!(subject, Subject::Entry(entry) if entry.kind == EntryKind::File);
+        // The editor for a file (or a link to one): its path, if the button is to be offered.
+        let editable_path = match subject {
+            Subject::Entry(entry) if entry.edits_as_text() => Some(entry.path.clone()),
+            _ => None,
+        };
+        let can_edit = self.model.ops_enabled();
         let grid_enabled = self.model.chmod_enabled();
         let draft = self.model.draft();
         let can_apply = self.model.chmod_request().is_some();
@@ -682,14 +687,22 @@ impl FilesPanel {
                     .map(|error| div().text_size(px(12.)).text_color(p.err).child(error.to_string())),
             )
             .child(div().flex_1())
-            .children(editable_file.then(|| {
-                Self::button("open-editor", "用内置编辑器打开", true, p)
+            .children(editable_path.map(|path| {
+                let button = Self::button("open-editor", "用内置编辑器打开", true, p)
                     .h(px(38.))
                     .rounded(px(12.))
-                    .text_size(px(13.))
-                    .opacity(0.45)
-                    .cursor_not_allowed()
-                    .tooltip(|window, cx| Tooltip::new("内置编辑器稍后提供").build(window, cx))
+                    .text_size(px(13.));
+                if can_edit {
+                    button
+                        .cursor_pointer()
+                        .hover(|d| d.opacity(0.88))
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_in_editor(path.clone(), cx)))
+                } else {
+                    button
+                        .opacity(0.45)
+                        .cursor_not_allowed()
+                        .tooltip(|window, cx| Tooltip::new("连接就绪后可用").build(window, cx))
+                }
             }))
     }
 }
@@ -724,7 +737,7 @@ impl FilesPanel {
                 .child(label)
         };
         let (open_label, open_enabled) =
-            if menu.opens_dir { ("打开", ops) } else { ("用内置编辑器打开", false) };
+            if menu.opens_dir { ("打开", ops) } else { ("用内置编辑器打开", ops && menu.editable) };
         let shadow = vec![
             BoxShadow {
                 color: black().opacity(0.22),

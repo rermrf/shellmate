@@ -17,7 +17,7 @@ use gpui::{
     Pixels, Point, ScrollHandle, ScrollStrategy, Subscription, UniformListScrollHandle, Window, actions,
 };
 use shellmate_sftp::transfer::{ItemId, TransferQueue};
-use shellmate_sftp::{SftpError, SftpSession};
+use shellmate_sftp::{Revision, SaveFormat, SaveOutcome, SftpError, SftpSession, TextFile, path};
 use shellmate_ssh::SshRuntime;
 use shellmate_term::{Terminal, TerminalEvent};
 use tokio::task::AbortHandle;
@@ -25,6 +25,7 @@ use tokio::task::AbortHandle;
 use super::model::{Applied, DeleteRequest, FilesModel, LinkStatus, Listed, Request, Row};
 use super::transfers::{Reveal, RowAction, TransferList, ensure_downloads_dir, reveal};
 use crate::dialogs::confirm::ConfirmDialog;
+use crate::editor::refusal::is_refusal;
 
 /// The key context of the panel: its shortcuts only work while the list has focus, so none of them
 /// can reach the terminal.
@@ -55,6 +56,10 @@ pub enum FilesEvent {
     SessionLost(Arc<SftpSession>),
     /// 处理 on a queue row: the question about names that exist is to be asked (again).
     HandleClash(ItemId),
+    /// A text file was read for the built-in editor.
+    OpenEditor(Box<TextFile>),
+    /// The editor will not open this file: the dialog says why (and offers a download where that makes sense).
+    EditorRefused { path: String, error: SftpError },
 }
 
 impl EventEmitter<FilesEvent> for FilesPanel {}
@@ -68,8 +73,10 @@ pub const ZSH_SNIPPET: &str = r#"precmd() { printf '\e]7;file://%s%s\a' "$HOST" 
 pub struct RowMenu {
     pub name: String,
     pub path: String,
-    /// A directory (or a link to one): 打开 enters it. Anything else is a file for the editor.
+    /// A directory (or a link to one): 打开 enters it.
     pub opens_dir: bool,
+    /// A file (or a link to one) the editor can be offered for.
+    pub editable: bool,
     /// Where it is drawn (window coordinates).
     pub position: Point<Pixels>,
 }
@@ -317,7 +324,34 @@ impl FilesPanel {
         T: Send + 'static,
         Fut: Future<Output = Result<T, SftpError>> + Send + 'static,
     {
-        let Some(session) = self.session.clone() else { return };
+        self.run_job(
+            job,
+            |this, result, cx| {
+                if !result.as_ref().is_err_and(SftpError::is_session_lost) {
+                    done(this, result, cx);
+                }
+            },
+            cx,
+        );
+    }
+
+    /// Like [`run_op`](Self::run_op), but `done` always hears the outcome: the editor has a buffer to
+    /// keep and a status to show when the session is lost (the loss is reported first, so that the
+    /// link reopens the session by the time the user tries again). With no session at all the
+    /// outcome is "disconnected".
+    fn run_job<T, Fut>(
+        &mut self,
+        job: impl FnOnce(Arc<SftpSession>) -> Fut,
+        done: impl FnOnce(&mut Self, Result<T, SftpError>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, SftpError>> + Send + 'static,
+    {
+        let Some(session) = self.session.clone() else {
+            done(self, Err(SftpError::Disconnected(String::new())), cx);
+            return;
+        };
         let used = session.clone();
         let id = self.next_op;
         self.next_op += 1;
@@ -327,10 +361,10 @@ impl FilesPanel {
             let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
             this.update(cx, |this, cx| {
                 this.ops.remove(&id);
-                match result {
-                    Err(err) if err.is_session_lost() => this.lose_session(used, cx),
-                    result => done(this, result, cx),
+                if result.as_ref().is_err_and(SftpError::is_session_lost) {
+                    this.lose_session(used, cx);
                 }
+                done(this, result, cx);
                 cx.notify();
             })
             .ok();
@@ -372,6 +406,13 @@ impl FilesPanel {
     }
 
     pub(super) fn open_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let editable = match self.model.row(index) {
+            Some(Row::Entry(entry)) if !entry.opens_as_dir() && entry.edits_as_text() => Some(entry.path.clone()),
+            _ => None,
+        };
+        if let Some(path) = editable {
+            return self.open_in_editor(path, cx);
+        }
         let request = self.model.open_row(index);
         self.start(request, cx);
         cx.notify();
@@ -489,12 +530,75 @@ impl FilesPanel {
         );
     }
 
+    // ---- the editor --------------------------------------------------------------------------------------
+
+    /// Reads the file at `path` (a link is followed) for the built-in editor. What the editor will
+    /// not open (binary, not UTF-8, too big, not a regular file) is reported with its reason; any
+    /// other failure goes above the list.
+    pub fn open_in_editor(&mut self, path: String, cx: &mut Context<Self>) {
+        self.menu = None;
+        if !self.model.ops_enabled() {
+            return;
+        }
+        let name = path::file_name(&path).unwrap_or(&path).to_string();
+        let (target, reported) = (path.clone(), path);
+        let began = Instant::now();
+        self.run_job(
+            move |session| async move { session.open_text(&target).await },
+            move |this, result, cx| match result {
+                Ok(file) => {
+                    log::info!(
+                        "编辑器：读取 {} ({} 字节) 用时 {} ms",
+                        file.path,
+                        file.text.len(),
+                        began.elapsed().as_millis()
+                    );
+                    cx.emit(FilesEvent::OpenEditor(Box::new(file)));
+                }
+                // The session is being replaced; the user opens the file again.
+                Err(err) if err.is_session_lost() => {}
+                Err(error) if is_refusal(&error) => cx.emit(FilesEvent::EditorRefused { path: reported, error }),
+                Err(err) => this.model.set_banner(format!("无法打开 {name}：{err}")),
+            },
+            cx,
+        );
+    }
+
+    /// Uploads the editor's `text` to `path`, expecting the server's file to still be at `expected`
+    /// (see `SftpSession::save_text`). The answer comes on the returned channel, whatever happens
+    /// (a lost session included, which is also reported so that it gets reopened).
+    pub fn save_text(
+        &mut self,
+        path: String,
+        text: String,
+        format: SaveFormat,
+        expected: Revision,
+        cx: &mut Context<Self>,
+    ) -> async_channel::Receiver<Result<SaveOutcome, SftpError>> {
+        let (answer, receiver) = async_channel::bounded(1);
+        self.run_job(
+            move |session| async move { session.save_text(&path, &text, format, Some(expected)).await },
+            move |_, result, _| {
+                let _ = answer.try_send(result);
+            },
+            cx,
+        );
+        receiver
+    }
+
     // ---- transfers -------------------------------------------------------------------------------------
 
     /// 下载 / the menu: the selected file or directory goes to the downloads folder.
     pub(super) fn begin_download(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
-        let (Some(path), Some(queue)) = (self.model.download_path(), self.queue.clone()) else { return };
+        if let Some(path) = self.model.download_path() {
+            self.download(path, cx);
+        }
+    }
+
+    /// Queues the download of `path` (a file or a directory of the server) into the downloads folder.
+    pub fn download(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(queue) = self.queue.clone() else { return };
         match ensure_downloads_dir() {
             Ok(dir) => {
                 queue.enqueue_download(vec![path], dir);
@@ -578,6 +682,7 @@ impl FilesPanel {
                 name: entry.name.clone(),
                 path: entry.path.clone(),
                 opens_dir: entry.opens_as_dir(),
+                editable: !entry.opens_as_dir() && entry.edits_as_text(),
                 position,
             }),
             _ => None,
@@ -597,7 +702,7 @@ impl FilesPanel {
         self.model.select_name(&menu.name);
         match action {
             MenuAction::Open if menu.opens_dir => self.go_to(&menu.path, cx),
-            // A file would open in the editor, which comes later.
+            MenuAction::Open if menu.editable => self.open_in_editor(menu.path.clone(), cx),
             MenuAction::Open => {}
             MenuAction::Download => self.begin_download(cx),
             MenuAction::Rename => {
@@ -662,6 +767,9 @@ impl FilesPanel {
 
     pub(super) fn on_open(&mut self, _: &FilesOpen, _: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        if let Some(index) = self.model.selected_index() {
+            return self.open_row(index, cx);
+        }
         let request = self.model.open_selected();
         self.start(request, cx);
         cx.notify();

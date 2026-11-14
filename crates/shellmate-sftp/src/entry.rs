@@ -114,6 +114,11 @@ impl Entry {
         self.is_dir() || self.link.as_ref().is_some_and(|link| link.resolved == Some(EntryKind::Dir))
     }
 
+    /// Whether the editor can be offered for it: a regular file, or a link that points at one.
+    pub fn edits_as_text(&self) -> bool {
+        self.kind == EntryKind::File || self.link.as_ref().is_some_and(|link| link.resolved == Some(EntryKind::File))
+    }
+
     /// Whether this is a symlink whose target does not exist.
     pub fn is_dangling(&self) -> bool {
         self.link.as_ref().is_some_and(|link| link.resolved.is_none())
@@ -236,6 +241,24 @@ mod tests {
         }
         let bare = Entry::from_attrs("/", "a", "", &FileAttributes::default());
         assert_eq!((bare.owner_display().as_str(), bare.kind, bare.mode), ("", EntryKind::Other, None));
+    }
+
+    #[test]
+    fn files_and_links_to_files_can_be_edited() {
+        let file = Entry::from_attrs("/", "a.txt", "", &attrs(0o100644, 4, 0));
+        assert!(file.edits_as_text());
+        let dir = Entry::from_attrs("/", "d", "", &attrs(0o040755, 0, 0));
+        assert!(!dir.edits_as_text());
+        let mut link = Entry::from_attrs("/", "l", "", &attrs(0o120777, 4, 0));
+        assert!(!link.edits_as_text(), "a link nobody looked at");
+        link.link = Some(Link { target: "a.txt".into(), resolved: Some(EntryKind::File) });
+        assert!(link.edits_as_text());
+        link.link = Some(Link { target: "d".into(), resolved: Some(EntryKind::Dir) });
+        assert!(!link.edits_as_text());
+        link.link = Some(Link { target: "nowhere".into(), resolved: None });
+        assert!(!link.edits_as_text());
+        link.link = Some(Link { target: "pipe".into(), resolved: Some(EntryKind::Other) });
+        assert!(!link.edits_as_text(), "a device or a pipe is not opened");
     }
 
     #[test]

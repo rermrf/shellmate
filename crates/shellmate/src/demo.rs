@@ -83,6 +83,48 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `editor:<host>:<path>:<scenario>` opens the file in the built-in editor and plays the scenario
+    // (`clean`, `modified`, `saved`, `conflict[-load|-overwrite|-third]`, `unsaved[-save|-discard]`, `refusal`, `perf`) by calling the editor,
+    // not by typing: the review script changes the file on the server between the steps of `conflict`.
+    if let Some(args) = name.strip_prefix("editor:") {
+        let mut parts = args.splitn(3, ':').map(str::to_string);
+        let (host, file, scenario) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        let dir = shellmate_sftp::path::parent(&file).unwrap_or_else(|| "/".into());
+        workspace.update(cx, |workspace, cx| {
+            workspace.connect_by_name(&host, window, cx);
+            workspace.demo_files(Some(&dir), None, false, window, cx);
+        });
+        let steps: &[(u64, &str)] = match scenario.as_str() {
+            "modified" => &[(4000, "open"), (6000, "type")],
+            "saved" => &[(4000, "open"), (6000, "type"), (7000, "save")],
+            "conflict" => &[(4000, "open"), (6000, "type"), (9500, "save")],
+            "conflict-load" => &[(4000, "open"), (6000, "type"), (9500, "save"), (12000, "load")],
+            "conflict-overwrite" => &[(4000, "open"), (6000, "type"), (9500, "save"), (12000, "overwrite")],
+            // The script changes the file again after the dialog came up: overwriting is another conflict.
+            "conflict-third" => &[(4000, "open"), (6000, "type"), (9500, "save"), (13500, "overwrite")],
+            "unsaved" => &[(4000, "open"), (6000, "type"), (7000, "close")],
+            "unsaved-save" => &[(4000, "open"), (6000, "type"), (7000, "close"), (9000, "unsaved-save")],
+            "unsaved-discard" => &[(4000, "open"), (6000, "type"), (7000, "close"), (9000, "unsaved-discard")],
+            "perf" => &[(4000, "open"), (10000, "timed")],
+            _ => &[(4000, "open")],
+        };
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let mut last = 0;
+                for &(at_ms, step) in steps {
+                    cx.background_executor().timer(std::time::Duration::from_millis(at_ms - last)).await;
+                    last = at_ms;
+                    workspace.update_in(cx, |workspace, window, cx| workspace.demo_editor_step(step, &file, window, cx)).ok();
+                }
+            })
+            .detach();
+        return;
+    }
     // `files-act:<host>:<dir>:<name>:<what>[:<text>]` shows the panel there and, a few seconds later,
     // does `what` to the entry `name` by calling the panel (`menu`, `rename-error`, `delete`, `permissions`, `drag`,
     // `download`, `newfolder`); `files-queue:<host>:<dir>` shows a transfer queue in all its states.

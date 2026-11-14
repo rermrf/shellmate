@@ -23,6 +23,7 @@ use shellmate_term::view::ToggleSearch;
 use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
 
 use crate::connect;
+use crate::editor::view::FileEditor;
 use crate::sidebar::{LiveStatus, Sidebar, SidebarEvent};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
@@ -141,6 +142,9 @@ pub struct Workspace {
     next_group: usize,
     user_host: SharedString,
     focus_handle: FocusHandle,
+    /// The editor modal, if one is open (one at a time per window).
+    editor: Option<Entity<FileEditor>>,
+    _editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -170,6 +174,8 @@ impl Workspace {
             next_group: 1,
             user_host: user_at_host().into(),
             focus_handle: cx.focus_handle(),
+            editor: None,
+            _editor_subscription: None,
             _subscriptions: subscriptions,
         };
         if let Some(message) = store_notice {

@@ -3,6 +3,7 @@
 mod assets;
 mod connect;
 mod dialogs;
+mod editor;
 mod files;
 mod library;
 mod reconnect;
@@ -63,6 +64,7 @@ fn main() {
         sidebar::init(cx);
         workspace::init(cx);
         files::panel::init(cx);
+        editor::view::init(cx);
 
         let dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         #[cfg(debug_assertions)]

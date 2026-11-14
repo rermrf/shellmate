@@ -9,6 +9,7 @@ pub struct Broken {
     pub day: u32,
     pub hour: u32,
     pub minute: u32,
+    pub second: u32,
 }
 
 /// `11-12 08:55` for a time in the year `now` is in, `2025-11-12` for any other year. `local` turns
@@ -35,7 +36,28 @@ pub fn local_broken(secs: i64) -> Option<Broken> {
         day: tm.tm_mday as u32,
         hour: tm.tm_hour as u32,
         minute: tm.tm_min as u32,
+        second: tm.tm_sec as u32,
     })
+}
+
+/// The time of day: `09:12:03` with `seconds`, else `09:12`. `local` is the time zone (injected for tests);
+/// a time that cannot be converted is written as `—`.
+pub fn format_clock(secs: i64, seconds: bool, local: impl Fn(i64) -> Option<Broken>) -> String {
+    match local(secs) {
+        Some(t) if seconds => format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second),
+        Some(t) => format!("{:02}:{:02}", t.hour, t.minute),
+        None => "—".to_string(),
+    }
+}
+
+/// Now, as `09:12:03` in this machine's time zone.
+pub fn clock_now() -> String {
+    format_clock(now_secs(), true, local_broken)
+}
+
+/// A time of day as `09:12` in this machine's time zone.
+pub fn clock_hm(secs: i64) -> String {
+    format_clock(secs, false, local_broken)
 }
 
 /// Seconds since the epoch, now.
@@ -64,7 +86,14 @@ mod tests {
         let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
         let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
         let year = (yoe + era * 400 + i64::from(month <= 2)) as i32;
-        Some(Broken { year, month, day, hour: (rest / 3600) as u32, minute: (rest % 3600 / 60) as u32 })
+        Some(Broken {
+            year,
+            month,
+            day,
+            hour: (rest / 3600) as u32,
+            minute: (rest % 3600 / 60) as u32,
+            second: (rest % 60) as u32,
+        })
     }
 
     /// The days since the epoch of a civil date (the inverse of the conversion above).
@@ -88,9 +117,21 @@ mod tests {
 
     #[test]
     fn the_stand_in_zone_is_right() {
-        assert_eq!(utc(0), Some(Broken { year: 1970, month: 1, day: 1, hour: 0, minute: 0 }));
-        assert_eq!(utc(at(2024, 2, 29, 23, 7)), Some(Broken { year: 2024, month: 2, day: 29, hour: 23, minute: 7 }));
+        assert_eq!(utc(0), Some(Broken { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0 }));
+        assert_eq!(
+            utc(at(2024, 2, 29, 23, 7) + 41),
+            Some(Broken { year: 2024, month: 2, day: 29, hour: 23, minute: 7, second: 41 })
+        );
         assert_eq!(now(), 1_794_657_600);
+    }
+
+    #[test]
+    fn the_time_of_day_has_seconds_when_asked_and_a_dash_when_unknown() {
+        let t = at(2026, 11, 14, 9, 5) + 3;
+        assert_eq!(format_clock(t, true, utc), "09:05:03");
+        assert_eq!(format_clock(t, false, utc), "09:05");
+        assert_eq!(format_clock(t, true, |_| None), "—");
+        assert_eq!(format_clock(at(2026, 11, 14, 23, 59) + 59, true, utc), "23:59:59");
     }
 
     #[test]
