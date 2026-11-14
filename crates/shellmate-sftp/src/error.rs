@@ -85,6 +85,13 @@ impl SftpError {
         matches!(self, Self::Disconnected(_))
     }
 
+    /// Whether the session cannot be relied on any more: the connection is gone, or the server
+    /// stopped answering. A transfer that meets this stops and waits for a new session instead of
+    /// failing its files.
+    pub fn is_session_lost(&self) -> bool {
+        matches!(self, Self::Disconnected(_) | Self::Timeout)
+    }
+
     /// Whether the path does not exist.
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound { .. })

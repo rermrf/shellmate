@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::stream::{self, StreamExt as _};
 use russh_sftp::client::RawSftpSession;
@@ -102,6 +103,7 @@ impl ServerInfo {
 pub struct SftpSession {
     pub(crate) raw: Arc<RawSftpSession>,
     info: ServerInfo,
+    timeout_secs: AtomicU64,
 }
 
 impl SftpSession {
@@ -138,7 +140,19 @@ impl SftpSession {
             }
         }
         let info = ServerInfo { version: version.version, extensions, limits };
-        Ok(Self { raw: Arc::new(raw), info })
+        Ok(Self { raw: Arc::new(raw), info, timeout_secs: AtomicU64::new(REQUEST_TIMEOUT_SECS) })
+    }
+
+    /// How long a request may wait for its answer before the session counts as stalled
+    /// ([`SftpError::Timeout`]); 30 seconds by default.
+    pub fn set_request_timeout(&self, seconds: u64) {
+        self.timeout_secs.store(seconds, Ordering::Relaxed);
+        self.raw.set_timeout(seconds);
+    }
+
+    /// The current request timeout.
+    pub(crate) fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.load(Ordering::Relaxed))
     }
 
     /// What the server advertised.

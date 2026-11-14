@@ -1,5 +1,6 @@
 //! Running one item: walking the selection, then transferring entry after entry.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use super::control::{Control, Interrupt};
 use super::names::{download_temp_name, upload_temp_path};
 use super::plan::{Plan, PlanEntry, Top, Walked, walk_local, walk_remote};
 use super::queue::{Partial, Reporter};
-use super::{Choice, Clash, Direction, TransferFailure, failure_summary};
+use super::{Choice, Clash, Direction, PauseReason, TransferFailure, failure_summary};
 use crate::entry::EntryKind;
 use crate::error::SftpError;
 use crate::path;
@@ -56,8 +57,28 @@ enum End {
     Interrupted(Interrupt),
 }
 
-/// How long in-flight writes get to finish when a transfer is paused.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long in-flight writes get to finish when the user pauses an upload: half the time a request
+/// may take (15 seconds by default), so that a session that does not answer is given up on before
+/// its requests time out one by one.
+fn drain_timeout(session: &SftpSession) -> Duration {
+    (session.request_timeout() / 2).max(Duration::from_millis(250))
+}
+
+/// How long cleaning up after a stop (closing a handle, removing a temporary file) may take: on a
+/// session that does not answer, it must not hold the stop up.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Runs `cleanup`, but not for longer than [`CLEANUP_TIMEOUT`], and ignores how it went.
+async fn quietly<T>(cleanup: impl std::future::Future<Output = T>) {
+    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await;
+}
+
+/// Whether an error means the session is gone (or not answering), so that the item has to wait for
+/// a new one instead of failing the file: the error says so, or the queue has already taken the
+/// session away (whatever comes back from a session being torn down is not the file's fault).
+fn session_gone(err: &SftpError, control: &Control) -> bool {
+    err.is_session_lost() || control.interrupted() == Some(Interrupt::Pause(PauseReason::Disconnected))
+}
 
 // ---- the whole item ---------------------------------------------------------------------------
 
@@ -105,7 +126,10 @@ async fn execute(
         match result {
             Ok(End::Done) => {
                 reporter.entry_done(index, entry.size, !entry.dir);
+                // A downloaded directory ends up where it was planned; a file reports its own path
+                // (the name may have changed at the last moment).
                 if input.direction == Direction::Download
+                    && entry.dir
                     && entry.rel.is_empty()
                     && let Some(dest) = &plan.tops[entry.top].dest
                 {
@@ -113,7 +137,8 @@ async fn execute(
                 }
             }
             Ok(End::Interrupted(interrupt)) => return RunOutcome::Interrupted(interrupt),
-            Err(err) if err.is_disconnected() => return RunOutcome::Disconnected,
+            // The session is gone: wait for a new one, the file did nothing wrong.
+            Err(err) if session_gone(&err, control) => return RunOutcome::Disconnected,
             Err(err) => {
                 let top = &plan.tops[entry.top];
                 let shown = source_path(input.direction, top, entry);
@@ -165,7 +190,7 @@ async fn make_plan(reporter: &Reporter, session: &SftpSession, input: &RunInput)
     };
     if plan.entries.is_empty() && !failures.is_empty() {
         reporter.set_plan(Arc::new(plan), skipped, failures.clone());
-        return Err(RunOutcome::Failed(failure_summary(&failures)));
+        return Err(RunOutcome::Failed(failure_summary(&failures, failures.len())));
     }
     let plan = Arc::new(plan);
     reporter.set_plan(plan.clone(), skipped, failures);
@@ -397,7 +422,7 @@ async fn upload_file(
     // does not allow one, the existing file itself (not atomic, and not resumable: a stop leaves it
     // partly written, and a resume starts over).
     let (handle, start, in_place) = match resumed {
-        Some((handle, len)) => (handle, len, false),
+        Some((handle, from)) => (handle, from, false),
         None => {
             let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
             match session.create_exclusive(&temp, attrs).await {
@@ -420,25 +445,25 @@ async fn upload_file(
         temp_local: None,
         src_size: size,
         src_mtime: mtime,
+        highwater: start,
     }));
     reporter.set_offset(start);
 
-    let pushed =
-        push(session, &handle, &local, start, size, control, &written_to, |bytes| reporter.progress(bytes)).await;
-    match pushed {
+    match push(session, &handle, &local, start, size, control, &written_to, reporter).await {
         Ok(End::Done) => {}
         Ok(End::Interrupted(interrupt)) => {
-            let _ = session.close_handle(&handle, &written_to).await;
+            quietly(session.close_handle(&handle, &written_to)).await;
             if interrupt == Interrupt::Cancel && !in_place {
-                let _ = session.remove_file(&temp).await;
+                quietly(session.remove_file(&temp)).await;
                 reporter.set_partial(None);
             }
             return Ok(End::Interrupted(interrupt));
         }
         Err(err) => {
-            let _ = session.close_handle(&handle, &written_to).await;
-            if !err.is_disconnected() && !in_place {
-                let _ = session.remove_file(&temp).await;
+            quietly(session.close_handle(&handle, &written_to)).await;
+            // A lost session keeps the temporary file for the resume; any other failure removes it.
+            if !session_gone(&err, control) && !in_place {
+                quietly(session.remove_file(&temp)).await;
                 reporter.set_partial(None);
             }
             return Err(err);
@@ -462,13 +487,13 @@ async fn upload_file(
         Ok(()) if in_place => Ok(()),
         Ok(()) => session.replace_file(&temp, &target).await.map_err(|err| err.at(&dest)),
         Err(err) => {
-            let _ = session.close_handle(&handle, &written_to).await;
+            quietly(session.close_handle(&handle, &written_to)).await;
             Err(err)
         }
     };
     if let Err(err) = replaced {
-        if !err.is_disconnected() && !in_place {
-            let _ = session.remove_file(&temp).await;
+        if !session_gone(&err, control) && !in_place {
+            quietly(session.remove_file(&temp)).await;
             reporter.set_partial(None);
         }
         return Err(err);
@@ -478,6 +503,9 @@ async fn upload_file(
 
 /// Opens the temporary file of an interrupted upload to continue it, if it is safe to: the
 /// source is as it was, and the temporary file is still a regular file no longer than the source.
+/// Returns the handle and where to go on from: the smaller of the temporary file's length and the
+/// part known to be written without gaps (the server may have applied requests out of order, so
+/// the length alone can have holes below it). What is above is simply written again.
 async fn resume_upload(
     session: &SftpSession,
     partial: Option<&Partial>,
@@ -498,12 +526,15 @@ async fn resume_upload(
         return Ok(None);
     }
     let handle = session.open_handle(temp, OpenFlags::WRITE, FileAttributes::empty()).await?;
-    Ok(Some((handle, found.size)))
+    Ok(Some((handle, found.size.min(partial.highwater))))
 }
 
-/// Writes the local file from `start` on to the open remote `handle`, with many requests in flight.
-/// Stops at a chunk boundary when told to, after the requests already sent have been answered
-/// (so the temporary file is exactly as long as what was acknowledged).
+/// Writes the local file from `start` on to the open remote `handle`, with many requests in flight,
+/// and tells `reporter` how far the file is written without gaps (requests may be answered, or even
+/// applied, in any order).
+///
+/// Stops at a chunk boundary when told to. A user's pause waits (for a while) for the requests
+/// already sent; a cancel or a lost session does not wait for anything.
 #[allow(clippy::too_many_arguments)]
 async fn push(
     session: &SftpSession,
@@ -513,22 +544,28 @@ async fn push(
     size: u64,
     control: &Control,
     shown: &str,
-    mut progress: impl FnMut(u64),
+    reporter: &Reporter,
 ) -> Result<End, SftpError> {
     let tuning = session.info().tuning();
     let (chunk, window) = (tuning.write_chunk, tuning.write_window);
+    let drain = drain_timeout(session);
     let mut file = tokio::fs::File::open(local).await.map_err(|err| local_error(local, err))?;
     file.seek(io::SeekFrom::Start(start)).await.map_err(|err| local_error(local, err))?;
 
     let mut inflight = FuturesUnordered::new();
     let mut offset = start;
-    let mut stopping = None;
+    // Writes that were answered but are not yet part of the gapless run from `start`.
+    let mut answered: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut highwater = start;
+    let mut pausing = false;
     loop {
-        while stopping.is_none() && inflight.len() < window && offset < size {
+        while !pausing && inflight.len() < window && offset < size {
             match control.interrupted() {
-                Some(Interrupt::Cancel) => return Ok(End::Interrupted(Interrupt::Cancel)),
-                Some(pause) => {
-                    stopping = Some(pause);
+                Some(stop @ (Interrupt::Cancel | Interrupt::Pause(PauseReason::Disconnected))) => {
+                    return Ok(End::Interrupted(stop));
+                }
+                Some(Interrupt::Pause(PauseReason::User)) => {
+                    pausing = true;
                     break;
                 }
                 None => {}
@@ -540,42 +577,67 @@ async fn push(
             offset += len as u64;
             let raw = &session.raw;
             inflight.push(async move {
-                raw.write(handle, at, buffer).await.map(|_| len as u64).map_err(|err| SftpError::from_raw(err, shown))
+                raw.write(handle, at, buffer)
+                    .await
+                    .map(|_| (at, len as u64))
+                    .map_err(|err| SftpError::from_raw(err, shown))
             });
         }
         if inflight.is_empty() {
             break;
         }
-        let acknowledged = if stopping.is_some() {
-            // Let what is on its way land, so that resuming finds a temporary file of known length.
-            match tokio::time::timeout(DRAIN_TIMEOUT, inflight.next()).await {
-                Ok(next) => next,
-                Err(_) => return Err(SftpError::Timeout),
+        let next = if pausing {
+            // Let what is on its way land, so that the part known to be written is as long as it can be.
+            tokio::select! {
+                biased;
+                stop = control.hard_stop() => return Ok(End::Interrupted(stop)),
+                waited = tokio::time::timeout(drain, inflight.next()) => match waited {
+                    Ok(next) => next,
+                    // Not answering: the pause is no less of a pause for that.
+                    Err(_) => return Ok(End::Interrupted(Interrupt::Pause(PauseReason::User))),
+                },
             }
         } else {
             tokio::select! {
                 biased;
-                () = control.cancelled() => return Ok(End::Interrupted(Interrupt::Cancel)),
+                stop = control.interrupt() => match stop {
+                    Interrupt::Pause(PauseReason::User) => {
+                        // Stop sending, and wait (for a while) for what is on its way.
+                        pausing = true;
+                        continue;
+                    }
+                    hard => return Ok(End::Interrupted(hard)),
+                },
                 next = inflight.next() => next,
             }
         };
-        match acknowledged {
-            Some(Ok(len)) => progress(len),
+        match next {
+            Some(Ok((at, len))) => {
+                reporter.progress(len);
+                answered.insert(at, len);
+                let before = highwater;
+                while let Some(len) = answered.remove(&highwater) {
+                    highwater += len;
+                }
+                if highwater != before {
+                    reporter.set_highwater(highwater);
+                }
+            }
             Some(Err(err)) => return Err(err),
             None => break,
         }
-        if stopping.is_none() {
+        if !pausing {
             match control.interrupted() {
-                Some(Interrupt::Cancel) => return Ok(End::Interrupted(Interrupt::Cancel)),
-                pause => stopping = pause,
+                Some(stop @ (Interrupt::Cancel | Interrupt::Pause(PauseReason::Disconnected))) => {
+                    return Ok(End::Interrupted(stop));
+                }
+                Some(Interrupt::Pause(PauseReason::User)) => pausing = true,
+                None => {}
             }
         }
     }
-    // A pause that came when everything had already been sent changes nothing.
-    Ok(match stopping {
-        Some(interrupt) if offset < size => End::Interrupted(interrupt),
-        _ => End::Done,
-    })
+    // A pause that came when everything had already been sent and answered changes nothing.
+    Ok(if pausing && offset < size { End::Interrupted(Interrupt::Pause(PauseReason::User)) } else { End::Done })
 }
 
 // ---- downloading a file -------------------------------------------------------------------------
@@ -620,21 +682,26 @@ async fn download_file(
         temp_local: Some(temp.clone()),
         src_size: size,
         src_mtime: mtime,
+        highwater: start,
     }));
     reporter.set_offset(start);
 
+    // A file is never dropped with a write still pending: a resume that opens it would race that write.
     let handle = match session.open_handle(&remote, OpenFlags::READ, FileAttributes::empty()).await {
         Ok(handle) => handle,
         Err(err) => {
+            let _ = file.flush().await;
             drop(file);
-            let _ = tokio::fs::remove_file(&temp).await;
-            reporter.set_partial(None);
+            if !session_gone(&err, control) {
+                let _ = tokio::fs::remove_file(&temp).await;
+                reporter.set_partial(None);
+            }
             return Err(err);
         }
     };
     let pulled =
         pull(session, &handle, &mut file, start, size, control, &remote, |bytes| reporter.progress(bytes)).await;
-    let _ = session.close_handle(&handle, &remote).await;
+    quietly(session.close_handle(&handle, &remote)).await;
     match pulled {
         Ok(End::Done) => {}
         Ok(End::Interrupted(interrupt)) => {
@@ -647,8 +714,10 @@ async fn download_file(
             return Ok(End::Interrupted(interrupt));
         }
         Err(err) => {
+            let _ = file.flush().await;
             drop(file);
-            if !err.is_disconnected() {
+            // A lost session keeps the temporary file for the resume; any other failure removes it.
+            if !session_gone(&err, control) {
                 let _ = tokio::fs::remove_file(&temp).await;
                 reporter.set_partial(None);
             }
@@ -667,15 +736,24 @@ async fn download_file(
         drop(std_file);
         // Never over something that appeared in the meantime.
         let destination = free_local_name(&final_path).await;
-        tokio::fs::rename(&temp, &destination).await.map_err(|err| local_error(&destination, err))
+        tokio::fs::rename(&temp, &destination).await.map_err(|err| local_error(&destination, err))?;
+        Ok(destination)
     }
     .await;
-    if let Err(err) = finished {
-        let _ = tokio::fs::remove_file(&temp).await;
-        reporter.set_partial(None);
-        return Err(err);
+    match finished {
+        Ok(destination) => {
+            // Where it really ended up (the name may have been taken since it was planned).
+            if entry.rel.is_empty() {
+                reporter.set_result(destination);
+            }
+            Ok(End::Done)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            reporter.set_partial(None);
+            Err(err)
+        }
     }
-    Ok(End::Done)
 }
 
 /// `path`, or the first numbered variant that does not exist.
@@ -774,9 +852,10 @@ async fn pull(
         if inflight.is_empty() {
             break;
         }
+        // Nothing to wait for when stopping: what has not arrived is simply read again.
         let answer = tokio::select! {
             biased;
-            () = control.cancelled() => return Ok(End::Interrupted(Interrupt::Cancel)),
+            stop = control.interrupt() => return Ok(End::Interrupted(stop)),
             answer = inflight.next() => answer,
         };
         let Some((offset, asked, result)) = answer else { break };

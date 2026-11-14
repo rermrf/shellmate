@@ -12,8 +12,8 @@ use super::plan::Plan;
 use super::run::{self, RunInput, RunOutcome};
 use super::speed::SpeedMeter;
 use super::{
-    Choice, Clash, Direction, ItemId, MAX_RUNNING, PauseReason, Skipped, TransferEvent, TransferFailure, TransferState,
-    TransferView, failure_summary,
+    Choice, Clash, Direction, ItemId, MAX_FAILURES_KEPT, MAX_RUNNING, PauseReason, Skipped, TransferEvent,
+    TransferFailure, TransferState, TransferView, failure_summary,
 };
 use crate::path;
 use crate::session::SftpSession;
@@ -33,6 +33,11 @@ pub(super) struct Partial {
     /// Size and time the source had when the file was started.
     pub src_size: u64,
     pub src_mtime: Option<i64>,
+    /// How far the file is known to be written without gaps: the end of the contiguous run of
+    /// acknowledged writes from the start. A server may apply requests in another order, so the
+    /// length of the temporary file only says how far *something* was written; a resume goes on
+    /// from the smaller of the two and rewrites what is above.
+    pub highwater: u64,
 }
 
 enum Selection {
@@ -52,6 +57,8 @@ struct Item {
     ready: bool,
     /// A task is checking the destination for names that exist.
     checking: bool,
+    /// The generation of the session on which that check failed (it waits for the next one).
+    check_failed: Option<u64>,
     choice: Option<Choice>,
     clash: Option<Clash>,
     /// Remote paths of what an upload will create at the top level.
@@ -69,7 +76,9 @@ struct Item {
     skipped: Skipped,
     /// Files overwritten in place because the directory had no room for a temporary file.
     in_place: u32,
+    /// The first [`MAX_FAILURES_KEPT`] failures; `failure_total` counts them all.
     failures: Vec<TransferFailure>,
+    failure_total: usize,
     current: Option<String>,
     result: Option<PathBuf>,
     /// Local names this download holds.
@@ -84,6 +93,13 @@ struct Item {
 impl Item {
     fn bytes_done(&self) -> u64 {
         self.completed_bytes + self.current_offset
+    }
+
+    fn add_failure(&mut self, failure: TransferFailure) {
+        self.failure_total += 1;
+        if self.failures.len() < MAX_FAILURES_KEPT {
+            self.failures.push(failure);
+        }
     }
 
     /// What the total counts for entry `index`: its size when it was planned, unless the source
@@ -110,6 +126,7 @@ impl Item {
             skipped: self.skipped,
             in_place: self.in_place,
             failures: self.failures.clone(),
+            failure_total: self.failure_total,
             clash: self.clash.clone(),
             result: self.result.clone(),
         }
@@ -121,6 +138,8 @@ struct State {
     session: Option<Arc<SftpSession>>,
     /// Counts the sessions handed in; a task of an older one is told apart from the current.
     generation: u64,
+    /// The generation for which [`TransferEvent::SessionLost`] was sent.
+    lost_generation: Option<u64>,
     next_id: u64,
     /// Local names that running or paused downloads have picked.
     reserved_local: HashSet<PathBuf>,
@@ -153,8 +172,14 @@ impl TransferQueue {
     /// starts until a session is set ([`set_session`](Self::set_session)).
     pub fn new(runtime: Handle) -> (Self, async_channel::Receiver<TransferEvent>) {
         let (events, receiver) = async_channel::unbounded();
-        let state =
-            State { items: Vec::new(), session: None, generation: 0, next_id: 1, reserved_local: HashSet::new() };
+        let state = State {
+            items: Vec::new(),
+            session: None,
+            generation: 0,
+            lost_generation: None,
+            next_id: 1,
+            reserved_local: HashSet::new(),
+        };
         (Self { inner: Arc::new(Inner { state: Mutex::new(state), events, handle: runtime }) }, receiver)
     }
 
@@ -243,6 +268,7 @@ impl TransferQueue {
                 state: TransferState::Queued,
                 ready,
                 checking: false,
+                check_failed: None,
                 choice: None,
                 clash: None,
                 claims,
@@ -258,6 +284,7 @@ impl TransferQueue {
                 skipped: Skipped::default(),
                 in_place: 0,
                 failures: Vec::new(),
+                failure_total: 0,
                 current: None,
                 result: None,
                 reserved: Vec::new(),
@@ -437,7 +464,12 @@ fn schedule(inner: &Arc<Inner>) {
         .collect();
 
     for (ix, item) in state.items.iter_mut().enumerate() {
-        if item.state == TransferState::Queued && !item.ready && !item.checking && !blocked[ix] {
+        if item.state == TransferState::Queued
+            && !item.ready
+            && !item.checking
+            && item.check_failed != Some(generation)
+            && !blocked[ix]
+        {
             item.checking = true;
             let (id, names, dir) = (item.id, top_names(item), item.destination.clone());
             let (inner, session) = (inner.clone(), session.clone());
@@ -488,11 +520,28 @@ fn top_names(item: &Item) -> Vec<String> {
     }
 }
 
+/// Sends [`TransferEvent::SessionLost`], once for each session handed in, when a task found the
+/// session it was given unusable and the queue still holds that very session.
+fn note_session_lost(
+    inner: &Inner,
+    lost_generation: &mut Option<u64>,
+    task_generation: u64,
+    current: u64,
+    holds: bool,
+) {
+    if holds && task_generation == current && *lost_generation != Some(current) {
+        *lost_generation = Some(current);
+        inner.emit(TransferEvent::SessionLost);
+    }
+}
+
 /// The check for existing names is over.
-fn checked(inner: &Arc<Inner>, id: ItemId, _generation: u64, found: Result<Vec<String>, crate::SftpError>) {
+fn checked(inner: &Arc<Inner>, id: ItemId, generation: u64, found: Result<Vec<String>, crate::SftpError>) {
     {
         let mut state = inner.lock();
-        let Some(item) = state.items.iter_mut().find(|item| item.id == id) else { return };
+        let (current, holds) = (state.generation, state.session.is_some());
+        let State { items, lost_generation, .. } = &mut *state;
+        let Some(item) = items.iter_mut().find(|item| item.id == id) else { return };
         item.checking = false;
         if item.state != TransferState::Queued {
             return;
@@ -508,11 +557,14 @@ fn checked(inner: &Arc<Inner>, id: ItemId, _generation: u64, found: Result<Vec<S
                 item.state = TransferState::AwaitingClash;
                 inner.emit(TransferEvent::State(item.view(Instant::now())));
             }
-            // The connection went away: the check is repeated when there is a session again.
-            Err(err) if err.is_disconnected() => {}
+            // The session went away: the check waits for the next one (and does not spin on this one).
+            Err(err) if err.is_session_lost() => {
+                item.check_failed = Some(generation);
+                note_session_lost(inner, lost_generation, generation, current, holds);
+            }
             Err(err) => {
                 item.state = TransferState::Failed(err.to_string());
-                item.failures.push(TransferFailure { path: item.destination.clone(), reason: err.to_string() });
+                item.add_failure(TransferFailure { path: item.destination.clone(), reason: err.to_string() });
                 let view = item.view(Instant::now());
                 let dir = item.destination.clone();
                 inner.emit(TransferEvent::State(view));
@@ -529,7 +581,7 @@ fn finish(inner: &Arc<Inner>, id: ItemId, token: u64, generation: u64, outcome: 
         let mut state = inner.lock();
         let current_generation = state.generation;
         let has_session = state.session.is_some();
-        let State { items, reserved_local, .. } = &mut *state;
+        let State { items, reserved_local, lost_generation, .. } = &mut *state;
         let Some(item) = items.iter_mut().find(|item| item.id == id) else { return };
         if item.run != token {
             return;
@@ -544,7 +596,7 @@ fn finish(inner: &Arc<Inner>, id: ItemId, token: u64, generation: u64, outcome: 
                 item.state = if item.failures.is_empty() {
                     TransferState::Done
                 } else {
-                    TransferState::Failed(failure_summary(&item.failures))
+                    TransferState::Failed(failure_summary(&item.failures, item.failure_total))
                 };
                 release = true;
             }
@@ -559,13 +611,14 @@ fn finish(inner: &Arc<Inner>, id: ItemId, token: u64, generation: u64, outcome: 
             RunOutcome::Interrupted(Interrupt::Pause(PauseReason::User)) => {
                 item.state = TransferState::Paused(PauseReason::User)
             }
-            RunOutcome::Interrupted(Interrupt::Pause(PauseReason::Disconnected)) | RunOutcome::Disconnected => {
-                // A new session may have been set while this task was still stopping: go on with it.
-                item.state = if has_session && generation != current_generation {
-                    TransferState::Queued
-                } else {
-                    TransferState::Paused(PauseReason::Disconnected)
-                };
+            // Told to stop because the session was taken away or replaced.
+            RunOutcome::Interrupted(Interrupt::Pause(PauseReason::Disconnected)) => {
+                item.state = paused_for_session(has_session, generation, current_generation);
+            }
+            // The task found the session unusable by itself.
+            RunOutcome::Disconnected => {
+                item.state = paused_for_session(has_session, generation, current_generation);
+                note_session_lost(inner, lost_generation, generation, current_generation, has_session);
             }
             RunOutcome::Clash(clash) => {
                 item.clash = Some(clash);
@@ -590,6 +643,16 @@ fn finish(inner: &Arc<Inner>, id: ItemId, token: u64, generation: u64, outcome: 
         }
     }
     schedule(inner);
+}
+
+/// What an item whose task stopped because of the session becomes: queued again if a newer session
+/// was handed in meanwhile, paused (waiting for one) otherwise.
+fn paused_for_session(has_session: bool, task_generation: u64, current_generation: u64) -> TransferState {
+    if has_session && task_generation != current_generation {
+        TransferState::Queued
+    } else {
+        TransferState::Paused(PauseReason::Disconnected)
+    }
 }
 
 // ---- what a running task tells the queue -----------------------------------------------------
@@ -644,7 +707,9 @@ impl Reporter {
             item.bytes_total = plan.total_bytes;
             item.plan = Some(plan);
             item.skipped = skipped;
-            item.failures.extend(failures);
+            for failure in failures {
+                item.add_failure(failure);
+            }
             item.scanning = false;
             inner.emit(TransferEvent::State(item.view(Instant::now())));
         });
@@ -676,6 +741,15 @@ impl Reporter {
     /// The temporary file of the entry in progress, if there is one that a resume could continue.
     pub fn set_partial(&self, partial: Option<Partial>) {
         self.with(|item, _, _| item.partial = partial);
+    }
+
+    /// The file in progress is known to be written without gaps up to `offset`.
+    pub fn set_highwater(&self, offset: u64) {
+        self.with(|item, _, _| {
+            if let Some(partial) = &mut item.partial {
+                partial.highwater = partial.highwater.max(offset);
+            }
+        });
     }
 
     /// Where the entry in progress stands (after a resume, or a restart from 0).
@@ -732,7 +806,7 @@ impl Reporter {
     /// Entry `index` could not be transferred; the item goes on.
     pub fn entry_failed(&self, index: usize, failure: TransferFailure, planned: u64) {
         self.with(|item, _, inner| {
-            item.failures.push(failure);
+            item.add_failure(failure);
             item.completed_bytes += item.counted_size(index, planned);
             item.current_offset = 0;
             item.partial = None;

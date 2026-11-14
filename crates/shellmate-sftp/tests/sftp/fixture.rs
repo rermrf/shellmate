@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::{self, Metadata, OpenOptions};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +65,14 @@ pub struct SftpOptions {
     pub limits: Option<(u64, u64, u64)>,
     /// Answer reads with at most this many bytes (short reads are allowed by the protocol).
     pub max_read: Option<u32>,
+    /// Every open request waits this long.
+    pub open_delay: Duration,
+    /// On the first SFTP session only: the write request for this offset is lost on its way to the
+    /// server (it is never answered), while the requests after it go through: a hole.
+    pub drop_write_at: Option<u64>,
+    /// On the first SFTP session only: after this many write requests have got through, nothing
+    /// more reaches the server and nothing is answered any more.
+    pub stall_after_writes: Option<usize>,
     /// Where `realpath(".")` leads, relative to the root.
     pub home: &'static str,
 }
@@ -83,6 +92,9 @@ impl Default for SftpOptions {
             write_delay: Duration::ZERO,
             limits: None,
             max_read: None,
+            open_delay: Duration::ZERO,
+            drop_write_at: None,
+            stall_after_writes: None,
             home: "/home/tester",
         }
     }
@@ -100,6 +112,10 @@ pub type RequestLog = Arc<Mutex<Vec<(PathBuf, u64, usize)>>>;
 pub struct Logs {
     pub reads: RequestLog,
     pub writes: RequestLog,
+    /// While set, every open request is refused (checked after its delay).
+    pub fail_opens: Arc<AtomicBool>,
+    /// The next SFTP session gets the trouble `drop_write_at` / `stall_after_writes` describe (once).
+    pub armed: Arc<AtomicBool>,
 }
 
 struct FsHandler {
@@ -267,6 +283,10 @@ impl Handler for FsHandler {
         pflags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
+        tokio::time::sleep(self.options.open_delay).await;
+        if self.logs.fail_opens.load(Ordering::Relaxed) {
+            return Err(StatusCode::Failure.with_message("injected failure"));
+        }
         let path = self.host(&filename);
         if pflags.contains(OpenFlags::CREATE) && !path.exists() {
             self.deny_if_unwritable()?;
@@ -442,10 +462,67 @@ impl Handler for FsHandler {
 
 /// The `sftp` subsystem over `root`.
 pub fn runner(root: PathBuf, options: SftpOptions, logs: Logs) -> SubsystemRunner {
+    // The trouble happens on one SFTP session only (the next after `logs.armed` is set): a new one works.
     Arc::new(move |stream| {
         let handler = FsHandler::new(root.clone(), options.clone(), logs.clone());
-        tokio::spawn(russh_sftp::server::run(stream, handler));
+        let trouble = options.drop_write_at.is_some() || options.stall_after_writes.is_some();
+        if !trouble || !logs.armed.swap(false, Ordering::SeqCst) {
+            tokio::spawn(russh_sftp::server::run(stream, handler));
+            return;
+        }
+        // Between the channel and the server sits something that loses packets.
+        let (towards_server, server_side) = tokio::io::duplex(8 << 20);
+        tokio::spawn(russh_sftp::server::run(server_side, handler));
+        tokio::spawn(lossy_link(stream, towards_server, options.drop_write_at, options.stall_after_writes));
     })
+}
+
+/// Carries SFTP packets between the SSH channel and the server, losing the ones asked for.
+async fn lossy_link<S>(
+    channel: S,
+    server: tokio::io::DuplexStream,
+    drop_write_at: Option<u64>,
+    stall_after: Option<usize>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut from_client, mut to_client) = tokio::io::split(channel);
+    let (mut from_server, mut to_server) = tokio::io::split(server);
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+    });
+    let (mut writes, mut dropped, mut stalled) = (0usize, false, false);
+    loop {
+        let mut length = [0u8; 4];
+        if from_client.read_exact(&mut length).await.is_err() {
+            break;
+        }
+        let mut packet = vec![0u8; u32::from_be_bytes(length) as usize];
+        if from_client.read_exact(&mut packet).await.is_err() {
+            break;
+        }
+        // SSH_FXP_WRITE: type 6, id, handle (string), offset (u64), data.
+        let offset = (packet.first() == Some(&6))
+            .then(|| {
+                let handle_len = u32::from_be_bytes(packet.get(5..9)?.try_into().ok()?) as usize;
+                Some(u64::from_be_bytes(packet.get(9 + handle_len..17 + handle_len)?.try_into().ok()?))
+            })
+            .flatten();
+        if offset.is_some() {
+            writes += 1;
+            if stall_after.is_some_and(|limit| writes > limit) {
+                stalled = true;
+            }
+        }
+        if stalled || (!dropped && offset.is_some() && offset == drop_write_at) {
+            dropped |= offset.is_some() && offset == drop_write_at;
+            continue;
+        }
+        if to_server.write_all(&length).await.is_err() || to_server.write_all(&packet).await.is_err() {
+            break;
+        }
+    }
 }
 
 /// Reproducible bytes that do not repeat on the scale of a chunk.

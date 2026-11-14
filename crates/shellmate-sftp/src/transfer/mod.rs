@@ -28,8 +28,13 @@
 //!   over. Cancelling removes the temporary file; files of a directory that were already
 //!   finished stay.
 //! * A disconnect pauses running items ([`PauseReason::Disconnected`]); handing the queue a new
-//!   session ([`TransferQueue::set_session`]) resumes exactly those. The engine never reconnects
-//!   by itself.
+//!   session ([`TransferQueue::set_session`]) resumes exactly those. A session that stops
+//!   answering (a request times out) counts as lost; an error that comes back while the session is
+//!   being taken away is not the file's failure. When a transfer finds the session it was given
+//!   unusable, the queue says so once ([`TransferEvent::SessionLost`]), because the SFTP
+//!   subsystem can die while the SSH connection lives on. The engine never reconnects by itself.
+//! * Uploads resume from the part of the temporary file that is known to be written without gaps
+//!   (servers may apply requests out of order), rewriting what lies above.
 //! * The queue lives in memory: it is not saved across restarts of the application.
 
 mod control;
@@ -47,6 +52,10 @@ use std::path::PathBuf;
 
 /// At most this many items run at the same time on one connection.
 pub const MAX_RUNNING: usize = 2;
+
+/// An item keeps the first this many failures (and counts the rest), so that a transfer of a
+/// whole tree on a broken server does not carry an endless list around.
+pub const MAX_FAILURES_KEPT: usize = 100;
 
 /// Identifies an item of a queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -172,14 +181,15 @@ pub struct TransferFailure {
 }
 
 /// The reason an item with failures ends with: the count, the first reason and up to five paths.
-pub fn failure_summary(failures: &[TransferFailure]) -> String {
-    match failures {
+/// `kept` are the failures that were kept (the first ones), `total` how many there were.
+pub fn failure_summary(kept: &[TransferFailure], total: usize) -> String {
+    match kept {
         [] => String::new(),
-        [only] => only.reason.clone(),
+        [only] if total <= 1 => only.reason.clone(),
         [first, ..] => {
-            let shown: Vec<&str> = failures.iter().take(5).map(|f| f.path.as_str()).collect();
-            let more = if failures.len() > 5 { format!(" 等 {} 个", failures.len()) } else { String::new() };
-            format!("{} 个文件传输失败，首个原因：{}（{}{more}）", failures.len(), first.reason, shown.join("、"))
+            let shown: Vec<&str> = kept.iter().take(5).map(|f| f.path.as_str()).collect();
+            let more = if total > 5 { format!(" 等 {total} 个") } else { String::new() };
+            format!("{total} 个文件传输失败，首个原因：{}（{}{more}）", first.reason, shown.join("、"))
         }
     }
 }
@@ -216,8 +226,10 @@ pub struct TransferView {
     /// Files of an upload that were written over the existing file because the directory has no
     /// room for a temporary file (not atomic).
     pub in_place: u32,
-    /// The files that failed.
+    /// The files that failed (the first [`MAX_FAILURES_KEPT`] of them).
     pub failures: Vec<TransferFailure>,
+    /// How many files failed in all.
+    pub failure_total: usize,
     /// The names to ask about, while [`TransferState::AwaitingClash`].
     pub clash: Option<Clash>,
     /// For a finished download: where the (first) thing ended up, to show in Finder.
@@ -249,6 +261,11 @@ pub enum TransferEvent {
     Removed(Vec<ItemId>),
     /// Something changed in this directory on the server: the file panel may refresh.
     RemoteChanged(String),
+    /// A transfer found the session unusable (the connection is gone, or the SFTP subsystem died or
+    /// stopped answering) while the queue still holds it. Sent once per session: the owner should
+    /// open a new session if the connection is alive and hand it to
+    /// [`TransferQueue::set_session`]; the paused items then resume by themselves.
+    SessionLost,
 }
 
 #[cfg(test)]
@@ -284,17 +301,23 @@ mod tests {
     fn failures_are_summarized_with_count_first_reason_and_up_to_five_paths() {
         let failure =
             |n: usize| TransferFailure { path: format!("/d/f{n}"), reason: format!("权限不足：/d/f{n}") };
-        assert_eq!(failure_summary(&[]), "");
-        assert_eq!(failure_summary(&[failure(1)]), "权限不足：/d/f1");
+        assert_eq!(failure_summary(&[], 0), "");
+        assert_eq!(failure_summary(&[failure(1)], 1), "权限不足：/d/f1");
         assert_eq!(
-            failure_summary(&[failure(1), failure(2)]),
+            failure_summary(&[failure(1), failure(2)], 2),
             "2 个文件传输失败，首个原因：权限不足：/d/f1（/d/f1、/d/f2）"
         );
         let many: Vec<_> = (1..=8).map(failure).collect();
         assert_eq!(
-            failure_summary(&many),
+            failure_summary(&many, 8),
             "8 个文件传输失败，首个原因：权限不足：/d/f1（/d/f1、/d/f2、/d/f3、/d/f4、/d/f5 等 8 个）"
         );
+        // Only the first ones are kept; the count is the real one.
+        assert_eq!(
+            failure_summary(&many[..2], 500),
+            "500 个文件传输失败，首个原因：权限不足：/d/f1（/d/f1、/d/f2 等 500 个）"
+        );
+        assert_eq!(failure_summary(&many[..1], 40), "40 个文件传输失败，首个原因：权限不足：/d/f1（/d/f1 等 40 个）");
     }
 
     #[test]
@@ -321,6 +344,7 @@ mod tests {
             skipped: Skipped::default(),
             in_place: 0,
             failures: Vec::new(),
+            failure_total: 0,
             clash: None,
             result: None,
         };

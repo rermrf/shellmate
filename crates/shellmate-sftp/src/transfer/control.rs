@@ -59,14 +59,25 @@ impl Control {
         self.changed.notify_waiters();
     }
 
-    /// Resolves once the task has been told to cancel.
-    pub async fn cancelled(&self) {
+    /// Resolves once the task has been told to stop, whatever the reason.
+    pub async fn interrupt(&self) -> Interrupt {
+        self.wait(|_| true).await
+    }
+
+    /// Resolves once the task has to stop *now*: cancelled, or the session is gone (waiting for
+    /// answers that will not come would only delay it).
+    pub async fn hard_stop(&self) -> Interrupt {
+        self.wait(|interrupt| matches!(interrupt, Interrupt::Cancel | Interrupt::Pause(PauseReason::Disconnected)))
+            .await
+    }
+
+    async fn wait(&self, wanted: impl Fn(Interrupt) -> bool) -> Interrupt {
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.signal.load(Ordering::Acquire) == CANCEL {
-                return;
+            if let Some(interrupt) = self.interrupted().filter(|interrupt| wanted(*interrupt)) {
+                return interrupt;
             }
             notified.await;
         }
@@ -97,19 +108,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_for_a_cancel_wakes_up_when_it_comes() {
+    async fn a_hard_stop_comes_with_a_cancel_or_a_lost_session_but_not_with_a_user_pause() {
         let control = Arc::new(Control::new());
         let waiting = tokio::spawn({
             let control = control.clone();
-            async move { control.cancelled().await }
+            async move { control.hard_stop().await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!waiting.is_finished());
         control.set(Some(Interrupt::Pause(PauseReason::User)));
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!waiting.is_finished(), "a pause is not a cancel");
+        assert!(!waiting.is_finished(), "a user pause waits for the requests on their way");
+        control.set(Some(Interrupt::Pause(PauseReason::Disconnected)));
+        let stop = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        assert_eq!(stop, Interrupt::Pause(PauseReason::Disconnected));
+
+        let control = Control::new();
         control.set(Some(Interrupt::Cancel));
-        tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
-        control.cancelled().await;
+        assert_eq!(control.hard_stop().await, Interrupt::Cancel);
+        assert_eq!(control.interrupt().await, Interrupt::Cancel);
+    }
+
+    #[tokio::test]
+    async fn any_interrupt_wakes_the_waiter() {
+        let control = Arc::new(Control::new());
+        let waiting = tokio::spawn({
+            let control = control.clone();
+            async move { control.interrupt().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        control.set(Some(Interrupt::Pause(PauseReason::User)));
+        let seen = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        assert_eq!(seen, Interrupt::Pause(PauseReason::User));
     }
 }

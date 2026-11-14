@@ -208,7 +208,7 @@ pub(crate) async fn walk_remote(session: &SftpSession, selection: &[String]) -> 
         let entry = match session.stat(source).await {
             Ok(entry) => entry,
             Err(err) => {
-                walked.disconnected |= err.is_disconnected();
+                walked.disconnected |= err.is_session_lost();
                 walked.fail(source.clone(), err.to_string());
                 continue;
             }
@@ -249,7 +249,7 @@ fn walk_remote_dir<'a>(
         let children = match session.list(dir).await {
             Ok(children) => children,
             Err(err) => {
-                walked.disconnected |= err.is_disconnected();
+                walked.disconnected |= err.is_session_lost();
                 walked.fail(dir.to_string(), err.to_string());
                 return;
             }

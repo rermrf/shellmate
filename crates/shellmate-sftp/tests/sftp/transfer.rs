@@ -27,9 +27,20 @@ impl Rig {
     }
 
     async fn with(options: SftpOptions) -> Self {
+        Self::with_timeout(options, None).await
+    }
+
+    /// Like [`with`](Self::with), with a short request timeout on the session the queue starts with.
+    async fn with_timeout(options: SftpOptions, timeout_secs: Option<u64>) -> Self {
         let fx = Fixture::start(options).await;
         let (queue, events) = TransferQueue::new(tokio::runtime::Handle::current());
-        queue.set_session(Some(Arc::new(fx.new_session().await)));
+        // If the server is to misbehave, the session of the queue is the one to suffer.
+        fx.logs.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let session = fx.new_session().await;
+        if let Some(seconds) = timeout_secs {
+            session.set_request_timeout(seconds);
+        }
+        queue.set_session(Some(Arc::new(session)));
         let local = tempfile::tempdir().unwrap();
         std::fs::create_dir(local.path().join("downloads")).unwrap();
         fx.dir("/up");
@@ -1119,4 +1130,220 @@ async fn shutting_the_queue_down_stops_the_transfers_and_lets_go_of_the_session(
         TransferState::Paused(PauseReason::Disconnected),
         "nothing restarts it"
     );
+}
+
+// ---- gaps, stalls and lost sessions ------------------------------------------------------------------
+
+const CHUNK: u64 = 32 * 1024;
+
+fn session_lost_events(events: &[TransferEvent]) -> usize {
+    events.iter().filter(|e| matches!(e, TransferEvent::SessionLost)).count()
+}
+
+#[tokio::test]
+async fn a_resume_goes_on_from_the_gapless_part_not_from_the_length_of_the_temporary_file() {
+    // One write request is lost on its way while the ones after it get through: the temporary file
+    // ends up as long as the source, with a hole of zeros in it.
+    let hole_at = 5 * CHUNK;
+    let rig = Rig::with(SftpOptions { drop_write_at: Some(hole_at), ..Default::default() }).await;
+    let content = pattern(1 << 20, 100);
+    let id = rig.queue.enqueue_upload(vec![rig.source("big.bin", &content, 0o644)], "/up");
+    rig.wait(id, "all but the lost chunk", |v| v.bytes_done == (1 << 20) - CHUNK).await;
+    tokio::time::sleep(SEC / 5).await;
+    let on_server = std::fs::read(rig.fx.host("/up/.big.bin.shellmate-upload")).unwrap();
+    assert_eq!(on_server.len(), 1 << 20, "the temporary file is as long as the source");
+    assert!(on_server[hole_at as usize..(hole_at + CHUNK) as usize].iter().all(|b| *b == 0), "with a hole in it");
+
+    rig.fx.server.state.kill_connections();
+    let paused = rig.state(id, TransferState::Paused(PauseReason::Disconnected)).await;
+    assert_eq!(paused.failure_total, 0);
+    let log_len = rig.fx.logs.writes.lock().unwrap().len();
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    assert_eq!(rig.finished(id).await.state, TransferState::Done);
+    assert!(rig.fx.read("/up/big.bin") == content, "no zeros left over from the hole");
+    let log = rig.fx.logs.writes.lock().unwrap()[log_len..].to_vec();
+    assert_eq!(log.iter().map(|(_, offset, _)| *offset).min(), Some(hole_at), "it went on from the gapless part");
+}
+
+#[tokio::test]
+async fn a_session_that_stops_answering_pauses_the_item_and_a_new_one_resumes_it_without_resending() {
+    let stalls_after = 20;
+    let rig =
+        Rig::with_timeout(SftpOptions { stall_after_writes: Some(stalls_after), ..Default::default() }, Some(1)).await;
+    let content = pattern(2 << 20, 101);
+    let id = rig.queue.enqueue_upload(vec![rig.source("big.bin", &content, 0o644)], "/up");
+    // Nothing is answered after the 20th write: the requests time out, and the item waits.
+    let paused = rig.state(id, TransferState::Paused(PauseReason::Disconnected)).await;
+    assert_eq!((paused.failure_total, paused.failures.len()), (0, 0), "a stalled session is not the file's failure");
+    assert_eq!(paused.bytes_done, stalls_after as u64 * CHUNK);
+    assert_eq!(
+        std::fs::metadata(rig.fx.host("/up/.big.bin.shellmate-upload")).unwrap().len(),
+        stalls_after as u64 * CHUNK,
+        "the temporary file is kept"
+    );
+    assert_eq!(session_lost_events(&rig.events()), 1, "the owner is told");
+
+    let log_len = rig.fx.logs.writes.lock().unwrap().len();
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    assert_eq!(rig.finished(id).await.state, TransferState::Done);
+    assert!(rig.fx.read("/up/big.bin") == content);
+    let log = rig.fx.logs.writes.lock().unwrap()[log_len..].to_vec();
+    assert!(
+        log.iter().all(|(_, offset, _)| *offset >= stalls_after as u64 * CHUNK),
+        "the acknowledged part was not sent again"
+    );
+}
+
+#[tokio::test]
+async fn a_download_from_a_stalled_session_waits_too() {
+    let rig =
+        Rig::with_timeout(SftpOptions { read_delay: Duration::from_millis(2), ..Default::default() }, Some(1)).await;
+    // Reads are not lost by the link; the connection is cut under a download without anybody noticing
+    // the transfer itself: it finds out by the first answer that does not come.
+    let content = pattern(8 << 20, 102);
+    rig.fx.file("/srv/big.bin", &content, 0o644);
+    let id = rig.queue.enqueue_download(vec!["/srv/big.bin".into()], rig.downloads());
+    rig.wait(id, "a bit of the file", |v| v.bytes_done > (1 << 20)).await;
+    rig.fx.server.state.kill_connections();
+    let paused = rig.state(id, TransferState::Paused(PauseReason::Disconnected)).await;
+    assert_eq!(paused.failure_total, 0);
+    assert!(rig.downloads().join("big.bin.shellmate-download").exists(), "the partial file is kept");
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    assert_eq!(rig.finished(id).await.state, TransferState::Done);
+    assert!(std::fs::read(rig.downloads().join("big.bin")).unwrap() == content);
+}
+
+#[tokio::test]
+async fn taking_the_session_away_stops_a_transfer_at_once_without_waiting_for_answers() {
+    let rig = Rig::with(SftpOptions { stall_after_writes: Some(10), ..Default::default() }).await;
+    let id = rig.queue.enqueue_upload(vec![rig.source("big.bin", &pattern(2 << 20, 103), 0o644)], "/up");
+    rig.wait(id, "ten chunks", |v| v.bytes_done >= 10 * CHUNK).await;
+    tokio::time::sleep(SEC / 4).await;
+    let began = Instant::now();
+    rig.queue.set_session(None);
+    let paused = rig.state(id, TransferState::Paused(PauseReason::Disconnected)).await;
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "no draining of requests nobody will answer: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(paused.failure_total, 0);
+    assert!(rig.fx.exists("/up/.big.bin.shellmate-upload"), "the temporary file is kept");
+    assert_eq!(session_lost_events(&rig.events()), 0, "taking it away is not losing it");
+}
+
+#[tokio::test]
+async fn a_user_pause_on_a_stalled_session_ends_as_paused_not_failed_and_resumes_cleanly() {
+    let stalls_after = 10;
+    let rig =
+        Rig::with_timeout(SftpOptions { stall_after_writes: Some(stalls_after), ..Default::default() }, Some(2)).await;
+    let content = pattern(2 << 20, 104);
+    let id = rig.queue.enqueue_upload(vec![rig.source("big.bin", &content, 0o644)], "/up");
+    rig.wait(id, "ten chunks", |v| v.bytes_done >= stalls_after as u64 * CHUNK).await;
+    rig.queue.pause(id);
+    // Waiting for the requests on their way is given up after a while: the pause still lands.
+    let paused = rig.state(id, TransferState::Paused(PauseReason::User)).await;
+    assert_eq!((paused.failure_total, paused.bytes_done), (0, stalls_after as u64 * CHUNK));
+
+    let log_len = rig.fx.logs.writes.lock().unwrap().len();
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    tokio::time::sleep(SEC / 4).await;
+    assert_eq!(rig.queue.view(id).unwrap().state, TransferState::Paused(PauseReason::User), "the user's pause stays");
+    rig.queue.resume(id);
+    assert_eq!(rig.finished(id).await.state, TransferState::Done);
+    assert!(rig.fx.read("/up/big.bin") == content);
+    let log = rig.fx.logs.writes.lock().unwrap()[log_len..].to_vec();
+    assert!(log.iter().all(|(_, offset, _)| *offset >= stalls_after as u64 * CHUNK), "nothing was sent twice");
+}
+
+#[tokio::test]
+async fn an_error_that_comes_back_after_the_session_was_taken_away_is_not_the_files_failure() {
+    // The server is slow to answer the open of the temporary file, and then refuses: but by then the
+    // session is gone, and what comes back from a session being torn down means nothing.
+    let rig = Rig::with(SftpOptions { open_delay: Duration::from_millis(400), ..Default::default() }).await;
+    let id = rig.queue.enqueue_upload(vec![rig.source("a.txt", b"a", 0o644)], "/up");
+    rig.wait(id, "the file to be started", |v| v.state == TransferState::Running && v.current.is_some()).await;
+    rig.queue.set_session(None);
+    rig.fx.logs.fail_opens.store(true, std::sync::atomic::Ordering::Relaxed);
+    let paused = rig.state(id, TransferState::Paused(PauseReason::Disconnected)).await;
+    assert_eq!((paused.failure_total, paused.files_done), (0, 0), "no failure was recorded");
+    rig.fx.logs.fail_opens.store(false, std::sync::atomic::Ordering::Relaxed);
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    assert_eq!(rig.finished(id).await.state, TransferState::Done);
+    assert_eq!(rig.fx.text("/up/a.txt"), "a");
+}
+
+#[tokio::test]
+async fn the_queue_says_once_for_each_session_when_the_one_it_holds_is_lost() {
+    let rig = Rig::slow().await;
+    let up =
+        |n: u64| rig.queue.enqueue_upload(vec![rig.source(&format!("f{n}.bin"), &pattern(BIG, 110 + n), 0o644)], "/up");
+    let (a, b) = (up(1), up(2));
+    rig.started(a).await;
+    rig.started(b).await;
+    rig.events();
+
+    rig.fx.server.state.kill_connections();
+    rig.state(a, TransferState::Paused(PauseReason::Disconnected)).await;
+    rig.state(b, TransferState::Paused(PauseReason::Disconnected)).await;
+    tokio::time::sleep(SEC / 3).await;
+    assert_eq!(session_lost_events(&rig.events()), 1, "two items, one session, one message");
+
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    rig.finished(a).await;
+    rig.finished(b).await;
+    // The next session is lost in its turn: told again.
+    let c = up(3);
+    rig.started(c).await;
+    rig.events();
+    rig.fx.server.state.kill_connections();
+    rig.state(c, TransferState::Paused(PauseReason::Disconnected)).await;
+    tokio::time::sleep(SEC / 3).await;
+    assert_eq!(session_lost_events(&rig.events()), 1);
+
+    // Taking a session away on purpose is not losing it.
+    rig.queue.set_session(Some(Arc::new(rig.fx.new_session().await)));
+    rig.started(c).await;
+    rig.events();
+    rig.queue.set_session(None);
+    rig.state(c, TransferState::Paused(PauseReason::Disconnected)).await;
+    tokio::time::sleep(SEC / 3).await;
+    assert_eq!(session_lost_events(&rig.events()), 0);
+}
+
+// ---- small things -------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn only_the_first_failures_are_kept_and_the_rest_are_counted() {
+    if is_root() {
+        return;
+    }
+    let rig = Rig::new().await;
+    for n in 0..130 {
+        rig.source(&format!("tree/f{n:03}.txt"), b"x", 0o000);
+    }
+    let id = rig.queue.enqueue_upload(vec![rig.src("tree")], "/up");
+    let view = rig.finished(id).await;
+    let TransferState::Failed(summary) = &view.state else { panic!("{:?}", view.state) };
+    assert_eq!((view.failure_total, view.failures.len()), (130, 100));
+    assert!(summary.starts_with("130 个文件传输失败，首个原因：权限不足"), "{summary}");
+    assert!(summary.ends_with("等 130 个）"), "{summary}");
+    assert!(view.failures[0].path.ends_with("f000.txt"), "the first ones are the ones kept");
+    assert_eq!(rig.fx.names("/up/tree").len(), 0, "no temporary files");
+}
+
+#[tokio::test]
+async fn the_result_of_a_download_is_the_name_it_really_got() {
+    let rig = Rig::slow().await;
+    let content = pattern(1 << 20, 120);
+    rig.fx.file("/srv/a.txt", &content, 0o644);
+    let id = rig.queue.enqueue_download(vec!["/srv/a.txt".into()], rig.downloads());
+    rig.started(id).await;
+    // Somebody takes the planned name while the download is under way.
+    std::fs::write(rig.downloads().join("a.txt"), "somebody else's file").unwrap();
+    let view = rig.finished(id).await;
+    assert_eq!(view.state, TransferState::Done);
+    assert_eq!(std::fs::read_to_string(rig.downloads().join("a.txt")).unwrap(), "somebody else's file");
+    assert!(std::fs::read(rig.downloads().join("a (1).txt")).unwrap() == content);
+    assert_eq!(view.result, Some(rig.downloads().join("a (1).txt")), "Finder is shown the right file");
 }
