@@ -83,6 +83,51 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `files-act:<host>:<dir>:<name>:<what>[:<text>]` shows the panel there and, a few seconds later,
+    // does `what` to the entry `name` by calling the panel (`menu`, `rename-error`, `delete`, `permissions`, `drag`,
+    // `download`, `newfolder`); `files-queue:<host>:<dir>` shows a transfer queue in all its states.
+    // Uploads come from `$SHELLMATE_DEMO_UPLOADS`, downloads go to `$SHELLMATE_DOWNLOADS`.
+    if let Some(args) = name.strip_prefix("files-act:") {
+        let mut parts = args.splitn(5, ':').map(str::to_string);
+        let (host, dir, entry, what, text) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        workspace.update(cx, |workspace, cx| {
+            workspace.connect_by_name(&host, window, cx);
+            workspace.demo_files(Some(&dir), Some(&entry), false, window, cx);
+        });
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                workspace.update_in(cx, |workspace, window, cx| workspace.demo_act(&what, &entry, &text, window, cx)).ok();
+            })
+            .detach();
+        return;
+    }
+    if let Some(args) = name.strip_prefix("files-queue:") {
+        let (host, dir) = args.split_once(':').unwrap_or((args, "/"));
+        workspace.update(cx, |workspace, cx| {
+            workspace.connect_by_name(host, window, cx);
+            workspace.demo_files(Some(dir), None, false, window, cx);
+        });
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let mut last = 0;
+                for (at_ms, step) in [(4000u64, 1u8), (6500, 2), (7000, 3), (12500, 4), (15200, 5), (17500, 6)] {
+                    cx.background_executor().timer(std::time::Duration::from_millis(at_ms - last)).await;
+                    last = at_ms;
+                    workspace.update_in(cx, |workspace, window, cx| workspace.demo_queue_step(step, window, cx)).ok();
+                }
+            })
+            .detach();
+        return;
+    }
     // `files:<host>[:<dir>[:<name to select>]]` connects the host and shows its files panel there;
     // `files-hint:<host>` shows it with the OSC 7 hint open.
     if let Some(args) = name.strip_prefix("files:").or_else(|| name.strip_prefix("files-hint:")) {

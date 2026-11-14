@@ -362,6 +362,21 @@ impl SftpSession {
         Ok(())
     }
 
+    /// Creates a directory called `base` in `dir`, or `base (1)`, `base (2)`, … when that name is
+    /// taken (by a file or a link as well), and returns its path. The server decides what is taken:
+    /// `mkdir` refuses an existing name, so two folders made at the same time never share a name.
+    pub async fn create_dir_unique(&self, dir: &str, base: &str) -> Result<String, SftpError> {
+        for name in crate::transfer::candidates(base, false) {
+            let target = path::join(dir, &name);
+            match self.mkdir(&target).await {
+                Ok(()) => return Ok(target),
+                Err(SftpError::AlreadyExists { .. }) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(SftpError::AlreadyExists { path: path::join(dir, base) })
+    }
+
     /// Creates a directory with the given permission bits (`0o755`; applied for real after
     /// creation, because the server's umask applies to the mode given at creation). Fails if
     /// something is there already.

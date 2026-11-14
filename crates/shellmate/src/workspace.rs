@@ -296,6 +296,7 @@ impl Workspace {
         let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
         self.focus_active(window, cx);
+        self.pump_active_clash(window, cx);
         self.sync_sidebar(cx);
         cx.notify();
     }

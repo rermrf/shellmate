@@ -6,6 +6,7 @@
 //! the dialog layer.
 
 pub mod auth;
+pub mod clash;
 pub mod confirm;
 pub mod host_editor;
 pub mod hostkey;

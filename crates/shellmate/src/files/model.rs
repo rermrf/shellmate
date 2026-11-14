@@ -48,6 +48,71 @@ pub enum Applied {
     SessionLost,
 }
 
+/// Inline editing of an entry's name (a rename, or the name of a folder just made).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Edit {
+    /// The entry being renamed (its current name).
+    pub name: String,
+    /// Why the last attempt did not work; the editor stays open to try again.
+    pub error: Option<String>,
+    /// The rename is on its way to the server.
+    pub busy: bool,
+}
+
+/// A rename to carry out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameRequest {
+    pub from: String,
+    pub to: String,
+    pub new_name: String,
+}
+
+/// What a deletion removes, for the confirmation and the sentence in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteKind {
+    File,
+    /// A directory: everything inside goes too.
+    Dir,
+    /// A symbolic link: the link goes, not what it points at.
+    Link,
+}
+
+/// A deletion to confirm and carry out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRequest {
+    pub path: String,
+    pub name: String,
+    pub kind: DeleteKind,
+    /// The entry to select afterwards: the one below the deleted, else the one above.
+    next: Option<String>,
+}
+
+impl DeleteRequest {
+    /// The confirmation's title.
+    pub fn title(&self) -> String {
+        match self.kind {
+            DeleteKind::Dir => format!("删除目录 {}？", self.name),
+            DeleteKind::File | DeleteKind::Link => format!("删除 {}？", self.name),
+        }
+    }
+
+    /// The confirmation's text. For a directory it says that everything inside goes, recursively.
+    pub fn body(&self) -> String {
+        match self.kind {
+            DeleteKind::File => format!("将从服务器永久删除 {}，无法撤销。", self.path),
+            DeleteKind::Dir => format!("将递归删除目录 {} 及其中的全部文件和子目录，无法撤销。", self.path),
+            DeleteKind::Link => format!("将删除符号链接 {}（不会删除它指向的内容），无法撤销。", self.path),
+        }
+    }
+}
+
+/// What to do with the next listing: select something, and maybe start renaming it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct After {
+    select: Option<String>,
+    rename: bool,
+}
+
 /// What the details panel is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject<'a> {
@@ -179,6 +244,14 @@ pub struct FilesModel {
     draft: Option<PermDraft>,
     /// What went wrong applying the permissions.
     chmod_error: Option<String>,
+    /// The name being edited in the list.
+    edit: Option<Edit>,
+    /// What the next listing of this directory selects (after a rename, a new folder, a delete).
+    after: Option<After>,
+    /// The listing just selected something that is to be scrolled into view.
+    reveal: bool,
+    /// A message that has to survive the listing that follows the operation which failed.
+    banner_after: Option<String>,
 }
 
 impl Default for FilesModel {
@@ -204,6 +277,10 @@ impl FilesModel {
             next_request: 1,
             draft: None,
             chmod_error: None,
+            edit: None,
+            after: None,
+            reveal: false,
+            banner_after: None,
         }
     }
 
@@ -344,6 +421,10 @@ impl FilesModel {
     /// reconnect is coming if the SSH connection is fine.
     pub fn session_lost(&mut self) {
         self.pending = None;
+        // A rename that was on its way is not known to have happened: the user may try again.
+        if let Some(edit) = &mut self.edit {
+            edit.busy = false;
+        }
         if self.link == LinkStatus::Ready {
             self.link = LinkStatus::Connecting;
         }
@@ -369,6 +450,11 @@ impl FilesModel {
     pub fn navigate(&mut self, dir: &str, cause: Cause) -> Option<Request> {
         if cause == Cause::Hand {
             self.follow = false;
+        }
+        if cause != Cause::Refresh {
+            // Somewhere else: a half-typed name and what an earlier operation wanted selected are moot.
+            self.edit = None;
+            self.after = None;
         }
         if self.link != LinkStatus::Ready {
             // The user's choice is remembered for when there is a session; following the terminal
@@ -417,8 +503,21 @@ impl FilesModel {
                 // The server lists directories in a sorted order already; keep it as it is.
                 std::mem::swap(&mut self.entries, &mut entries);
                 self.view = View::List;
-                self.banner = None;
+                self.banner = self.banner_after.take();
                 self.selection = previous.filter(|_| keep).filter(|sel| self.selection_exists(sel));
+                if self.edit.as_ref().is_some_and(|edit| !self.entries.iter().any(|e| e.name == edit.name)) {
+                    self.edit = None;
+                }
+                if let Some(After { select, rename }) = self.after.take() {
+                    self.selection =
+                        select.clone().filter(|name| self.entries.iter().any(|e| &e.name == name)).map(Selection::Name);
+                    if let Some(name) = select.filter(|_| self.selection.is_some()) {
+                        self.reveal = true;
+                        if rename {
+                            self.edit = Some(Edit { name, error: None, busy: false });
+                        }
+                    }
+                }
                 self.reset_draft();
             }
             Err(err) if err.is_session_lost() => {
@@ -514,6 +613,14 @@ impl FilesModel {
         self.set_selection(selection);
     }
 
+    /// Selects the entry called `name`, if it is listed (a click or a right-click on its row, as far
+    /// as the operations that follow are concerned).
+    pub fn select_name(&mut self, name: &str) {
+        if self.entries.iter().any(|entry| entry.name == name) {
+            self.set_selection(Some(Selection::Name(name.to_string())));
+        }
+    }
+
     /// ↑ (`-1`) and ↓ (`1`): moves the selection, without wrapping around; with nothing selected, ↓ takes
     /// the first row and ↑ the last. Returns the row now selected.
     pub fn move_selection(&mut self, delta: i32) -> Option<usize> {
@@ -533,6 +640,10 @@ impl FilesModel {
     fn set_selection(&mut self, selection: Option<Selection>) {
         if self.selection != selection {
             self.selection = selection;
+            // Selecting something else ends an edit of a name (unless it is being sent).
+            if self.edit.as_ref().is_some_and(|edit| !edit.busy) {
+                self.edit = None;
+            }
             self.reset_draft();
         }
     }
@@ -558,6 +669,148 @@ impl FilesModel {
             }
         }
         None
+    }
+
+    // ---- operations ---------------------------------------------------------------------------------------------
+
+    /// Whether the toolbar and menus can act: there has to be a session, and no rename on its way.
+    pub fn ops_enabled(&self) -> bool {
+        self.link == LinkStatus::Ready && !self.edit.as_ref().is_some_and(|edit| edit.busy)
+    }
+
+    /// Shows `text` above the list until the next listing.
+    pub fn set_banner(&mut self, text: impl Into<String>) {
+        self.banner = Some(text.into());
+    }
+
+    /// The name being edited, if any.
+    pub fn edit(&self) -> Option<&Edit> {
+        self.edit.as_ref()
+    }
+
+    /// 重命名 on the selected entry. `false` if nothing that can be renamed is selected.
+    pub fn start_rename(&mut self) -> bool {
+        if !self.ops_enabled() {
+            return false;
+        }
+        let Some(name) = self.selected_entry().map(|entry| entry.name.clone()) else { return false };
+        self.edit = Some(Edit { name, error: None, busy: false });
+        true
+    }
+
+    /// Esc: stops editing the name (nothing is renamed).
+    pub fn cancel_edit(&mut self) {
+        if self.edit.as_ref().is_some_and(|edit| !edit.busy) {
+            self.edit = None;
+        }
+    }
+
+    /// Enter: the rename to carry out for `text`, or `None` — when the name did not change (the
+    /// editor closes) or cannot be used (the editor stays open and says why).
+    pub fn commit_edit(&mut self, text: &str) -> Option<RenameRequest> {
+        let edit = self.edit.as_mut().filter(|edit| !edit.busy)?;
+        let from_name = edit.name.clone();
+        let invalid = if text.trim().is_empty() {
+            Some("名称不能为空".to_string())
+        } else if text.contains('/') {
+            Some("名称不能包含「/」".to_string())
+        } else if text.contains('\0') || matches!(text, "." | "..") {
+            Some("名称无效".to_string())
+        } else {
+            None
+        };
+        if let Some(error) = invalid {
+            edit.error = Some(error);
+            return None;
+        }
+        if text == from_name {
+            self.edit = None;
+            return None;
+        }
+        let to = path::join(&self.cwd, text);
+        // The server would say the same; saying it here saves the trip (and holds on servers that
+        // would silently replace).
+        if self.entries.iter().any(|entry| entry.name == text) {
+            edit.error = Some(SftpError::AlreadyExists { path: to }.to_string());
+            return None;
+        }
+        edit.error = None;
+        edit.busy = true;
+        Some(RenameRequest { from: path::join(&self.cwd, &from_name), to, new_name: text.to_string() })
+    }
+
+    /// The outcome of a rename. Success selects the entry under its new name and refreshes (the
+    /// returned listing); a failure is shown in the editor, which stays open for another try.
+    pub fn rename_done(&mut self, request: &RenameRequest, result: Result<(), SftpError>) -> Option<Request> {
+        match result {
+            Ok(()) => {
+                self.edit = None;
+                self.after = Some(After { select: Some(request.new_name.clone()), rename: false });
+                self.refresh()
+            }
+            Err(err) => {
+                if let Some(edit) = &mut self.edit {
+                    edit.busy = false;
+                    edit.error = Some(err.to_string());
+                }
+                None
+            }
+        }
+    }
+
+    /// A folder was made at `path`: list again, select it and start naming it.
+    pub fn new_folder_done(&mut self, path: &str) -> Option<Request> {
+        let name = path::file_name(path)?.to_string();
+        self.after = Some(After { select: Some(name), rename: true });
+        self.refresh()
+    }
+
+    /// The scroll position (row) of what the last listing selected for the user, once.
+    pub fn take_reveal(&mut self) -> Option<usize> {
+        std::mem::take(&mut self.reveal).then(|| self.selected_index()).flatten()
+    }
+
+    /// 删除 on the selected entry (never `..`).
+    pub fn delete_request(&self) -> Option<DeleteRequest> {
+        if !self.ops_enabled() {
+            return None;
+        }
+        let entry = self.selected_entry()?;
+        let index = self.entries.iter().position(|e| e.name == entry.name)?;
+        let next = self.entries.get(index + 1).or_else(|| index.checked_sub(1).and_then(|i| self.entries.get(i)));
+        let kind = match entry.kind {
+            EntryKind::Dir => DeleteKind::Dir,
+            EntryKind::Symlink => DeleteKind::Link,
+            _ => DeleteKind::File,
+        };
+        Some(DeleteRequest {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            kind,
+            next: next.map(|entry| entry.name.clone()),
+        })
+    }
+
+    /// The outcome of a deletion. Either way the directory is listed again (a directory that failed
+    /// halfway has lost part of what was in it); a failure stays above the list.
+    pub fn delete_done(&mut self, request: &DeleteRequest, result: Result<(), SftpError>) -> Option<Request> {
+        match result {
+            Ok(()) => self.after = Some(After { select: request.next.clone(), rename: false }),
+            Err(err) => {
+                let text = format!("无法删除 {}：{err}", request.name);
+                self.banner = Some(text.clone());
+                self.banner_after = Some(text);
+            }
+        }
+        self.refresh()
+    }
+
+    /// 下载 on the selected entry: its path (a file, a directory, or a link, which is followed).
+    pub fn download_path(&self) -> Option<String> {
+        if !self.ops_enabled() {
+            return None;
+        }
+        self.selected_entry().map(|entry| entry.path.clone())
     }
 
     // ---- permissions ------------------------------------------------------------------------------------------
@@ -1144,5 +1397,229 @@ mod tests {
             model.toggle_perm(1, 1);
             assert_eq!(model.draft().cloned(), before, "{link:?}: the grid does not move");
         }
+    }
+
+    // ---- renaming, new folders, deleting ----
+
+    #[test]
+    fn rename_opens_an_editor_on_the_selected_entry_only() {
+        let mut model = at_app();
+        assert!(!model.start_rename(), "nothing selected");
+        model.select_row(0);
+        assert!(!model.start_rename(), "`..` cannot be renamed");
+        model.select_row(4);
+        assert!(model.start_rename());
+        assert_eq!(model.edit(), Some(&Edit { name: "nginx.conf".into(), error: None, busy: false }));
+        // Esc closes it, selecting something else too.
+        model.cancel_edit();
+        assert_eq!(model.edit(), None);
+        assert!(model.start_rename());
+        model.select_row(3);
+        assert_eq!(model.edit(), None, "the editor belonged to the other row");
+    }
+
+    #[test]
+    fn an_unchanged_name_closes_the_editor_and_bad_names_keep_it_open_with_the_reason() {
+        let mut model = at_app();
+        model.select_row(4);
+        model.start_rename();
+        assert_eq!(model.commit_edit("nginx.conf"), None);
+        assert_eq!(model.edit(), None, "nothing to do: closed");
+
+        model.start_rename();
+        for (text, why) in [
+            ("", "名称不能为空"),
+            ("   ", "名称不能为空"),
+            ("a/b", "名称不能包含「/」"),
+            ("..", "名称无效"),
+            (".", "名称无效"),
+            (".env", "已存在：/srv/app/.env"),
+        ] {
+            assert_eq!(model.commit_edit(text), None, "{text:?}");
+            assert_eq!(model.edit().and_then(|e| e.error.as_deref()), Some(why), "{text:?}");
+            assert_eq!(model.edit().map(|e| e.busy), Some(false), "still editable");
+        }
+    }
+
+    #[test]
+    fn a_rename_is_sent_once_and_selects_the_new_name_when_it_worked() {
+        let mut model = at_app();
+        model.select_row(4);
+        model.start_rename();
+        let request = model.commit_edit("nginx.old").expect("a rename");
+        assert_eq!(
+            request,
+            RenameRequest {
+                from: "/srv/app/nginx.conf".into(),
+                to: "/srv/app/nginx.old".into(),
+                new_name: "nginx.old".into()
+            }
+        );
+        assert_eq!(model.edit().map(|e| e.busy), Some(true));
+        assert_eq!(model.commit_edit("again"), None, "not twice while it is on its way");
+        assert!(!model.ops_enabled(), "nothing else meanwhile");
+
+        let list = model.rename_done(&request, Ok(())).expect("the directory is listed again");
+        assert_eq!((list.dir.as_str(), list.cause), ("/srv/app", Cause::Refresh));
+        assert_eq!(model.edit(), None);
+        model.apply(list.id, ok(&list, vec![dir("config"), dir("dist"), file(".env"), file("nginx.old")]));
+        assert_eq!(model.selected_entry().map(|e| e.name.as_str()), Some("nginx.old"));
+        assert_eq!(model.take_reveal(), Some(4), "scrolled to it");
+        assert_eq!(model.take_reveal(), None, "once");
+    }
+
+    #[test]
+    fn a_refused_rename_shows_the_servers_reason_and_stays_in_edit_mode() {
+        let mut model = at_app();
+        model.select_row(4);
+        model.start_rename();
+        let request = model.commit_edit("other.conf").unwrap();
+        let exists = SftpError::AlreadyExists { path: "/srv/app/other.conf".into() };
+        assert_eq!(model.rename_done(&request, Err(exists)), None);
+        let edit = model.edit().unwrap();
+        assert_eq!((edit.error.as_deref(), edit.busy), (Some("已存在：/srv/app/other.conf"), false));
+        // Another try with another name works.
+        let request = model.commit_edit("third.conf").expect("try again");
+        assert_eq!(model.edit().and_then(|e| e.error.clone()), None, "the old message is gone");
+        assert!(model.rename_done(&request, Ok(())).is_some());
+    }
+
+    #[test]
+    fn a_rename_that_loses_the_session_can_be_tried_again() {
+        let mut model = at_app();
+        model.select_row(4);
+        model.start_rename();
+        model.commit_edit("x.conf").unwrap();
+        model.session_lost();
+        assert_eq!(model.edit().map(|e| e.busy), Some(false));
+        assert!(model.edit().is_some(), "the typed name is still there to send again");
+    }
+
+    #[test]
+    fn a_new_folder_is_selected_and_named_right_away() {
+        let mut model = at_app();
+        let list = model.new_folder_done("/srv/app/新建文件夹").expect("a listing");
+        let mut entries = listing();
+        entries.insert(2, dir("新建文件夹"));
+        model.apply(list.id, ok(&list, entries));
+        assert_eq!(model.selected_entry().map(|e| e.name.as_str()), Some("新建文件夹"));
+        assert_eq!(model.edit(), Some(&Edit { name: "新建文件夹".into(), error: None, busy: false }));
+        assert_eq!(model.take_reveal(), Some(3));
+        // Esc leaves it with the name it has.
+        model.cancel_edit();
+        assert_eq!(model.edit(), None);
+        assert_eq!(model.selected_entry().map(|e| e.name.as_str()), Some("新建文件夹"));
+    }
+
+    #[test]
+    fn an_edit_does_not_outlive_the_listing_it_belongs_to() {
+        let mut model = at_app();
+        let list = model.new_folder_done("/srv/app/新建文件夹").unwrap();
+        // The user went elsewhere before the listing arrived: nothing is selected or edited there.
+        model.go_to("/var");
+        let mut entries = listing();
+        entries.push(dir("新建文件夹"));
+        model.apply(list.id, ok(&list, entries));
+        assert_eq!(model.edit(), None);
+        // A refresh in which the edited entry is gone closes the editor.
+        model.select_row(4);
+        model.start_rename();
+        let list = model.refresh().expect("refresh");
+        model.apply(list.id, ok(&list, vec![dir("config")]));
+        assert_eq!(model.edit(), None);
+    }
+
+    #[test]
+    fn deleting_asks_about_the_selected_entry_and_says_what_goes() {
+        let mut model = at_app();
+        assert_eq!(model.delete_request(), None, "nothing selected");
+        model.select_row(0);
+        assert_eq!(model.delete_request(), None, "never `..`");
+
+        model.select_row(4);
+        let file_request = model.delete_request().unwrap();
+        assert_eq!(file_request.title(), "删除 nginx.conf？");
+        assert_eq!(file_request.body(), "将从服务器永久删除 /srv/app/nginx.conf，无法撤销。");
+
+        model.select_row(1);
+        let dir_request = model.delete_request().unwrap();
+        assert_eq!(dir_request.kind, DeleteKind::Dir);
+        assert_eq!(dir_request.title(), "删除目录 config？");
+        assert_eq!(dir_request.body(), "将递归删除目录 /srv/app/config 及其中的全部文件和子目录，无法撤销。");
+
+        let mut link = entry("current", EntryKind::Symlink, 0o777);
+        link.link = Some(shellmate_sftp::Link { target: "config".into(), resolved: Some(EntryKind::Dir) });
+        let list = model.refresh().unwrap();
+        model.apply(list.id, ok(&list, vec![link]));
+        model.select_row(1);
+        let link_request = model.delete_request().unwrap();
+        assert_eq!(link_request.kind, DeleteKind::Link, "a link to a directory is removed as a link");
+        assert_eq!(link_request.body(), "将删除符号链接 /srv/app/current（不会删除它指向的内容），无法撤销。");
+    }
+
+    #[test]
+    fn after_a_delete_the_next_entry_is_selected_else_the_previous_one() {
+        let delete = |model: &mut FilesModel, row: usize, remaining: Vec<Entry>| {
+            model.select_row(row);
+            let request = model.delete_request().unwrap();
+            let list = model.delete_done(&request, Ok(())).expect("listed again");
+            model.apply(list.id, ok(&list, remaining));
+        };
+        let selected = |model: &FilesModel| model.selected_entry().map(|e| e.name.clone());
+
+        let mut model = at_app();
+        delete(&mut model, 2, vec![dir("config"), file(".env"), file("nginx.conf")]);
+        assert_eq!(selected(&model).as_deref(), Some(".env"), "the one that moved up into its place");
+        assert_eq!(model.take_reveal(), Some(2));
+
+        let mut model = at_app();
+        delete(&mut model, 4, vec![dir("config"), dir("dist"), file(".env")]);
+        assert_eq!(selected(&model).as_deref(), Some(".env"), "the last one was deleted: the one above");
+
+        let mut model = at_app();
+        let list = model.refresh().unwrap();
+        model.apply(list.id, ok(&list, vec![file("only")]));
+        delete(&mut model, 1, vec![]);
+        assert_eq!(selected(&model), None, "nothing left to select");
+        assert_eq!(model.row_count(), 1, "just `..`");
+    }
+
+    #[test]
+    fn a_failed_delete_lists_again_and_keeps_saying_so() {
+        let mut model = at_app();
+        model.select_row(1);
+        let request = model.delete_request().unwrap();
+        let denied = SftpError::PermissionDenied { path: "/srv/app/config".into() };
+        let list = model.delete_done(&request, Err(denied)).expect("part of it may be gone: list again");
+        assert_eq!(model.banner(), Some("无法删除 config：权限不足：/srv/app/config"));
+        model.apply(list.id, ok(&list, listing()));
+        assert_eq!(model.banner(), Some("无法删除 config：权限不足：/srv/app/config"), "survives the listing");
+        let list = model.refresh().unwrap();
+        model.apply(list.id, ok(&list, listing()));
+        assert_eq!(model.banner(), None, "gone with the next one");
+    }
+
+    #[test]
+    fn download_takes_the_selection_and_only_with_a_session() {
+        let mut model = at_app();
+        assert_eq!(model.download_path(), None, "nothing selected");
+        model.select_row(0);
+        assert_eq!(model.download_path(), None, "`..` is not downloaded");
+        model.select_row(2);
+        assert_eq!(model.download_path().as_deref(), Some("/srv/app/dist"), "a directory too");
+        model.set_link(LinkStatus::Disconnected);
+        assert_eq!(model.download_path(), None);
+        assert_eq!(model.delete_request(), None);
+        assert!(!model.start_rename());
+    }
+
+    #[test]
+    fn messages_set_by_the_panel_stay_until_the_next_listing() {
+        let mut model = at_app();
+        model.set_banner("无法创建下载目录");
+        assert_eq!(model.banner(), Some("无法创建下载目录"));
+        let list = model.refresh().unwrap();
+        model.apply(list.id, ok(&list, listing()));
+        assert_eq!(model.banner(), None);
     }
 }

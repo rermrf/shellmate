@@ -7,18 +7,21 @@
 //! is [`SftpLink`]'s job; this module opens it, tells it what happens to the connection and hands
 //! what it says to the panels.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{AppContext as _, Context, Entity, Focusable as _, Subscription, Window};
 use shellmate_sftp::SftpSession;
 use shellmate_sftp::link::{LinkState, SftpLink};
-use shellmate_sftp::transfer::TransferEvent;
+use shellmate_sftp::transfer::{Choice, Clash, ItemId, TransferEvent, TransferState};
 use shellmate_ssh::Connection;
 
 use super::ssh::SshStatus;
 use super::{Panel, Workspace};
+use crate::dialogs::clash::{Answer, ClashDialog};
 use crate::files::model::LinkStatus;
 use crate::files::panel::{FilesEvent, FilesPanel};
+use crate::files::transfers::TransferList;
 use crate::runtime;
 
 /// The files panel of a tab and what keeps it wired to the workspace.
@@ -62,24 +65,158 @@ impl Workspace {
         });
         let queue = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
-                if this.update_in(cx, |this, _, cx| this.on_transfer_event(group_id, &event, cx)).is_err() {
+                if this.update_in(cx, |this, window, cx| this.on_transfer_event(group_id, &event, window, cx)).is_err()
+                {
                     break;
                 }
             }
         });
+        let transfers = cx.new(|_| TransferList::new());
         if let Some(group) = self.group_mut(group_id) {
             group.link = Some(link);
             group.link_tasks = vec![changed, queue];
+            group.transfers = Some(transfers);
         }
     }
 
-    /// An event of the connection's transfer queue. The link reopens a session that died; the
-    /// transfer list (next step) shows the rest.
-    fn on_transfer_event(&mut self, group_id: usize, event: &TransferEvent, cx: &mut Context<Self>) {
-        if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
-            link.handle_event(event);
+    /// An event of the connection's transfer queue: the link reopens a session that died, the list
+    /// every panel of the connection shows takes it in, a finished upload makes the panels that show
+    /// its directory list it again, and names that exist are asked about.
+    fn on_transfer_event(
+        &mut self,
+        group_id: usize,
+        event: &TransferEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self.group(group_id) {
+            if let Some(link) = &group.link {
+                link.handle_event(event);
+            }
+            if let Some(transfers) = &group.transfers {
+                transfers.update(cx, |list, cx| {
+                    list.apply(event);
+                    cx.notify();
+                });
+            }
+        }
+        match event {
+            TransferEvent::RemoteChanged(dir) => self.remote_changed(group_id, dir, cx),
+            TransferEvent::Added(view) | TransferEvent::State(view) if view.state == TransferState::AwaitingClash => {
+                self.pump_clash(group_id, window, cx)
+            }
+            _ => {}
         }
         cx.notify();
+    }
+
+    /// Something changed in `dir` on the server: every panel of the connection that shows it lists it again.
+    fn remote_changed(&mut self, group_id: usize, dir: &str, cx: &mut Context<Self>) {
+        let panels: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id))
+            .filter_map(|s| s.files.as_ref().map(|files| files.panel.clone()))
+            .collect();
+        for panel in panels {
+            panel.update(cx, |panel, cx| panel.on_remote_changed(dir, cx));
+        }
+    }
+
+    // ---- names that exist ---------------------------------------------------------------------------
+
+    /// Asks about the first upload of the connection that is waiting for an answer, if the tab on
+    /// screen is one of the connection's and shows its files (otherwise the question waits for the
+    /// user to get there). One dialog at a time; one closed with Esc is not asked again by itself.
+    pub(super) fn pump_clash(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = self
+            .active
+            .and_then(|ix| self.sessions.get(ix))
+            .is_some_and(|s| s.panel == Panel::Files && s.ssh().is_some_and(|ssh| ssh.group == group_id));
+        let Some(group) = self.group(group_id).filter(|group| showing && group.clash.open.is_none()) else { return };
+        let Some(transfers) = group.transfers.clone() else { return };
+        let next = transfers
+            .read(cx)
+            .awaiting_clash()
+            .find(|view| !group.clash.dismissed.contains(&view.id))
+            .and_then(|view| view.clash.clone().map(|clash| (view.id, clash)));
+        if let Some((id, clash)) = next {
+            self.open_clash(group_id, id, clash, window, cx);
+        }
+    }
+
+    /// The group of the tab on screen, if it is an SSH tab.
+    fn active_group(&self) -> Option<usize> {
+        self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.ssh()).map(|ssh| ssh.group)
+    }
+
+    /// Asks the question of the connection waiting on screen, if any (after switching tabs or panels).
+    pub(super) fn pump_active_clash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(group_id) = self.active_group() {
+            self.pump_clash(group_id, window, cx);
+        }
+    }
+
+    fn open_clash(&mut self, group_id: usize, id: ItemId, clash: Clash, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(group) = self.group_mut(group_id) {
+            group.clash.open = Some(id);
+            group.clash.dismissed.remove(&id);
+        }
+        let workspace = cx.entity().downgrade();
+        // The dialog is closing when it answers: what that sets going (the next question, say) waits until it is gone.
+        let answer: Answer = Rc::new(move |id, choice, window, cx| {
+            let workspace = workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace.update(cx, |this, cx| this.on_clash_answer(group_id, id, choice, window, cx)).ok();
+            });
+        });
+        ClashDialog::open(id, clash, answer, window, cx);
+    }
+
+    /// The dialog was answered (`Some`) or closed with Esc (`None`: the item keeps waiting).
+    fn on_clash_answer(
+        &mut self,
+        group_id: usize,
+        id: ItemId,
+        choice: Option<Choice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self.group_mut(group_id) {
+            group.clash.open = None;
+            match choice {
+                Some(choice) => {
+                    group.clash.dismissed.remove(&id);
+                    if let Some(link) = &group.link {
+                        link.queue().answer_clash(id, choice);
+                    }
+                }
+                None => {
+                    group.clash.dismissed.insert(id);
+                }
+            }
+        }
+        self.pump_clash(group_id, window, cx);
+    }
+
+    /// 处理 on a queue row: the question about item `id` again.
+    fn handle_clash(&mut self, session_id: usize, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group_id) =
+            self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group)
+        else {
+            return;
+        };
+        let Some(group) = self.group(group_id).filter(|group| group.clash.open.is_none()) else { return };
+        let clash = group
+            .transfers
+            .as_ref()
+            .and_then(|transfers| {
+                transfers.read(cx).get(id).filter(|v| v.state == TransferState::AwaitingClash).cloned()
+            })
+            .and_then(|view| view.clash);
+        if let Some(clash) = clash {
+            self.open_clash(group_id, id, clash, window, cx);
+        }
     }
 
     /// The connection came up (the first time, or after a reconnect).
@@ -119,6 +256,8 @@ impl Workspace {
     pub(super) fn sync_files(&mut self, group_id: usize, cx: &mut Context<Self>) {
         let Some(group) = self.group(group_id) else { return };
         let state = group.link.as_ref().map(SftpLink::state);
+        let queue = group.link.as_ref().map(|link| link.queue().clone());
+        let transfers = group.transfers.clone();
         let panels: Vec<_> = self
             .sessions
             .iter()
@@ -130,7 +269,10 @@ impl Workspace {
                 Some(state) => (link_status(state, tab), state.session().cloned()),
                 None => (LinkStatus::Failed("SSH 运行时未能启动".into()), None),
             };
-            panel.update(cx, |panel, cx| panel.set_link(status, session, cx));
+            panel.update(cx, |panel, cx| {
+                panel.set_transfers(queue.clone(), transfers.clone(), cx);
+                panel.set_link(status, session, cx);
+            });
         }
     }
 
@@ -156,6 +298,7 @@ impl Workspace {
             self.open_sftp(group, cx);
         }
         self.focus_active(window, cx);
+        self.pump_active_clash(window, cx);
         cx.notify();
     }
 
@@ -167,10 +310,12 @@ impl Workspace {
         let Some(runtime) = runtime::get(cx) else { return false };
         let (session_id, terminal) = (self.sessions[ix].id, self.sessions[ix].terminal.clone());
         let panel = cx.new(|cx| FilesPanel::new(&terminal, runtime, window, cx));
-        let subscription = cx.subscribe(&panel, move |this: &mut Self, _, event: &FilesEvent, cx| match event {
-            FilesEvent::RetrySession => this.retry_sftp(session_id, cx),
-            FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
-        });
+        let subscription =
+            cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
+                FilesEvent::RetrySession => this.retry_sftp(session_id, cx),
+                FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
+                FilesEvent::HandleClash(id) => this.handle_clash(session_id, *id, window, cx),
+            });
         self.sessions[ix].files = Some(FilesTab { panel, _subscription: subscription });
         true
     }
@@ -215,6 +360,100 @@ impl Workspace {
         let panel = self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.files.as_ref());
         if let Some(panel) = panel.map(|files| files.panel.clone()) {
             panel.update(cx, |panel, cx| panel.demo_refresh(cx));
+        }
+    }
+
+    /// Debug review hook: the files panel of the active tab.
+    #[cfg(debug_assertions)]
+    fn demo_panel(&self) -> Option<Entity<FilesPanel>> {
+        self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.files.as_ref()).map(|files| files.panel.clone())
+    }
+
+    /// Debug review hook: something the user does to the entry `name`, done by calling the panel.
+    /// `what` is `menu`, `rename-error` (with `arg` typed in), `delete`, `permissions`, `drag`, `download`, `newfolder` or `upload` (the path in `arg`).
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_act(&mut self, what: &str, name: &str, arg: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::{point, px};
+        let Some(panel) = self.demo_panel() else { return };
+        panel.update(cx, |panel, cx| match what {
+            "menu" => panel.demo_menu(name, point(px(400.), px(300.)), cx),
+            "rename-error" => panel.demo_rename(name, arg, cx),
+            "delete" => panel.demo_delete(name, window, cx),
+            "permissions" => panel.demo_permissions(name, window, cx),
+            "drag" => panel.demo_drag(true, cx),
+            "download" => {
+                panel.demo_select(name);
+                panel.demo_download(cx)
+            }
+            "newfolder" => panel.demo_new_folder(cx),
+            "upload" => panel.demo_upload(vec![std::path::PathBuf::from(arg)], cx),
+            other => log::warn!("unknown files action {other:?}"),
+        });
+    }
+
+    /// Debug review hook: one step of the transfer queue show. Everything it uploads comes from
+    /// `$SHELLMATE_DEMO_UPLOADS`, and every download goes to `$SHELLMATE_DOWNLOADS`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_queue_step(&mut self, step: u8, window: &mut Window, cx: &mut Context<Self>) {
+        use std::path::PathBuf;
+
+        use gpui::component::WindowExt as _;
+        let Some(panel) = self.demo_panel() else { return };
+        let Some(uploads) = std::env::var_os("SHELLMATE_DEMO_UPLOADS").map(PathBuf::from) else {
+            return log::error!("set SHELLMATE_DEMO_UPLOADS to a scratch directory with the files to send");
+        };
+        if std::env::var_os("SHELLMATE_DOWNLOADS").is_none() {
+            return log::error!(
+                "set SHELLMATE_DOWNLOADS to a scratch directory: the demo must not write to ~/Downloads"
+            );
+        }
+        let at = |name: &str| uploads.join(name);
+        match step {
+            // A small upload that is done in no time, a folder with a link in it (skipped), one that
+            // is refused, and a big one that will be paused.
+            1 => panel.update(cx, |panel, cx| {
+                let dir = panel.demo_cwd();
+                if let Some(queue) = panel.demo_queue() {
+                    queue.enqueue_upload(vec![at("done.txt")], &dir);
+                    queue.enqueue_upload(vec![at("tree")], &dir);
+                    queue.enqueue_upload(vec![at("fail.txt")], "/root");
+                    queue.enqueue_upload(vec![at("paused.bin")], &dir);
+                }
+                cx.notify();
+            }),
+            2 => panel.update(cx, |panel, _| panel.demo_pause_named("paused.bin")),
+            // Two big ones running, one queued behind them, a download, and one whose name exists.
+            3 => panel.update(cx, |panel, cx| {
+                let dir = panel.demo_cwd();
+                if let (Some(queue), Ok(downloads)) =
+                    (panel.demo_queue(), crate::files::transfers::ensure_downloads_dir())
+                {
+                    queue.enqueue_upload(vec![at("nginx.conf")], &dir);
+                    queue.enqueue_upload(vec![at("big-1.bin")], &dir);
+                    queue.enqueue_upload(vec![at("big-2.bin")], &dir);
+                    queue.enqueue_upload(vec![at("queued.bin")], &dir);
+                    queue.enqueue_download(vec![format!("{dir}/app.log")], downloads);
+                }
+                cx.notify();
+            }),
+            // Esc on the dialog.
+            4 => {
+                let Some((group_id, id)) = self
+                    .active_group()
+                    .and_then(|g| self.group(g).and_then(|group| group.clash.open).map(|id| (g, id)))
+                else {
+                    return;
+                };
+                window.close_all_dialogs(cx);
+                self.on_clash_answer(group_id, id, None, window, cx);
+            }
+            5 => panel.update(cx, |panel, cx| {
+                panel.demo_scroll_queue(3);
+                cx.notify();
+            }),
+            // 处理 on the row that is still waiting.
+            6 => panel.update(cx, |panel, cx| panel.demo_handle_clash(cx)),
+            other => log::warn!("unknown queue step {other}"),
         }
     }
 

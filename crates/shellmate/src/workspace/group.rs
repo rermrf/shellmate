@@ -10,15 +10,18 @@
 //! connection closes with its last tab. It only keeps a [`WeakConnection`] to hand the live
 //! connection to new tabs.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use gpui::Task;
+use gpui::{Entity, Task};
 use shellmate_core::{Host, HostId};
 use shellmate_sftp::link::SftpLink;
+use shellmate_sftp::transfer::ItemId;
 use shellmate_ssh::{Connection, WeakConnection};
 use tokio::task::AbortHandle;
 
 use crate::connect::{AuthMemory, Endpoint};
+use crate::files::transfers::TransferList;
 use crate::reconnect::{Phase, Reconnect};
 
 /// What makes two connections interchangeable: the saved host and the route to it as resolved
@@ -71,6 +74,16 @@ impl Attempt {
     }
 }
 
+/// Which questions about names that exist are on screen or were put aside.
+#[derive(Default)]
+pub struct ClashState {
+    /// The item whose dialog is open.
+    pub open: Option<ItemId>,
+    /// Items whose dialog was closed with Esc: they keep waiting (their queue row has 处理) and are
+    /// not asked about again by themselves.
+    pub dismissed: HashSet<ItemId>,
+}
+
 /// One connection and the tabs on it.
 pub struct ConnGroup {
     pub id: usize,
@@ -101,6 +114,10 @@ pub struct ConnGroup {
     pub link: Option<SftpLink>,
     /// The UI tasks that follow the link; they end with the group.
     pub link_tasks: Vec<Task<()>>,
+    /// What the connection's transfer queue holds, as every one of its panels shows it.
+    pub transfers: Option<Entity<TransferList>>,
+    /// The dialog about names that exist.
+    pub clash: ClashState,
 }
 
 impl ConnGroup {
@@ -120,6 +137,8 @@ impl ConnGroup {
             timer: None,
             link: None,
             link_tasks: Vec::new(),
+            transfers: None,
+            clash: ClashState::default(),
         }
     }
 
@@ -134,7 +153,7 @@ impl ConnGroup {
 
     /// Whether a dialog of this group may be open.
     pub fn has_open_prompt(&self) -> bool {
-        self.prompting && self.attempt.is_some()
+        (self.prompting && self.attempt.is_some()) || self.clash.open.is_some()
     }
 
     /// Stops whatever is running: the attempt (and with it its questions) and the countdown.

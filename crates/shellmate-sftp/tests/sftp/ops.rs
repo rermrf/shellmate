@@ -18,6 +18,25 @@ async fn mkdir_creates_a_directory_and_refuses_what_is_there() {
 }
 
 #[tokio::test]
+async fn a_new_folder_takes_the_first_free_name() {
+    let fx = Fixture::default().await;
+    fx.dir("/work");
+    assert_eq!(fx.session.create_dir_unique("/work", "新建文件夹").await.unwrap(), "/work/新建文件夹");
+    assert_eq!(fx.session.create_dir_unique("/work", "新建文件夹").await.unwrap(), "/work/新建文件夹 (1)");
+    assert_eq!(fx.session.create_dir_unique("/work", "新建文件夹").await.unwrap(), "/work/新建文件夹 (2)");
+    assert_eq!(fx.names("/work"), ["新建文件夹", "新建文件夹 (1)", "新建文件夹 (2)"]);
+    // A gap is filled, and a file or a link in the way counts as taken like a folder does.
+    fx.session.remove("/work/新建文件夹 (1)").await.unwrap();
+    assert_eq!(fx.session.create_dir_unique("/work", "新建文件夹").await.unwrap(), "/work/新建文件夹 (1)");
+    fx.file("/work/f", "x", 0o644);
+    fx.link("/work/f (1)", "f");
+    assert_eq!(fx.session.create_dir_unique("/work", "f").await.unwrap(), "/work/f (2)");
+    // At the root, and in a directory that is not there.
+    assert_eq!(fx.session.create_dir_unique("/", "top").await.unwrap(), "/top");
+    assert!(fx.session.create_dir_unique("/nowhere", "x").await.unwrap_err().is_not_found());
+}
+
+#[tokio::test]
 async fn rename_moves_files_and_directories() {
     let fx = Fixture::default().await;
     fx.file("/a/one.txt", "1", 0o644);

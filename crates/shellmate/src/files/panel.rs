@@ -1,38 +1,39 @@
-//! The 文件 panel: top bar, list and details of the directory the panel is in.
+//! The 文件 panel of one tab: its state, what it asks of the server, and what the user can do with
+//! it. Drawing is in [`super::draw`] and [`super::queue_card`]; what the lists and rows say is in
+//! [`super::model`] and [`super::transfers`], which need no window.
 
-use std::ops::Range;
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui::assets::IconName as Lucide;
-use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::popover::Popover;
-use gpui::component::tooltip::Tooltip;
-use gpui::component::{Icon, Sizable as _};
+use gpui::component::WindowExt as _;
+use gpui::component::input::{Escape, InputEvent, InputState};
+use gpui::component::notification::Notification;
 use gpui::prelude::*;
 use gpui::{
-    Anchor, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding,
-    ScrollStrategy, SharedString, Stateful, Subscription, Task, UniformListScrollHandle, Window, actions, div, px,
-    uniform_list, white,
+    App, ClipboardItem, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, KeyBinding, PathPromptOptions,
+    Pixels, Point, ScrollHandle, ScrollStrategy, Subscription, UniformListScrollHandle, Window, actions,
 };
-use shellmate_sftp::{Entry, EntryKind, SftpError, SftpSession, format_size, mode_string, path};
+use shellmate_sftp::transfer::{ItemId, TransferQueue};
+use shellmate_sftp::{SftpError, SftpSession};
 use shellmate_ssh::SshRuntime;
 use shellmate_term::{Terminal, TerminalEvent};
 use tokio::task::AbortHandle;
 
-use super::format::mtime_text;
-use super::model::{Applied, FilesModel, LinkStatus, Listed, Request, Row, Subject, View};
-use crate::theme::{ActivePalette, MONO_FONT, Palette};
-use crate::ui::card_shadow;
+use super::model::{Applied, DeleteRequest, FilesModel, LinkStatus, Listed, Request, Row};
+use super::transfers::{Reveal, RowAction, TransferList, ensure_downloads_dir, reveal};
+use crate::dialogs::confirm::ConfirmDialog;
 
 /// The key context of the panel: its shortcuts only work while the list has focus, so none of them
 /// can reach the terminal.
 pub const CONTEXT: &str = "FilesPanel";
 
 /// The keystrokes of the panel (each is bound to the action of the same row in [`init`]).
-pub const KEYS: [&str; 4] = ["up", "down", "enter", "cmd-up"];
+pub const KEYS: [&str; 6] = ["up", "down", "enter", "cmd-up", "cmd-backspace", "escape"];
 
-actions!(files, [FilesPrevious, FilesNext, FilesOpen, FilesParent]);
+actions!(files, [FilesPrevious, FilesNext, FilesOpen, FilesParent, FilesDelete, FilesEscape]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -40,6 +41,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(KEYS[1], FilesNext, Some(CONTEXT)),
         KeyBinding::new(KEYS[2], FilesOpen, Some(CONTEXT)),
         KeyBinding::new(KEYS[3], FilesParent, Some(CONTEXT)),
+        KeyBinding::new(KEYS[4], FilesDelete, Some(CONTEXT)),
+        KeyBinding::new(KEYS[5], FilesEscape, Some(CONTEXT)),
     ]);
 }
 
@@ -50,36 +53,87 @@ pub enum FilesEvent {
     /// An operation found this session unusable (the connection is gone, or the server stopped
     /// answering): the owner has to tell the link, which opens a new one.
     SessionLost(Arc<SftpSession>),
+    /// 处理 on a queue row: the question about names that exist is to be asked (again).
+    HandleClash(ItemId),
 }
 
 impl EventEmitter<FilesEvent> for FilesPanel {}
 
 /// The snippets that make a shell report its directory.
-const BASH_SNIPPET: &str = r#"PROMPT_COMMAND='printf "\e]7;file://%s%s\a" "$HOSTNAME" "$PWD"'"#;
-const ZSH_SNIPPET: &str = r#"precmd() { printf '\e]7;file://%s%s\a' "$HOST" "$PWD" }"#;
+pub const BASH_SNIPPET: &str = r#"PROMPT_COMMAND='printf "\e]7;file://%s%s\a" "$HOSTNAME" "$PWD"'"#;
+pub const ZSH_SNIPPET: &str = r#"precmd() { printf '\e]7;file://%s%s\a' "$HOST" "$PWD" }"#;
+
+/// The right-click menu of a row, as it was opened.
+#[derive(Clone, Debug)]
+pub struct RowMenu {
+    pub name: String,
+    pub path: String,
+    /// A directory (or a link to one): 打开 enters it. Anything else is a file for the editor.
+    pub opens_dir: bool,
+    /// Where it is drawn (window coordinates).
+    pub position: Point<Pixels>,
+}
+
+/// What a menu item does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Open,
+    Download,
+    Rename,
+    CopyPath,
+    Permissions,
+    Delete,
+}
+
+/// The text field of a rename in progress.
+pub(super) struct RenameInput {
+    pub state: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// What the review hooks have set (debug builds only).
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct Demo {
+    /// The entry to select as soon as it is listed.
+    select: Option<String>,
+    /// The text the rename editor starts with (instead of the entry's name).
+    rename_text: Option<String>,
+    /// Draw the highlight of a drag over the list, as if something were being dragged there.
+    drag: bool,
+}
 
 pub struct FilesPanel {
-    model: FilesModel,
+    pub(super) model: FilesModel,
     session: Option<Arc<SftpSession>>,
     runtime: SshRuntime,
-    focus: FocusHandle,
-    scroll: UniformListScrollHandle,
-    hint_open: bool,
-    /// Debug review hook: the entry to select as soon as it is listed.
+    pub(super) focus: FocusHandle,
+    /// The permission grid takes focus for 修改权限.
+    pub(super) perm_focus: FocusHandle,
+    pub(super) scroll: UniformListScrollHandle,
+    /// The scroll position of the queue card's list.
+    pub(super) queue_scroll: ScrollHandle,
+    pub(super) hint_open: bool,
+    /// The connection's transfer queue and what it has in it (shared by all its tabs).
+    pub(super) queue: Option<TransferQueue>,
+    pub(super) transfers: Option<Entity<TransferList>>,
+    watching: Option<(EntityId, Subscription)>,
+    pub(super) menu: Option<RowMenu>,
+    pub(super) rename: Option<RenameInput>,
     #[cfg(debug_assertions)]
-    demo_select: Option<String>,
-    listing: Option<Task<()>>,
-    chmod: Option<Task<()>>,
-    /// The work on the SSH runtime behind `listing` and `chmod`: stopped when it is superseded or
-    /// the panel goes away, so a closed tab does not keep its connection busy.
+    demo: Demo,
+    /// The listing in flight (superseded or dropped with the panel it is aborted: a closed tab
+    /// does not keep its connection busy).
     listing_abort: Option<AbortHandle>,
-    chmod_abort: Option<AbortHandle>,
+    /// Other work on the SSH runtime (rename, delete, new folder, chmod), by number.
+    ops: HashMap<u64, AbortHandle>,
+    next_op: u64,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Drop for FilesPanel {
     fn drop(&mut self) {
-        for handle in [self.listing_abort.take(), self.chmod_abort.take()].into_iter().flatten() {
+        for handle in self.listing_abort.take().into_iter().chain(self.ops.drain().map(|(_, handle)| handle)) {
             handle.abort();
         }
     }
@@ -109,14 +163,20 @@ impl FilesPanel {
             session: None,
             runtime,
             focus: cx.focus_handle(),
+            perm_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            queue_scroll: ScrollHandle::new(),
             hint_open: false,
+            queue: None,
+            transfers: None,
+            watching: None,
+            menu: None,
+            rename: None,
             #[cfg(debug_assertions)]
-            demo_select: None,
-            listing: None,
-            chmod: None,
+            demo: Demo::default(),
             listing_abort: None,
-            chmod_abort: None,
+            ops: HashMap::new(),
+            next_op: 1,
             _subscriptions: vec![subscription],
         }
     }
@@ -132,36 +192,37 @@ impl FilesPanel {
             return;
         }
         self.session = session;
+        if !matches!(status, LinkStatus::Ready) {
+            self.menu = None;
+        }
         let request = self.model.set_link(status);
         self.start(request, cx);
         cx.notify();
     }
 
-    /// Debug review hook: goes to `dir` as if the user had.
-    #[cfg(debug_assertions)]
-    pub fn demo_go(&mut self, dir: &str, cx: &mut Context<Self>) {
-        let request = self.model.go_to(dir);
-        self.start(request, cx);
-        cx.notify();
+    /// The transfer queue of the connection the tab is on, and the list that follows it. The panel
+    /// redraws when the list changes.
+    pub fn set_transfers(
+        &mut self,
+        queue: Option<TransferQueue>,
+        transfers: Option<Entity<TransferList>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue = queue;
+        let id = transfers.as_ref().map(Entity::entity_id);
+        if self.watching.as_ref().map(|(watched, _)| *watched) != id {
+            self.watching = transfers.as_ref().map(|list| (list.entity_id(), cx.observe(list, |_, _, cx| cx.notify())));
+            cx.notify();
+        }
+        self.transfers = transfers;
     }
 
-    /// Debug review hook: selects the entry called `name` once it is listed (now, or when it is).
-    #[cfg(debug_assertions)]
-    pub fn demo_select(&mut self, name: &str) {
-        self.demo_select = Some(name.to_string());
-    }
-
-    /// Debug review hook: a click on 刷新.
-    #[cfg(debug_assertions)]
-    pub fn demo_refresh(&mut self, cx: &mut Context<Self>) {
-        self.refresh(cx);
-    }
-
-    /// Debug review hook: opens the OSC 7 hint.
-    #[cfg(debug_assertions)]
-    pub fn demo_hint(&mut self, cx: &mut Context<Self>) {
-        self.hint_open = true;
-        cx.notify();
+    /// Something changed in `dir` on the server (an upload finished there, say): a panel that shows
+    /// it lists it again.
+    pub fn on_remote_changed(&mut self, dir: &str, cx: &mut Context<Self>) {
+        if self.model.cwd() == dir && self.model.link() == &LinkStatus::Ready {
+            self.refresh(cx);
+        }
     }
 
     // ---- loading ------------------------------------------------------------------------------------
@@ -190,7 +251,7 @@ impl FilesPanel {
             Listed { dir: Some(dir), entries, stat: stat.ok() }
         });
         self.listing_abort = Some(join.abort_handle());
-        self.listing = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result =
                 join.await.unwrap_or_else(|err| Listed::failed(SftpError::Protocol(format!("任务异常终止：{err}"))));
             this.update(cx, |this, cx| {
@@ -210,23 +271,70 @@ impl FilesPanel {
                     );
                 }
                 #[cfg(debug_assertions)]
-                if let Some(name) = this.demo_select.take()
-                    && let Some(index) = (0..this.model.row_count())
-                        .find(|i| matches!(this.model.row(*i), Some(Row::Entry(e)) if e.name == name))
-                {
-                    this.model.select_row(index);
-                    this.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+                if let Some(name) = this.demo.select.take() {
+                    this.model.select_name(&name);
+                    if let Some(index) = this.model.selected_index() {
+                        this.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+                    }
                 }
                 if this.model.cwd() != before {
                     this.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
                 }
+                if let Some(index) = this.model.take_reveal() {
+                    this.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+                }
                 cx.notify();
             })
             .ok();
-        }));
+        })
+        .detach();
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Runs `job` on the SSH runtime with the current session and hands the outcome to `done`. A
+    /// session that turns out to be unusable is reported instead (and `done` does not run): the
+    /// panel waits for a new one.
+    fn run_op<T, Fut>(
+        &mut self,
+        job: impl FnOnce(Arc<SftpSession>) -> Fut,
+        done: impl FnOnce(&mut Self, Result<T, SftpError>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) where
+        T: Send + 'static,
+        Fut: Future<Output = Result<T, SftpError>> + Send + 'static,
+    {
+        let Some(session) = self.session.clone() else { return };
+        let used = session.clone();
+        let id = self.next_op;
+        self.next_op += 1;
+        let join = self.runtime.spawn(job(session));
+        self.ops.insert(id, join.abort_handle());
+        cx.spawn(async move |this, cx| {
+            let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
+            this.update(cx, |this, cx| {
+                this.ops.remove(&id);
+                match result {
+                    Err(err) if err.is_session_lost() => this.lose_session(used, cx),
+                    result => done(this, result, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An operation found `session` unusable: the panel waits for a new one, and the owner is asked
+    /// to open it.
+    fn lose_session(&mut self, session: Arc<SftpSession>, cx: &mut Context<Self>) {
+        self.model.session_lost();
+        self.menu = None;
+        cx.emit(FilesEvent::SessionLost(session));
+        cx.notify();
+    }
+
+    // ---- navigation ------------------------------------------------------------------------------------
+
+    pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
         if matches!(self.model.link(), LinkStatus::Failed(_)) {
             cx.emit(FilesEvent::RetrySession);
             return;
@@ -236,680 +344,453 @@ impl FilesPanel {
         cx.notify();
     }
 
-    fn go_to(&mut self, dir: &str, cx: &mut Context<Self>) {
+    pub(super) fn go_to(&mut self, dir: &str, cx: &mut Context<Self>) {
         let request = self.model.go_to(dir);
         self.start(request, cx);
         cx.notify();
     }
 
-    fn go_parent(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn go_parent(&mut self, cx: &mut Context<Self>) {
         let request = self.model.go_parent();
         self.start(request, cx);
         cx.notify();
     }
 
-    fn open_row(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn open_row(&mut self, index: usize, cx: &mut Context<Self>) {
         let request = self.model.open_row(index);
         self.start(request, cx);
         cx.notify();
     }
 
-    fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_row(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
         self.model.select_row(index);
-        window.focus(&self.focus, cx);
+        if self.rename.is_none() {
+            window.focus(&self.focus, cx);
+        }
         cx.notify();
     }
 
-    fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         let request = self.model.set_follow(on);
         self.start(request, cx);
         cx.notify();
     }
 
-    fn apply_chmod(&mut self, cx: &mut Context<Self>) {
-        let (Some((path, mode)), Some(session)) = (self.model.chmod_request(), self.session.clone()) else { return };
-        let used = session.clone();
-        let join = self.runtime.spawn(async move { session.chmod(&path, mode).await });
-        self.chmod_abort = Some(join.abort_handle());
-        self.chmod = Some(cx.spawn(async move |this, cx| {
-            let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
-            this.update(cx, |this, cx| {
-                if result.as_ref().is_err_and(SftpError::is_session_lost) {
-                    this.lose_session(used, cx);
-                    return;
-                }
+    // ---- permissions -----------------------------------------------------------------------------------
+
+    pub(super) fn apply_chmod(&mut self, cx: &mut Context<Self>) {
+        let Some((path, mode)) = self.model.chmod_request() else { return };
+        self.run_op(
+            move |session| async move { session.chmod(&path, mode).await },
+            |this, result, cx| {
                 let request = this.model.chmod_done(result);
                 this.start(request, cx);
-                cx.notify();
-            })
-            .ok();
-        }));
+            },
+            cx,
+        );
     }
 
-    /// An operation found `session` unusable: the panel waits for a new one, and the owner is asked
-    /// to open it.
-    fn lose_session(&mut self, session: Arc<SftpSession>, cx: &mut Context<Self>) {
-        self.model.session_lost();
-        cx.emit(FilesEvent::SessionLost(session));
+    // ---- renaming, new folders, deleting -----------------------------------------------------------
+
+    /// Enter in the name editor.
+    fn commit_rename(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(request) = self.model.commit_edit(text) else {
+            cx.notify();
+            return;
+        };
+        let (from, to) = (request.from.clone(), request.to.clone());
+        self.run_op(
+            move |session| async move { session.rename(&from, &to).await },
+            move |this, result, cx| {
+                let request = this.model.rename_done(&request, result);
+                this.start(request, cx);
+            },
+            cx,
+        );
         cx.notify();
+    }
+
+    /// Esc in the name editor.
+    pub(super) fn on_cancel_rename(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.edit().is_some() {
+            self.model.cancel_edit();
+            window.focus(&self.focus, cx);
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// 新建文件夹: makes "新建文件夹" (or "新建文件夹 (1)" …) here, selects it and starts naming it.
+    pub(super) fn new_folder(&mut self, cx: &mut Context<Self>) {
+        if !self.model.ops_enabled() || self.model.cwd().is_empty() {
+            return;
+        }
+        let dir = self.model.cwd().to_string();
+        self.run_op(
+            move |session| async move { session.create_dir_unique(&dir, "新建文件夹").await },
+            |this, result, cx| match result {
+                Ok(path) => {
+                    let request = this.model.new_folder_done(&path);
+                    this.start(request, cx);
+                }
+                Err(err) => this.model.set_banner(format!("无法新建文件夹：{err}")),
+            },
+            cx,
+        );
+    }
+
+    /// 删除 / ⌘⌫: asks first, and for a directory says that everything inside goes.
+    pub(super) fn ask_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let Some(request) = self.model.delete_request() else { return };
+        let panel = cx.entity().downgrade();
+        let confirmed = request.clone();
+        ConfirmDialog::open(
+            request.title(),
+            request.body(),
+            "删除",
+            true,
+            move |_, cx| {
+                let request = confirmed.clone();
+                panel.update(cx, |this, cx| this.begin_delete(request, cx)).ok();
+                Ok(())
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn begin_delete(&mut self, request: DeleteRequest, cx: &mut Context<Self>) {
+        let path = request.path.clone();
+        self.run_op(
+            move |session| async move { session.remove(&path).await },
+            move |this, result, cx| {
+                let list = this.model.delete_done(&request, result);
+                this.start(list, cx);
+            },
+            cx,
+        );
+    }
+
+    // ---- transfers -------------------------------------------------------------------------------------
+
+    /// 下载 / the menu: the selected file or directory goes to the downloads folder.
+    pub(super) fn begin_download(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        let (Some(path), Some(queue)) = (self.model.download_path(), self.queue.clone()) else { return };
+        match ensure_downloads_dir() {
+            Ok(dir) => {
+                queue.enqueue_download(vec![path], dir);
+            }
+            Err(message) => self.model.set_banner(message),
+        }
+        cx.notify();
+    }
+
+    /// 上传: asks macOS for files and folders and sends them to this directory.
+    pub(super) fn pick_upload(&mut self, cx: &mut Context<Self>) {
+        if !self.model.ops_enabled() || self.queue.is_none() {
+            return;
+        }
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some("上传".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                this.update(cx, |this, cx| this.upload(paths, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Sends `paths` (picked, or dropped from Finder) to the directory shown.
+    pub(super) fn upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        match self.queue.clone().filter(|_| self.model.ops_enabled() && !self.model.cwd().is_empty()) {
+            Some(queue) => {
+                queue.enqueue_upload(paths, self.model.cwd());
+            }
+            None => self.model.set_banner("连接就绪后才能上传"),
+        }
+        cx.notify();
+    }
+
+    /// The main button of a queue row.
+    pub(super) fn row_action(&mut self, id: ItemId, action: RowAction, cx: &mut Context<Self>) {
+        let Some(queue) = self.queue.clone() else { return };
+        match action {
+            RowAction::Pause => queue.pause(id),
+            RowAction::Resume => queue.resume(id),
+            RowAction::Handle => cx.emit(FilesEvent::HandleClash(id)),
+            RowAction::Open => {
+                let view = self.transfers.as_ref().and_then(|list| list.read(cx).get(id).cloned());
+                match view.as_ref().and_then(reveal) {
+                    Some(Reveal::Finder(path)) => cx.reveal_path(&path),
+                    Some(Reveal::Remote(dir)) => self.go_to(&dir, cx),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// The small 取消 of a queue row.
+    pub(super) fn cancel_item(&mut self, id: ItemId) {
+        if let Some(queue) = &self.queue {
+            queue.cancel(id);
+        }
+    }
+
+    /// 清除已完成.
+    pub(super) fn clear_finished(&mut self) {
+        if let Some(queue) = &self.queue {
+            queue.clear_finished();
+        }
+    }
+
+    // ---- the row menu ------------------------------------------------------------------------------------
+
+    /// A right-click on row `index`: the menu opens there (never for `..`: nothing to do to it).
+    pub(super) fn open_menu(&mut self, index: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = match self.model.row(index) {
+            Some(Row::Entry(entry)) => Some(RowMenu {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+                opens_dir: entry.opens_as_dir(),
+                position,
+            }),
+            _ => None,
+        };
+        cx.notify();
+    }
+
+    pub(super) fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// An item of the row menu.
+    pub(super) fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.take() else { return };
+        self.model.select_name(&menu.name);
+        match action {
+            MenuAction::Open if menu.opens_dir => self.go_to(&menu.path, cx),
+            // A file would open in the editor, which comes later.
+            MenuAction::Open => {}
+            MenuAction::Download => self.begin_download(cx),
+            MenuAction::Rename => {
+                self.model.start_rename();
+            }
+            MenuAction::CopyPath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(menu.path.clone()));
+                window.push_notification(Notification::success(menu.path.clone()).title("已复制路径"), cx);
+            }
+            MenuAction::Permissions => window.focus(&self.perm_focus, cx),
+            MenuAction::Delete => self.ask_delete(window, cx),
+        }
+        cx.notify();
+    }
+
+    // ---- the name editor ---------------------------------------------------------------------------------
+
+    /// Keeps the text field in step with the model: one while a name is being edited.
+    pub(super) fn sync_rename_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match (self.model.edit().map(|edit| edit.name.clone()), self.rename.is_some()) {
+            (Some(name), false) => {
+                #[cfg(debug_assertions)]
+                let name = self.demo.rename_text.take().unwrap_or(name);
+                let state = cx.new(|cx| InputState::new(window, cx).default_value(name));
+                let subscription = cx.subscribe_in(&state, window, |this, state, event: &InputEvent, _, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        let text = state.read(cx).value().to_string();
+                        this.commit_rename(&text, cx);
+                    }
+                });
+                state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                    state.select_all(window, cx);
+                });
+                self.rename = Some(RenameInput { state, _subscription: subscription });
+            }
+            (None, true) => {
+                self.rename = None;
+                window.focus(&self.focus, cx);
+            }
+            _ => {}
+        }
     }
 
     // ---- actions -----------------------------------------------------------------------------------------
 
-    fn on_previous(&mut self, _: &FilesPrevious, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_previous(&mut self, _: &FilesPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
         if let Some(index) = self.model.move_selection(-1) {
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
 
-    fn on_next(&mut self, _: &FilesNext, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_next(&mut self, _: &FilesNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
         if let Some(index) = self.model.move_selection(1) {
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
 
-    fn on_open(&mut self, _: &FilesOpen, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_open(&mut self, _: &FilesOpen, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
         let request = self.model.open_selected();
         self.start(request, cx);
         cx.notify();
     }
 
-    fn on_parent(&mut self, _: &FilesParent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_parent(&mut self, _: &FilesParent, _: &mut Window, cx: &mut Context<Self>) {
         self.go_parent(cx);
     }
 
-    // ---- drawing ---------------------------------------------------------------------------------------------
-
-    fn button(id: &'static str, label: &'static str, primary: bool, p: &Palette) -> Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .h(px(32.))
-            .px(px(if primary { 14. } else { 12. }))
-            .rounded(px(10.))
-            .text_size(px(12.5))
-            .font_weight(FontWeight::SEMIBOLD)
-            .bg(if primary { p.acc } else { p.card2 })
-            .text_color(if primary { white() } else { p.tx })
-            .child(label)
+    /// ⌘⌫: the same confirmation as 删除.
+    pub(super) fn on_delete(&mut self, _: &FilesDelete, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_delete(window, cx);
     }
 
-    /// A button that is there but cannot be used yet.
-    fn soon(id: &'static str, label: &'static str, primary: bool, p: &Palette) -> impl IntoElement {
-        Self::button(id, label, primary, p)
-            .opacity(0.45)
-            .cursor_not_allowed()
-            .tooltip(|window, cx| Tooltip::new("下一步提供").build(window, cx))
-    }
-
-    fn render_breadcrumbs(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let crumbs = self.model.crumbs();
-        let last = crumbs.len().saturating_sub(1);
-        let piece = |id: (&'static str, usize), label: String, dir: String, strong: bool, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .px(px(4.))
-                .py(px(2.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .font_weight(if strong { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                .text_color(if strong { p.tx } else { p.tx2 })
-                .hover(|d| d.bg(p.card2))
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.go_to(&dir, cx)))
-        };
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .gap(px(4.))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .font_family(MONO_FONT)
-            .text_size(px(13.))
-            .child(piece(("crumb", 0), "/".into(), "/".into(), crumbs.is_empty(), cx))
-            .children(crumbs.into_iter().enumerate().map(|(i, (name, dir))| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(piece(("crumb", i + 1), name, dir, i == last, cx))
-                    .child(div().text_color(p.tx3).child("/"))
-            }))
-    }
-
-    fn render_follow(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = self.model.follow();
-        let panel = cx.entity();
-        let hint = (!self.model.osc7_seen()).then(|| {
-            let panel_for_open = panel.clone();
-            let (tx2, card2) = (p.tx2, p.card2);
-            Popover::new("osc7-hint")
-                .anchor(Anchor::TopRight)
-                .open(self.hint_open)
-                .on_open_change(move |open, _, cx| {
-                    panel_for_open.update(cx, |this, cx| {
-                        this.hint_open = *open;
-                        cx.notify();
-                    });
-                })
-                .trigger(Button::new("osc7-hint-trigger").ghost().small().label("终端未上报目录"))
-                .content(move |_, _, _| {
-                    let snippet = |id: &'static str, shell: &'static str, text: &'static str| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(div().text_size(px(12.)).text_color(tx2).child(shell))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .px(px(10.))
-                                            .py(px(7.))
-                                            .rounded(px(8.))
-                                            .bg(card2)
-                                            .font_family(MONO_FONT)
-                                            .text_size(px(11.5))
-                                            .child(text),
-                                    )
-                                    .child(Button::new(id).small().label("复制").on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-                                    })),
-                            )
-                    };
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.))
-                        .w(px(560.))
-                        .p(px(4.))
-                        .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("让终端报告当前目录"))
-                        .child(div().text_size(px(12.)).text_color(tx2).child(
-                            "远程 shell 默认不上报目录。把下面一行加进 ~/.bashrc 或 ~/.zshrc，面板就能跟随终端所在目录。",
-                        ))
-                        .child(snippet("copy-bash", "bash", BASH_SNIPPET))
-                        .child(snippet("copy-zsh", "zsh", ZSH_SNIPPET))
-                })
-        });
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .text_size(px(12.))
-            .text_color(p.tx2)
-            .children(hint)
-            .child("跟随终端目录 · OSC 7")
-            .child(
-                div()
-                    .id("follow-switch")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .w(px(42.))
-                    .h(px(24.))
-                    .p(px(2.))
-                    .rounded(px(12.))
-                    .cursor_pointer()
-                    .bg(if on { p.ok } else { p.card3 })
-                    .when(on, |d| d.justify_end())
-                    .child(div().size(px(20.)).rounded_full().bg(white()).shadow(vec![gpui::BoxShadow {
-                        color: gpui::black().opacity(0.2),
-                        offset: gpui::point(px(0.), px(1.)),
-                        blur_radius: px(3.),
-                        spread_radius: px(0.),
-                        inset: false,
-                    }]))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_follow(!on, cx))),
-            )
-    }
-
-    fn render_top_bar(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .pl(px(18.))
-            .pr(px(14.))
-            .pt(px(12.))
-            .pb(px(10.))
-            .child(self.render_breadcrumbs(p, cx))
-            .child(self.render_follow(p, cx))
-            .child(Self::soon("new-folder", "新建文件夹", false, p))
-            .child(Self::soon("download", "下载", false, p))
-            .child(Self::soon("upload", "上传", true, p))
-            .child(
-                div()
-                    .id("refresh")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(32.))
-                    .rounded(px(10.))
-                    .bg(p.card2)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.card3))
-                    .child(Icon::new(Lucide::RefreshCw).size(px(15.)).text_color(p.tx2))
-                    .tooltip(|window, cx| Tooltip::new("刷新").build(window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-            )
-    }
-
-    fn header_cell(label: &'static str, width: Option<f32>, right: bool) -> gpui::Div {
-        let cell = div().child(label);
-        let cell = match width {
-            Some(w) => cell.w(px(w)).flex_none(),
-            None => cell.flex_1().min_w_0(),
-        };
-        if right { cell.text_right() } else { cell }
-    }
-
-    fn render_header(&self, p: &Palette) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .px(px(18.))
-            .py(px(6.))
-            .text_size(px(11.5))
-            .text_color(p.tx2)
-            .border_b_1()
-            .border_color(p.line)
-            .child(Self::header_cell("名称", None, false))
-            .child(Self::header_cell("大小", Some(84.), true))
-            .child(Self::header_cell("修改时间", Some(110.), false))
-            .child(Self::header_cell("权限", Some(104.), false))
-    }
-
-    fn entry_icon(entry: &Entry, p: &Palette) -> Icon {
-        match entry.kind {
-            EntryKind::Dir => Icon::new(Lucide::Folder).text_color(p.acc),
-            EntryKind::Symlink if entry.opens_as_dir() => Icon::new(Lucide::Link).text_color(p.acc),
-            EntryKind::Symlink => Icon::new(Lucide::Link).text_color(p.tx2),
-            _ => Icon::new(Lucide::File).text_color(p.tx3),
-        }
-        .size(px(17.))
-    }
-
-    fn render_row(&self, index: usize, p: &Palette, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let row = self.model.row(index)?;
-        let selected = self.model.selected_index() == Some(index);
-        let (icon, name, note, size, time, perms) = match row {
-            Row::Parent => (
-                Icon::new(Lucide::Folder).size(px(17.)).text_color(p.acc),
-                "..".to_string(),
-                None,
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-            Row::Entry(entry) => {
-                let note = entry.link.as_ref().map(|link| {
-                    if link.resolved.is_none() {
-                        (format!("→ {}（目标不存在）", link.target), p.err)
-                    } else {
-                        (format!("→ {}", link.target), p.tx3)
-                    }
-                });
-                let size = if entry.kind == EntryKind::File { format_size(entry.size) } else { "—".to_string() };
-                let perms = entry.mode.map_or_else(String::new, mode_string);
-                (Self::entry_icon(entry, p), entry.name.clone(), note, size, mtime_text(entry.modified), perms)
-            }
-        };
-        let dangling = matches!(row, Row::Entry(e) if e.is_dangling());
-        Some(
-            div()
-                .id(("file-row", index))
-                .flex()
-                .w_full()
-                .items_center()
-                .gap(px(12.))
-                .h(px(38.))
-                .px(px(10.))
-                .rounded(px(10.))
-                .text_size(px(13.))
-                .cursor_default()
-                .when(selected, |d| d.bg(p.accs))
-                .when(!selected, |d| d.hover(|d| d.bg(p.card2)))
-                .child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_w_0()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(icon)
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(if selected {
-                                    p.acc
-                                } else if dangling {
-                                    p.err
-                                } else {
-                                    p.tx
-                                })
-                                .child(name),
-                        )
-                        .children(note.map(|(text, color)| {
-                            div().min_w_0().truncate().text_size(px(11.5)).text_color(color).child(text)
-                        })),
-                )
-                .child(div().w(px(84.)).flex_none().text_right().text_size(px(12.)).text_color(p.tx2).child(size))
-                .child(div().w(px(110.)).flex_none().text_size(px(12.)).text_color(p.tx2).child(time))
-                .child(
-                    div()
-                        .w(px(104.))
-                        .flex_none()
-                        .text_size(px(12.))
-                        .font_family(MONO_FONT)
-                        .text_color(p.tx2)
-                        .child(perms),
-                )
-                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    this.select_row(index, window, cx);
-                    if event.click_count() >= 2 {
-                        this.open_row(index, cx);
-                    }
-                }))
-                .into_any_element(),
-        )
-    }
-
-    /// A centered message in the list area, optionally with a button.
-    fn message(
-        &self,
-        text: impl Into<SharedString>,
-        color: Hsla,
-        button: Option<Stateful<gpui::Div>>,
-        icon: Option<Lucide>,
-    ) -> gpui::AnyElement {
-        div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(12.))
-            .px(px(24.))
-            .py(px(40.))
-            .text_size(px(13.))
-            .text_color(color)
-            .children(icon.map(|icon| Icon::new(icon).size(px(26.)).text_color(color)))
-            .child(div().max_w(px(520.)).text_center().child(text.into()))
-            .children(button)
-            .into_any_element()
-    }
-
-    fn render_list_area(&self, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match (self.model.link(), self.model.view()) {
-            (LinkStatus::Disconnected, _) => {
-                self.message("连接已断开，重连后自动刷新", p.warn, None, Some(Lucide::TriangleAlert))
-            }
-            (LinkStatus::Failed(reason), _) => {
-                let retry = Self::button("retry", "刷新", false, p)
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)));
-                self.message(reason.clone(), p.err, Some(retry), Some(Lucide::CircleAlert))
-            }
-            (_, View::Loading) => self.message("加载中…", p.tx2, None, None),
-            (_, View::Error(reason)) => {
-                let back = self.model.parent_dir().is_some().then(|| {
-                    Self::button("back", "返回上级", false, p)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.go_parent(cx)))
-                });
-                self.message(reason.clone(), p.err, back, Some(Lucide::CircleAlert))
-            }
-            (_, View::List) if self.model.entries().is_empty() => {
-                let parent = if self.model.has_parent() { self.render_row(0, p, cx) } else { None };
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px(px(8.))
-                    .py(px(4.))
-                    .children(parent)
-                    .child(
-                        div()
-                            .py(px(40.))
-                            .text_center()
-                            .text_size(px(13.))
-                            .text_color(p.tx2)
-                            .child("空目录 · 拖入文件或新建文件夹"),
-                    )
-                    .into_any_element()
-            }
-            (_, View::List) => {
-                let list = uniform_list(
-                    "file-rows",
-                    self.model.row_count(),
-                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                        let began = Instant::now();
-                        let p = cx.palette().clone();
-                        let rows = range.clone().filter_map(|index| this.render_row(index, &p, cx)).collect::<Vec<_>>();
-                        log::debug!("文件面板：构建第 {range:?} 行用时 {} µs", began.elapsed().as_micros());
-                        rows
-                    }),
-                )
-                .track_scroll(&self.scroll)
-                .size_full();
-                div().flex_1().min_h_0().px(px(8.)).py(px(4.)).child(list).into_any_element()
-            }
+    /// Esc: closes the menu (a name being edited has its own Esc, [`Self::on_cancel_rename`]).
+    pub(super) fn on_escape(&mut self, _: &FilesEscape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() {
+            self.close_menu(cx);
+        } else {
+            cx.propagate();
         }
     }
 
-    fn render_files_card(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let banner = self.model.banner().map(|text| {
-            div()
-                .mx(px(18.))
-                .mb(px(8.))
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(8.))
-                .bg(p.errs)
-                .text_size(px(12.))
-                .text_color(p.err)
-                .child(text.to_string())
-        });
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .rounded(crate::theme::CARD_RADIUS)
-            .bg(p.card)
-            .shadow(card_shadow(p))
-            .overflow_hidden()
-            .child(self.render_top_bar(p, cx))
-            .children(banner)
-            .child(self.render_header(p))
-            .child(self.render_list_area(p, cx))
-            .child(
-                div()
-                    .px(px(18.))
-                    .pt(px(10.))
-                    .pb(px(12.))
-                    .text_size(px(12.))
-                    .text_color(p.tx2)
-                    .border_t_1()
-                    .border_color(p.line)
-                    .child("拖拽文件到此处上传 · 双击进入目录或编辑文件 · 右键更多操作"),
-            )
-    }
-
-    fn info_row(label: &'static str, value: String, p: &Palette) -> impl IntoElement {
-        div()
-            .flex()
-            .gap(px(12.))
-            .child(div().w(px(30.)).flex_none().text_color(p.tx2).child(label))
-            .child(div().flex_1().min_w_0().child(value))
-    }
-
-    fn render_details(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let subject = self.model.subject();
-        let dash = || "—".to_string();
-        let attributes = |entry: &Entry| {
-            let owner = if entry.owner_display().is_empty() { dash() } else { entry.owner_display() };
-            (mtime_text(entry.modified), owner)
-        };
-        let (title, kind, size, time, owner) = match subject {
-            Subject::Entry(entry) => {
-                let kind = match (&entry.kind, &entry.link) {
-                    (EntryKind::Dir, _) => "目录".to_string(),
-                    (EntryKind::File, _) => "文件".to_string(),
-                    (EntryKind::Symlink, Some(link)) if link.resolved.is_none() => {
-                        format!("符号链接 → {}（目标不存在）", link.target)
-                    }
-                    (EntryKind::Symlink, Some(link)) => format!("符号链接 → {}", link.target),
-                    (EntryKind::Symlink, None) => "符号链接".to_string(),
-                    (EntryKind::Other, _) => "特殊文件".to_string(),
-                };
-                let size = if entry.kind == EntryKind::File { format_size(entry.size) } else { dash() };
-                let (time, owner) = attributes(entry);
-                (entry.name.clone(), kind, size, time, owner)
-            }
-            // Nothing selected: the directory itself, with what `stat` said about it.
-            Subject::Dir(stat) => {
-                let name = path::file_name(self.model.cwd()).unwrap_or("/").to_string();
-                let (time, owner) = stat.map_or_else(|| (dash(), dash()), attributes);
-                (name, "目录".into(), dash(), time, owner)
-            }
-            Subject::Parent => ("..".into(), "上级目录".into(), dash(), dash(), dash()),
-        };
-        let editable_file = matches!(subject, Subject::Entry(entry) if entry.kind == EntryKind::File);
-        let grid_enabled = self.model.chmod_enabled();
-        let draft = self.model.draft();
-        let can_apply = self.model.chmod_request().is_some();
-        let rows = ["所有者", "用户组", "其他"];
-        let columns = ["读", "写", "执行"];
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(268.))
-            .gap(px(12.))
-            .p(px(18.))
-            .rounded(crate::theme::CARD_RADIUS)
-            .bg(p.card)
-            .shadow(card_shadow(p))
-            .child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).child(title))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .text_size(px(12.5))
-                    .child(Self::info_row("类型", kind, p))
-                    .child(Self::info_row("大小", size, p))
-                    .child(Self::info_row("修改", time, p))
-                    .child(Self::info_row("属主", owner, p)),
-            )
-            .child(div().h(px(1.)).bg(p.line))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("权限"))
-                    .child(
-                        div().font_family(MONO_FONT).text_size(px(12.5)).text_color(p.tx2).child(
-                            draft.map_or_else(|| "—".to_string(), |d| format!("{} · {}", d.octal(), d.symbolic())),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .opacity(if draft.is_some() && grid_enabled { 1.0 } else { 0.45 })
-                    .children(rows.iter().enumerate().map(|(row, label)| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(div().w(px(48.)).text_size(px(12.)).text_color(p.tx2).child(*label))
-                            .children(columns.iter().enumerate().map(|(column, name)| {
-                                let on = draft.is_some_and(|d| d.is_set(row, column));
-                                div()
-                                    .id(("perm", row * 3 + column))
-                                    .flex()
-                                    .flex_1()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(30.))
-                                    .rounded(px(9.))
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .bg(if on { p.acc } else { p.card2 })
-                                    .text_color(if on { white() } else { p.tx2 })
-                                    .when(draft.is_some() && grid_enabled, |d| {
-                                        d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                                            this.model.toggle_perm(row, column);
-                                            cx.notify();
-                                        }))
-                                    })
-                                    .child(*name)
-                            }))
-                    })),
-            )
-            .child(
-                Self::button("apply-chmod", "应用 chmod", false, p)
-                    .h(px(34.))
-                    .rounded(px(11.))
-                    .when(!can_apply, |d| d.opacity(0.5))
-                    .when(can_apply, |d| {
-                        d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.apply_chmod(cx)))
-                    }),
-            )
-            .children(
-                self.model
-                    .chmod_error()
-                    .map(|error| div().text_size(px(12.)).text_color(p.err).child(error.to_string())),
-            )
-            .child(div().flex_1())
-            .children(editable_file.then(|| {
-                Self::button("open-editor", "用内置编辑器打开", true, p)
-                    .h(px(38.))
-                    .rounded(px(12.))
-                    .text_size(px(13.))
-                    .opacity(0.45)
-                    .cursor_not_allowed()
-                    .tooltip(|window, cx| Tooltip::new("内置编辑器稍后提供").build(window, cx))
-            }))
+    /// Whether the highlight of a drag over the list is forced (the review hook).
+    pub(super) fn demo_dragging(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.demo.drag
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
     }
 }
 
-impl Render for FilesPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = cx.palette().clone();
-        div()
-            .id("files-panel")
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(Self::on_previous))
-            .on_action(cx.listener(Self::on_next))
-            .on_action(cx.listener(Self::on_open))
-            .on_action(cx.listener(Self::on_parent))
-            .size_full()
-            .flex()
-            .gap(px(10.))
-            .child(self.render_files_card(&p, cx))
-            .child(self.render_details(&p, cx))
+#[cfg(debug_assertions)]
+impl FilesPanel {
+    /// Debug review hook: goes to `dir` as if the user had.
+    pub fn demo_go(&mut self, dir: &str, cx: &mut Context<Self>) {
+        let request = self.model.go_to(dir);
+        self.start(request, cx);
+        cx.notify();
+    }
+
+    /// Debug review hook: selects the entry called `name` once it is listed (now, or when it is).
+    pub fn demo_select(&mut self, name: &str) {
+        self.demo.select = Some(name.to_string());
+        self.model.select_name(name);
+    }
+
+    /// Debug review hook: a click on 刷新.
+    pub fn demo_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+    }
+
+    /// Debug review hook: opens the OSC 7 hint.
+    pub fn demo_hint(&mut self, cx: &mut Context<Self>) {
+        self.hint_open = true;
+        cx.notify();
+    }
+
+    /// Debug review hook: a right-click on the row of `name`.
+    pub fn demo_menu(&mut self, name: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.model.select_name(name);
+        if let Some(index) = self.model.selected_index() {
+            self.open_menu(index, position, cx);
+        }
+    }
+
+    /// Debug review hook: 重命名 on `name`, with `text` typed in and Enter pressed (to show an error).
+    pub fn demo_rename(&mut self, name: &str, text: &str, cx: &mut Context<Self>) {
+        self.model.select_name(name);
+        if self.model.start_rename() {
+            self.demo.rename_text = Some(text.to_string());
+            self.commit_rename(text, cx);
+        }
+        cx.notify();
+    }
+
+    /// Debug review hook: 修改权限 on `name`: the row is selected and the grid takes focus.
+    pub fn demo_permissions(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.select_name(name);
+        window.focus(&self.perm_focus, cx);
+        cx.notify();
+    }
+
+    /// Debug review hook: 删除 on `name`.
+    pub fn demo_delete(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.select_name(name);
+        self.ask_delete(window, cx);
+    }
+
+    /// Debug review hook: the drag highlight on or off.
+    pub fn demo_drag(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.demo.drag = on;
+        cx.notify();
+    }
+
+    /// Debug review hook: 新建文件夹.
+    pub fn demo_new_folder(&mut self, cx: &mut Context<Self>) {
+        self.new_folder(cx);
+    }
+
+    /// Debug review hook: uploads `paths` as a drop from Finder would.
+    pub fn demo_upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.upload(paths, cx);
+    }
+
+    /// Debug review hook: 下载 on the selected entry.
+    pub fn demo_download(&mut self, cx: &mut Context<Self>) {
+        self.begin_download(cx);
+    }
+
+    /// Debug review hook: pauses the queue item called `name`.
+    pub fn demo_pause_named(&mut self, name: &str) {
+        if let Some(queue) = &self.queue
+            && let Some(view) = queue.snapshot().into_iter().find(|view| view.name == name)
+        {
+            queue.pause(view.id);
+        }
+    }
+
+    /// Debug review hook: scrolls the queue card's list down by `rows` rows.
+    pub fn demo_scroll_queue(&self, rows: usize) {
+        self.queue_scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(-44. * rows as f32)));
+    }
+
+    /// Debug review hook: 处理 on the first queue row that waits for an answer.
+    pub fn demo_handle_clash(&mut self, cx: &mut Context<Self>) {
+        let id = self.transfers.as_ref().and_then(|list| list.read(cx).awaiting_clash().next().map(|view| view.id));
+        if let Some(id) = id {
+            self.row_action(id, RowAction::Handle, cx);
+        }
+    }
+
+    /// Debug review hook: the transfer queue.
+    pub fn demo_queue(&self) -> Option<TransferQueue> {
+        self.queue.clone()
+    }
+
+    /// Debug review hook: the directory the panel is in.
+    pub fn demo_cwd(&self) -> String {
+        self.model.cwd().to_string()
     }
 }
 
@@ -924,7 +805,7 @@ mod tests {
         for key in KEYS {
             assert!(Keystroke::parse(key).is_ok(), "{key}");
         }
-        assert_eq!(KEYS, ["up", "down", "enter", "cmd-up"]);
+        assert_eq!(KEYS, ["up", "down", "enter", "cmd-up", "cmd-backspace", "escape"]);
         assert_eq!(CONTEXT, "FilesPanel");
     }
 
