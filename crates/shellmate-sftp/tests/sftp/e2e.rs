@@ -7,6 +7,7 @@
 //! to prepare files, symlinks and permissions with `docker exec`, and to check results).
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use shellmate_core::AuthMethod;
 use shellmate_sftp::{
@@ -54,9 +55,14 @@ struct Scratch {
 
 impl Scratch {
     fn new(home: &str) -> Self {
-        let id: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-        let path = format!("{}/sftp-e2e-{id:x}", home.trim_end_matches('/'));
-        docker(&format!("mkdir -p '{path}'"));
+        // Unique per process (pid), per call (counter) and per run (time): tests start together,
+        // and the clock alone has microsecond resolution at best.
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let id = format!("{:x}-{:x}-{nanos:x}", std::process::id(), CALLS.fetch_add(1, Ordering::Relaxed));
+        let path = format!("{}/sftp-e2e-{id}", home.trim_end_matches('/'));
+        // Plain mkdir: a name somebody else already holds is an error, never shared.
+        docker(&format!("mkdir '{path}'"));
         Self { path }
     }
 
