@@ -67,3 +67,18 @@ M3 需要一台有 **systemd 与 Docker** 的 Linux 主机。建议用 OrbStack 
 - 只操作测试用的容器 / 机器，不动用户的其他容器（例如 `openssh-server-new`）和本机服务；测试监听只用 `127.0.0.1`。
 - 测试里在远端起的进程、服务、容器，结束时清理干净。
 - 每个里程碑：`cargo build`、`cargo test --workspace`、`cargo clippy --workspace --all-targets` 零警告；动到 ssh 代码时跑 SSH / SFTP / forward 的 e2e。
+
+## M1 review 结论（2026-11-15，通过）
+
+提交：`2b9506c`（`shellmate-ssh` 的 `exec` / `exec_stream`）、`fc3346d`（新 crate `shellmate-monitor`）。
+
+- `exec`：stdout / stderr 分开、退出码、每路 1 MiB 上限（超出即关通道并标 `truncated`）、超时；`exec_stream`：按行、有损解码、单行 256 KiB 截断、慢读者时只缓存 256 行（之后靠 SSH 窗口让服务器等）、丢弃即关通道，持有连接（有泄漏测试）。
+- 采集脚本：每轮最多 3 次 fork（每秒一次 `sleep`，进程帧加 `cut` + `ps`，磁盘帧加 `df`，二者错开）；帧标记带每次运行随机的令牌，服务器内容冒充不了；通道关闭后 1 秒内退出（SIGPIPE 被忽略时靠 `printf` 失败）。命令行用 `ps`（procps：`-eo pid=,uid=,args=`；busybox：`-o pid=,user=,args=`，启动时探测），只在进程号列表变化或每 11 帧时调用；`df` 只问本地文件系统（死掉的 NFS 不会卡住）。
+- 速率在客户端算；命令生成是纯函数，名字单引号转义、拒绝以 `-` 开头的名字、PID 只收正整数；需要 root 时按"直接 / `sudo -n` / 在终端中执行"三种方式，应用不收 sudo 密码。
+- `Monitor`：与 `Forwarder` 同样的结构（弱连接、任意线程可调用、`shutdown` 后不再发事件）；采集通道意外结束按 1 / 3 / 10 秒退避重启，用尽后 `Failed`。
+- 真实服务器（`shellmate-e2e`，Alpine）：探测一次往返约 0.22 秒；30 秒采样与容器内 `/proc` 对照一致；烧满一核时总 CPU 12.6%（8 核中的一核 = 12.5%）；`sleep 1234` 以正确用户出现、经动作 API 的 TERM 生效；停止后约 2 秒内远端无残留。采集成本：13 个进程时约 0.13–0.20% 单核；320 个进程时约 0.8–1.0% 单核、约 1 MB/分钟。
+- 复跑：clippy 零警告；`cargo test --workspace` 894 通过；e2e 监控 4/4、SSH 8/8、SFTP 17/17、forward 7/7。
+
+并入 M2 一起修的小问题：本机跑探测脚本的测试会在开发机上执行 `sudo -n true`（改为桩命令目录，不碰本机 sudo）；转义时以 `=` 开头的词也加引号（zsh 的 `=cmd` 展开）；"分析目录"改用 `du -xh -d 1`（busybox 的 du 没有 `--max-depth`）；`/proc/[pid]/stat` 只截 28 个字段，进程名含多个空格时 RSS 等字段可能被截掉——补样本测试，必要时多截几个字段。
+
+测试机：用户同意后已建 OrbStack 机器 `shellmate-mon`（Ubuntu 24.04、`/bin/sh` 为 dash、systemd 255、Docker 29.1.3），`tester@shellmate-mon.orb.local:22`，与 `shellmate-e2e` 同一把测试密钥，免密 sudo，在 docker 组。只供测试使用；机器会挂载 Mac 的文件（`/Users`、`/mnt/mac`），测试不得触碰这些路径。
