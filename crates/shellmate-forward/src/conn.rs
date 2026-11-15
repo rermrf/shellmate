@@ -20,6 +20,11 @@ use crate::stats::{ActiveGuard, RuleStats, pump};
 const SOCKS_HANDSHAKE: Duration = Duration::from_secs(30);
 /// How long a remote forward waits to reach its local target.
 const LOCAL_CONNECT: Duration = Duration::from_secs(10);
+/// A server that refuses a remote forward on a port we named may only be still holding it for the
+/// connection that had it a moment ago (a reconnect, a rule switched off and on, a rule that moved
+/// to another connection): ask again this many times, this far apart, before giving up.
+const DENIED_RETRIES: u32 = 5;
+const DENIED_RETRY_DELAY: Duration = Duration::from_millis(400);
 
 /// A spawned task that is aborted when this is dropped (and with it the connection tasks it
 /// owns, and their hold on the SSH connection).
@@ -67,14 +72,15 @@ pub(crate) enum Mode {
 
 /// Accepts connections on `listener` until aborted. While no connection to the server is up,
 /// connections are closed as soon as they are accepted — the port stays taken, so nobody else
-/// can pick it up in the meantime.
+/// can pick it up in the meantime. Spawned on `runtime`: the caller (the UI thread) is not inside it.
 pub(crate) fn spawn_listener(
+    runtime: &tokio::runtime::Handle,
     listener: TcpListener,
     mode: Mode,
     slot: Arc<ConnSlot>,
     stats: Arc<RuleStats>,
 ) -> AbortOnDrop {
-    AbortOnDrop::new(tokio::spawn(accept_loop(listener, mode, slot, stats)))
+    AbortOnDrop::new(runtime.spawn(accept_loop(listener, mode, slot, stats)))
 }
 
 async fn accept_loop(listener: TcpListener, mode: Mode, slot: Arc<ConnSlot>, stats: Arc<RuleStats>) {
@@ -182,7 +188,19 @@ pub(crate) async fn run_remote(
         update(Box::new(|entry| entry.set_state(RuleState::WaitingReconnect)));
         return;
     };
-    let asked = connection.request_remote_forward(&listen.host, listen.port).await;
+    let mut retries = 0;
+    let asked = loop {
+        match connection.request_remote_forward(&listen.host, listen.port).await {
+            // Port 0 lets the server choose, so a refusal is about forwarding itself.
+            Err(SshError::RemoteForwardDenied)
+                if listen.port != 0 && retries < DENIED_RETRIES && !connection.is_closed() =>
+            {
+                retries += 1;
+                tokio::time::sleep(DENIED_RETRY_DELAY).await;
+            }
+            other => break other,
+        }
+    };
     let mut forward = match asked {
         Ok(forward) => forward,
         Err(err) => {

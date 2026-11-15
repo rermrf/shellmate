@@ -1,5 +1,7 @@
 //! `-R`: a port on the server that leads to a target on this machine.
 
+use std::time::Duration;
+
 use shellmate_forward::{ForwardKind, RuleError, RuleState};
 
 use crate::rig::*;
@@ -98,4 +100,36 @@ async fn a_local_target_that_is_down_closes_the_forwarded_connection_and_the_rul
     expect_closed(&mut dial(port).await).await;
     expect_closed(&mut dial(port).await).await;
     assert!(rig.forwarder.state(&rule.id).is_running());
+}
+
+/// The server still holds the port for a moment (the connection that had it is being closed, or the
+/// rule was just switched off): the rule is asked again instead of failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixed_port_the_server_still_holds_is_asked_for_again() {
+    let rig = Rig::start().await;
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let rule = rule(ForwardKind::Remote, &format!("127.0.0.1:{port}"), &rig.echo_target());
+    rig.forwarder.start(rule.clone());
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(rig.forwarder.state(&rule.id), RuleState::Starting, "still asking, not failed");
+    drop(holder);
+    assert_eq!(rig.running_port(&rule.id).await, port);
+    assert_eq!(echo_through(port, b"through the retried forward").await, b"through the retried forward");
+    let states = states_of(&drain(&rig.events), &rule.id);
+    assert_eq!(states, [RuleState::Starting, RuleState::Running { port }], "the refusals were not reported");
+}
+
+/// A refusal that goes on is still reported, after the retries (and with a port named; port 0 fails at once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixed_port_the_server_keeps_refusing_fails_after_the_retries() {
+    let rig = Rig::with(ServerOptions { forwarding: true, ..Default::default() }).await;
+    let rule = rule(ForwardKind::Remote, &format!("127.0.0.1:{}", free_port()), &rig.echo_target());
+    rig.forwarder.start(rule.clone());
+    let state = eventually("the refusal", || match rig.forwarder.state(&rule.id) {
+        RuleState::Failed(err) => Some(err),
+        _ => None,
+    })
+    .await;
+    assert_eq!(state, RuleError::RemoteDenied);
 }

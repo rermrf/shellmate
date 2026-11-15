@@ -414,3 +414,27 @@ async fn a_rule_on_a_port_that_nobody_listens_on_is_not_mistaken_for_a_shadow() 
     assert!(rig.forwarder.start(rule.clone()).is_running());
     assert_eq!(echo_through(rule.listen.port, b"free").await, b"free");
 }
+
+/// The app drives the forwarder from its UI thread, which is not inside the tokio runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_call_works_from_a_thread_outside_the_runtime() {
+    let rig = Rig::start().await;
+    let (local, socks, remote) = (rig.local_rule(), rig.socks_rule(), rig.remote_rule());
+    let forwarder = rig.forwarder.clone();
+    let (rules, done) = (vec![local.clone(), socks.clone(), remote.clone()], tokio::sync::oneshot::channel());
+    let connection = rig.connection.clone();
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err(), "this thread has no runtime");
+        for rule in rules {
+            forwarder.start(rule);
+        }
+        forwarder.connection_lost();
+        forwarder.connection_restored(&connection);
+        let _ = done.0.send(());
+    });
+    done.1.await.unwrap();
+    let port = rig.running_port(&local.id).await;
+    assert_eq!(echo_through(port, b"from the ui thread").await, b"from the ui thread");
+    rig.running_port(&socks.id).await;
+    rig.running_port(&remote.id).await;
+}

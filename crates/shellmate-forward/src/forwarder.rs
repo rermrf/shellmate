@@ -190,7 +190,13 @@ impl Forwarder {
                     Ok(listener) => {
                         let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(rule.listen.port);
                         entry.bound = Some(port);
-                        entry.task = Some(spawn_listener(listener, mode, inner.slot.clone(), entry.stats.clone()));
+                        entry.task = Some(spawn_listener(
+                            &inner.runtime,
+                            listener,
+                            mode,
+                            inner.slot.clone(),
+                            entry.stats.clone(),
+                        ));
                         entry.state = if connected { RuleState::Running { port } } else { RuleState::WaitingReconnect };
                     }
                     Err(err) => entry.state = RuleState::Failed(err),
