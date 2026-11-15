@@ -32,6 +32,7 @@ mod files;
 mod forward;
 mod group;
 mod hosts;
+mod monitor;
 mod ssh;
 
 actions!(
@@ -120,6 +121,11 @@ struct Session {
     files: Option<files::FilesTab>,
     /// The port forwarding panel, made the first time the tab shows it (SSH tabs only).
     forward: Option<forward::ForwardTab>,
+    /// The monitor panel, made the first time the tab shows it (SSH tabs only).
+    monitor: Option<monitor::MonitorTab>,
+    /// A command line to type into the shell as soon as it is there (a tab opened for a command: strace, du,
+    /// or a `sudo` command the user has to type the password for).
+    typed: Option<ssh::TypedLine>,
     kind: SessionKind,
     _subscription: Subscription,
 }
@@ -145,6 +151,8 @@ pub struct Workspace {
     library_is_temporary: bool,
     /// What the servers granted for remote forwards in this run, shared by every connection (see `GrantMemory`).
     forward_grants: shellmate_forward::GrantMemory,
+    /// Debug review hook: the monitor panels show made-up data and ignore what the servers say.
+    monitor_frozen: bool,
     /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
     groups: Vec<group::ConnGroup>,
     active: Option<usize>,
@@ -189,6 +197,7 @@ impl Workspace {
             sessions: Vec::new(),
             library_is_temporary: store_notice.is_some(),
             forward_grants: shellmate_forward::GrantMemory::new(),
+            monitor_frozen: false,
             groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,
@@ -307,6 +316,8 @@ impl Workspace {
             panel: Panel::Terminal,
             files: None,
             forward: None,
+            monitor: None,
+            typed: None,
             kind: SessionKind::Local,
             _subscription: subscription,
         });
@@ -355,6 +366,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);
         self.sync_sidebar(cx);
+        self.sync_monitor_activity();
         cx.notify();
     }
 
@@ -380,6 +392,7 @@ impl Workspace {
             _ => {}
         }
         self.sync_sidebar(cx);
+        self.sync_monitor_activity();
         cx.notify();
     }
 
@@ -610,7 +623,7 @@ impl Workspace {
                 match (session, panel) {
                     (None, _) => item.disabled("没有打开的会话"),
                     (Some(_), Panel::Terminal) => item,
-                    (Some(s), Panel::Files | Panel::Forward) if s.ssh().is_some() => item,
+                    (Some(s), Panel::Files | Panel::Forward | Panel::Monitor) if s.ssh().is_some() => item,
                     (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
                     (Some(_), other) => item.disabled(other.local_hint()),
                 }
@@ -792,6 +805,9 @@ impl Render for Workspace {
             }
             Some(Session { panel: Panel::Forward, forward: Some(forward), .. }) => {
                 div().flex_1().min_h_0().flex().child(forward.panel.clone()).into_any_element()
+            }
+            Some(Session { panel: Panel::Monitor, monitor: Some(monitor), .. }) => {
+                div().flex_1().min_h_0().flex().child(monitor.panel.clone()).into_any_element()
             }
             Some(session) => self.render_terminal_card(session, cx).into_any_element(),
             None => self.render_empty(cx).into_any_element(),

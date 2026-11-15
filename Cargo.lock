@@ -7140,6 +7140,7 @@ dependencies = [
  "log",
  "shellmate-core",
  "shellmate-forward",
+ "shellmate-monitor",
  "shellmate-sftp",
  "shellmate-ssh",
  "shellmate-store",

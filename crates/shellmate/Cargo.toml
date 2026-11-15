@@ -11,6 +11,7 @@ shellmate-store.workspace = true
 shellmate-ssh.workspace = true
 shellmate-sftp.workspace = true
 shellmate-forward.workspace = true
+shellmate-monitor.workspace = true
 async-channel.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

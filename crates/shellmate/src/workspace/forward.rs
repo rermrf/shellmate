@@ -428,7 +428,7 @@ impl Workspace {
     }
 
     /// Closes the tab with this id if it is still there (the answer to the question above).
-    fn close_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_session(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.sessions.iter().position(|s| s.id == session_id) {
             self.close_now(ix, window, cx);
         }

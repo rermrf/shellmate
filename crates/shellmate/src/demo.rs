@@ -161,6 +161,85 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `monitor:<host>:<scenario>` connects the host and plays a scenario on the monitor page: `live`, `live-proc`,
+    // `live-svc`, `live-dk` (the server's own numbers, on a sub-page), `fake-<page>[-<variant>]` (made-up numbers,
+    // `<page>` is `ov`, `proc`, `svc` or `dk`; the variants are in `monitor::demo` and `proc-tree`, `proc-sel`,
+    // `proc-term`, `proc-filter`), `gating`, `act=<action>|<command>` (a button of the process page pressed on the process
+    // with that command line, `act-now=` without the question), `analyze=<mount>`, `reconnect`, `close-now`.
+    if let Some(args) = name.strip_prefix("monitor:") {
+        let (host, scenario) = args.split_once(':').unwrap_or((args, ""));
+        let (scenario, arg) = scenario.split_once('=').unwrap_or((scenario, ""));
+        let (host, arg) = (host.to_string(), arg.to_string());
+        workspace.update(cx, |workspace, cx| workspace.connect_by_name(&host, window, cx));
+        let show = (3500u64, "show", String::new());
+        let steps: Vec<(u64, &'static str, String)> = if let Some(rest) = scenario.strip_prefix("fake-") {
+            let (page, variant) = rest.split_once('-').unwrap_or((rest, ""));
+            let data = match variant {
+                "waiting" | "failed" | "first" | "starting" | "quiet" | "cores" | "notlinux" | "nosudo" => variant,
+                "term" => "nosudo",
+                _ if page == "svc" || page == "dk" => if variant == "ubuntu" { "overview" } else { "alpine" },
+                _ => "overview",
+            };
+            let data = if data == "cores" { "many-cores" } else { data };
+            let mut steps = vec![show, (4000, "fake", data.into()), (4300, "page", page.into())];
+            match variant {
+                "tree" => steps.push((4600, "table", "|cpu|tree".into())),
+                "filter" => steps.push((4600, "table", "nginx|cpu|list".into())),
+                "sel" => steps.push((4600, "select", "2207".into())),
+                "term" => steps.push((4600, "select", "1".into())),
+                _ => {}
+            }
+            steps
+        } else {
+            match scenario {
+                "live" => vec![show, (7000, "log", "overview".into()), (12000, "log", "later".into())],
+                "live-proc" => vec![show, (3800, "page", "proc".into()), (9000, "log", "processes".into())],
+                "live-svc" | "live-dk" => vec![show, (3800, "page", scenario[5..].into()), (6000, "log", "page".into())],
+                "act" | "act-now" => vec![
+                    show,
+                    (3800, "page", "proc".into()),
+                    (8000, "log", "before".into()),
+                    (9000, scenario_step(scenario), arg.clone()),
+                    (12000, "log", "after".into()),
+                ],
+                "analyze" => vec![show, (8000, "analyze", arg.clone())],
+                // Collecting only while the monitor page is in front (and 10 s after): the page is shown, left for
+                // the terminal, shown again within the 10 s (the collector stays), and left for good.
+                "gating" => vec![
+                    show,
+                    (5000, "page", "proc".into()),
+                    (7000, "page", "ov".into()),
+                    (9000, "terminal", String::new()),
+                    (14000, "show", String::new()),
+                    (17000, "terminal", String::new()),
+                ],
+                "reconnect" => vec![
+                    show,
+                    (3800, "page", "proc".into()),
+                    (6000, "log", "up".into()),
+                    (14000, "log", "lost".into()),
+                    (22000, "log", "back".into()),
+                    (27000, "log", "later".into()),
+                ],
+                "close-now" => vec![show, (8000, "log", "before".into()), (8500, "close-now", String::new())],
+                _ => vec![show, (7000, "log", "live".into())],
+            }
+        };
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let mut last = 0;
+                for (at_ms, step, arg) in steps {
+                    cx.background_executor().timer(std::time::Duration::from_millis(at_ms - last)).await;
+                    last = at_ms;
+                    workspace
+                        .update_in(cx, |workspace, window, cx| workspace.demo_monitor_step(step, &arg, window, cx))
+                        .ok();
+                }
+            })
+            .detach();
+        return;
+    }
     // `files-refresh:<host>:<dir>` shows the panel there and refreshes it 9 seconds later (as a click
     // on 刷新 would), so that a script can kill the server's SFTP process in between.
     if let Some(args) = name.strip_prefix("files-refresh:") {
@@ -394,4 +473,9 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
         ),
         other => log::warn!("unknown SHELLMATE_DEMO {other:?}; available: {}", NAMES.join(", ")),
     }
+}
+
+/// The step a `monitor:act` scenario plays (`act` asks first, `act-now` does not).
+fn scenario_step(scenario: &str) -> &'static str {
+    if scenario == "act-now" { "act-now" } else { "act" }
 }

@@ -287,8 +287,7 @@ impl Workspace {
         let Some(session) = self.sessions.get(ix) else { return };
         let available = match panel {
             Panel::Terminal => true,
-            Panel::Files | Panel::Forward => session.ssh().is_some(),
-            Panel::Monitor => false,
+            Panel::Files | Panel::Forward | Panel::Monitor => session.ssh().is_some(),
         };
         if !available {
             return;
@@ -299,6 +298,9 @@ impl Workspace {
         if panel == Panel::Forward && !self.ensure_forward_tab(ix, window, cx) {
             return;
         }
+        if panel == Panel::Monitor && !self.ensure_monitor_tab(ix, window, cx) {
+            return;
+        }
         self.sessions[ix].panel = panel;
         if panel == Panel::Files
             && let Some(group) = self.sessions[ix].ssh().map(|ssh| ssh.group)
@@ -307,6 +309,7 @@ impl Workspace {
         }
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);
+        self.sync_monitor_activity();
         cx.notify();
     }
 
@@ -426,8 +429,12 @@ impl Workspace {
     /// Puts keyboard focus where the active tab's panel wants it: the terminal, or the file list.
     pub(super) fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.active.and_then(|ix| self.sessions.get(ix)) else { return };
-        let handle = match (&session.files, session.panel) {
-            (Some(files), Panel::Files) => files.panel.focus_handle(cx),
+        // The panel that is showing takes the keys, so that nothing typed there reaches a terminal that is out of
+        // sight.
+        let handle = match (&session.files, &session.forward, &session.monitor, session.panel) {
+            (Some(files), _, _, Panel::Files) => files.panel.focus_handle(cx),
+            (_, Some(forward), _, Panel::Forward) => forward.panel.focus_handle(cx),
+            (_, _, Some(monitor), Panel::Monitor) => monitor.panel.focus_handle(cx),
             _ => session.view.focus_handle(cx),
         };
         window.focus(&handle, cx);

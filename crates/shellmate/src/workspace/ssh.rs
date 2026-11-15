@@ -124,6 +124,15 @@ impl SshSession {
     }
 }
 
+/// A command line to put in a tab's shell as soon as the shell is there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedLine {
+    /// What to type (pasted, so that a shell that asks for it does not take it for a series of keys).
+    pub text: String,
+    /// Whether to press Enter after it. Without, the user presses it (and types the password of a `sudo`).
+    pub enter: bool,
+}
+
 /// What connecting a host does about tabs that already exist for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Existing {
@@ -177,7 +186,7 @@ pub fn panel_hint(panel: Panel) -> &'static str {
         Panel::Terminal => "",
         Panel::Files => "",
         Panel::Forward => "",
-        Panel::Monitor => "服务器监控（P5 实现）",
+        Panel::Monitor => "",
     }
 }
 
@@ -261,6 +270,7 @@ impl Workspace {
         self.groups.push(ConnGroup::new(id, key, machine, memory));
         self.attach_link(id, window, cx);
         self.attach_forwarder(id, window, cx);
+        self.attach_monitor(id, window, cx);
         id
     }
 
@@ -296,6 +306,8 @@ impl Workspace {
             panel: Panel::Terminal,
             files: None,
             forward: None,
+            monitor: None,
+            typed: None,
             kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
             _subscription: subscription,
         });
@@ -610,6 +622,7 @@ impl Workspace {
                 terminal.update(cx, |terminal, cx| terminal.notice(&reconnect::healed_line(manual), cx));
             }
             Self::attach_shell(&terminal, shell, cx);
+            self.type_pending(session_id, window, cx);
         }
         // Tabs that started waiting while the attempt ran have no shell yet: they get a channel
         // on the connection that is up now.
@@ -617,6 +630,7 @@ impl Workspace {
         if let Some(live) = live {
             self.link_connected(group_id, &live, cx);
             self.forward_connected(group_id, &live, cx);
+            self.monitor_connected(group_id, &live, cx);
         }
 
         if !reconnected && let Some(host_id) = first_host {
@@ -706,8 +720,66 @@ impl Workspace {
             Err(err) if err.is_cancelled() => {}
             Err(err) => self.connect_separately(session_id, &format!("连接任务异常终止：{err}"), window, cx),
         }
+        self.type_pending(session_id, window, cx);
         self.sync_sidebar(cx);
         cx.notify();
+    }
+
+    /// Types what the tab was opened for into its shell, a moment after the shell is there (so that the
+    /// prompt has been drawn and the line does not appear twice).
+    fn type_pending(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
+        let Some(typed) = session.typed.take() else { return };
+        let terminal = session.terminal.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+            terminal
+                .update(cx, |terminal, _| {
+                    terminal.paste(&typed.text);
+                    if typed.enter {
+                        terminal.input(b"\r");
+                    }
+                });
+        })
+        .detach();
+    }
+
+    /// Opens a tab on the connection of tab `source` (no new login) and types `text` into its shell: what a
+    /// monitor action does that is for a terminal (strace, the analysis of a disk, a `sudo` line for the user to
+    /// finish). The new tab is called `<host> · <label>`.
+    pub(super) fn open_command_tab(
+        &mut self,
+        source: usize,
+        label: &str,
+        text: String,
+        enter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((source_group, host_id)) =
+            self.sessions.iter().find(|s| s.id == source).and_then(|s| s.ssh()).map(|ssh| (ssh.group, ssh.host.id.clone()))
+        else {
+            return;
+        };
+        let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
+        let key = PoolKey::of(&chain, &connect::default_user());
+        let live = self
+            .group_mut(source_group)
+            .filter(|group| group.key == key)
+            .and_then(|group| group.live_connection().map(|connection| (connection, group.next_channel())));
+        let Some((connection, number)) = live else {
+            window.push_notification(
+                Notification::warning("连接已断开，重连后再试").title(format!("{} · {label}", host.name)),
+                cx,
+            );
+            return;
+        };
+        let title = format!("{} · {label}", host.name);
+        let session_id = self.push_ssh_tab(title, host, chain, source_group, window, cx);
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.typed = Some(TypedLine { text, enter });
+        }
+        self.open_channel(session_id, connection, number, window, cx);
     }
 
     /// The connection could not take another channel (it died, or the server refused): the tab
@@ -755,6 +827,7 @@ impl Workspace {
         // forwards keep their local ports and wait too.
         self.link_lost(group_id, cx);
         self.forward_lost(group_id, cx);
+        self.monitor_lost(group_id, cx);
         self.step_group(group_id, Input::Lost, window, cx);
         if let Some(ssh) = self.ssh_mut(session_id)
             && ssh.status == SshStatus::Connected
@@ -959,7 +1032,7 @@ mod tests {
     fn panels_name_the_phase_that_brings_them() {
         assert_eq!(panel_hint(Panel::Files), "", "the files panel is there for SSH sessions");
         assert_eq!(panel_hint(Panel::Forward), "", "the port forwarding panel is there for SSH sessions");
-        assert_eq!(panel_hint(Panel::Monitor), "服务器监控（P5 实现）");
+        assert_eq!(panel_hint(Panel::Monitor), "", "the monitor is there for SSH sessions");
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use gpui::{Entity, Task};
 use shellmate_core::{Host, HostId};
 use shellmate_forward::{ForwardRule, Forwarder};
+use shellmate_monitor::{ActionId, Monitor};
 use shellmate_sftp::link::SftpLink;
 use shellmate_sftp::transfer::ItemId;
 use shellmate_ssh::{Connection, WeakConnection};
@@ -113,6 +114,30 @@ impl Drop for GroupForward {
     }
 }
 
+/// What is done when an action of the monitor reports back.
+#[derive(Clone, Debug)]
+pub struct PendingAction {
+    /// What the toast says after the command line when it worked (`已发送`).
+    pub done: &'static str,
+}
+
+/// The monitor of a connection: the engine, the actions it is running, and the task that follows what it says.
+pub struct GroupMonitor {
+    /// Probes the server and follows the collector while a tab of the connection shows the monitor page.
+    pub monitor: Monitor,
+    /// Actions that were started and have not reported yet.
+    pub pending: std::collections::HashMap<ActionId, PendingAction>,
+    /// The UI task following the engine's events; it ends with the group.
+    pub _task: Option<Task<()>>,
+}
+
+impl Drop for GroupMonitor {
+    /// A connection nobody is on any more stops its collector, so that nothing keeps the SSH connection open.
+    fn drop(&mut self) {
+        self.monitor.shutdown();
+    }
+}
+
 /// The connection that carries the rules of `host`: of the connections to it that have a forwarder,
 /// the oldest (lowest number). The others show the same rules and take them over when it goes.
 pub fn forward_owner<'a>(groups: impl IntoIterator<Item = &'a ConnGroup>, host: &HostId) -> Option<usize> {
@@ -155,6 +180,8 @@ pub struct ConnGroup {
     pub clash: ClashState,
     /// The port forwarding of the connection (`None` only if the SSH runtime could not be started).
     pub forward: Option<GroupForward>,
+    /// The monitor of the connection (`None` only if the SSH runtime could not be started).
+    pub monitor: Option<GroupMonitor>,
 }
 
 impl ConnGroup {
@@ -177,6 +204,7 @@ impl ConnGroup {
             transfers: None,
             clash: ClashState::default(),
             forward: None,
+            monitor: None,
         }
     }
 
