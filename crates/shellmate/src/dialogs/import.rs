@@ -26,6 +26,10 @@ pub struct ImportNotes {
     pub skipped_patterns: Vec<String>,
     /// Number of `Match` blocks that were skipped.
     pub match_blocks: usize,
+    /// Port forwardings the importable hosts have (they become rules).
+    pub forwards: usize,
+    /// Forwardings of those hosts that cannot be imported.
+    pub skipped_forwards: usize,
 }
 
 impl ImportNotes {
@@ -43,6 +47,15 @@ impl ImportNotes {
         }
         if self.match_blocks > 0 {
             lines.push(format!("已忽略 {} 个 Match 块。", self.match_blocks));
+        }
+        if self.forwards > 0 {
+            lines.push(format!("这些主机带有 {} 条端口转发（LocalForward 等），导入时一并生成规则。", self.forwards));
+        }
+        if self.skipped_forwards > 0 {
+            lines.push(format!(
+                "另有 {} 条端口转发无法导入（Unix 套接字、远程 SOCKS 或无法识别的写法）。",
+                self.skipped_forwards
+            ));
         }
         lines
     }
@@ -304,11 +317,15 @@ mod tests {
             includes: vec!["~/.ssh/config.d/*".into(), "extra.conf".into()],
             skipped_patterns: vec!["*.corp.io".into(), "!bastion".into()],
             match_blocks: 2,
+            forwards: 3,
+            skipped_forwards: 1,
         };
         let lines = notes.lines();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].starts_with("Include ~/.ssh/config.d/*、extra.conf 未展开"));
         assert!(lines[1].contains("*.corp.io、!bastion"));
         assert_eq!(lines[2], "已忽略 2 个 Match 块。");
+        assert_eq!(lines[3], "这些主机带有 3 条端口转发（LocalForward 等），导入时一并生成规则。");
+        assert!(lines[4].starts_with("另有 1 条端口转发无法导入"));
     }
 }

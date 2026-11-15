@@ -7139,6 +7139,7 @@ dependencies = [
  "libc",
  "log",
  "shellmate-core",
+ "shellmate-forward",
  "shellmate-sftp",
  "shellmate-ssh",
  "shellmate-store",
@@ -7218,6 +7219,7 @@ dependencies = [
  "keyring",
  "rusqlite",
  "shellmate-core",
+ "shellmate-forward",
  "tempfile",
  "thiserror 2.0.21",
 ]

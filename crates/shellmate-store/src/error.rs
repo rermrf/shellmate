@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use shellmate_core::{GroupId, HostId};
+use shellmate_forward::RuleId;
 
 /// Why a host store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,9 @@ pub enum StoreError {
     /// No group has this id.
     #[error("找不到分组（{0}）")]
     GroupNotFound(GroupId),
+    /// No forwarding rule has this id.
+    #[error("找不到端口转发规则（{0}）")]
+    RuleNotFound(RuleId),
     /// A host lists a jump host that does not exist.
     #[error("主机「{host}」引用的跳板机不存在（{jump}）")]
     MissingJump {

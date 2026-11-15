@@ -4,6 +4,7 @@
 //! key passphrases go to the macOS keychain through [`SecretStore`].
 
 mod error;
+mod forwards;
 mod hosts;
 mod secrets;
 

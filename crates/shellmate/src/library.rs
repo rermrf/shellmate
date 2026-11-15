@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use shellmate_core::{AuthMethod, Group, GroupTone, Host, HostId, ImportCandidate, Secret, plan_import};
+use shellmate_core::{
+    AuthMethod, ForwardDirective, Group, GroupTone, Host, HostId, ImportCandidate, ImportPlan, Secret, plan_import,
+};
+use shellmate_forward::{ForwardKind, ForwardRule, RuleId};
 use shellmate_store::{HostStore, SecretKey, SecretStore};
 
 /// What the host editor produced.
@@ -69,6 +72,10 @@ pub struct ImportSummary {
     pub jump_hosts: usize,
     /// Selected rows that already existed.
     pub skipped_existing: usize,
+    /// Port forwarding rules created from the `LocalForward` / `RemoteForward` / `DynamicForward` lines.
+    pub forwards: usize,
+    /// Forwardings that could not be taken over (Unix-domain sockets, remote SOCKS, unreadable lines).
+    pub skipped_forwards: usize,
 }
 
 impl ImportSummary {
@@ -80,6 +87,15 @@ impl ImportSummary {
         }
         if self.skipped_existing > 0 {
             text.push_str(&format!("，跳过 {} 台已存在的主机", self.skipped_existing));
+        }
+        if self.forwards > 0 {
+            text.push_str(&format!("，生成 {} 条端口转发规则", self.forwards));
+        }
+        if self.skipped_forwards > 0 {
+            text.push_str(&format!(
+                "；另有 {} 条端口转发无法导入（Unix 套接字、远程 SOCKS 或无法识别的写法）",
+                self.skipped_forwards
+            ));
         }
         text
     }
@@ -97,12 +113,44 @@ pub fn import_hosts(
     let group_name = group_name.trim();
     let group = if group_name.is_empty() { None } else { Some(group_named(store, group_name)?) };
     let plan = plan_import(selected, all, &existing, group.as_ref().map(|g| &g.id));
-    store.apply_import(&plan).map_err(|e| e.to_string())?;
+    let (rules, unreadable) = forward_rules_of(&plan);
+    store.apply_import_with_forwards(&plan, &rules).map_err(|e| e.to_string())?;
     Ok(ImportSummary {
         imported: plan.hosts.len() - plan.jump_hosts,
         jump_hosts: plan.jump_hosts,
         skipped_existing: plan.skipped_existing,
+        forwards: rules.len(),
+        skipped_forwards: plan.skipped_forwards + unreadable,
     })
+}
+
+/// The rules the forwardings of an import become (named like `-L 3306`, enabled), each with its
+/// host. A forwarding the rule parser does not accept (a port out of range, a malformed address) is
+/// counted in the second number, and a repeat of a rule the host already has is dropped.
+pub fn forward_rules_of(plan: &ImportPlan) -> (Vec<(HostId, ForwardRule)>, usize) {
+    let mut rules: Vec<(HostId, ForwardRule)> = Vec::new();
+    let mut unreadable = 0;
+    for (host, forward) in &plan.forwards {
+        let kind = match forward.kind {
+            ForwardDirective::Local => ForwardKind::Local,
+            ForwardDirective::Remote => ForwardKind::Remote,
+            ForwardDirective::Dynamic => ForwardKind::Dynamic,
+        };
+        let target = forward.target.as_deref().unwrap_or_default();
+        match ForwardRule::parse(RuleId::generate(), "", kind, &forward.listen, target, true) {
+            Ok(rule) => {
+                let repeat = rules.iter().any(|(h, r)| h == host && r.kind == rule.kind && r.listen == rule.listen);
+                if !repeat {
+                    rules.push((host.clone(), rule));
+                }
+            }
+            Err(err) => {
+                log::debug!("端口转发 {} 未导入：{err}", forward.listen);
+                unreadable += 1;
+            }
+        }
+    }
+    (rules, unreadable)
 }
 
 // ---- the editor's form ----------------------------------------------------------------
@@ -411,7 +459,10 @@ mod tests {
         );
         let rows = shellmate_core::candidates(&parsed, &[]);
         let summary = import_hosts(&mut store, &rows, &rows, "导入自 ssh config").unwrap();
-        assert_eq!(summary, ImportSummary { imported: 2, jump_hosts: 1, skipped_existing: 0 });
+        assert_eq!(
+            summary,
+            ImportSummary { imported: 2, jump_hosts: 1, skipped_existing: 0, forwards: 0, skipped_forwards: 0 }
+        );
         assert_eq!(summary.message(), "已导入 2 台主机（另创建 1 台跳板机）");
 
         let book = store.book().unwrap();
@@ -424,7 +475,10 @@ mod tests {
         // Again: everything exists now.
         let rows = shellmate_core::candidates(&parsed, &store.hosts().unwrap());
         let again = import_hosts(&mut store, &rows, &rows, "导入自 ssh config").unwrap();
-        assert_eq!(again, ImportSummary { imported: 0, jump_hosts: 0, skipped_existing: 2 });
+        assert_eq!(
+            again,
+            ImportSummary { imported: 0, jump_hosts: 0, skipped_existing: 2, forwards: 0, skipped_forwards: 0 }
+        );
         assert_eq!(again.message(), "已导入 0 台主机，跳过 2 台已存在的主机");
         assert_eq!(store.hosts().unwrap().len(), 3);
     }
@@ -443,5 +497,65 @@ mod tests {
             hosts.iter().all(|h| h.group.is_none()) && store.groups().unwrap().is_empty(),
             "an empty group name means no group"
         );
+    }
+
+    #[test]
+    fn importing_turns_forwardings_into_enabled_rules_named_after_them() {
+        let mut store = store();
+        let parsed = parse_ssh_config(
+            "Host db\n  HostName 10.0.2.8\n  LocalForward 3306 10.0.2.8:3306\n  LocalForward [::1]:5432 db.internal:5432\n  RemoteForward 0.0.0.0:9000 localhost:3000\n  DynamicForward *:1080\n  LocalForward 3306 10.0.2.8:3306\n",
+            None,
+        );
+        let rows = shellmate_core::candidates(&parsed, &[]);
+        let summary = import_hosts(&mut store, &rows, &rows, "").unwrap();
+        assert_eq!((summary.forwards, summary.skipped_forwards), (4, 0), "the repeated line is one rule");
+        assert_eq!(summary.message(), "已导入 1 台主机，生成 4 条端口转发规则");
+
+        let db = store.hosts().unwrap().remove(0);
+        let rules = store.forward_rules(&db.id).unwrap();
+        assert_eq!(
+            rules.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["-L 3306", "-L 5432", "-R 9000", "-D 1080"]
+        );
+        assert!(rules.iter().all(|r| r.enabled));
+        assert_eq!(rules[0].route_text(), "127.0.0.1:3306 → 10.0.2.8:3306");
+        assert_eq!(rules[1].listen.host, "::1");
+        assert_eq!(rules[2].listen.to_string(), "0.0.0.0:9000", "a remote forward's bind address is the server's");
+        assert_eq!(rules[3].listen.to_string(), "0.0.0.0:1080", "* binds every address");
+    }
+
+    #[test]
+    fn what_cannot_be_imported_is_counted_in_the_summary_not_an_error() {
+        let mut store = store();
+        let parsed = parse_ssh_config(
+            "Host db\n  HostName d\n  LocalForward 5432 /var/run/pg.sock\n  RemoteForward 1080\n  LocalForward 99999 h:1\n  LocalForward 8080 h:notaport\n  LocalForward 7000 ok:7000\n",
+            None,
+        );
+        let rows = shellmate_core::candidates(&parsed, &[]);
+        let summary = import_hosts(&mut store, &rows, &rows, "").unwrap();
+        assert_eq!(
+            (summary.forwards, summary.skipped_forwards),
+            (1, 4),
+            "two skipped by the parser, two refused by the rules"
+        );
+        assert_eq!(
+            summary.message(),
+            "已导入 1 台主机，生成 1 条端口转发规则；另有 4 条端口转发无法导入（Unix 套接字、远程 SOCKS 或无法识别的写法）"
+        );
+        let db = store.hosts().unwrap().remove(0);
+        assert_eq!(store.forward_rules(&db.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hosts_that_exist_keep_their_rules_when_imported_again() {
+        let mut store = store();
+        let parsed = parse_ssh_config("Host db\n  HostName d\n  LocalForward 3306 d:3306\n", None);
+        let rows = shellmate_core::candidates(&parsed, &[]);
+        import_hosts(&mut store, &rows, &rows, "").unwrap();
+        let rows = shellmate_core::candidates(&parsed, &store.hosts().unwrap());
+        let again = import_hosts(&mut store, &rows, &rows, "").unwrap();
+        assert_eq!((again.forwards, again.skipped_existing), (0, 1));
+        let db = store.hosts().unwrap().remove(0);
+        assert_eq!(store.forward_rules(&db.id).unwrap().len(), 1, "no second copy");
     }
 }

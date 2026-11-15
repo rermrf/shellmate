@@ -17,4 +17,4 @@ pub use host::{
 pub use import::{ImportCandidate, ImportPlan, candidates, plan_import};
 pub use io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 pub use secret::Secret;
-pub use ssh_config::{ParsedConfig, SshConfigEntry, parse_ssh_config};
+pub use ssh_config::{ConfigForward, ForwardDirective, ParsedConfig, SshConfigEntry, parse_ssh_config};

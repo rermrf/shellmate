@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::host::{AuthMethod, GroupId, Host, HostId};
-use crate::ssh_config::ParsedConfig;
+use crate::ssh_config::{ConfigForward, ParsedConfig};
 
 /// One row of the import dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +26,10 @@ pub struct ImportCandidate {
     pub identity_file: Option<PathBuf>,
     /// `ProxyJump` entries: aliases or `[user@]host[:port]` specs.
     pub proxy_jump: Vec<String>,
+    /// The port forwardings the entry has (they become rules of the host).
+    pub forwards: Vec<ConfigForward>,
+    /// Forwardings of the entry that cannot be taken over.
+    pub skipped_forwards: usize,
     /// The saved host this entry duplicates: same name as the alias, or the same
     /// (address, port, user). Existing entries are not imported again.
     pub existing: Option<HostId>,
@@ -51,6 +55,8 @@ pub fn candidates(parsed: &ParsedConfig, hosts: &[Host]) -> Vec<ImportCandidate>
                 port,
                 identity_file: entry.identity_file.clone(),
                 proxy_jump: entry.proxy_jump.clone(),
+                forwards: entry.forwards.clone(),
+                skipped_forwards: entry.skipped_forwards,
                 existing,
             }
         })
@@ -67,6 +73,11 @@ pub struct ImportPlan {
     pub skipped_existing: usize,
     /// How many of `hosts` were created only because a selected host jumps through them.
     pub jump_hosts: usize,
+    /// The port forwardings to save as rules, with the host (one of `hosts`) each belongs to:
+    /// those of the created hosts that were selected themselves.
+    pub forwards: Vec<(HostId, ConfigForward)>,
+    /// Forwardings of the imported hosts that cannot be taken over.
+    pub skipped_forwards: usize,
 }
 
 /// Decides which hosts to create for the `selected` rows.
@@ -91,7 +102,9 @@ pub fn plan_import(
         if candidate.existing.is_some() {
             plan.skipped_existing += 1;
         } else {
-            planner.create_from_candidate(candidate);
+            let id = planner.create_from_candidate(candidate);
+            plan.forwards.extend(candidate.forwards.iter().map(|forward| (id.clone(), forward.clone())));
+            plan.skipped_forwards += candidate.skipped_forwards;
         }
     }
     let selected_count = selected.iter().filter(|c| c.existing.is_none()).count();
@@ -395,5 +408,31 @@ mod tests {
         assert_eq!(parse_jump_spec("me@[fe80::1]"), (Some("me"), "fe80::1", None));
         assert_eq!(parse_jump_spec("fe80::1"), (None, "fe80::1", None), "bare IPv6 has no port");
         assert_eq!(parse_jump_spec("host:notaport"), (None, "host:notaport", None));
+    }
+
+    #[test]
+    fn selected_hosts_bring_their_forwardings_and_the_count_of_those_left_out() {
+        let rows = rows(
+            "Host db\n  HostName d\n  LocalForward 3306 d:3306\n  RemoteForward 1080\nHost web\n  HostName w\n  DynamicForward 1080\nHost jump\n  HostName j\n  LocalForward 1 x:1\nHost app\n  HostName a\n  ProxyJump jump\n  LocalForward 8080 a:80\n",
+            &[],
+        );
+        let selected = [rows[0].clone(), rows[3].clone()];
+        let plan = plan_import(&selected, &rows, &[], None);
+        let id = |name: &str| by_name(&plan, name).id.clone();
+        assert_eq!(plan.hosts.len(), 3, "db, app, and jump created because app jumps through it");
+        assert_eq!(
+            plan.forwards.iter().map(|(host, forward)| (host.clone(), forward.listen.as_str())).collect::<Vec<_>>(),
+            [(id("db"), "3306"), (id("app"), "8080")],
+            "jump host was not selected: its forwarding is not imported; web was not selected at all"
+        );
+        assert_eq!(plan.skipped_forwards, 1, "db's remote SOCKS");
+    }
+
+    #[test]
+    fn hosts_that_exist_already_keep_their_rules_and_get_no_new_ones() {
+        let hosts = [saved("db", "d", 22, None)];
+        let rows = rows("Host db\n  HostName d\n  LocalForward 3306 d:3306\n", &hosts);
+        let plan = plan_import(&rows, &rows, &hosts, None);
+        assert!(plan.forwards.is_empty() && plan.skipped_forwards == 0);
     }
 }

@@ -4,8 +4,9 @@
 //! passes the home directory for `~` expansion).
 //!
 //! Supported: `Host` blocks with several names (one entry per name), `HostName`,
-//! `User`, `Port`, `IdentityFile`, `ProxyJump` (comma list, `none`); keywords are
-//! case-insensitive; `Key Value` and `Key=Value`; double-quoted values; comments.
+//! `User`, `Port`, `IdentityFile`, `ProxyJump` (comma list, `none`), `LocalForward`,
+//! `RemoteForward` and `DynamicForward`; keywords are case-insensitive; `Key Value` and
+//! `Key=Value`; double-quoted values; comments.
 //!
 //! Settings follow OpenSSH: for each alias, all `Host` blocks are walked in file
 //! order; a block applies if one of its patterns (`*` and `?` wildcards) matches
@@ -20,8 +21,35 @@
 //!   their settings still apply to the aliases they match.
 //! - `Match` blocks are skipped up to the next `Host` ([`ParsedConfig::match_blocks`]).
 //! - `Include` is not followed; its arguments are reported in [`ParsedConfig::includes`].
+//! - Unlike the other keywords, forwardings add up: every forwarding of every block that
+//!   applies to an alias belongs to it. The ones that cannot be imported (Unix-domain socket
+//!   paths, `RemoteForward` with a port only — OpenSSH's remote SOCKS mode — and malformed lines)
+//!   are counted in [`SshConfigEntry::skipped_forwards`].
 
 use std::path::{Path, PathBuf};
+
+/// Which of the three kinds of forwarding a config line asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardDirective {
+    /// `LocalForward`.
+    Local,
+    /// `RemoteForward`.
+    Remote,
+    /// `DynamicForward`.
+    Dynamic,
+}
+
+/// One port forwarding of a host, as written: the addresses are not checked here (the forwarding
+/// engine's parser does that, with its own error messages).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigForward {
+    /// The kind of forwarding.
+    pub kind: ForwardDirective,
+    /// `[bind:]port` (`[::1]:8080`, `127.0.0.1:8080`, `8080`); a leading `*:` is written `0.0.0.0:`.
+    pub listen: String,
+    /// `host:port` the forwarding leads to; `None` for `DynamicForward`.
+    pub target: Option<String>,
+}
 
 /// One host alias with its settings, defaults already applied.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -38,6 +66,10 @@ pub struct SshConfigEntry {
     pub identity_file: Option<PathBuf>,
     /// `ProxyJump` entries in order (`user@host:port` specs or aliases); empty for none.
     pub proxy_jump: Vec<String>,
+    /// Every `LocalForward` / `RemoteForward` / `DynamicForward` that applies, in file order.
+    pub forwards: Vec<ConfigForward>,
+    /// How many forwardings that apply could not be taken over (see the module docs).
+    pub skipped_forwards: usize,
 }
 
 /// Result of parsing a configuration file.
@@ -61,6 +93,9 @@ struct Settings {
     port: Option<u16>,
     identity_file: Option<PathBuf>,
     proxy_jump: Option<Vec<String>>,
+    /// Forwardings add up instead of the first one winning.
+    forwards: Vec<ConfigForward>,
+    skipped_forwards: usize,
 }
 
 impl Settings {
@@ -71,6 +106,8 @@ impl Settings {
         self.port = self.port.or(other.port);
         self.identity_file = self.identity_file.take().or_else(|| other.identity_file.clone());
         self.proxy_jump = self.proxy_jump.take().or_else(|| other.proxy_jump.clone());
+        self.forwards.extend(other.forwards.iter().cloned());
+        self.skipped_forwards += other.skipped_forwards;
     }
 }
 
@@ -133,6 +170,15 @@ pub fn parse_ssh_config(text: &str, home: Option<&Path>) -> ParsedConfig {
                 current = Current::Match;
             }
             "include" => parsed.includes.extend(args),
+            key @ ("localforward" | "remoteforward" | "dynamicforward") => {
+                if let Current::Block(index) = current {
+                    let settings = &mut blocks[index].settings;
+                    match parse_forward(key, &args) {
+                        Some(forward) => settings.forwards.push(forward),
+                        None => settings.skipped_forwards += 1,
+                    }
+                }
+            }
             key @ ("hostname" | "user" | "port" | "identityfile" | "proxyjump") => {
                 // A jump list may be written with spaces around the commas: take it whole.
                 let value = if key == "proxyjump" { Some(args.join(",")) } else { args.into_iter().next() };
@@ -159,10 +205,34 @@ pub fn parse_ssh_config(text: &str, home: Option<&Path>) -> ParsedConfig {
                 port: resolved.port,
                 identity_file: resolved.identity_file,
                 proxy_jump: resolved.proxy_jump.unwrap_or_default(),
+                forwards: resolved.forwards,
+                skipped_forwards: resolved.skipped_forwards,
             }
         })
         .collect();
     parsed
+}
+
+/// Reads the arguments of a forwarding line. `None` for what is not taken over: Unix-domain
+/// socket paths, `RemoteForward` with only a port (remote SOCKS) and the wrong number of arguments.
+fn parse_forward(keyword: &str, args: &[String]) -> Option<ConfigForward> {
+    if args.iter().any(|arg| arg.contains('/')) {
+        return None;
+    }
+    // `*` binds to every address.
+    let listen = |arg: &str| arg.strip_prefix("*:").map_or_else(|| arg.to_string(), |rest| format!("0.0.0.0:{rest}"));
+    match (keyword, args) {
+        ("localforward", [bind, target]) => {
+            Some(ConfigForward { kind: ForwardDirective::Local, listen: listen(bind), target: Some(target.clone()) })
+        }
+        ("remoteforward", [bind, target]) => {
+            Some(ConfigForward { kind: ForwardDirective::Remote, listen: listen(bind), target: Some(target.clone()) })
+        }
+        ("dynamicforward", [bind]) => {
+            Some(ConfigForward { kind: ForwardDirective::Dynamic, listen: listen(bind), target: None })
+        }
+        _ => None,
+    }
 }
 
 /// Case-insensitive `*` / `?` wildcard match, as used for host patterns.
@@ -297,6 +367,8 @@ mod tests {
                 port: Some(2222),
                 identity_file: Some(PathBuf::from("/Users/me/.ssh/web_ed25519")),
                 proxy_jump: vec!["bastion".into()],
+                forwards: Vec::new(),
+                skipped_forwards: 0,
             }]
         );
         assert!(parsed.includes.is_empty() && parsed.skipped_patterns.is_empty() && parsed.match_blocks == 0);
@@ -518,5 +590,89 @@ mod tests {
     fn keyword_without_value_is_ignored() {
         let parsed = parse("Host a\n  User\n  HostName\n  Port\n");
         assert_eq!(parsed.entries, [SshConfigEntry { alias: "a".into(), ..Default::default() }]);
+    }
+
+    fn forwards(parsed: &ParsedConfig, alias: &str) -> Vec<(ForwardDirective, String, Option<String>)> {
+        entry(parsed, alias).forwards.iter().map(|f| (f.kind, f.listen.clone(), f.target.clone())).collect()
+    }
+
+    #[test]
+    fn the_three_forwardings_in_their_usual_spellings() {
+        let parsed = parse(
+            "Host db\n  HostName 10.0.2.8\n  LocalForward 3306 10.0.2.8:3306\n  LocalForward 127.0.0.1:5432 db.internal:5432\n  LocalForward [::1]:6379 [fd00::5]:6379\n  RemoteForward 9000 localhost:3000\n  RemoteForward 0.0.0.0:8080 [::1]:80\n  DynamicForward 1080\n  DynamicForward [::1]:1081\n  DynamicForward *:1082\n",
+        );
+        use ForwardDirective::*;
+        let line = |kind, listen: &str, target: Option<&str>| (kind, listen.to_string(), target.map(String::from));
+        assert_eq!(
+            forwards(&parsed, "db"),
+            [
+                line(Local, "3306", Some("10.0.2.8:3306")),
+                line(Local, "127.0.0.1:5432", Some("db.internal:5432")),
+                line(Local, "[::1]:6379", Some("[fd00::5]:6379")),
+                line(Remote, "9000", Some("localhost:3000")),
+                line(Remote, "0.0.0.0:8080", Some("[::1]:80")),
+                line(Dynamic, "1080", None),
+                line(Dynamic, "[::1]:1081", None),
+                line(Dynamic, "0.0.0.0:1082", None),
+            ]
+        );
+        assert_eq!(entry(&parsed, "db").skipped_forwards, 0);
+    }
+
+    #[test]
+    fn forwarding_keywords_are_case_insensitive_and_take_equals() {
+        let parsed = parse("Host a\n  localforward 1 h:2\n  LOCALFORWARD=3 h:4\n  DynamicForward = 5\n");
+        assert_eq!(entry(&parsed, "a").forwards.len(), 3);
+        assert_eq!(entry(&parsed, "a").forwards[1].listen, "3");
+    }
+
+    #[test]
+    fn quoted_arguments_keep_their_spaces_out_of_the_way() {
+        let parsed = parse("Host a\n  LocalForward \"8080\" \"web.internal:80\"\n");
+        assert_eq!(
+            forwards(&parsed, "a"),
+            [(ForwardDirective::Local, "8080".to_string(), Some("web.internal:80".to_string()))]
+        );
+    }
+
+    #[test]
+    fn unix_sockets_remote_socks_and_malformed_lines_are_counted_not_imported() {
+        let parsed = parse(
+            "Host a\n  LocalForward 5432 /var/run/postgresql/.s.PGSQL.5432\n  LocalForward /tmp/local.sock host:22\n  RemoteForward 1080\n  RemoteForward 9000\n  DynamicForward /tmp/socks.sock\n  LocalForward 3306\n  LocalForward 1 h:2 extra\n  DynamicForward\n  LocalForward 7000 ok:7000\n",
+        );
+        assert_eq!(
+            forwards(&parsed, "a"),
+            [(ForwardDirective::Local, "7000".to_string(), Some("ok:7000".to_string()))],
+            "only the well-formed one is taken over"
+        );
+        assert_eq!(
+            entry(&parsed, "a").skipped_forwards,
+            8,
+            "every other line is counted (an empty `DynamicForward` has no argument at all)"
+        );
+    }
+
+    #[test]
+    fn forwardings_of_every_applicable_block_add_up_in_file_order() {
+        let parsed = parse(
+            "Host *\n  LocalForward 9999 monitor:9999\nHost web\n  HostName w\n  LocalForward 8080 w:80\nHost w*\n  DynamicForward 1080\nHost db\n  HostName d\n  LocalForward 3306 d:3306\n",
+        );
+        assert_eq!(forwards(&parsed, "web").len(), 3, "the shared ones and its own");
+        assert_eq!(forwards(&parsed, "web")[0].1, "9999", "in file order: Host * came first");
+        assert_eq!(forwards(&parsed, "web")[1].1, "8080");
+        assert_eq!(forwards(&parsed, "web")[2].0, ForwardDirective::Dynamic);
+        assert_eq!(forwards(&parsed, "db").iter().map(|f| f.1.as_str()).collect::<Vec<_>>(), ["9999", "3306"]);
+    }
+
+    #[test]
+    fn skipped_forwardings_of_a_shared_block_count_for_each_host() {
+        let parsed = parse("Host *\n  RemoteForward 1080\nHost a\n  HostName a\nHost b\n  HostName b\n");
+        assert_eq!((entry(&parsed, "a").skipped_forwards, entry(&parsed, "b").skipped_forwards), (1, 1));
+    }
+
+    #[test]
+    fn forwardings_after_a_match_block_belong_to_nobody() {
+        let parsed = parse("Host a\n  LocalForward 1 h:1\nMatch all\n  LocalForward 2 h:2\n");
+        assert_eq!(forwards(&parsed, "a").len(), 1);
     }
 }

@@ -86,10 +86,13 @@ impl Workspace {
             Some(Ok(text)) => {
                 let parsed = parse_ssh_config(&text, home.as_deref());
                 let rows = candidates(&parsed, &self.book.hosts);
+                let importable = rows.iter().filter(|row| row.existing.is_none());
                 let notes = ImportNotes {
                     includes: parsed.includes,
                     skipped_patterns: parsed.skipped_patterns,
                     match_blocks: parsed.match_blocks,
+                    forwards: importable.clone().map(|row| row.forwards.len()).sum(),
+                    skipped_forwards: importable.map(|row| row.skipped_forwards).sum(),
                 };
                 let unavailable =
                     rows.is_empty().then(|| "~/.ssh/config 里没有可导入的具体主机（只有通配符条目）。".to_string());

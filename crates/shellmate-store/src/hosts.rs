@@ -56,11 +56,27 @@ const MIGRATIONS: &[&str] = &[
         value  TEXT NOT NULL
     );
     ",
+    // v3: port forwarding rules of a host (the deletion of the host takes them along).
+    "
+    CREATE TABLE forward_rules (
+        id           TEXT PRIMARY KEY NOT NULL,
+        host_id      TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+        kind         TEXT NOT NULL CHECK (kind IN ('L', 'R', 'D')),
+        name         TEXT NOT NULL,
+        listen_host  TEXT NOT NULL,
+        listen_port  INTEGER NOT NULL,
+        target_host  TEXT,
+        target_port  INTEGER,
+        enabled      INTEGER NOT NULL DEFAULT 1,
+        sort         INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX forward_rules_by_host ON forward_rules(host_id, sort);
+    ",
 ];
 
 /// The host library.
 pub struct HostStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl HostStore {
@@ -175,35 +191,7 @@ impl HostStore {
     /// host's jump chain would loop back to itself.
     pub fn save_hosts(&mut self, hosts: &[Host]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let mut known: HashSet<String> =
-            tx.prepare("SELECT id FROM hosts")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
-        known.extend(hosts.iter().map(|h| h.id.as_str().to_string()));
-        for host in hosts {
-            if let Some(group) = &host.group {
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM groups WHERE id = ?1)",
-                    params![group.as_str()],
-                    |row| row.get(0),
-                )?;
-                if !exists {
-                    return Err(StoreError::GroupNotFound(group.clone()));
-                }
-            }
-            if let Some(missing) = host.jump.iter().find(|j| !known.contains(j.as_str())) {
-                return Err(StoreError::MissingJump { host: host.name.clone(), jump: missing.clone() });
-            }
-        }
-
-        // Rows first, then jump links: a link may point at a host later in the batch.
-        for host in hosts {
-            write_host_row(&tx, host)?;
-        }
-        for host in hosts {
-            write_jumps(&tx, host)?;
-        }
-        for host in hosts {
-            resolve(&tx, &host.id)?;
-        }
+        write_hosts(&tx, hosts)?;
         tx.commit()?;
         Ok(())
     }
@@ -322,6 +310,12 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Brings a database to `version` (test helper: what an older release would have left behind).
+#[cfg(test)]
+pub(crate) fn migrate_for_tests(conn: &mut Connection, version: usize) {
+    migrate(conn, &MIGRATIONS[..version]).unwrap();
+}
+
 // ---- reading ---------------------------------------------------------------
 
 fn load_groups(conn: &Connection) -> Result<Vec<Group>> {
@@ -427,6 +421,41 @@ fn relations(
 }
 
 // ---- writing ---------------------------------------------------------------
+
+/// The checks and writes of [`HostStore::save_hosts`], inside the caller's transaction.
+pub(crate) fn write_hosts(tx: &Transaction<'_>, hosts: &[Host]) -> Result<()> {
+    let mut known: HashSet<String> =
+        tx.prepare("SELECT id FROM hosts")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    known.extend(hosts.iter().map(|h| h.id.as_str().to_string()));
+    for host in hosts {
+        if let Some(group) = &host.group {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM groups WHERE id = ?1)",
+                params![group.as_str()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::GroupNotFound(group.clone()));
+            }
+        }
+        if let Some(missing) = host.jump.iter().find(|j| !known.contains(j.as_str())) {
+            return Err(StoreError::MissingJump { host: host.name.clone(), jump: missing.clone() });
+        }
+    }
+
+    // Rows first, then jump links: a link may point at a host later in the batch.
+    for host in hosts {
+        write_host_row(tx, host)?;
+    }
+    for host in hosts {
+        write_jumps(tx, host)?;
+    }
+    for host in hosts {
+        resolve(tx, &host.id)?;
+    }
+    Ok(())
+}
+
 
 fn write_host_row(tx: &Transaction<'_>, host: &Host) -> Result<()> {
     tx.execute(
@@ -572,7 +601,7 @@ mod tests {
     fn fresh_database_gets_every_migration() {
         let store = HostStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        for table in ["groups", "hosts", "host_tags", "host_jumps", "settings"] {
+        for table in ["groups", "hosts", "host_tags", "host_jumps", "settings", "forward_rules"] {
             let exists: bool = store
                 .conn
                 .query_row(
@@ -660,7 +689,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", 5).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 5, supported: 2 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v5），当前 Shellmate 只支持到 v2，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 5, supported: 3 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v5），当前 Shellmate 只支持到 v3，请升级后再试");
     }
 }

@@ -274,13 +274,16 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
         }
         "import" => {
             let book = workspace.read(cx).book();
-            let text = "Host *\n  User admin\nHost prod-web-01\n  HostName 10.0.1.21\n  User deploy\nHost build\n  HostName build.corp.io\n  IdentityFile ~/.ssh/id_work\nHost db-replica\n  HostName 10.0.2.9\n  User dba\n  ProxyJump bastion\nHost bastion\n  HostName bastion.corp.io\n  Port 2222\n  User ops\nHost *.corp.io !build.corp.io\n  ForwardAgent yes\nInclude ~/.ssh/config.d/*\n";
+            let text = "Host *\n  User admin\nHost prod-web-01\n  HostName 10.0.1.21\n  User deploy\n  LocalForward 3306 10.0.2.8:3306\n  DynamicForward 1080\nHost build\n  HostName build.corp.io\n  IdentityFile ~/.ssh/id_work\n  RemoteForward 1080\nHost db-replica\n  HostName 10.0.2.9\n  User dba\n  ProxyJump bastion\n  LocalForward 5432 db.internal:5432\nHost bastion\n  HostName bastion.corp.io\n  Port 2222\n  User ops\nHost *.corp.io !build.corp.io\n  ForwardAgent yes\nInclude ~/.ssh/config.d/*\n";
             let parsed = shellmate_core::parse_ssh_config(text, std::env::home_dir().as_deref());
             let rows = shellmate_core::candidates(&parsed, &book.hosts);
+            let importable = rows.iter().filter(|row| row.existing.is_none());
             let notes = ImportNotes {
                 includes: parsed.includes,
                 skipped_patterns: parsed.skipped_patterns,
                 match_blocks: parsed.match_blocks,
+                forwards: importable.clone().map(|row| row.forwards.len()).sum(),
+                skipped_forwards: importable.map(|row| row.skipped_forwards).sum(),
             };
             let groups = book.groups.iter().map(|g| g.name.clone()).collect();
             ImportDialog::open(workspace.downgrade(), rows, notes, None, groups, window, cx);
