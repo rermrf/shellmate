@@ -82,3 +82,14 @@ M3 需要一台有 **systemd 与 Docker** 的 Linux 主机。建议用 OrbStack 
 并入 M2 一起修的小问题：本机跑探测脚本的测试会在开发机上执行 `sudo -n true`（改为桩命令目录，不碰本机 sudo）；转义时以 `=` 开头的词也加引号（zsh 的 `=cmd` 展开）；"分析目录"改用 `du -xh -d 1`（busybox 的 du 没有 `--max-depth`）；`/proc/[pid]/stat` 只截 28 个字段，进程名含多个空格时 RSS 等字段可能被截掉——补样本测试，必要时多截几个字段。
 
 测试机：用户同意后已建 OrbStack 机器 `shellmate-mon`（Ubuntu 24.04、`/bin/sh` 为 dash、systemd 255、Docker 29.1.3），`tester@shellmate-mon.orb.local:22`，与 `shellmate-e2e` 同一把测试密钥，免密 sudo，在 docker 组。只供测试使用；机器会挂载 Mac 的文件（`/Users`、`/mnt/mac`），测试不得触碰这些路径。
+
+## M2 review 结论（2026-11-16，通过）
+
+提交：`d900929`（M1 遗留项：`=` 开头加引号、`du -xh -d 1`、`/proc/[pid]/stat` 取 40 个字段并补带空格进程名的样本、本机测试改用桩命令不再碰开发机的 sudo / docker；另外 df 跳过 virtiofs 等宿主机共享挂载、同一设备只算一次）、`d021a06`（监控页：概览与进程，接入工作区）。
+
+- 接线：每条连接一个 `Monitor`，该连接任一标签显示监控时采集，离开 10 秒后停止，切换子页不重启；断线灰显并标"等待重连"，重连后新采集器启动；关闭最后一个标签后远端 sshd 会话、采集器与本机连接 6 秒内全部归零（两台主机）。
+- 头部标签与子页：两台主机分别显示"sudo 需密码 / 无 Docker / 无 systemd"（Alpine）与"sudo 免密 / docker 组 / systemd 255"（Ubuntu）；服务与 Docker 子页在 Alpine 为对应空状态，在 Ubuntu 为"下一版本提供"占位。
+- 概览、进程按原型；进程操作 TERM / HUP / 降低优先级 / strace / KILL（确认）：Ubuntu 上 root 进程经 `sudo -n` 结束；Alpine（sudo 需密码）新开标签把 `sudo kill -TERM <pid>` 敲好但不执行。
+- 复跑：clippy 零警告；`cargo test --workspace` 929 通过；e2e 监控 7/7（两台主机）、SSH 8/8、SFTP 17/17、forward 7/7。采集成本约 320 个进程时 Alpine 0.96%、Ubuntu 0.60% 单核，约 1.2 MB/分钟。
+
+并入 M3 一起改：8 核时概览右栏被截断（核数多于 4 时分两列，概览在窗口矮时可滚动）；刚开始采样时走势线只剩右下角一小段或一根尖刺（点不够时铺满宽度、网络图设最小量程）；进程列表里会出现 Shellmate 自己的采集脚本（隐藏它及其子进程）；"在终端中执行"用固定 700 ms 后粘贴，改为等 shell 首次输出后安静一会儿再粘贴。
