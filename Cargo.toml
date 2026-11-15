@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# vendored crates are built as dependencies, not linted or tested with the workspace
+exclude = ["vendor/russh"]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,3 +41,7 @@ similar = "2"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.42", features = ["bundled"] }
 keyring = "4.2"
+
+# russh with per-channel flow control (see vendor/russh/SHELLMATE-PATCH.md)
+[patch.crates-io]
+russh = { path = "vendor/russh" }
