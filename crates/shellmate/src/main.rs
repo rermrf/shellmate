@@ -5,6 +5,7 @@ mod connect;
 mod dialogs;
 mod editor;
 mod files;
+mod forward;
 mod library;
 mod reconnect;
 #[cfg(debug_assertions)]

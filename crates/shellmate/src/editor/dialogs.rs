@@ -85,7 +85,7 @@ impl Render for ConflictDialog {
             None => format!("{} 在你打开之后被修改。", self.file),
         };
         let diff = (!self.snippet.is_empty()).then(|| {
-            div()
+            let lines = div()
                 .flex()
                 .flex_col()
                 .px(px(12.))
@@ -108,7 +108,9 @@ impl Render for ConflictDialog {
                         .text_color(color)
                         .when(matches!(line, DiffLine::Hunk(_)), |d| d.font_weight(FontWeight::SEMIBOLD))
                         .child(line.text())
-                }))
+                }));
+            let legend = div().text_size(px(11.5)).text_color(p.tx3).child("- 你的版本 · + 远端版本");
+            div().flex().flex_col().gap(px(6.)).child(legend).child(lines)
         });
         let note = if !self.remote_is_text {
             Some(

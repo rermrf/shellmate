@@ -176,7 +176,7 @@ pub fn panel_hint(panel: Panel) -> &'static str {
     match panel {
         Panel::Terminal => "",
         Panel::Files => "",
-        Panel::Forward => "端口转发（P4 实现）",
+        Panel::Forward => "",
         Panel::Monitor => "服务器监控（P5 实现）",
     }
 }
@@ -238,7 +238,12 @@ impl Workspace {
             if group.has_open_prompt() {
                 window.close_all_dialogs(cx);
             }
+            // The rules of the host go on with another connection to it, if there is one.
+            let handoff = group.forward.as_ref().map(|forward| (group.key.host().clone(), forward.rules.clone()));
             drop(group);
+            if let Some((host, rules)) = handoff {
+                self.forward_handed_over(&host, rules, cx);
+            }
         }
     }
 
@@ -255,6 +260,7 @@ impl Workspace {
         let key = PoolKey::of(chain, &connect::default_user());
         self.groups.push(ConnGroup::new(id, key, machine, memory));
         self.attach_link(id, window, cx);
+        self.attach_forwarder(id, window, cx);
         id
     }
 
@@ -289,6 +295,7 @@ impl Workspace {
             exited: false,
             panel: Panel::Terminal,
             files: None,
+            forward: None,
             kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
             _subscription: subscription,
         });
@@ -341,6 +348,20 @@ impl Workspace {
             Some(id) => self.connect_host(&id, window, cx),
             None => log::warn!("no saved host called {name:?}"),
         }
+    }
+
+    /// Opens a tab on a second connection to the host of the current tab, as ⌘⇧T does when the
+    /// connection of the source cannot be shared (debug review hook).
+    #[cfg(debug_assertions)]
+    pub(crate) fn demo_second_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ssh) = self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.ssh()) else { return };
+        let (source_group, host_id) = (ssh.group, ssh.host.id.clone());
+        let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
+        let title = format!("{} · 2", host.name);
+        let memory = self.group(source_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
+        let group = self.new_group(&chain, Reconnect::initial(), memory, window, cx);
+        self.push_ssh_tab(title, host, chain, group, window, cx);
+        self.launch_attempt(group, window, cx);
     }
 
     // ---- connecting ------------------------------------------------------------------------
@@ -595,6 +616,7 @@ impl Workspace {
         self.open_channels_for_waiting(group_id, window, cx);
         if let Some(live) = live {
             self.link_connected(group_id, &live, cx);
+            self.forward_connected(group_id, &live, cx);
         }
 
         if !reconnected && let Some(host_id) = first_host {
@@ -729,8 +751,10 @@ impl Workspace {
             group.declined = false;
             group.manual = false;
         }
-        // The SFTP session went with the connection; its transfers wait for the next one.
+        // The SFTP session went with the connection; its transfers wait for the next one. The
+        // forwards keep their local ports and wait too.
         self.link_lost(group_id, cx);
+        self.forward_lost(group_id, cx);
         self.step_group(group_id, Input::Lost, window, cx);
         if let Some(ssh) = self.ssh_mut(session_id)
             && ssh.status == SshStatus::Connected
@@ -934,7 +958,7 @@ mod tests {
     #[test]
     fn panels_name_the_phase_that_brings_them() {
         assert_eq!(panel_hint(Panel::Files), "", "the files panel is there for SSH sessions");
-        assert_eq!(panel_hint(Panel::Forward), "端口转发（P4 实现）");
+        assert_eq!(panel_hint(Panel::Forward), "", "the port forwarding panel is there for SSH sessions");
         assert_eq!(panel_hint(Panel::Monitor), "服务器监控（P5 实现）");
     }
 

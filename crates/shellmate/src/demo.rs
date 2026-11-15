@@ -66,6 +66,88 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             .detach();
         return;
     }
+    // `forward:<host>:<scenario>` connects the host and plays a scenario on the port forwarding panel:
+    // `empty`, `live` (the rules of the host as they run), `form`, `form-d`, `form-r`, `form-clean` (the
+    // new-rule form with problems and warnings), `cards`, `states`, `temporary` (cards made up for the
+    // picture), `close` (the question before the last tab closes), `close-now`, `toggle=<rule name>`,
+    // `toggle-off=<rule name>`, `handover` (a second connection, then the first tab closes), `retry=<rule
+    // name>`, `delete=<rule name>`, `reconnect` (logs how the rules stand around a loss the script causes).
+    // Everything is done by calling the panel and the workspace.
+    if let Some(args) = name.strip_prefix("forward:") {
+        let (host, scenario) = args.split_once(':').unwrap_or((args, ""));
+        let (scenario, arg) = scenario.split_once('=').unwrap_or((scenario, ""));
+        let (host, arg) = (host.to_string(), arg.to_string());
+        workspace.update(cx, |workspace, cx| workspace.connect_by_name(&host, window, cx));
+        let form = |values: &'static str| -> Vec<(u64, &'static str, String)> {
+            vec![(3500, "show", String::new()), (4200, "form", values.into())]
+        };
+        let steps: Vec<(u64, &'static str, String)> = match scenario {
+            "form" => {
+                let mut steps = form("L|MySQL 主库|0.0.0.0:3306|db.internal");
+                steps.push((5200, "submit-form", String::new()));
+                steps
+            }
+            "form-d" => form("D||0.0.0.0:1080|"),
+            "form-r" => form("R||0.0.0.0:9000|localhost:3000"),
+            "form-clean" => form("L|MySQL 主库|5433|db.internal:5432"),
+            "cards" | "states" | "temporary" => vec![(3500, "show", String::new()), (4200, "cards", scenario.into())],
+            "close" => vec![(3500, "show", String::new()), (7000, "close", String::new())],
+            "close-now" => {
+                vec![(3500, "show", String::new()), (8000, "log", "before".into()), (8500, "close-now", String::new())]
+            }
+            "toggle" => vec![
+                (3500, "show", String::new()),
+                (7000, "log", "before".into()),
+                (8000, "toggle-off", arg.clone()),
+                (9500, "log", "off".into()),
+                (11000, "toggle-on", arg.clone()),
+                (13000, "log", "on".into()),
+            ],
+            "toggle-off" => {
+                vec![(3500, "show", String::new()), (7000, "toggle-off", arg.clone()), (8500, "log", "off".into())]
+            }
+            // A second connection to the host; the first tab closes later and the rules move over.
+            "handover" => vec![
+                (3500, "show", String::new()),
+                (7000, "log", "owner".into()),
+                (7500, "second", String::new()),
+                (10500, "show", String::new()),
+                (11200, "log", "two connections".into()),
+                (13500, "close-first", String::new()),
+                (15500, "log", "handed over".into()),
+                (16000, "log", "later".into()),
+            ],
+            "retry" => vec![
+                (3500, "show", String::new()),
+                (7000, "log", "before".into()),
+                (8000, "retry", arg.clone()),
+                (9500, "log", "after".into()),
+            ],
+            "delete" => vec![(3500, "show", String::new()), (7000, "delete", arg.clone())],
+            "reconnect" => vec![
+                (3500, "show", String::new()),
+                (7000, "log", "up".into()),
+                (13000, "log", "lost".into()),
+                (22000, "log", "back".into()),
+                (26000, "log", "later".into()),
+            ],
+            _ => vec![(3500, "show", String::new()), (7000, "log", "live".into())],
+        };
+        let workspace = workspace.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let mut last = 0;
+                for (at_ms, step, arg) in steps {
+                    cx.background_executor().timer(std::time::Duration::from_millis(at_ms - last)).await;
+                    last = at_ms;
+                    workspace
+                        .update_in(cx, |workspace, window, cx| workspace.demo_forward_step(step, &arg, window, cx))
+                        .ok();
+                }
+            })
+            .detach();
+        return;
+    }
     // `files-refresh:<host>:<dir>` shows the panel there and refreshes it 9 seconds later (as a click
     // on 刷新 would), so that a script can kill the server's SFTP process in between.
     if let Some(args) = name.strip_prefix("files-refresh:") {

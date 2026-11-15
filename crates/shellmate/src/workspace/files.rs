@@ -22,7 +22,7 @@ use super::ssh::SshStatus;
 use super::{Panel, Workspace};
 use crate::dialogs::clash::{Answer, ClashDialog};
 use crate::dialogs::confirm::ConfirmDialog;
-use crate::editor::refusal::offers_download;
+use crate::editor::refusal::{dialog_text, offers_download};
 use crate::editor::view::{EditorEvent, FileEditor};
 use crate::files::model::LinkStatus;
 use crate::files::panel::{FilesEvent, FilesPanel};
@@ -287,13 +287,16 @@ impl Workspace {
         let Some(session) = self.sessions.get(ix) else { return };
         let available = match panel {
             Panel::Terminal => true,
-            Panel::Files => session.ssh().is_some(),
-            Panel::Forward | Panel::Monitor => false,
+            Panel::Files | Panel::Forward => session.ssh().is_some(),
+            Panel::Monitor => false,
         };
         if !available {
             return;
         }
         if panel == Panel::Files && !self.ensure_files_tab(ix, window, cx) {
+            return;
+        }
+        if panel == Panel::Forward && !self.ensure_forward_tab(ix, window, cx) {
             return;
         }
         self.sessions[ix].panel = panel;
@@ -392,7 +395,7 @@ impl Workspace {
             let panel = panel.panel.downgrade();
             ConfirmDialog::open(
                 format!("无法用内置编辑器打开 {name}"),
-                error.to_string(),
+                dialog_text(error),
                 "下载",
                 false,
                 move |_, cx| {

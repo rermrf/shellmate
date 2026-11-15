@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use gpui::{Entity, Task};
 use shellmate_core::{Host, HostId};
+use shellmate_forward::{ForwardRule, Forwarder};
 use shellmate_sftp::link::SftpLink;
 use shellmate_sftp::transfer::ItemId;
 use shellmate_ssh::{Connection, WeakConnection};
@@ -34,6 +35,11 @@ pub struct PoolKey {
 }
 
 impl PoolKey {
+    /// The saved host the connection is for.
+    pub fn host(&self) -> &HostId {
+        &self.host
+    }
+
     /// The key of the resolved `chain` (jump hosts first, the target last).
     pub fn of(chain: &[Host], default_user: &str) -> Self {
         Self {
@@ -84,6 +90,35 @@ pub struct ClashState {
     pub dismissed: HashSet<ItemId>,
 }
 
+/// The port forwarding of a connection: the engine, and the rules of the host while this
+/// connection is the one that carries them (see `Workspace::forward_owner`).
+pub struct GroupForward {
+    /// Runs the rules on the SSH runtime; it only holds the connection weakly.
+    pub forwarder: Forwarder,
+    /// The rules of the host, in order (what the panel shows). Only meaningful for the owner.
+    pub rules: Vec<ForwardRule>,
+    /// The rules were read from the host library (or are the ones kept in memory).
+    pub loaded: bool,
+    /// The enabled rules were started (when the connection first came up).
+    pub started: bool,
+    /// The UI task following the engine's events; it ends with the group.
+    pub _task: Option<Task<()>>,
+}
+
+impl Drop for GroupForward {
+    /// A connection nobody is on any more takes its forwards with it: listeners close and forwarded
+    /// connections are aborted, so nothing keeps the SSH connection open.
+    fn drop(&mut self) {
+        self.forwarder.shutdown();
+    }
+}
+
+/// The connection that carries the rules of `host`: of the connections to it that have a forwarder,
+/// the oldest (lowest number). The others show the same rules and take them over when it goes.
+pub fn forward_owner<'a>(groups: impl IntoIterator<Item = &'a ConnGroup>, host: &HostId) -> Option<usize> {
+    groups.into_iter().filter(|group| group.forward.is_some() && group.key.host() == host).map(|group| group.id).min()
+}
+
 /// One connection and the tabs on it.
 pub struct ConnGroup {
     pub id: usize,
@@ -118,6 +153,8 @@ pub struct ConnGroup {
     pub transfers: Option<Entity<TransferList>>,
     /// The dialog about names that exist.
     pub clash: ClashState,
+    /// The port forwarding of the connection (`None` only if the SSH runtime could not be started).
+    pub forward: Option<GroupForward>,
 }
 
 impl ConnGroup {
@@ -139,6 +176,7 @@ impl ConnGroup {
             link_tasks: Vec::new(),
             transfers: None,
             clash: ClashState::default(),
+            forward: None,
         }
     }
 
@@ -242,6 +280,75 @@ mod tests {
         // Closing the last tab drops the group; with the link gone nothing holds the SFTP session
         // (and through it the connection) open any more.
         assert!(changes.recv().await.is_err(), "nobody is left to report changes");
+    }
+
+    fn with_forwarding(id: usize, host: &Host) -> ConnGroup {
+        let (events, _changes) = async_channel::unbounded();
+        let forwarder = Forwarder::new(tokio::runtime::Handle::current(), events);
+        let mut group = ConnGroup::new(
+            id,
+            PoolKey::of(std::slice::from_ref(host), "me"),
+            Reconnect::connected(),
+            AuthMemory::new(),
+        );
+        group.forward = Some(GroupForward { forwarder, rules: Vec::new(), loaded: false, started: false, _task: None });
+        group
+    }
+
+    fn taken(port: u16) -> bool {
+        let bound = std::net::TcpListener::bind(("127.0.0.1", port));
+        matches!(bound, Err(err) if err.kind() == std::io::ErrorKind::AddrInUse)
+    }
+
+    #[tokio::test]
+    async fn dropping_a_group_closes_the_ports_of_its_forwards() {
+        use shellmate_forward::{ForwardKind, RuleId, RuleState};
+
+        let db = host("db");
+        let group = with_forwarding(1, &db);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let rule = ForwardRule::parse(
+            RuleId::generate(),
+            "proxy",
+            ForwardKind::Dynamic,
+            &format!("127.0.0.1:{port}"),
+            "",
+            true,
+        )
+        .unwrap();
+        let forwarder = group.forward.as_ref().unwrap().forwarder.clone();
+        assert_eq!(forwarder.start(rule), RuleState::WaitingReconnect, "no connection was announced to the engine");
+        assert!(taken(port), "the rule holds its port");
+
+        // The last tab closes: the group goes, and nothing keeps the port (or, through the forwarded
+        // connections, the SSH connection) any longer, even though the forwarder is still referenced here.
+        drop(group);
+        for _ in 0..100 {
+            if !taken(port) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!taken(port), "the port is free again");
+        assert_eq!(forwarder.running_rules(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_oldest_connection_to_a_host_carries_its_rules_and_the_next_takes_over() {
+        let (db, web) = (host("db"), host("web"));
+        let (first, second, other) = (with_forwarding(3, &db), with_forwarding(5, &db), with_forwarding(1, &web));
+        let mut without =
+            ConnGroup::new(2, PoolKey::of(std::slice::from_ref(&db), "me"), Reconnect::connected(), AuthMemory::new());
+        without.forward = None;
+        let mut groups = vec![second, other, without, first];
+        assert_eq!(forward_owner(&groups, &db.id), Some(3), "the lowest number among those with a forwarder");
+        assert_eq!(forward_owner(&groups, &web.id), Some(1), "each host has its own");
+        assert_eq!(forward_owner(&groups, &host("nobody").id), None);
+
+        groups.retain(|group| group.id != 3);
+        assert_eq!(forward_owner(&groups, &db.id), Some(5), "when the owner goes the next one carries the rules");
+        groups.retain(|group| group.key.host() != &db.id);
+        assert_eq!(forward_owner(&groups, &db.id), None);
     }
 
     #[tokio::test]

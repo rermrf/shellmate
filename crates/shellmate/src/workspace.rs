@@ -29,6 +29,7 @@ use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
 mod files;
+mod forward;
 mod group;
 mod hosts;
 mod ssh;
@@ -117,6 +118,8 @@ struct Session {
     panel: Panel,
     /// The file panel, made the first time the tab shows it (SSH tabs only).
     files: Option<files::FilesTab>,
+    /// The port forwarding panel, made the first time the tab shows it (SSH tabs only).
+    forward: Option<forward::ForwardTab>,
     kind: SessionKind,
     _subscription: Subscription,
 }
@@ -137,6 +140,9 @@ pub struct Workspace {
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
+    /// The host library is a temporary in-memory one (the saved file could not be opened): nothing
+    /// saved in it, rules included, survives the run.
+    library_is_temporary: bool,
     /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
     groups: Vec<group::ConnGroup>,
     active: Option<usize>,
@@ -179,6 +185,7 @@ impl Workspace {
             book,
             sidebar,
             sessions: Vec::new(),
+            library_is_temporary: store_notice.is_some(),
             groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,
@@ -296,6 +303,7 @@ impl Workspace {
             exited: false,
             panel: Panel::Terminal,
             files: None,
+            forward: None,
             kind: SessionKind::Local,
             _subscription: subscription,
         });
@@ -347,7 +355,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Closes the tab at `ix` right away (see [`Workspace::close`] for the confirmation).
+    fn close_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.sessions.len() {
             return;
         }
@@ -598,7 +607,7 @@ impl Workspace {
                 match (session, panel) {
                     (None, _) => item.disabled("没有打开的会话"),
                     (Some(_), Panel::Terminal) => item,
-                    (Some(s), Panel::Files) if s.ssh().is_some() => item,
+                    (Some(s), Panel::Files | Panel::Forward) if s.ssh().is_some() => item,
                     (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
                     (Some(_), other) => item.disabled(other.local_hint()),
                 }
@@ -777,6 +786,9 @@ impl Render for Workspace {
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
             Some(Session { panel: Panel::Files, files: Some(files), .. }) => {
                 div().flex_1().min_h_0().flex().child(files.panel.clone()).into_any_element()
+            }
+            Some(Session { panel: Panel::Forward, forward: Some(forward), .. }) => {
+                div().flex_1().min_h_0().flex().child(forward.panel.clone()).into_any_element()
             }
             Some(session) => self.render_terminal_card(session, cx).into_any_element(),
             None => self.render_empty(cx).into_any_element(),
