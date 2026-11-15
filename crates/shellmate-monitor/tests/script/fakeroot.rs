@@ -62,7 +62,7 @@ impl FakeRoot {
         );
         write(
             proc.join("mounts"),
-            "overlay / overlay rw 0 0\nproc /proc proc rw 0 0\n/dev/vdb1 /config ext4 rw 0 0\n/dev/sda9 /mnt/with\\040space ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\nserver:/export /nfs nfs4 rw 0 0\n/dev/sdb1 /data xfs rw 0 0\n/dev/sdc1 /boot ext4 rw 0 0\n/dev/loop3 /snap/core/1 squashfs ro 0 0\nsysfs /sys sysfs rw 0 0\nsshfs#me@host: /mnt/remote fuse.sshfs rw 0 0\n",
+            "overlay / overlay rw 0 0\nproc /proc proc rw 0 0\n/dev/vdb1 /config ext4 rw 0 0\n/dev/sda9 /mnt/with\\040space ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\nserver:/export /nfs nfs4 rw 0 0\n/dev/sdb1 /data xfs rw 0 0\n/dev/sdc1 /boot ext4 rw 0 0\n/dev/loop3 /snap/core/1 squashfs ro 0 0\nsysfs /sys sysfs rw 0 0\nsshfs#me@host: /mnt/remote fuse.sshfs rw 0 0\nmac /mnt/mac virtiofs rw 0 0\nmac /Users virtiofs rw 0 0\n/dev/vdb1 /config/bind btrfs rw 0 0\n/dev/sdb1 /data/again xfs rw 0 0\n",
         );
         for line in fixture("procps/proc_stat_lines.txt").lines() {
             let pid = line.split_whitespace().next().unwrap();
@@ -126,5 +126,38 @@ impl FakeRoot {
 
     pub fn bin(&self) -> PathBuf {
         self.path().join("bin")
+    }
+}
+
+/// A bin directory for running the probe on the developer's machine: only the tools the probe needs (as
+/// links to the real ones), and a `sudo`, `docker` and `podman` that do nothing but fail and note that
+/// they were called. A test must never run the real `sudo` or `docker`: the PATH of the probe is this
+/// directory and nothing else.
+pub struct ProbeBin {
+    pub dir: tempfile::TempDir,
+}
+
+impl ProbeBin {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        for tool in ["sh", "uname", "id", "head", "getconf"] {
+            if let Some(path) = std::env::var("PATH").unwrap().split(':').map(|d| Path::new(d).join(tool)).find(|p| p.is_file()) {
+                std::os::unix::fs::symlink(path, dir.path().join(tool)).unwrap();
+            }
+        }
+        for fake in ["sudo", "docker", "podman"] {
+            let path = dir.path().join(fake);
+            fs::write(&path, format!("#!/bin/sh\necho \"{fake} $*\" >> \"$CALLS\"\nexit 1\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn calls_log(&self) -> PathBuf {
+        self.dir.path().join("calls.log")
     }
 }

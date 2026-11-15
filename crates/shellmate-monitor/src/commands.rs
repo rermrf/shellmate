@@ -56,9 +56,15 @@ impl Command {
         &self.argv
     }
 
-    /// The command as a line for a shell: every word quoted where it needs to be.
+    /// The command as a line for a shell: every word quoted where it needs to be. The program is also
+    /// quoted if it has an `=` in it, which would make the line an assignment.
     pub fn line(&self) -> String {
-        quote::join(&self.argv).expect("a command has no NUL bytes")
+        let mut words = Vec::with_capacity(self.argv.len());
+        for (i, word) in self.argv.iter().enumerate() {
+            let quoted = quote::quote(word).expect("a command has no NUL bytes");
+            words.push(if i == 0 && word.contains('=') && !quoted.starts_with('\'') { format!("'{word}'") } else { quoted });
+        }
+        words.join(" ")
     }
 
     /// The command with `prefix` words in front.
@@ -276,10 +282,10 @@ pub fn container_shell(runtime: &str, name: &str, bash: bool) -> Result<Command,
 }
 
 /// The disk analysis the overview offers for a full mount point, for a terminal tab:
-/// `du -xh --max-depth=1 '/mnt/data' | sort -rh | head`.
+/// `du -xh -d 1 '/mnt/data' | sort -rh | head` (`-d 1`, not `--max-depth=1`: BusyBox has no long options).
 pub fn analyze_directory(mount: &str) -> Result<String, BuildError> {
     let mount = quote::quote(mount)?;
-    Ok(format!("du -xh --max-depth=1 {mount} | sort -rh | head"))
+    Ok(format!("du -xh -d 1 {mount} | sort -rh | head"))
 }
 
 #[cfg(test)]
@@ -368,8 +374,9 @@ mod tests {
         assert_eq!(container_logs("docker", "web 1", 100).unwrap().line(), "docker logs -f --tail 100 'web 1'");
         assert_eq!(container_shell("docker", "web-1", true).unwrap().line(), "docker exec -it web-1 bash");
         assert_eq!(container_shell("docker", "web-1", false).unwrap().line(), "docker exec -it web-1 sh");
-        assert_eq!(analyze_directory("/mnt/my data").unwrap(), "du -xh --max-depth=1 '/mnt/my data' | sort -rh | head");
-        assert_eq!(analyze_directory("/"), Ok("du -xh --max-depth=1 / | sort -rh | head".to_string()));
+        assert_eq!(analyze_directory("/mnt/my data").unwrap(), "du -xh -d 1 '/mnt/my data' | sort -rh | head");
+        assert_eq!(Command::new(["FOO=1", "x"]).unwrap().line(), "'FOO=1' x", "a program with = would be an assignment");
+        assert_eq!(analyze_directory("/"), Ok("du -xh -d 1 / | sort -rh | head".to_string()));
     }
 
     #[test]

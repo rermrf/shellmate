@@ -294,6 +294,7 @@ impl Engine {
                 rss_bytes,
                 threads: stat.threads,
                 nice: stat.nice,
+                start_time: stat.starttime,
                 is_collector: command.contains("shellmate-collector"),
             });
         }

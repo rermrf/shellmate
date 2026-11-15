@@ -9,15 +9,18 @@ pub enum QuoteError {
     Nul,
 }
 
-/// `arg` as one shell word: unchanged if it only has characters that are safe everywhere, otherwise in
-/// single quotes with each `'` written as `'\''`. Everything inside single quotes is literal to a POSIX
+/// `arg` as one shell word: unchanged if it only has characters that are safe everywhere (and does not start
+/// with `=`, which zsh expands as `=cmd` to the path of a command), otherwise in single quotes with each `'`
+/// written as `'\''`. Everything inside single quotes is literal to a POSIX
 /// shell (and to bash, zsh and fish, the usual login shells): spaces, `$`, `;`, backticks, newlines,
 /// non-ASCII text.
 pub fn quote(arg: &str) -> Result<String, QuoteError> {
     if arg.contains('\0') {
         return Err(QuoteError::Nul);
     }
-    let plain = !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b));
+    let plain = !arg.is_empty()
+        && !arg.starts_with('=')
+        && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"_@+=:,./-".contains(&b));
     if plain {
         return Ok(arg.to_string());
     }
@@ -53,6 +56,11 @@ mod tests {
         assert_eq!(quote("日本語").unwrap(), "'日本語'");
         assert_eq!(quote("*").unwrap(), "'*'");
         assert_eq!(quote("~").unwrap(), "'~'", "no tilde expansion");
+        assert_eq!(quote("=ls").unwrap(), "'=ls'", "zsh expands =cmd");
+        assert_eq!(quote("=").unwrap(), "'='");
+        assert_eq!(quote("a=b").unwrap(), "a=b", "only a leading = is special");
+        assert_eq!(quote("--tail=100").unwrap(), "--tail=100");
+        assert_eq!(quote("%1").unwrap(), "'%1'", "a job spec in zsh and bash");
         assert_eq!(quote("a\0b"), Err(QuoteError::Nul));
         assert_eq!(join(&["echo", "a b", "c'd"]).unwrap(), r"echo 'a b' 'c'\''d'");
     }
@@ -80,7 +88,10 @@ mod tests {
             "-n",
             "--help",
             "=foo",
+            "=",
             "a=b",
+            "%1",
+            "{a,b}",
         ];
         let script = format!("for a in {}; do printf '%s\\0' \"$a\"; done", join(&values).unwrap());
         let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();

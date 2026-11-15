@@ -24,12 +24,14 @@
 //!   where that is not understood, `ps -o pid=,user=,args=` (BusyBox has no numeric column; its names are
 //!   cut at 8 characters). Which one works is found out once, when the script starts. Without a usable `ps`
 //!   the list falls back to the short names in the stat lines.
-//! * **Process numbers** come from `cut -d" " -f1-28 /proc/[0-9]*/stat`: one fork for all processes, and the
+//! * **Process numbers** come from `cut -d" " -f1-40 /proc/[0-9]*/stat`: one fork for all processes, and the
 //!   lines are cut after the fields the monitor reads (a stat line is 300-400 bytes; the monitor needs
-//!   the first 24 fields, and a name with spaces in it shifts them: 28 covers a name with up to four
-//!   spaces, and for the oddest the memory of that one process is unknown). Reading the files with `read` would cost a system call per byte in dash.
-//! * **Disks:** `df -P -k` is only asked about local file systems from `/proc/mounts`, so a dead NFS
-//!   mount cannot hang the script.
+//!   the first 24 fields, and a name with spaces in it shifts them: a name has at most 15 characters, so
+//!   at most 15 spaces, so at most 16 words, which puts the memory field at 39 at the very most: 40 is
+//!   enough for any name). Reading the files with `read` would cost a system call per byte in dash.
+//! * **Disks:** `df -P -k` is only asked about local file systems from `/proc/mounts` (not network or
+//!   shared-folder mounts: a dead NFS mount cannot hang the script, and a Mac's files shared into a VM are
+//!   never touched), once per device however many times it is mounted.
 //! * **Stopping:** every tick writes a line, so a closed channel is noticed within a second (SIGPIPE, or
 //!   a failed write if SIGPIPE is ignored): the script exits and leaves nothing behind. The first line
 //!   of the script (a comment) names it, for `pgrep -f shellmate-collector`.
@@ -69,7 +71,7 @@ impl CollectorConfig {
             tick: "1".into(),
             proc_root: "/proc".into(),
             sys_root: "/sys".into(),
-            stat_fields: 28,
+            stat_fields: 40,
         }
     }
 }
@@ -138,9 +140,12 @@ slow() {{
   printf "%s slow %s\n" "$T" "$U"
   printf "%s df\n" "$T"
   set --
+  seen=" "
   while read -r dev mnt typ rest; do
-    case $typ in proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|overlay|squashfs|nsfs|autofs|binfmt_misc|bpf|configfs|debugfs|tracefs|securityfs|pstore|mqueue|hugetlbfs|fusectl|selinuxfs|efivarfs|ramfs|rpc_pipefs|nfs|nfs4|cifs|smb3|smbfs|9p|fuse.*|iso9660|udf|ecryptfs|aufs|rootfs) continue;; esac
+    case $typ in proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|overlay|squashfs|nsfs|autofs|binfmt_misc|bpf|configfs|debugfs|tracefs|securityfs|pstore|mqueue|hugetlbfs|fusectl|selinuxfs|efivarfs|ramfs|rpc_pipefs|nfs|nfs4|cifs|smb3|smbfs|9p|virtiofs|vboxsf|vmhgfs|prl_fs|fuse.*|iso9660|udf|ecryptfs|aufs|rootfs) continue;; esac
     case $mnt in *\\*|/proc*|/sys*|/dev*|/run/*|/snap/*|/var/lib/docker/*|/var/lib/containers/*|/var/lib/kubelet/*) continue;; esac
+    case $seen in *" $dev "*) continue;; esac
+    seen="$seen$dev "
     set -- "$@" "$mnt"
   done < $P/mounts
   if [ $# -gt 0 ]; then df -P -k "$@" 2>/dev/null; fi

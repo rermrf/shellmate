@@ -775,27 +775,39 @@ mod tests {
     }
 
     #[test]
-    fn lines_cut_by_the_collector_after_28_fields_still_have_what_is_needed() {
-        // What `cut -d" " -f1-28` leaves of a real container's stat files.
+    fn lines_cut_by_the_collector_after_40_fields_still_have_what_is_needed() {
+        // What `cut -d" " -f1-40` leaves of a real container's stat files.
         let text = fixture("procps/proc_stat_fields.txt");
         let stats: Vec<ProcStat> = text.lines().filter_map(parse_proc_stat).collect();
         assert_eq!(stats.len(), text.lines().count());
         assert!(stats.iter().all(|stat| stat.rss_pages.is_some()), "memory is there for every process");
-        assert!(text.lines().all(|line| line.split(' ').count() <= 28));
+        assert!(text.lines().all(|line| line.split(' ').count() <= 40));
 
-        // A name with up to four spaces shifts the fields but not beyond the cut; with more the memory of that
-        // one process is lost, nothing else.
-        let tail = "S 1 2 3 0 -1 4194560 10 0 0 0 7 9 0 0 20 5 3 0 777 12345678 4242 18446744073709551615 4194304 4194305 140737488 0 0 0";
-        let cut = |comm: &str| {
-            let line = format!("4321 ({comm}) {tail}");
-            line.split(' ').take(28).collect::<Vec<_>>().join(" ")
-        };
-        for comm in ["web", "Web Content", "tmux: server", "a b c d", "a b c d e"] {
-            let stat = parse_proc_stat(&cut(comm)).unwrap_or_else(|| panic!("{comm}"));
-            assert_eq!((stat.comm.as_str(), stat.starttime, stat.rss_pages), (comm, 777, Some(4242)), "{comm}");
+        // A name of 15 characters can hold 15 spaces (16 words, the first and last with the parentheses on
+        // them) and pushes the memory field to the 39th: the cut keeps it for every name.
+        let text = fixture("procps/proc_stat_spaces.txt");
+        let names = ["init", "Web Content", "tmux: server", "a b c d e f g", "a b c d e f g h", "a  b  c  d  e", "  x  ", "               ", "a b c d e f g h"];
+        let stats: Vec<ProcStat> = text.lines().filter_map(parse_proc_stat).collect();
+        assert_eq!(stats.len(), names.len());
+        for (stat, name) in stats.iter().zip(names) {
+            assert_eq!(stat.comm, name);
+            assert_eq!((stat.utime, stat.stime, stat.nice, stat.threads, stat.starttime), (7, 9, 5, 3, 777), "{name:?}");
+            assert_eq!(stat.rss_pages, Some(4242), "the memory of {name:?} is not lost");
         }
-        let lost = parse_proc_stat(&cut("a b c d e f")).unwrap();
-        assert_eq!((lost.utime, lost.stime, lost.starttime, lost.rss_pages), (7, 9, 777, None));
+        assert!(text.lines().all(|line| line.split(' ').count() <= 40), "and the lines really are cut");
+
+        // The reason for the number: every name of up to 15 characters, with any of its characters a space,
+        // keeps the memory field within the first 40.
+        let tail = "S 1 2 3 0 -1 4194560 10 0 0 0 7 9 0 0 20 5 3 0 777 12345678 4242 18446744073709551615 4194304 4194305 140737488 0 0 0";
+        for spaces in 0..=15 {
+            let comm = format!("{}{}", "x".repeat(15 - spaces), " ".repeat(spaces));
+            let cut = format!("4321 ({comm}) {tail}").split(' ').take(40).collect::<Vec<_>>().join(" ");
+            let stat = parse_proc_stat(&cut).unwrap_or_else(|| panic!("{comm:?}"));
+            assert_eq!((stat.comm.as_str(), stat.rss_pages), (comm.as_str(), Some(4242)), "{spaces} spaces");
+        }
+        // With the old cut of 28 fields a name with six spaces lost it.
+        let old = format!("4321 (a b c d e f g) {tail}").split(' ').take(28).collect::<Vec<_>>().join(" ");
+        assert_eq!(parse_proc_stat(&old).unwrap().rss_pages, None);
     }
 
     #[test]

@@ -127,6 +127,9 @@ pub struct Process {
     pub threads: u32,
     /// The nice value.
     pub nice: i32,
+    /// When the process started, in clock ticks after boot: with the process id it tells this process from
+    /// another one that got the same number later.
+    pub start_time: u64,
     /// This is the monitor's own collector.
     pub is_collector: bool,
 }

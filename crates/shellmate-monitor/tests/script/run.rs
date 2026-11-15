@@ -8,7 +8,7 @@ use shellmate_monitor::frame::{Frame, FrameKind, FrameParser, Item};
 use shellmate_monitor::probe::Probe;
 use shellmate_monitor::script::{CollectorConfig, collector_script};
 
-use crate::fakeroot::{FakeRoot, Ps};
+use crate::fakeroot::{FakeRoot, ProbeBin, Ps};
 
 const TOKEN: &str = "tok123";
 
@@ -164,8 +164,8 @@ fn what_the_frames_hold_after_the_engine_has_read_them() {
         );
         let procs = frames.iter().find(|f| f.kind == FrameKind::Procs).unwrap();
         assert!(
-            procs.section("stat").unwrap().lines.iter().all(|l| l.split(' ').count() <= 28 + 1),
-            "{shell}: cut after 28 fields"
+            procs.section("stat").unwrap().lines.iter().all(|l| l.split(' ').count() <= 40 + 1),
+            "{shell}: cut after 40 fields"
         );
         let kept = procs
             .section("stat")
@@ -407,17 +407,28 @@ fn the_command_line_survives_every_login_shell_the_server_may_hand_it_to() {
         assert!(frames.iter().any(|f| f.kind == FrameKind::Procs && f.section("ps").is_some()), "{login}: {lines:?}");
         assert!(frames.iter().any(|f| f.kind == FrameKind::Stats), "{login}");
 
-        // The probe too: it only runs against the real /proc, so here it must at least write its sections
-        // and end (on a Mac as "not Linux").
+        // The probe too: here it must write its sections and end (on a Mac as "not Linux"). It runs with a PATH
+        // that has only the tools it needs and stand-ins for sudo, docker and podman that fail: a test never
+        // runs the developer's own sudo or docker.
+        let bin = ProbeBin::new();
         let probe = shellmate_monitor::script::probe_command("ptok");
-        // (With a PATH that has no docker: the probe asks docker for its version, which is nothing to do on a
-        // developer's machine in a test.)
-        let output =
-            Command::new(login).arg("-c").arg(&probe).env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin").output().unwrap();
+        let output = Command::new(login)
+            .arg("-c")
+            .arg(&probe)
+            .env("PATH", bin.path())
+            .env("CALLS", bin.calls_log())
+            .output()
+            .unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert!(text.contains("@@ptok kernel") && text.contains("@@ptok end"), "{login}: {text}");
         let parsed = shellmate_monitor::probe::parse_probe("ptok", &text);
         assert!(parsed.kernel.starts_with("Darwin") && !parsed.can_collect(), "{login}: {parsed:?}");
+        // The stand-ins were what the probe found: sudo was asked (and refused), docker and podman failed.
+        let calls = std::fs::read_to_string(bin.calls_log()).unwrap();
+        assert!(calls.contains("sudo -n true"), "{login}: {calls}");
+        assert!(calls.contains("docker version") && calls.contains("podman version"), "{login}: {calls}");
+        assert_eq!(parsed.sudo, shellmate_monitor::Sudo::NeedsPassword, "{login}");
+        assert!(parsed.containers.iter().all(|c| c.access == shellmate_monitor::ContainerAccess::Error), "{login}: {parsed:?}");
         assert!(parsed.uid.is_some() && !parsed.user.is_empty(), "{login}");
     }
 }
