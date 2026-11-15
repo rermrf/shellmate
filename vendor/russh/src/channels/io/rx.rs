@@ -1,3 +1,4 @@
+// Modified for Shellmate (per-channel flow control, port of russh#730) - see ../../SHELLMATE-PATCH.md
 use std::borrow::BorrowMut;
 use std::io;
 use std::pin::Pin;
@@ -11,6 +12,7 @@ use super::{ChannelMsg, ChannelReadHalf};
 pub struct ChannelRx<R> {
     channel: R,
     buffer: Option<(ChannelMsg, usize)>,
+    eof: bool,
 
     ext: Option<u32>,
 }
@@ -20,6 +22,7 @@ impl<R> ChannelRx<R> {
         Self {
             channel,
             buffer: None,
+            eof: false,
             ext,
         }
     }
@@ -34,12 +37,22 @@ where
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.eof {
+            return Poll::Ready(Ok(()));
+        }
         let (msg, mut idx) = match self.buffer.take() {
             Some(msg) => msg,
-            None => match ready!(self.channel.borrow_mut().receiver.poll_recv(cx)) {
-                Some(msg) => (msg, 0),
-                None => return Poll::Ready(Ok(())),
-            },
+            None => {
+                let read_half = self.channel.borrow_mut();
+                match ready!(read_half.receiver.poll_recv(cx)) {
+                    Some(msg) => {
+                        // Room has been made in the queue: let the session use it.
+                        read_half.notify_drained();
+                        (msg, 0)
+                    }
+                    None => return Poll::Ready(Ok(())),
+                }
+            }
         };
 
         match (&msg, self.ext) {
@@ -72,7 +85,9 @@ where
                 Poll::Ready(Ok(()))
             }
             (ChannelMsg::Eof, _) => {
-                self.channel.borrow_mut().receiver.close();
+                // Remember the end of the data instead of closing the receiver, so that what the
+                // session still has queued behind it (exit status, close) can be read afterwards.
+                self.eof = true;
 
                 Poll::Ready(Ok(()))
             }

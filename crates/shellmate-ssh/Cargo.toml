@@ -19,3 +19,4 @@ data-encoding.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 futures.workspace = true
+libc.workspace = true

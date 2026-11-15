@@ -135,6 +135,29 @@ impl ServerState {
     }
 }
 
+/// Makes the server's TCP buffers big enough that it never has to wait for the client to read.
+///
+/// A russh session writes what it has to send before it reads again, so two russh sessions that
+/// both have megabytes to send each other (the client here, the in-process server) can end up
+/// both waiting for the other to read. The real servers this client talks to do not have that
+/// problem; the fixture avoids it by never blocking on its side.
+fn enlarge_socket_buffers(socket: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let size: libc::c_int = 8 * 1024 * 1024;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: a plain setsockopt on a socket we own, with a correctly sized integer value.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                std::ptr::from_ref(&size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
 pub struct TestServer {
     pub port: u16,
     pub host_key: PrivateKey,
@@ -173,6 +196,7 @@ impl TestServer {
                     *lock(&state.open_connections) += 1;
                     // Keep a second handle on the socket so tests can cut the connection.
                     let std_stream = stream.into_std().unwrap();
+                    enlarge_socket_buffers(&std_stream);
                     lock(&state.sockets).push(std_stream.try_clone().unwrap());
                     let stream = TcpStream::from_std(std_stream).unwrap();
                     let handler = FixtureHandler::new(options.clone(), state.clone());

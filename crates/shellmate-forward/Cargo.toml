@@ -18,4 +18,5 @@ russh.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 futures.workspace = true
+libc.workspace = true
 sha2 = "0.11"

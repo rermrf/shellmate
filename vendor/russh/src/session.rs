@@ -1,3 +1,4 @@
+// Modified for Shellmate (per-channel flow control, port of russh#730) - see ../SHELLMATE-PATCH.md
 // Copyright 2016 Pierre-Étienne Meunier
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -302,22 +303,33 @@ impl Encrypted {
         }
     }
 
-    pub fn adjust_window_size(
-        &mut self,
-        channel: ChannelId,
-        data: &[u8],
-        target: u32,
-    ) -> Result<bool, crate::Error> {
+    /// Debit `data.len()` from the channel's local receive window without sending a
+    /// `WINDOW_ADJUST`. Call it for every received `CHANNEL_DATA` / `CHANNEL_EXTENDED_DATA`;
+    /// [`Self::replenish_receive_window`] restores the window once the application has taken
+    /// the data.
+    pub fn record_received_data(&mut self, channel: ChannelId, data: &[u8]) {
         if let Some(channel) = self.channels.get_mut(&channel) {
-            trace!(
-                "adjust_window_size, channel = {}, size = {},",
-                channel.sender_channel, target
-            );
             // Ignore extra data.
             // https://tools.ietf.org/html/rfc4254#section-5.2
             if data.len() as u32 <= channel.sender_window_size {
                 channel.sender_window_size -= data.len() as u32;
             }
+        }
+    }
+
+    /// Send a `CHANNEL_WINDOW_ADJUST` if the channel's receive window dropped below `target / 2`,
+    /// restoring it to `target`. Only to be called when the application has room for more data
+    /// (not on receipt), so that a slow consumer throttles its peer instead of the session loop.
+    pub fn replenish_receive_window(
+        &mut self,
+        channel: ChannelId,
+        target: u32,
+    ) -> Result<bool, crate::Error> {
+        if let Some(channel) = self.channels.get_mut(&channel) {
+            trace!(
+                "replenish_receive_window, channel = {}, size = {},",
+                channel.sender_channel, target
+            );
             if channel.sender_window_size < target / 2 {
                 debug!(
                     "sender_window_size {:?}, target {:?}",

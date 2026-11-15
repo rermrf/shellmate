@@ -99,6 +99,8 @@ async fn a_peer_that_stops_reading_throttles_only_its_own_channel() {
     }
     assert_eq!(length, SIZE);
     assert_eq!(sum.finish(), Source::expected(SIZE, SEED), "every byte arrived intact and in order");
+    // The connection ends when the peer is done as well.
+    drop(stalled);
     eventually_idle(&rig, &firehose.id).await;
 }
 

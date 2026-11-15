@@ -1,3 +1,4 @@
+// Modified for Shellmate (per-channel flow control, port of russh#730) - see ../../SHELLMATE-PATCH.md
 // Copyright 2016 Pierre-Étienne Meunier
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -499,6 +500,11 @@ pub trait Handler: Sized {
 
     /// Called when a data packet is received. A response can be
     /// written to the `response` argument.
+    ///
+    /// If the channel data is only consumed through this callback (and not read from the
+    /// [`Channel`]), drop the [`Channel`] (or its [`ChannelReadHalf`](crate::ChannelReadHalf))
+    /// that `channel_open_*` handed you, so that the receive window keeps being re-opened: a
+    /// retained but unread channel throttles the peer once its queue is full.
     #[allow(unused_variables)]
     fn data(
         &mut self,
@@ -1108,10 +1114,12 @@ where
     let mut stream = SshRead::new(stream);
     let (priority_sender, priority_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (sender, receiver) = tokio::sync::mpsc::channel(config.event_buffer_size);
+    let drain_notify = Arc::new(tokio::sync::Notify::new());
     let handle = server::session::Handle {
         priority_sender,
         sender,
         channel_buffer_size: config.channel_buffer_size,
+        drain_notify: drain_notify.clone(),
     };
 
     let common = read_ssh_id(config, &mut stream).await?;
@@ -1124,6 +1132,8 @@ where
         pending_reads: Vec::new(),
         pending_len: 0,
         channels: HashMap::new(),
+        backlog: crate::channels::ChannelBacklog::default(),
+        drain_notify,
         open_global_requests: VecDeque::new(),
         kex: SessionKexState::Idle,
     };
