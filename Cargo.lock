@@ -7176,6 +7176,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "shellmate-monitor"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "async-trait",
+ "futures",
+ "libc",
+ "log",
+ "russh",
+ "shellmate-core",
+ "shellmate-ssh",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "shellmate-sftp"
 version = "0.1.0"
 dependencies = [

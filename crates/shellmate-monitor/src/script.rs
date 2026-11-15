@@ -1,0 +1,324 @@
+//! The two scripts the monitor runs on the server: the probe (once, to learn what the server is and
+//! what it allows) and the collector (a loop that writes frames for as long as somebody reads them).
+//! Nothing is installed or written on the server: the scripts are handed to `sh -c` and live in its
+//! memory.
+//!
+//! # The collector
+//!
+//! POSIX `sh` (dash, bash, BusyBox ash) with `LC_ALL=C`. One tick a second, at most **three forks** per
+//! tick, on every shell:
+//!
+//! | tick                      | forks                                          |
+//! |---------------------------|------------------------------------------------|
+//! | every one                 | `sleep`                                        |
+//! | system frame, every 2nd   | none: `/proc` and `/sys` are read with `read`  |
+//! | process frame, every 3rd  | `cut` (all `/proc/<pid>/stat`), `ps` (see below) |
+//! | slow frame, tick 1 of 30  | `df` (and no process frame: the schedule keeps them apart) |
+//!
+//! * **Rates are the client's job.** The script writes raw counters and the server's uptime (read from
+//!   `/proc/uptime`, so the clock is the server's and not the network's).
+//! * **Process command lines:** `/proc/<pid>/cmdline` cannot be read in a shell without a fork per process
+//!   (a NUL byte cannot be held by the shell, and every shell treats it differently), and `ps` is the one
+//!   tool that prints one line per process on procps and BusyBox alike. It is called once per process
+//!   frame as `ps -eo pid=,uid=,args=` (procps: numeric user ids, resolved with the probe's `passwd`) or,
+//!   where that is not understood, `ps -o pid=,user=,args=` (BusyBox has no numeric column; its names are
+//!   cut at 8 characters). Which one works is found out once, when the script starts. Without a usable `ps`
+//!   the list falls back to the short names in the stat lines.
+//! * **Process numbers** come from `cut -d" " -f1-28 /proc/[0-9]*/stat`: one fork for all processes, and the
+//!   lines are cut after the fields the monitor reads (a stat line is 300-400 bytes; the monitor needs
+//!   the first 24 fields, and a name with spaces in it shifts them: 28 covers a name with up to four
+//!   spaces, and for the oddest the memory of that one process is unknown). Reading the files with `read` would cost a system call per byte in dash.
+//! * **Disks:** `df -P -k` is only asked about local file systems from `/proc/mounts`, so a dead NFS
+//!   mount cannot hang the script.
+//! * **Stopping:** every tick writes a line, so a closed channel is noticed within a second (SIGPIPE, or
+//!   a failed write if SIGPIPE is ignored): the script exits and leaves nothing behind. The first line
+//!   of the script (a comment) names it, for `pgrep -f shellmate-collector`.
+
+use crate::quote;
+
+/// Settings of the collector. The defaults are what the app uses; the tests use others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectorConfig {
+    /// Marks the frames (see [`crate::frame`]); different for every run.
+    pub token: String,
+    /// A system frame every this many ticks.
+    pub system_every: u32,
+    /// A process frame every this many ticks.
+    pub process_every: u32,
+    /// A slow frame (disks) at tick 1 and then every this many ticks.
+    pub slow_every: u32,
+    /// What `sleep` is given (seconds, fractions where `sleep` takes them).
+    pub tick: String,
+    /// Where `/proc` is (tests point it at a copy).
+    pub proc_root: String,
+    /// Where `/sys` is.
+    pub sys_root: String,
+    /// How many space-separated fields of a stat line are kept (the monitor reads 24; see the module
+    /// documentation for why more).
+    pub stat_fields: u32,
+}
+
+impl CollectorConfig {
+    /// The settings of the app: system data every 2 s, processes every 3 s, disks every 30 s.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            system_every: 2,
+            process_every: 3,
+            slow_every: 30,
+            tick: "1".into(),
+            proc_root: "/proc".into(),
+            sys_root: "/sys".into(),
+            stat_fields: 28,
+        }
+    }
+}
+
+/// The collector as a shell script.
+pub fn collector_script(config: &CollectorConfig) -> String {
+    // No single quote appears in the script, so that it can be put in single quotes as it is.
+    format!(
+        r#"# shellmate-collector {token}
+LC_ALL=C; export LC_ALL
+T="@@{token}"; P={proc}; S={sys}; TICK={tick}
+PSA=; PL=; PN=0
+for c in "-eo pid=,uid=,args=" "-o pid=,user=,args="; do
+  if ps $c >/dev/null 2>&1; then PSA=$c; break; fi
+done
+up() {{ U=0; read -r U _ < $P/uptime; }}
+stats() {{
+  up
+  printf "%s stats %s\n" "$T" "$U"
+  printf "%s cpu\n" "$T"
+  while read -r l; do case $l in cpu*) printf "%s\n" "$l";; *) break;; esac; done < $P/stat
+  printf "%s load\n" "$T"
+  read -r l < $P/loadavg && printf "%s\n" "$l"
+  printf "%s mem\n" "$T"
+  while read -r k v u; do
+    case $k in MemTotal:|MemFree:|MemAvailable:|Buffers:|Cached:|SReclaimable:|Shmem:|SwapTotal:|SwapFree:) printf "%s %s\n" "$k" "$v";; esac
+  done < $P/meminfo
+  printf "%s net\n" "$T"
+  dif=
+  while read -r ri rd rg rf rr ru rm rk rest; do
+    if [ "$rd" = 00000000 ] && [ "$rk" = 00000000 ]; then dif=$ri; break; fi
+  done < $P/net/route
+  printf "defaultif %s\n" "$dif"
+  while read -r l; do
+    case $l in *:*) set -- ${{l%%:*}}; if [ -z "$dif" ] || [ "$1" = "$dif" ]; then printf "%s\n" "$l"; fi;; esac
+  done < $P/net/dev
+  printf "%s thermal\n" "$T"
+  for z in $S/class/thermal/thermal_zone*; do
+    [ -r "$z/temp" ] || continue
+    t=; k=
+    read -r t 2>/dev/null < "$z/temp"
+    read -r k 2>/dev/null < "$z/type"
+    printf "thermal %s %s %s\n" "${{z##*/}}" "$t" "$k"
+  done
+  printf "%s end\n" "$T"
+}}
+procs() {{
+  up
+  printf "%s procs %s\n" "$T" "$U"
+  printf "%s stat\n" "$T"
+  cut -d" " -f1-{fields} $P/[0-9]*/stat 2>/dev/null
+  if [ -n "$PSA" ]; then
+    set -- $P/[0-9]*
+    L="$*"
+    if [ "$L" != "$PL" ] || [ $PN -ge 10 ]; then
+      PL=$L; PN=0
+      printf "%s ps\n" "$T"; ps $PSA 2>/dev/null
+    else
+      PN=$((PN + 1))
+    fi
+  fi
+  printf "%s end\n" "$T"
+}}
+slow() {{
+  up
+  printf "%s slow %s\n" "$T" "$U"
+  printf "%s df\n" "$T"
+  set --
+  while read -r dev mnt typ rest; do
+    case $typ in proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|overlay|squashfs|nsfs|autofs|binfmt_misc|bpf|configfs|debugfs|tracefs|securityfs|pstore|mqueue|hugetlbfs|fusectl|selinuxfs|efivarfs|ramfs|rpc_pipefs|nfs|nfs4|cifs|smb3|smbfs|9p|fuse.*|iso9660|udf|ecryptfs|aufs|rootfs) continue;; esac
+    case $mnt in *\\*|/proc*|/sys*|/dev*|/run/*|/snap/*|/var/lib/docker/*|/var/lib/containers/*|/var/lib/kubelet/*) continue;; esac
+    set -- "$@" "$mnt"
+  done < $P/mounts
+  if [ $# -gt 0 ]; then df -P -k "$@" 2>/dev/null; fi
+  printf "%s end\n" "$T"
+}}
+n=0
+while :; do
+  printf "%s tick %s\n" "$T" "$n" || exit 0
+  [ $((n % {system})) -eq 0 ] && stats
+  [ $((n % {process})) -eq 0 ] && procs
+  [ $((n % {slow})) -eq 1 ] && slow
+  n=$((n + 1))
+  sleep $TICK
+done
+"#,
+        token = config.token,
+        proc = config.proc_root,
+        sys = config.sys_root,
+        tick = config.tick,
+        fields = config.stat_fields.max(24),
+        system = config.system_every.max(1),
+        process = config.process_every.max(1),
+        slow = config.slow_every.max(2),
+    )
+}
+
+/// The command that runs `script` with `sh` on the server, whatever the login shell is.
+pub fn sh_command(script: &str) -> String {
+    format!("sh -c {}", quote::quote(script).expect("a script has no NUL bytes"))
+}
+
+/// The command line of the collector.
+pub fn collector_command(config: &CollectorConfig) -> String {
+    sh_command(&collector_script(config))
+}
+
+/// The probe: one script that prints labelled sections (see [`crate::probe::parse_probe`]), so that
+/// everything is learned in a single round trip.
+pub fn probe_script(token: &str) -> String {
+    format!(
+        r#"# shellmate-probe {token}
+LC_ALL=C; export LC_ALL
+T="@@{token}"
+m() {{ printf "%s %s\n" "$T" "$1"; }}
+tmo() {{ if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi; }}
+m os
+for f in /etc/os-release /usr/lib/os-release; do
+  if [ -r $f ]; then
+    while read -r l; do case $l in PRETTY_NAME=*) printf "%s\n" "$l";; esac; done < $f
+    break
+  fi
+done
+m kernel
+uname -sr 2>/dev/null
+m procfs
+[ -r /proc/stat ] && [ -r /proc/meminfo ] && echo yes
+m uptime
+if [ -r /proc/uptime ]; then read -r u _ < /proc/uptime; printf "%s\n" "$u"; fi
+m user
+id -u 2>/dev/null
+id -un 2>/dev/null
+m sudo
+if command -v sudo >/dev/null 2>&1; then
+  if tmo 5 sudo -n true >/dev/null 2>&1; then SUDO=1; echo nopasswd; else SUDO=0; echo password; fi
+else SUDO=0; echo none; fi
+m systemd
+v=$(systemctl --version 2>/dev/null | {{ read -r a b rest; printf "%s %s" "$a" "$b"; }})
+printf "%s\n" "$v"
+if [ -d /run/systemd/system ]; then echo running; fi
+m containers
+for b in docker podman; do
+  p=$(command -v $b 2>/dev/null) || continue
+  printf "bin %s %s\n" "$b" "$p"
+  if [ $b = docker ]; then f="{{{{.Server.Version}}}}"; else f="{{{{.Version}}}}"; fi
+  out=$(tmo 8 $b version --format "$f" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    printf "access %s user ok %s\n" "$b" "$out"
+  else
+    case $out in
+      *ermission*denied*) printf "access %s user denied\n" "$b";;
+      *annot*connect*|*aemon*running*|*onnection*refused*|*"no such file"*|*"No such file"*) printf "access %s user nodaemon\n" "$b";;
+      *) printf "access %s user error\n" "$b";;
+    esac
+    if [ "$SUDO" = 1 ]; then
+      if out=$(tmo 8 sudo -n $b version --format "$f" 2>&1); then printf "access %s sudo ok %s\n" "$b" "$out"; fi
+    fi
+  fi
+done
+m page
+v=$(getconf PAGESIZE 2>/dev/null) || v=
+if [ -z "$v" ] && [ -r /proc/self/smaps ]; then
+  while read -r k n u; do case $k in KernelPageSize:) v=$((n * 1024)); break;; esac; done < /proc/self/smaps
+fi
+printf "%s\n" "$v"
+m clk
+getconf CLK_TCK 2>/dev/null
+m passwd
+pw=
+if command -v getent >/dev/null 2>&1; then pw=$(getent passwd 2>/dev/null | head -n 2000); fi
+if [ -z "$pw" ]; then pw=$(head -n 2000 /etc/passwd 2>/dev/null); fi
+printf "%s\n" "$pw"
+m end
+"#
+    )
+}
+
+/// The command line of the probe.
+pub fn probe_command(token: &str) -> String {
+    sh_command(&probe_script(token))
+}
+
+/// A token for the markers of one run: 12 hex digits nobody can guess from the server's side.
+pub fn new_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_scripts_have_no_single_quote_and_name_themselves() {
+        let collector = collector_script(&CollectorConfig::new("abc123"));
+        assert!(!collector.contains('\''), "the script is put in single quotes as it is");
+        assert!(collector.starts_with("# shellmate-collector abc123\n"));
+        let probe = probe_script("abc123");
+        assert!(!probe.contains('\''));
+        assert!(probe.starts_with("# shellmate-probe abc123\n"));
+        assert!(probe.contains("{{.Server.Version}}"), "the go template reaches the server as written");
+    }
+
+    #[test]
+    fn the_command_is_one_sh_invocation() {
+        let command = collector_command(&CollectorConfig::new("t"));
+        assert!(command.starts_with("sh -c '# shellmate-collector t\n"));
+        assert!(command.ends_with("done\n'"));
+        assert_eq!(command.matches('\'').count(), 2, "one pair of quotes around everything");
+    }
+
+    #[test]
+    fn the_schedule_is_written_into_the_script() {
+        let mut config = CollectorConfig::new("t");
+        config.tick = "0.05".into();
+        config.system_every = 4;
+        config.process_every = 5;
+        config.slow_every = 7;
+        config.proc_root = "/tmp/fake proc".replace(' ', "_");
+        let script = collector_script(&config);
+        assert!(script.contains("TICK=0.05"));
+        assert!(script.contains("$((n % 4))") && script.contains("$((n % 5))") && script.contains("$((n % 7))"));
+        assert!(script.contains("P=/tmp/fake_proc"));
+        // Zero would divide by zero in the shell.
+        config.system_every = 0;
+        config.process_every = 0;
+        assert!(collector_script(&config).contains("$((n % 1))"));
+    }
+
+    #[test]
+    fn the_schedule_never_puts_three_forking_jobs_on_one_tick() {
+        // The forks of a tick: sleep, plus cut and ps on a process tick, plus df on a slow tick.
+        let config = CollectorConfig::new("t");
+        let mut busiest = 0;
+        for n in 0..3000u32 {
+            let forks =
+                1 + if n % config.process_every == 0 { 2 } else { 0 } + if n % config.slow_every == 1 { 1 } else { 0 };
+            busiest = busiest.max(forks);
+            if n % config.slow_every == 1 {
+                assert_ne!(n % config.process_every, 0, "tick {n}: disks and processes together");
+            }
+        }
+        assert_eq!(busiest, 3);
+    }
+
+    #[test]
+    fn tokens_are_short_and_different() {
+        let (a, b) = (new_token(), new_token());
+        assert_eq!(a.len(), 12);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+}

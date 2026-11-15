@@ -1,0 +1,21 @@
+PID   USER     COMMAND
+    1 root     /package/admin/s6/command/s6-svscan -d4 -- /run/service
+   17 root     s6-supervise s6-linux-init-shutdownd
+   18 root     /package/admin/s6-linux-init/command/s6-linux-init-shutdownd -d3 -c /run/s6/basedir -g 3000 -C -B
+   36 root     s6-supervise s6rc-oneshot-runner
+   37 root     s6-supervise s6rc-fdholder
+   38 root     s6-supervise log-openssh-server
+   39 root     s6-supervise svc-cron
+   40 root     s6-supervise svc-openssh-server
+   51 root     /package/admin/s6-2.13.2.0/command/s6-fdholderd -1 -n 256 -i data/rules
+   52 root     /package/admin/s6/command/s6-ipcserverd -1 -- /package/admin/s6/command/s6-ipcserver-access -v0 -E -l0 -i data/rules -- /package/admin/s6/command/s6-sudod -t 30000 -- /package/admin/s6-rc/command/s6-rc-oneshot-run -l ../.. --
+  190 root     busybox crond -f -S -l 5
+  191 tester   s6-log n30 s10000000 S30000000 T !gzip -nq9 /config/logs/openssh
+  199 tester   sshd.pam: /usr/sbin/sshd.pam -D -e -f /config/sshd/sshd_config -h /config/ssh_host_keys/ssh_host_ecdsa_key -h /config/ssh_host_keys/ssh_host_ed25519_key -h /config/ssh_host_keys/ssh_host_rsa_key [listener] 0 of 10-100 startups
+  262 root     bash
+37826 tester   sleep 1234
+37827 tester   sleep 1235
+37883 tester   sleep 1234
+37903 tester   sh -c sleep 1234 & p=$!; sleep 0.2; busybox ps -o pid,user,args ; kill $p
+37909 tester   sleep 1234
+37911 tester   busybox ps -o pid,user,args

@@ -16,6 +16,7 @@ shellmate-ssh = { path = "crates/shellmate-ssh" }
 shellmate-store = { path = "crates/shellmate-store" }
 shellmate-sftp = { path = "crates/shellmate-sftp" }
 shellmate-forward = { path = "crates/shellmate-forward" }
+shellmate-monitor = { path = "crates/shellmate-monitor" }
 
 gpui = { package = "gpui-kit", version = "0.9.1", features = ["syntect"] }
 libc = "0.2"
