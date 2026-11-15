@@ -143,6 +143,8 @@ pub struct Workspace {
     /// The host library is a temporary in-memory one (the saved file could not be opened): nothing
     /// saved in it, rules included, survives the run.
     library_is_temporary: bool,
+    /// What the servers granted for remote forwards in this run, shared by every connection (see `GrantMemory`).
+    forward_grants: shellmate_forward::GrantMemory,
     /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
     groups: Vec<group::ConnGroup>,
     active: Option<usize>,
@@ -186,6 +188,7 @@ impl Workspace {
             sidebar,
             sessions: Vec::new(),
             library_is_temporary: store_notice.is_some(),
+            forward_grants: shellmate_forward::GrantMemory::new(),
             groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,

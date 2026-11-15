@@ -11,7 +11,9 @@ use gpui::{
 };
 use shellmate_forward::{ForwardKind, ForwardRule, RuleId};
 
-use super::model::{EMPTY_KINDS, EMPTY_TITLE, ForwardView, KINDS, RuleCard, RuleForm, Tone, kind_name, segment_label};
+use super::model::{
+    EMPTY_KINDS, EMPTY_TITLE, ForwardView, KINDS, RetryAction, RuleCard, RuleForm, Tone, kind_name, segment_label,
+};
 use crate::theme::{ActivePalette, CARD_RADIUS, MONO_FONT, Palette};
 use crate::ui::{SegmentItem, card_shadow, dot, segmented};
 
@@ -21,8 +23,9 @@ pub enum ForwardPanelEvent {
     Add(ForwardRule),
     /// The toggle of a rule: switch it on or off (and save which).
     Toggle(RuleId, bool),
-    /// 换用 M 重试: listen on this port instead, save that and start the rule.
-    Retry(RuleId, u16),
+    /// A retry button: 换用 M 重试 (listen on this port instead, save that and start the rule), or
+    /// 重试 / 立即重试 (ask the server for the remote port again).
+    Retry(RuleId, RetryAction),
     /// The × of a rule: ask, and delete it.
     Delete(RuleId),
 }
@@ -406,6 +409,7 @@ impl ForwardPanel {
                     }))
                     .children(card.retry.clone().map(|retry| {
                         let retry_id = id.clone();
+                        let (bg, fg) = if card.tone == Tone::Failed { (p.errs, p.err) } else { (p.warns, p.warn) };
                         div()
                             .id(("fwd-retry", ix))
                             .h(px(24.))
@@ -413,15 +417,15 @@ impl ForwardPanel {
                             .flex()
                             .items_center()
                             .rounded(px(8.))
-                            .bg(p.errs)
-                            .text_color(p.err)
+                            .bg(bg)
+                            .text_color(fg)
                             .text_size(px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .cursor_pointer()
                             .hover(|d| d.opacity(0.8))
                             .child(SharedString::from(retry.label))
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(ForwardPanelEvent::Retry(retry_id.clone(), retry.port));
+                                cx.emit(ForwardPanelEvent::Retry(retry_id.clone(), retry.action));
                             }))
                     })),
             )

@@ -66,14 +66,38 @@ fn states() -> (Vec<ForwardRule>, Vec<RuleRuntime>) {
     )
 }
 
+/// The new card state next to a running rule and a plain refusal: the server still holds the port of a remote
+/// rule that worked before, and a rule the server never granted.
+fn held() -> (Vec<ForwardRule>, Vec<RuleRuntime>) {
+    (
+        vec![
+            rule("MySQL 主库", ForwardKind::Local, "127.0.0.1:3306", "10.0.2.8:3306"),
+            rule("回显服务", ForwardKind::Remote, "127.0.0.1:9100", "localhost:8000"),
+            rule("Webhook", ForwardKind::Remote, "9000", "localhost:3000"),
+        ],
+        vec![
+            running(3306, 2, 19_293_798, 1_258_291),
+            RuleRuntime::Started {
+                state: RuleState::RemotePortHeld { port: 9100 },
+                stats: StatsSnapshot { active: 0, down: 4_096, up: 812 },
+            },
+            failed(RuleError::RemoteDenied),
+        ],
+    )
+}
+
 /// The view for the set called `name` on the connection to `host`: `prototype` (the three rules of the
-/// prototype), `states` (every state), `temporary` (the prototype's, for a host that is not saved), or
+/// prototype), `states` (every state), `held` (a remote port the server still holds), `temporary` (the prototype's, for a host that is not saved), or
 /// `empty`.
 pub fn view(name: &str, host: &str) -> ForwardView {
     let (rules, runtime, notes) = match name {
         "empty" => (Vec::new(), Vec::new(), Vec::new()),
         "states" => {
             let (rules, runtime) = states();
+            (rules, runtime, Vec::new())
+        }
+        "held" => {
+            let (rules, runtime) = held();
             (rules, runtime, Vec::new())
         }
         "temporary" => {

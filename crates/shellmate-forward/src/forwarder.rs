@@ -8,8 +8,9 @@ use shellmate_ssh::Connection;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 
-use crate::conn::{AbortOnDrop, ConnSlot, Mode, Update, run_remote, spawn_listener};
+use crate::conn::{AbortOnDrop, ConnSlot, Mode, RemoteRun, Update, spawn_listener};
 use crate::listen;
+use crate::retry::{GrantMemory, RetryTiming};
 use crate::rule::{ForwardKind, ForwardRule, RuleId};
 use crate::state::{ForwardEvent, RuleError, RuleState, RuleView};
 use crate::stats::{RuleStats, StatsSnapshot};
@@ -22,6 +23,24 @@ const RELEASE_GRACE: Duration = Duration::from_secs(2);
 const RELEASE_RETRY: Duration = Duration::from_millis(5);
 /// How long cancelling a remote forward at the server may take.
 const CANCEL_LIMIT: Duration = Duration::from_secs(3);
+
+/// What a [`Forwarder`] can be told besides the runtime and the channel for its events.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// How often changed numbers are reported (at most).
+    pub stats_interval: Duration,
+    /// What the servers granted so far; give the forwarders of all connections to a host the same
+    /// memory, so that a rule that moves to another connection is still known to have worked.
+    pub grants: GrantMemory,
+    /// How long the engine waits before it asks for a remote port again.
+    pub retry: RetryTiming,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { stats_interval: STATS_INTERVAL, grants: GrantMemory::new(), retry: RetryTiming::default() }
+    }
+}
 
 /// A started rule.
 pub(crate) struct Entry {
@@ -59,6 +78,8 @@ struct State {
 pub(crate) struct Inner {
     runtime: Handle,
     events: async_channel::Sender<ForwardEvent>,
+    grants: GrantMemory,
+    retry: RetryTiming,
     slot: Arc<ConnSlot>,
     state: Mutex<State>,
     /// Stops with the forwarder.
@@ -119,7 +140,7 @@ impl Forwarder {
     /// A forwarder with no rules and no connection. State changes and statistics are sent to
     /// `events` (an unbounded channel; the sender never blocks).
     pub fn new(runtime: Handle, events: async_channel::Sender<ForwardEvent>) -> Self {
-        Self::with_stats_interval(runtime, events, STATS_INTERVAL)
+        Self::with_options(runtime, events, Options::default())
     }
 
     /// Like [`new`](Self::new) with another statistics interval (the tests use a short one).
@@ -128,9 +149,17 @@ impl Forwarder {
         events: async_channel::Sender<ForwardEvent>,
         interval: Duration,
     ) -> Self {
+        Self::with_options(runtime, events, Options { stats_interval: interval, ..Options::default() })
+    }
+
+    /// Like [`new`](Self::new) with `options`.
+    pub fn with_options(runtime: Handle, events: async_channel::Sender<ForwardEvent>, options: Options) -> Self {
+        let interval = options.stats_interval;
         let inner = Arc::new(Inner {
             runtime: runtime.clone(),
             events,
+            grants: options.grants,
+            retry: options.retry,
             slot: Arc::new(ConnSlot::default()),
             state: Mutex::new(State::default()),
             _stats_task: Mutex::new(None),
@@ -148,6 +177,12 @@ impl Forwarder {
         });
         *inner._stats_task.lock().unwrap_or_else(PoisonError::into_inner) = Some(AbortOnDrop::new(task));
         Self { inner }
+    }
+
+    /// What the servers granted so far (see [`Options::grants`]); hand it to the forwarder of the next
+    /// connection to the same host.
+    pub fn grants(&self) -> GrantMemory {
+        self.inner.grants.clone()
     }
 
     /// Starts `rule` (replacing a running rule with the same id) and returns where it stands:
@@ -204,7 +239,7 @@ impl Forwarder {
             }
             ForwardKind::Remote => {
                 if connected {
-                    self.spawn_remote(&mut state, &mut entry);
+                    self.spawn_remote(&mut state, &mut entry, false);
                 } else {
                     entry.state = RuleState::WaitingReconnect;
                 }
@@ -265,22 +300,52 @@ impl Forwarder {
         drop(entry);
     }
 
-    fn spawn_remote(&self, state: &mut State, entry: &mut Entry) {
+    /// Starts (or restarts) the task that asks the server for a remote forward. `held`: the entry waits
+    /// out a refusal ([`RuleState::RemotePortHeld`]) and keeps saying so while it asks again.
+    fn spawn_remote(&self, state: &mut State, entry: &mut Entry, held: bool) {
         state.next_generation += 1;
         entry.generation = state.next_generation;
-        entry.state = RuleState::Starting;
+        if !held {
+            entry.state = RuleState::Starting;
+        }
         entry.remote = None;
         let target = entry.rule.target.clone().expect("a remote forward has a target");
-        let task = run_remote(
-            Arc::downgrade(&self.inner),
-            self.inner.slot.clone(),
-            entry.rule.id.clone(),
-            entry.generation,
-            entry.rule.listen.clone(),
+        let run = RemoteRun {
+            inner: Arc::downgrade(&self.inner),
+            slot: self.inner.slot.clone(),
+            id: entry.rule.id.clone(),
+            generation: entry.generation,
+            listen: entry.rule.listen.clone(),
             target,
-            entry.stats.clone(),
-        );
-        entry.task = Some(AbortOnDrop::new(self.inner.runtime.spawn(task)));
+            stats: entry.stats.clone(),
+            grants: self.inner.grants.clone(),
+            timing: self.inner.retry.clone(),
+            held,
+        };
+        entry.task = Some(AbortOnDrop::new(self.inner.runtime.spawn(run.run())));
+    }
+
+    /// Asks the server for a remote forward again, now: for a rule that waits out a refusal
+    /// ([`RemotePortHeld`](RuleState::RemotePortHeld)) instead of waiting for its next turn, and for one that
+    /// [failed](RuleState::Failed). Returns whether it was asked (`false` for other rules and states).
+    pub fn retry(&self, id: &RuleId) -> bool {
+        let mut state = lock(&self.inner.state);
+        if state.closed {
+            return false;
+        }
+        let Some(position) = state.rules.iter().position(|entry| entry.rule.id == *id) else { return false };
+        let mut entry = state.rules.remove(position);
+        let held = matches!(entry.state, RuleState::RemotePortHeld { .. });
+        let retryable = entry.rule.kind == ForwardKind::Remote && (held || matches!(entry.state, RuleState::Failed(_)));
+        if retryable {
+            let before = entry.state.clone();
+            self.spawn_remote(&mut state, &mut entry, held);
+            if entry.state != before {
+                self.inner.emit(ForwardEvent::State { id: id.clone(), state: entry.state.clone() });
+            }
+        }
+        state.rules.insert(position, entry);
+        retryable
     }
 
     /// Stops a rule: closes its listener, ends its connections and (remote forwards) tells the
@@ -309,7 +374,10 @@ impl Forwarder {
                     entry.task = None;
                     entry.remote = None;
                     entry.generation = 0;
-                    matches!(entry.state, RuleState::Running { .. } | RuleState::Starting)
+                    matches!(
+                        entry.state,
+                        RuleState::Running { .. } | RuleState::Starting | RuleState::RemotePortHeld { .. }
+                    )
                 }
             };
             if waiting {
@@ -339,7 +407,7 @@ impl Forwarder {
                 }
                 ForwardKind::Remote => {
                     if matches!(entry.state, RuleState::WaitingReconnect | RuleState::Failed(_)) {
-                        self.spawn_remote(&mut state, entry);
+                        self.spawn_remote(&mut state, entry, false);
                     }
                 }
             }

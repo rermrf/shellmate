@@ -68,10 +68,11 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
     }
     // `forward:<host>:<scenario>` connects the host and plays a scenario on the port forwarding panel:
     // `empty`, `live` (the rules of the host as they run), `form`, `form-d`, `form-r`, `form-clean` (the
-    // new-rule form with problems and warnings), `cards`, `states`, `temporary` (cards made up for the
-    // picture), `close` (the question before the last tab closes), `close-now`, `toggle=<rule name>`,
-    // `toggle-off=<rule name>`, `handover` (a second connection, then the first tab closes), `retry=<rule
-    // name>`, `delete=<rule name>`, `reconnect` (logs how the rules stand around a loss the script causes).
+    // new-rule form with problems and warnings), `cards`, `states`, `held`, `temporary` (cards made up for
+    // the picture), `close` (the question before the last tab closes), `close-now`, `toggle=<rule name>`,
+    // `toggle-off=<rule name>`, `heldport[=<rule name>]` (the server holds a remote port), `handover` (a
+    // second connection, then the first tab closes), `retry=<rule name>`, `delete=<rule name>`, `reconnect`
+    // (logs how the rules stand around a loss the script causes).
     // Everything is done by calling the panel and the workspace.
     if let Some(args) = name.strip_prefix("forward:") {
         let (host, scenario) = args.split_once(':').unwrap_or((args, ""));
@@ -90,7 +91,9 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
             "form-d" => form("D||0.0.0.0:1080|"),
             "form-r" => form("R||0.0.0.0:9000|localhost:3000"),
             "form-clean" => form("L|MySQL 主库|5433|db.internal:5432"),
-            "cards" | "states" | "temporary" => vec![(3500, "show", String::new()), (4200, "cards", scenario.into())],
+            "cards" | "states" | "held" | "temporary" => {
+                vec![(3500, "show", String::new()), (4200, "cards", scenario.into())]
+            }
             "close" => vec![(3500, "show", String::new()), (7000, "close", String::new())],
             "close-now" => {
                 vec![(3500, "show", String::new()), (8000, "log", "before".into()), (8500, "close-now", String::new())]
@@ -116,6 +119,16 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
                 (13500, "close-first", String::new()),
                 (15500, "log", "handed over".into()),
                 (16000, "log", "later".into()),
+            ],
+            // A remote port the server keeps holding (the script makes the server hold it and lets go again):
+            // logs the states, and presses the rule's retry button (a name after `=`) at 8 s.
+            "heldport" => vec![
+                (2000, "log", "granted".into()),
+                (3500, "show", String::new()),
+                (6500, "log", "held".into()),
+                (8000, "retry", arg.clone()),
+                (9500, "log", "after the button".into()),
+                (30000, "log", "later".into()),
             ],
             "retry" => vec![
                 (3500, "show", String::new()),

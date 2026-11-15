@@ -182,13 +182,27 @@ pub enum Tone {
     Failed,
 }
 
-/// The button of a rule that could not take its port.
+/// What a retry button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryAction {
+    /// The local port is taken: listen on this one from now on.
+    OtherPort(u16),
+    /// Ask the server for the remote port again.
+    Again,
+}
+
+/// The button of a rule that could not start, or that waits for the server to let go of its port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetryButton {
-    /// The port the rule would listen on instead.
-    pub port: u16,
-    /// `换用 18080 重试`.
+    /// What it does.
+    pub action: RetryAction,
+    /// `换用 18080 重试`, `重试` or `立即重试`.
     pub label: String,
+}
+
+/// What a card says while the server still holds the port of a remote rule that worked before.
+pub fn port_held_text(port: u16) -> String {
+    format!("远端端口 {port} 仍被占用（可能是断线前的会话还没被服务器回收）· 正在重试")
 }
 
 /// What the panel knows about a rule that is not running (yet).
@@ -228,7 +242,7 @@ pub struct RuleCard {
     pub tone: Tone,
     /// `↓ 18.4 MB · ↑ 1.2 MB` while there is something to say.
     pub traffic: Option<String>,
-    /// The button of a rule that could not take its port.
+    /// The button of a rule that could not start or waits for its port.
     pub retry: Option<RetryButton>,
     /// Where the toggle stands.
     pub enabled: bool,
@@ -297,6 +311,12 @@ pub fn card(rule: &ForwardRule, runtime: &RuleRuntime, host: &str) -> RuleCard {
                     card.tone = Tone::Waiting;
                     card.traffic = has_traffic.then(|| traffic(stats));
                 }
+                RuleState::RemotePortHeld { port } => {
+                    card.status = port_held_text(*port);
+                    card.tone = Tone::Waiting;
+                    card.traffic = has_traffic.then(|| traffic(stats));
+                    card.retry = Some(RetryButton { action: RetryAction::Again, label: "立即重试".into() });
+                }
                 RuleState::Failed(error) => {
                     card.status = error.to_string();
                     card.tone = Tone::Failed;
@@ -312,7 +332,14 @@ pub fn card(rule: &ForwardRule, runtime: &RuleRuntime, host: &str) -> RuleCard {
 }
 
 fn retry_button(error: &RuleError) -> Option<RetryButton> {
-    error.suggested_port().map(|port| RetryButton { port, label: format!("换用 {port} 重试") })
+    match error {
+        RuleError::RemoteDenied | RuleError::Remote(_) => {
+            Some(RetryButton { action: RetryAction::Again, label: "重试".into() })
+        }
+        other => other
+            .suggested_port()
+            .map(|port| RetryButton { action: RetryAction::OtherPort(port), label: format!("换用 {port} 重试") }),
+    }
 }
 
 /// The rule with its listen port replaced, for 换用 M 重试.
@@ -620,7 +647,10 @@ mod tests {
         let taken = RuleError::PortInUse { host: "127.0.0.1".into(), port: 8080, suggestion: Some(18080) };
         let card = card(&rule, &started(RuleState::Failed(taken), stats(0, 0, 0)), "h");
         assert_eq!((card.status.as_str(), card.tone), ("本地端口 8080 已被占用", Tone::Failed));
-        assert_eq!(card.retry, Some(RetryButton { port: 18080, label: "换用 18080 重试".into() }));
+        assert_eq!(
+            card.retry,
+            Some(RetryButton { action: RetryAction::OtherPort(18080), label: "换用 18080 重试".into() })
+        );
         assert!(card.traffic.is_none());
 
         let no_suggestion = RuleError::PortInUse { host: "127.0.0.1".into(), port: 8080, suggestion: None };
@@ -628,12 +658,53 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_remote_rule_names_the_server_setting() {
+    fn a_denied_remote_rule_names_the_server_setting_and_can_be_tried_again() {
         let rule = rule(ForwardKind::Remote, "9000", "localhost:3000");
         let card = card(&rule, &started(RuleState::Failed(RuleError::RemoteDenied), stats(0, 0, 0)), "h");
         assert_eq!(card.status, "服务器拒绝了远程转发（可能禁用了 AllowTcpForwarding）");
         assert_eq!(card.tone, Tone::Failed);
-        assert!(card.retry.is_none(), "the port is not the problem");
+        assert_eq!(
+            card.retry,
+            Some(RetryButton { action: RetryAction::Again, label: "重试".into() }),
+            "without toggling the rule off and on"
+        );
+        let other = card_for_failure(&rule, RuleError::Remote("通道已关闭".into()));
+        assert_eq!(
+            (other.status.as_str(), other.retry.map(|retry| retry.action)),
+            ("通道已关闭", Some(RetryAction::Again))
+        );
+        // Other failures have nothing to retry: an incomplete rule, an address that cannot be listened on.
+        assert!(card_for_failure(&rule, RuleError::MissingTarget).retry.is_none());
+        let bind = RuleError::BindFailed { host: "127.0.0.1".into(), port: 80, reason: "权限不足".into() };
+        assert!(card_for_failure(&rule, bind).retry.is_none());
+    }
+
+    fn card_for_failure(rule: &ForwardRule, error: RuleError) -> RuleCard {
+        card(rule, &started(RuleState::Failed(error), stats(0, 0, 0)), "h")
+    }
+
+    #[test]
+    fn a_port_the_server_still_holds_says_so_and_offers_to_ask_now() {
+        let rule = rule(ForwardKind::Remote, "9100", "localhost:8000");
+        let held = |stats| card(&rule, &started(RuleState::RemotePortHeld { port: 9100 }, stats), "h");
+        let card = held(stats(0, 0, 0));
+        assert_eq!(card.status, "远端端口 9100 仍被占用（可能是断线前的会话还没被服务器回收）· 正在重试");
+        assert_eq!(card.tone, Tone::Waiting, "a wait, not a failure");
+        assert_eq!(card.retry, Some(RetryButton { action: RetryAction::Again, label: "立即重试".into() }));
+        assert_eq!(card.route, "远端 127.0.0.1:9100 → 本机 localhost:8000", "the port that was asked for");
+        assert!(card.traffic.is_none(), "nothing went through yet");
+        assert!(card.enabled);
+        // What went through before the drop is still counted.
+        assert_eq!(held(stats(0, 2048, 512)).traffic.as_deref(), Some("↓ 2.0 KB · ↑ 512 B"));
+        // A rule that waits for its port does not count as running.
+        let view = summary_view(
+            "h",
+            std::slice::from_ref(&rule),
+            &[started(RuleState::RemotePortHeld { port: 9100 }, stats(0, 0, 0))],
+            0,
+            &[],
+        );
+        assert_eq!(view.summary.title, "0 条规则运行中");
     }
 
     #[test]

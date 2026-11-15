@@ -12,13 +12,13 @@ use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
 use gpui::{AppContext as _, Context, Entity, Subscription, Window};
 use shellmate_core::{Host, HostId};
-use shellmate_forward::{ForwardEvent, ForwardRule, Forwarder, RuleId};
+use shellmate_forward::{ForwardEvent, ForwardRule, Forwarder, Options, RuleId};
 use shellmate_ssh::Connection;
 
-use super::group::{self, GroupForward};
 use super::Workspace;
+use super::group::{self, GroupForward};
 use crate::dialogs::confirm::ConfirmDialog;
-use crate::forward::model::{self, ForwardView, RuleRuntime, TEMPORARY_NOTE};
+use crate::forward::model::{self, ForwardView, RetryAction, RuleRuntime, TEMPORARY_NOTE};
 use crate::forward::panel::{ForwardPanel, ForwardPanelEvent};
 use crate::runtime;
 
@@ -35,7 +35,8 @@ impl Workspace {
     pub(super) fn attach_forwarder(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(runtime) = runtime::get(cx) else { return };
         let (events, changes) = async_channel::unbounded();
-        let forwarder = Forwarder::new(runtime.handle(), events);
+        let options = Options { grants: self.forward_grants.clone(), ..Options::default() };
+        let forwarder = Forwarder::with_options(runtime.handle(), events, options);
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = changes.recv().await {
                 if let ForwardEvent::State { id, state } = &event {
@@ -235,7 +236,7 @@ impl Workspace {
         match event {
             ForwardPanelEvent::Add(rule) => self.add_rule(&host, rule.clone(), window, cx),
             ForwardPanelEvent::Toggle(id, on) => self.toggle_rule(&host, id, *on, window, cx),
-            ForwardPanelEvent::Retry(id, port) => self.retry_rule(&host, id, *port, window, cx),
+            ForwardPanelEvent::Retry(id, action) => self.retry_rule(&host, id, *action, window, cx),
             ForwardPanelEvent::Delete(id) => self.confirm_delete_rule(&host, id, window, cx),
         }
     }
@@ -309,8 +310,27 @@ impl Workspace {
         self.sync_forward(host, cx);
     }
 
-    /// 换用 M 重试: the rule listens on `port` from now on, saved, and starts.
-    fn retry_rule(&mut self, host: &HostId, id: &RuleId, port: u16, window: &mut Window, cx: &mut Context<Self>) {
+    /// A retry button: 换用 M 重试 (the rule listens on the other port from now on, saved, and starts) or
+    /// 重试 / 立即重试 (the server is asked for the remote port again, now).
+    fn retry_rule(
+        &mut self,
+        host: &HostId,
+        id: &RuleId,
+        action: RetryAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = match action {
+            RetryAction::OtherPort(port) => port,
+            RetryAction::Again => {
+                self.with_rules(host, window, cx, |forward| {
+                    let asked = forward.forwarder.retry(id);
+                    log::debug!("端口转发 规则 {id:?} 重试：{}", if asked { "已再次向服务器请求" } else { "无需重试" });
+                    Ok(())
+                });
+                return self.sync_forward(host, cx);
+            }
+        };
         let Some(moved) = self.with_rules(host, window, cx, |forward| {
             Ok(forward.rules.iter().find(|rule| rule.id == *id).map(|rule| model::with_listen_port(rule, port)))
         }) else {
@@ -513,8 +533,8 @@ impl Workspace {
             // Retries a rule that could not take its port, with the port it suggests.
             "retry" => {
                 let target = self.forward_view(group_id, &host).cards.into_iter().find(|card| card.name == arg);
-                if let Some((id, port)) = target.and_then(|card| card.retry.map(|retry| (card.id, retry.port))) {
-                    self.retry_rule(&host.id, &id, port, window, cx);
+                if let Some((id, action)) = target.and_then(|card| card.retry.map(|retry| (card.id, retry.action))) {
+                    self.retry_rule(&host.id, &id, action, window, cx);
                 }
             }
             // The question before the last tab closes, as the click on × would show it.

@@ -60,6 +60,14 @@ pub enum RuleState {
         /// The listening port.
         port: u16,
     },
+    /// A remote forward on a fixed port that the server granted earlier in this run and now refuses: the
+    /// port is probably still held by a session from before a network drop. The server is asked again
+    /// (2 s, 5 s, 10 s, then every 30 s) while the connection is up, or at once with
+    /// [`Forwarder::retry`](crate::Forwarder::retry).
+    RemotePortHeld {
+        /// The port the server refuses.
+        port: u16,
+    },
     /// The connection is down. Local and dynamic forwards keep their port and close new
     /// connections at once; remote forwards are asked for again after the reconnect.
     WaitingReconnect,

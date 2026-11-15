@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_channel::Receiver;
 use shellmate_core::AuthMethod;
-use shellmate_forward::{ForwardEvent, ForwardKind, ForwardRule, Forwarder, RuleId, RuleState};
+use shellmate_forward::{ForwardEvent, ForwardKind, ForwardRule, Forwarder, Options, RuleId, RuleState};
 use shellmate_ssh::{Connection, Route, Secret, SshHost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -33,20 +33,25 @@ impl Rig {
     }
 
     pub async fn with(options: ServerOptions) -> Self {
-        Self::build(options, None).await
+        Self::build(options, None, Options::default()).await
+    }
+
+    /// A rig whose forwarder was made with `forward` (other retry times, a shared memory).
+    pub async fn with_forwarder(forward: Options) -> Self {
+        Self::build(forwarding(), None, forward).await
     }
 
     /// A connection whose channel opens give up after `watchdog`.
     pub async fn with_watchdog(options: ServerOptions, watchdog: Duration) -> Self {
-        Self::build(options, Some(watchdog)).await
+        Self::build(options, Some(watchdog), Options::default()).await
     }
 
-    async fn build(options: ServerOptions, watchdog: Option<Duration>) -> Self {
+    async fn build(options: ServerOptions, watchdog: Option<Duration>, forward: Options) -> Self {
         let server = TestServer::start(options).await;
         let env = Env::new();
         let echo = EchoServer::start().await;
         let (events_tx, events) = async_channel::unbounded();
-        let forwarder = Forwarder::new(tokio::runtime::Handle::current(), events_tx);
+        let forwarder = Forwarder::with_options(tokio::runtime::Handle::current(), events_tx, forward);
         let rig =
             Self { connection: connect(&server, &env, watchdog).await, server, env, echo, forwarder, events, watchdog };
         rig.forwarder.connection_restored(&rig.connection);
