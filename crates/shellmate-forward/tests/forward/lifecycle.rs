@@ -138,16 +138,17 @@ async fn rules_started_without_a_connection_wait_for_one() {
     assert_eq!(echo_through(port, b"r").await, b"r");
 }
 
-/// Takes a port in the 21000–29999 range (below the ports the system hands out at random, so that
-/// other tests cannot grab the ones around it) whose "ten thousand above" neighbours are free.
-fn occupy_a_quiet_port() -> (u16, std::net::TcpListener) {
+/// Takes a port in the 21000–29999 range on `host` (below the ports the system hands out at random,
+/// so that other tests cannot grab the ones around it) whose "ten thousand above" neighbours are
+/// free on both loopbacks.
+fn occupy_a_quiet_port(host: &str) -> (u16, std::net::TcpListener) {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     let start = 21_000 + (std::process::id() % 4_000) as u16 + NEXT.fetch_add(37, std::sync::atomic::Ordering::SeqCst);
     for port in (start..30_000).chain(21_000..start) {
-        let free = |p: u16| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok();
+        let free = |p: u16| ["127.0.0.1", "::1"].iter().all(|host| std::net::TcpListener::bind((*host, p)).is_ok());
         if free(port + 10_000)
             && free(port + 10_001)
-            && let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port))
+            && let Ok(listener) = std::net::TcpListener::bind((host, port))
         {
             return (port, listener);
         }
@@ -158,7 +159,7 @@ fn occupy_a_quiet_port() -> (u16, std::net::TcpListener) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_taken_port_is_reported_with_a_free_port_to_use_instead() {
     let rig = Rig::start().await;
-    let (taken, occupant) = occupy_a_quiet_port();
+    let (taken, occupant) = occupy_a_quiet_port("127.0.0.1");
     let rule = rule(ForwardKind::Local, &format!("127.0.0.1:{taken}"), &rig.echo_target());
 
     let state = rig.forwarder.start(rule.clone());
@@ -367,4 +368,49 @@ async fn connections_through_a_remote_forward_end_when_the_transport_dies_even_i
     eventually("the forwarded connection to be gone", || (rig.forwarder.stats(&rule.id).active == 0).then_some(()))
         .await;
     expect_closed(&mut client).await;
+}
+
+fn ipv6_loopback_works() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
+/// `localhost` may mean either loopback, so a program that listens on one of them must not be
+/// shadowed by a rule on the other: its local clients would end up in the tunnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_on_the_other_loopback_makes_the_port_taken() {
+    if !ipv6_loopback_works() {
+        eprintln!("no IPv6 loopback on this machine, skipping");
+        return;
+    }
+    let rig = Rig::start().await;
+    for (occupied, rule_host, rule_text) in [("127.0.0.1", "::1", "[::1]"), ("::1", "127.0.0.1", "127.0.0.1")] {
+        let (port, occupant) = occupy_a_quiet_port(occupied);
+        let rule = rule(ForwardKind::Local, &format!("{rule_text}:{port}"), &rig.echo_target());
+        let state = rig.forwarder.start(rule.clone());
+        let RuleState::Failed(error) = state else {
+            panic!("a rule on {rule_host}:{port} started beside {occupied}: {state:?}")
+        };
+        assert!(
+            matches!(&error, RuleError::PortInUse { host, port: p, .. } if host == rule_host && *p == port),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), format!("本地端口 {port} 已被占用"));
+        assert_eq!(error.suggested_port(), Some(port + 10_000), "the suggestion is free on both loopbacks");
+
+        // With the program gone, the same rule starts.
+        drop(occupant);
+        assert!(rig.forwarder.start(rule.clone()).is_running());
+        assert!(rig.forwarder.stop(&rule.id));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_on_a_port_that_nobody_listens_on_is_not_mistaken_for_a_shadow() {
+    let rig = Rig::start().await;
+    let rule = rig.local_rule();
+    assert!(rig.forwarder.start(rule.clone()).is_running());
+    assert!(rig.forwarder.stop(&rule.id));
+    // The probes of the previous start left nothing behind.
+    assert!(rig.forwarder.start(rule.clone()).is_running());
+    assert_eq!(echo_through(rule.listen.port, b"free").await, b"free");
 }

@@ -23,7 +23,7 @@ pub(crate) struct Shared {
     host_key: Mutex<Option<HostKeyRecord>>,
     disconnect: Mutex<Option<String>>,
     /// Who the server's `forwarded-tcpip` channels go to.
-    pub remote: RemoteRegistry,
+    pub remote: Arc<RemoteRegistry>,
     /// Set once the transport has ended.
     pub closed: ClosedFlag,
 }

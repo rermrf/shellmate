@@ -120,9 +120,26 @@ pub fn rule(kind: ForwardKind, listen: &str, target: &str) -> ForwardRule {
         .unwrap_or_else(|err| panic!("{listen}: {err}"))
 }
 
-/// A loopback port nothing listens on right now.
+/// A loopback port nothing listens on, on either loopback.
+///
+/// Taken from a range (41000-48999) below the one the system uses for the ports of outgoing connections and
+/// for `bind(0)` (49152 and up), where the connections of tests running at the same time could
+/// take the number between choosing it and listening on it; the numbers differ per call and per
+/// process.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = 41_000 + (std::process::id().wrapping_mul(37).wrapping_add(n.wrapping_mul(13)) % 8_000) as u16;
+        // `AddrNotAvailable` (no IPv6) is as good as free.
+        let free = |host: &str| match std::net::TcpListener::bind((host, port)) {
+            Ok(_) => true,
+            Err(err) => err.kind() == std::io::ErrorKind::AddrNotAvailable,
+        };
+        if free("127.0.0.1") && free("::1") {
+            return port;
+        }
+    }
 }
 
 pub async fn dial(port: u16) -> TcpStream {

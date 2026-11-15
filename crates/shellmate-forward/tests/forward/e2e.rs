@@ -397,8 +397,6 @@ async fn e2e_a_reader_that_stalls_for_20_seconds_holds_up_nothing_else() {
     const FIREHOSE: usize = 256 * 1024 * 1024;
     const UPLOAD: usize = 32 * 1024 * 1024;
     let s = session().await;
-    // The guard that used to cut such a peer off after 15 s is not what is being tested.
-    s.forwarder.set_stall_limit(Duration::from_secs(3600));
     let base = 20_000 + (std::process::id() % 19_000) as u16;
     let (firehose_port, sink_port) = (base + 2, base + 3);
     let cleanup = StopListeners(vec![firehose_port, sink_port]);

@@ -18,7 +18,7 @@ mod state;
 mod stats;
 
 pub use addr::{AddrError, Endpoint, parse_listen, parse_target};
-pub use forwarder::{DEFAULT_STALL_LIMIT, Forwarder};
+pub use forwarder::Forwarder;
 pub use rule::{ForwardKind, ForwardRule, RuleId};
 pub use state::{ForwardEvent, RuleError, RuleState, RuleView};
 pub use stats::StatsSnapshot;

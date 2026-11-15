@@ -324,8 +324,12 @@ impl RemoteRegistry {
     }
 
     /// Hands a channel the server opened to whoever registered for it, or refuses it.
+    ///
+    /// Runs inside the session loop, which must not be held up: when the answer is not known yet
+    /// (a request for port 0 whose reply has not been noted by its requester), the wait happens in
+    /// a task of its own and this returns at once.
     pub(crate) async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         channel: Channel<Msg>,
         address: &str,
         port: u32,
@@ -333,34 +337,119 @@ impl RemoteRegistry {
         originator_port: u32,
         reply: ChannelOpenHandle,
     ) {
-        for _ in 0..PENDING_TRIES {
-            match self.route(address, port) {
-                Route::Found(sender) => {
-                    // Reserve the place first so a full queue can still refuse the channel.
-                    let permit = match sender.try_reserve() {
-                        Ok(permit) => permit,
-                        Err(mpsc::error::TrySendError::Full(())) => {
-                            reply.reject(ChannelOpenFailure::ResourceShortage).await;
-                            return;
+        match self.route(address, port) {
+            Route::Found(sender) => deliver(sender, channel, originator_address, originator_port, reply).await,
+            Route::Nobody => refuse(address, port, reply).await,
+            Route::Pending => {
+                let (registry, address, originator_address) =
+                    (self.clone(), address.to_string(), originator_address.to_string());
+                tokio::spawn(async move {
+                    for _ in 0..PENDING_TRIES {
+                        tokio::time::sleep(PENDING_WAIT).await;
+                        match registry.route(&address, port) {
+                            Route::Found(sender) => {
+                                return deliver(sender, channel, &originator_address, originator_port, reply).await;
+                            }
+                            Route::Nobody => break,
+                            Route::Pending => {}
                         }
-                        Err(mpsc::error::TrySendError::Closed(())) => {
-                            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
-                            return;
-                        }
-                    };
-                    reply.accept().await;
-                    permit.send(Incoming {
-                        channel,
-                        originator_address: originator_address.to_string(),
-                        originator_port: u16::try_from(originator_port).unwrap_or(0),
-                    });
-                    return;
-                }
-                Route::Pending => tokio::time::sleep(PENDING_WAIT).await,
-                Route::Nobody => break,
+                    }
+                    refuse(&address, port, reply).await;
+                });
             }
         }
-        log::debug!("refused a forwarded-tcpip channel for {address}:{port}: nobody registered it");
-        reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+    }
+}
+
+/// Puts the channel into the registrant's queue and confirms it, or refuses it if the queue is
+/// full or gone.
+async fn deliver(
+    sender: mpsc::Sender<Incoming>,
+    channel: Channel<Msg>,
+    originator_address: &str,
+    originator_port: u32,
+    reply: ChannelOpenHandle,
+) {
+    // Reserve the place first so that a full queue can still refuse the channel.
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            return reply.reject(ChannelOpenFailure::ResourceShortage).await;
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            return reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+        }
+    };
+    reply.accept().await;
+    permit.send(Incoming {
+        channel,
+        originator_address: originator_address.to_string(),
+        originator_port: u16::try_from(originator_port).unwrap_or(0),
+    });
+}
+
+async fn refuse(address: &str, port: u32, reply: ChannelOpenHandle) {
+    log::debug!("refused a forwarded-tcpip channel for {address}:{port}: nobody registered it");
+    reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sender() -> mpsc::Sender<Incoming> {
+        mpsc::channel(1).0
+    }
+
+    fn found(route: Route) -> bool {
+        matches!(route, Route::Found(_))
+    }
+
+    #[test]
+    fn the_exact_address_wins_and_a_lone_registration_on_the_port_takes_what_the_server_reports() {
+        let registry = RemoteRegistry::default();
+        let (a, b) = (sender(), sender());
+        registry.register("127.0.0.1", Some(9000), a.clone());
+        assert!(found(registry.route("127.0.0.1", 9000)));
+        // `localhost` comes back as 127.0.0.1 (or the other way round): same port, only one taker.
+        assert!(found(registry.route("localhost", 9000)));
+        assert!(found(registry.route("[127.0.0.1]", 9000)), "brackets and case do not matter");
+        assert!(matches!(registry.route("127.0.0.1", 9001), Route::Nobody));
+
+        // Two on one port: only the exact address is unambiguous.
+        registry.register("::1", Some(9000), b.clone());
+        let Route::Found(exact) = registry.route("::1", 9000) else { panic!("exact") };
+        assert!(exact.same_channel(&b));
+        let Route::Found(exact) = registry.route("127.0.0.1", 9000) else { panic!("exact") };
+        assert!(exact.same_channel(&a));
+        assert!(matches!(registry.route("localhost", 9000), Route::Nobody), "ambiguous: refused");
+    }
+
+    #[test]
+    fn a_request_waiting_for_its_port_makes_unknown_ports_wait_instead_of_being_refused() {
+        let registry = RemoteRegistry::default();
+        let id = registry.register("127.0.0.1", None, sender());
+        assert!(matches!(registry.route("127.0.0.1", 40_000), Route::Pending));
+        registry.set_port(id, 40_000);
+        assert!(found(registry.route("127.0.0.1", 40_000)));
+        assert!(matches!(registry.route("127.0.0.1", 40_001), Route::Nobody), "nothing pending any more");
+
+        // A port that is taken does not wait for somebody else's request.
+        registry.register("127.0.0.1", None, sender());
+        assert!(found(registry.route("127.0.0.1", 40_000)));
+    }
+
+    #[test]
+    fn closing_or_removing_registrations_refuses_what_comes_next() {
+        let registry = RemoteRegistry::default();
+        let id = registry.register("127.0.0.1", Some(9000), sender());
+        registry.register("127.0.0.1", Some(9001), sender());
+        registry.remove(id);
+        assert!(matches!(registry.route("127.0.0.1", 9000), Route::Nobody));
+        registry.remove_bound("127.0.0.1", 9001);
+        assert!(matches!(registry.route("127.0.0.1", 9001), Route::Nobody));
+        registry.register("127.0.0.1", Some(9002), sender());
+        registry.close();
+        assert!(matches!(registry.route("127.0.0.1", 9002), Route::Nobody));
     }
 }

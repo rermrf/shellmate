@@ -215,27 +215,3 @@ fn rule_to(rig: &Rig, target: &str) -> shellmate_forward::ForwardRule {
     let _ = rig;
     rule(shellmate_forward::ForwardKind::Local, &format!("127.0.0.1:{}", free_port()), target)
 }
-
-/// The SSH library stops serving a whole connection while one channel's data is not taken, so a
-/// local peer that stops reading would freeze terminals and other forwards alike.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_local_peer_that_stops_reading_cannot_freeze_the_ssh_connection_for_long() {
-    let rig = Rig::start().await;
-    rig.forwarder.set_stall_limit(Duration::from_millis(700));
-    let source = Source::start(512 * 1024 * 1024, 3).await;
-    let firehose =
-        rule(ForwardKind::Local, &format!("127.0.0.1:{}", free_port()), &format!("127.0.0.1:{}", source.port));
-    let other = rig.local_rule();
-    rig.forwarder.start(firehose.clone());
-    rig.forwarder.start(other.clone());
-
-    let mut stalled = dial(firehose.listen.port).await; // takes the first bytes, then never reads
-    let mut first = [0u8; 16];
-    stalled.read_exact(&mut first).await.unwrap();
-    let started = Instant::now();
-    let back = tokio::time::timeout(Duration::from_secs(20), echo_through(other.listen.port, b"are you there")).await;
-    assert_eq!(back.expect("the other forward works again"), b"are you there");
-    assert!(started.elapsed() < Duration::from_secs(10), "freed after {:?}", started.elapsed());
-    eventually("the stalled connection to be closed", || (rig.forwarder.stats(&firehose.id).active == 0).then_some(()))
-        .await;
-}

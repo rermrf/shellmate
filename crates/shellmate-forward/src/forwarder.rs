@@ -1,7 +1,6 @@
 //! The forwarder of one SSH connection: starts and stops rules and follows the connection
 //! through losses and reconnects.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -17,9 +16,6 @@ use crate::stats::{RuleStats, StatsSnapshot};
 
 /// How often changed numbers are reported (at most).
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a local peer may leave a forwarded connection's data untouched before the
-/// connection is closed (see [`Forwarder::set_stall_limit`]).
-pub const DEFAULT_STALL_LIMIT: Duration = Duration::from_secs(15);
 /// How long after a rule released a local port the same port is retried when it still looks
 /// taken: the listener is closed by its task a moment after the rule is stopped.
 const RELEASE_GRACE: Duration = Duration::from_secs(2);
@@ -65,8 +61,6 @@ pub(crate) struct Inner {
     events: async_channel::Sender<ForwardEvent>,
     slot: Arc<ConnSlot>,
     state: Mutex<State>,
-    /// See [`Forwarder::set_stall_limit`], in milliseconds.
-    stall_ms: Arc<AtomicU64>,
     /// Stops with the forwarder.
     _stats_task: Mutex<Option<AbortOnDrop>>,
 }
@@ -139,7 +133,6 @@ impl Forwarder {
             events,
             slot: Arc::new(ConnSlot::default()),
             state: Mutex::new(State::default()),
-            stall_ms: Arc::new(AtomicU64::new(DEFAULT_STALL_LIMIT.as_millis() as u64)),
             _stats_task: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
@@ -155,17 +148,6 @@ impl Forwarder {
         });
         *inner._stats_task.lock().unwrap_or_else(PoisonError::into_inner) = Some(AbortOnDrop::new(task));
         Self { inner }
-    }
-
-    /// How long a local peer may leave the data of a forwarded connection untouched (not read
-    /// it, while the other side has more to send) before that connection is closed; applies to
-    /// connections accepted afterwards. The default is [`DEFAULT_STALL_LIMIT`].
-    ///
-    /// The SSH library pauses the *whole* SSH connection — terminals and file transfers
-    /// included — when the application does not take the data of one channel, so a browser tab
-    /// that stopped reading must not be waited for indefinitely.
-    pub fn set_stall_limit(&self, limit: Duration) {
-        self.inner.stall_ms.store(limit.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
     /// Starts `rule` (replacing a running rule with the same id) and returns where it stands:
@@ -190,7 +172,7 @@ impl Forwarder {
         let mut entry = Entry {
             rule: rule.clone(),
             state: RuleState::Stopped,
-            stats: Arc::new(RuleStats::new(inner.stall_ms.clone())),
+            stats: Arc::new(RuleStats::default()),
             generation: 0,
             task: None,
             remote: None,
