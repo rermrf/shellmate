@@ -6,6 +6,7 @@
 mod support;
 
 mod e2e;
+mod flow;
 mod lifecycle;
 mod local;
 mod remote;

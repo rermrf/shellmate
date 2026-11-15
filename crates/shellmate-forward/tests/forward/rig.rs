@@ -264,6 +264,7 @@ impl Drop for Digest {
 /// it never reads (a one-way bulk download).
 pub struct Source {
     pub port: u16,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -271,24 +272,36 @@ impl Source {
     pub async fn start(size: usize, seed: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let task = tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut left = size;
-                    let mut block = 0u64;
-                    while left > 0 {
-                        let chunk = pattern(left.min(256 * 1024), seed.wrapping_add(block));
-                        if socket.write_all(&chunk).await.is_err() {
-                            return;
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn({
+            let written = written.clone();
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let written = written.clone();
+                    tokio::spawn(async move {
+                        let mut left = size;
+                        let mut block = 0u64;
+                        while left > 0 {
+                            let chunk = pattern(left.min(256 * 1024), seed.wrapping_add(block));
+                            if socket.write_all(&chunk).await.is_err() {
+                                return;
+                            }
+                            written.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+                            left -= chunk.len();
+                            block += 1;
                         }
-                        left -= chunk.len();
-                        block += 1;
-                    }
-                    let _ = socket.shutdown().await;
-                });
+                        let _ = socket.shutdown().await;
+                    });
+                }
             }
         });
-        Self { port, task }
+        Self { port, written, task }
+    }
+
+    /// How many bytes the service has managed to hand to its socket so far: what the connection
+    /// and the sockets in between have taken from it.
+    pub fn written(&self) -> u64 {
+        self.written.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The checksum of what a client should receive.

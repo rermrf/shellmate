@@ -225,6 +225,35 @@ fn start_sink(port: u16) -> std::thread::JoinHandle<String> {
     panic!("the sink did not start listening on {port}");
 }
 
+/// Sends `size` bytes of pattern through `local_port` to a sink started with [`start_sink`] and
+/// returns (what was sent, what the container says it received) as sha256 hex, and how long it took.
+async fn upload_to_sink(
+    local_port: u16,
+    sink: std::thread::JoinHandle<String>,
+    size: usize,
+) -> (String, String, Duration) {
+    let client = dial(local_port).await;
+    let (_reader, mut writer) = client.into_split();
+    let started = Instant::now();
+    let mut sha = Sha256::new();
+    let (mut left, mut block) = (size, 0u64);
+    while left > 0 {
+        let chunk = pattern(left.min(1 << 20), 1000 + block);
+        sha.update(&chunk);
+        writer
+            .write_all(&chunk)
+            .await
+            .expect("the forward closed the connection: the SSH connection is frozen or gone");
+        left -= chunk.len();
+        block += 1;
+    }
+    writer.shutdown().await.unwrap();
+    let remote = tokio::task::spawn_blocking(move || sink.join().unwrap()).await.unwrap();
+    let elapsed = started.elapsed();
+    let remote_sum = remote.split_whitespace().next().unwrap_or_default().to_string();
+    (sha256_hex(sha.finalize()), remote_sum, elapsed)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a real OpenSSH server with AllowTcpForwarding (see the module docs)"]
 async fn e2e_throughput_of_a_128_mib_upload_through_a_local_forward() {
@@ -234,23 +263,8 @@ async fn e2e_throughput_of_a_128_mib_upload_through_a_local_forward() {
     assert!(s.forwarder.start(rule.clone()).is_running());
     let sink = start_sink(sink_port);
 
-    let client = dial(rule.listen.port).await;
-    let (_reader, mut writer) = client.into_split();
-    let started = Instant::now();
-    let mut sha = Sha256::new();
-    let (mut left, mut block) = (TRANSFER, 0u64);
-    while left > 0 {
-        let chunk = pattern(left.min(1 << 20), 1000 + block);
-        sha.update(&chunk);
-        writer.write_all(&chunk).await.unwrap();
-        left -= chunk.len();
-        block += 1;
-    }
-    writer.shutdown().await.unwrap();
-    let remote = tokio::task::spawn_blocking(move || sink.join().unwrap()).await.unwrap();
-    let elapsed = started.elapsed();
-    let remote_sum = remote.split_whitespace().next().unwrap_or_default().to_string();
-    assert_eq!(remote_sum, sha256_hex(sha.finalize()), "the container received the same bytes");
+    let (sent, received, elapsed) = upload_to_sink(rule.listen.port, sink, TRANSFER).await;
+    assert_eq!(received, sent, "the container received the same bytes");
     let rate = TRANSFER as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     eprintln!("UPLOAD {TRANSFER} bytes in {elapsed:.2?}: {rate:.1} MiB/s (includes producing the data)");
     let stats = s.forwarder.stats(&rule.id);
@@ -313,5 +327,153 @@ async fn e2e_throughput_of_a_128_mib_download_through_a_local_forward() {
     assert_eq!(sha256_hex(sha.finalize()), sha256_hex(expected.finalize()));
     let rate = TRANSFER as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
     eprintln!("DOWNLOAD {TRANSFER} bytes in {elapsed:.2?}: {rate:.1} MiB/s (includes hashing)");
+    drop(s.connection);
+}
+
+/// Stops the `nc` listeners of the container that a test started on these ports (they are ours:
+/// found by their port), also when the test fails halfway.
+struct StopListeners(Vec<u16>);
+
+impl Drop for StopListeners {
+    fn drop(&mut self) {
+        for port in &self.0 {
+            let _ = Command::new("docker")
+                .args([
+                    "exec",
+                    &container(),
+                    "sh",
+                    "-c",
+                    &format!(
+                        "kill $(ps -o pid,args | grep 'nc -l -p {port}' | grep -v grep | awk '{{print $1}}') 2>/dev/null || true"
+                    ),
+                ])
+                .output();
+        }
+    }
+}
+
+/// A shell on `connection` that answers within `within`; returns how long the answer took.
+async fn shell_answers(connection: &Connection, within: Duration) -> Duration {
+    use shellmate_core::{PtyDims, TerminalBackend};
+
+    let dims = PtyDims { cols: 100, rows: 30, pixel_width: 0, pixel_height: 0 };
+    let (recorder, sink) = crate::support::Recorder::sink();
+    let pending = tokio::time::timeout(Duration::from_secs(10), connection.open_shell(dims))
+        .await
+        .expect("the connection is frozen: a shell could not be opened")
+        .expect("open shell");
+    let mut shell = pending.start(sink, dims);
+    // Whatever the server prints first (a prompt, a banner) means the shell is up.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while recorder.text().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the connection is frozen: the shell said nothing");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    // The typed text is echoed back as written; only the shell's own answer is 42 + the marker.
+    shell.write(b"echo $((6*7))stalled\r").unwrap();
+    tokio::time::timeout(within, async {
+        while !recorder.text().contains("42stalled") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the connection is frozen: the shell did not answer within {within:?}"));
+    let took = started.elapsed();
+    shell.close();
+    took
+}
+
+/// The old behaviour of the library (and of the guard that papered over it): a local peer that
+/// stops reading froze the whole SSH connection. A peer that stalls for 20 s must only pause its
+/// own channel, everything else on the connection must go on, and it must get every byte after it
+/// reads again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real OpenSSH server with AllowTcpForwarding (see the module docs)"]
+async fn e2e_a_reader_that_stalls_for_20_seconds_holds_up_nothing_else() {
+    const FIREHOSE: usize = 256 * 1024 * 1024;
+    const UPLOAD: usize = 32 * 1024 * 1024;
+    let s = session().await;
+    // The guard that used to cut such a peer off after 15 s is not what is being tested.
+    s.forwarder.set_stall_limit(Duration::from_secs(3600));
+    let base = 20_000 + (std::process::id() % 19_000) as u16;
+    let (firehose_port, sink_port) = (base + 2, base + 3);
+    let cleanup = StopListeners(vec![firehose_port, sink_port]);
+
+    // A source of zeros in the container, far more than the windows in between can hold.
+    let (user, name) = (setting("SHELLMATE_E2E_USER", "tester"), container());
+    let script =
+        format!("dd if=/dev/zero bs=1048576 count={} 2>/dev/null | nc -l -p {firehose_port} -w 60", FIREHOSE >> 20);
+    let source = std::thread::spawn(move || {
+        Command::new("docker")
+            .args(["exec", "-u", &user, &name, "sh", "-c", &script])
+            .stderr(Stdio::null())
+            .output()
+            .expect("docker is installed");
+    });
+    for _ in 0..50 {
+        let listening = docker(&format!("netstat -ltn 2>/dev/null | grep -c ':{firehose_port} ' || true"));
+        if listening.trim() != "0" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let firehose =
+        rule(ForwardKind::Local, &format!("127.0.0.1:{}", free_port()), &format!("127.0.0.1:{firehose_port}"));
+    let other = rule(ForwardKind::Local, &format!("127.0.0.1:{}", free_port()), &format!("127.0.0.1:{sink_port}"));
+    assert!(s.forwarder.start(firehose.clone()).is_running());
+    assert!(s.forwarder.start(other.clone()).is_running());
+    let sink = start_sink(sink_port);
+
+    // The peer takes the first 64 KiB and then does not read for 20 s.
+    let mut stalled = dial(firehose.listen.port).await;
+    let mut sha = Sha256::new();
+    let mut length = 0usize;
+    let mut buf = vec![0u8; 1 << 20];
+    while length < 64 * 1024 {
+        let n = stalled.read(&mut buf).await.unwrap();
+        assert_ne!(n, 0);
+        sha.update(&buf[..n]);
+        length += n;
+    }
+    let stall_began = Instant::now();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Meanwhile: a second forward moves 32 MiB, and a shell on the same connection answers.
+    let (sent, received, elapsed) =
+        tokio::time::timeout(Duration::from_secs(30), upload_to_sink(other.listen.port, sink, UPLOAD))
+            .await
+            .expect("the connection is frozen: the second forward moved no data while the first was stalled");
+    assert_eq!(received, sent);
+    eprintln!("{} MiB uploaded in {elapsed:.2?} while the other forward was stalled", UPLOAD >> 20);
+    let took = shell_answers(&s.connection, Duration::from_secs(2)).await;
+    eprintln!("a shell answered in {took:.2?} while the other forward was stalled");
+
+    tokio::time::sleep(Duration::from_secs(20).saturating_sub(stall_began.elapsed())).await;
+    eprintln!("the peer resumes after {:.1?}", stall_began.elapsed());
+
+    // The peer reads on and gets everything.
+    while length < FIREHOSE {
+        let n = tokio::time::timeout(Duration::from_secs(60), stalled.read(&mut buf)).await.expect("progress").unwrap();
+        assert_ne!(n, 0, "the connection ended after {length} bytes");
+        let n = n.min(FIREHOSE - length);
+        sha.update(&buf[..n]);
+        length += n;
+    }
+    let mut expected = Sha256::new();
+    let zeros = vec![0u8; 1 << 20];
+    for _ in 0..FIREHOSE >> 20 {
+        expected.update(&zeros);
+    }
+    assert_eq!(sha256_hex(sha.finalize()), sha256_hex(expected.finalize()), "every byte arrived intact");
+    drop(stalled);
+
+    // busybox's nc keeps its connection after the data; stop it so that the thread ends.
+    drop(cleanup);
+    let _ = source.join();
     drop(s.connection);
 }
