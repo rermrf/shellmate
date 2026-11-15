@@ -56,6 +56,9 @@ pub enum SshError {
     /// A session channel or PTY could not be set up.
     #[error("无法打开会话：{0}")]
     Channel(String),
+    /// A command run with `exec` did not finish in time.
+    #[error("命令执行超时（{}内没有结束）", describe_limit(*.limit))]
+    ExecTimeout { limit: std::time::Duration },
     /// The connection dropped.
     #[error("连接已断开：{0}")]
     Disconnected(String),

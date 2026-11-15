@@ -50,6 +50,60 @@ pub struct KbdRound {
 /// Runs a subsystem (`sftp`) on the byte stream of the channel that requested it.
 pub type SubsystemRunner = Arc<dyn Fn(ChannelStream<Msg>) + Send + Sync>;
 
+/// Runs a command requested with `exec` (the command text and the channel to answer on). It should
+/// spawn a task for anything that takes time; see [`exec_runner`].
+pub type ExecRunner = Arc<dyn Fn(String, ExecChannel) + Send + Sync>;
+
+/// Turns an async function into an [`ExecRunner`]: every `exec` request runs it in its own task.
+pub fn exec_runner<F, Fut>(run: F) -> ExecRunner
+where
+    F: Fn(String, ExecChannel) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move |command, channel| {
+        tokio::spawn(run(command, channel));
+    })
+}
+
+/// The server's end of an exec channel: what a command writes, how it ends, and whether the client
+/// has closed the channel (a real command would die of SIGPIPE at its next write then).
+#[derive(Clone)]
+pub struct ExecChannel {
+    handle: server::Handle,
+    id: ChannelId,
+    closed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ExecChannel {
+    /// Writes to stdout; `false` once the client has gone.
+    pub async fn stdout(&self, data: impl Into<Vec<u8>>) -> bool {
+        !self.is_closed() && self.handle.data(self.id, data.into()).await.is_ok()
+    }
+
+    /// Writes to stderr; `false` once the client has gone.
+    pub async fn stderr(&self, data: impl Into<Vec<u8>>) -> bool {
+        !self.is_closed() && self.handle.extended_data(self.id, 1, data.into()).await.is_ok()
+    }
+
+    /// Ends the command with exit status `code` and closes the channel.
+    pub async fn exit(&self, code: u32) {
+        let _ = self.handle.exit_status_request(self.id, code).await;
+        let _ = self.handle.eof(self.id).await;
+        let _ = self.handle.close(self.id).await;
+    }
+
+    /// Whether the client closed the channel.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Resolves when the client closes the channel (or the connection goes).
+    pub async fn wait_closed(&self) {
+        let mut closed = self.closed.clone();
+        let _ = closed.wait_for(|closed| *closed).await;
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerOptions {
     /// (user, password) pairs accepted by `password` auth.
@@ -77,6 +131,8 @@ pub struct ServerOptions {
     pub auth_delay: Duration,
     /// Subsystems served on session channels, by name; others are refused.
     pub subsystems: Vec<(&'static str, SubsystemRunner)>,
+    /// Runs `exec` requests; `None` refuses them.
+    pub exec: Option<ExecRunner>,
 }
 
 impl Default for ServerOptions {
@@ -94,6 +150,7 @@ impl Default for ServerOptions {
             pty_delay: Duration::ZERO,
             auth_delay: Duration::ZERO,
             subsystems: Vec::new(),
+            exec: None,
         }
     }
 }
@@ -121,6 +178,8 @@ pub struct ServerState {
     pub shells: Mutex<usize>,
     /// Names of the subsystems requested (`sftp`).
     pub subsystem_requests: Mutex<Vec<String>>,
+    /// The command of every `exec` request.
+    pub execs: Mutex<Vec<String>>,
     /// Channels the client closed.
     pub closed_channels: Mutex<usize>,
     sockets: Mutex<Vec<std::net::TcpStream>>,
@@ -249,6 +308,8 @@ struct FixtureHandler {
     channels: HashMap<ChannelId, Channel<Msg>>,
     /// Listeners of remote forwards, by (address, actual port); stopped with the connection.
     listeners: HashMap<(String, u32), tokio::task::JoinHandle<()>>,
+    /// Exec channels still open; set when the client closes the channel.
+    exec_closed: HashMap<ChannelId, tokio::sync::watch::Sender<bool>>,
 }
 
 impl Drop for FixtureHandler {
@@ -271,6 +332,7 @@ impl FixtureHandler {
             sizes: HashMap::new(),
             channels: HashMap::new(),
             listeners: HashMap::new(),
+            exec_closed: HashMap::new(),
         }
     }
 
@@ -417,7 +479,12 @@ impl server::Handler for FixtureHandler {
         Ok(())
     }
 
-    async fn tcpip_forward(&mut self, address: &str, port: &mut u32, session: &mut Session) -> Result<bool, Self::Error> {
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
         lock(&self.state.remote_forwards).push((address.to_string(), *port));
         if !self.options.remote_forwarding {
             return Ok(false);
@@ -535,8 +602,31 @@ impl server::Handler for FixtureHandler {
         Ok(())
     }
 
-    async fn channel_close(&mut self, _channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data).into_owned();
+        lock(&self.state.execs).push(command.clone());
+        match self.options.exec.clone() {
+            Some(run) => {
+                session.channel_success(channel)?;
+                let (closed_tx, closed) = tokio::sync::watch::channel(false);
+                self.exec_closed.insert(channel, closed_tx);
+                run(command, ExecChannel { handle: session.handle(), id: channel, closed });
+            }
+            None => session.channel_failure(channel)?,
+        }
+        Ok(())
+    }
+
+    async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
         *lock(&self.state.closed_channels) += 1;
+        if let Some(closed) = self.exec_closed.remove(&channel) {
+            let _ = closed.send(true);
+        }
         Ok(())
     }
 }
@@ -565,7 +655,12 @@ impl Verifier {
 
     /// Trusts everything except the servers on `ports`.
     pub fn denying(ports: &[u16]) -> Arc<Self> {
-        Arc::new(Self { accept: true, delay: Duration::ZERO, deny_ports: ports.to_vec(), requests: Mutex::new(Vec::new()) })
+        Arc::new(Self {
+            accept: true,
+            delay: Duration::ZERO,
+            deny_ports: ports.to_vec(),
+            requests: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn asked(&self) -> Vec<HostKeyRequest> {
