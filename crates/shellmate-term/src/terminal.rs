@@ -556,6 +556,7 @@ impl Terminal {
     pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{self.output_capture.lock().start(path,file,header)}
     pub fn stop_recording(&mut self)->std::io::Result<Option<crate::capture_output::RecordingResult>>{self.output_capture.lock().stop()}
     pub fn recording_seconds(&self)->Option<f64>{self.output_capture.lock().seconds()}
+    pub fn recording_duration(&self)->Option<f64>{self.output_capture.lock().playback_duration()}
     pub fn flush_archives(&mut self)->Option<String>{let mut c=self.output_capture.lock();c.flush();c.error()}
     pub fn set_logging(&mut self,root:Option<std::path::PathBuf>,host:&str){
         self.output_capture.lock().stop_logging();

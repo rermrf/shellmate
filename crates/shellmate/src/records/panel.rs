@@ -122,6 +122,7 @@ impl RecordsWindow {
                 demo_end: None,
             };
             this.load(cx);
+            this.refresh_durations(cx);
             this
         });
         dialogs::open(
@@ -132,6 +133,53 @@ impl RecordsWindow {
             body.clone(),
         );
         body
+    }
+    /// Older catalog rows contain wall time. Repair them from the immutable event stream,
+    /// off the UI thread, without loading all recordings into memory.
+    fn refresh_durations(&mut self, cx: &mut Context<Self>) {
+        let rows = self
+            .recordings
+            .iter()
+            .filter(|r| !self.active.contains(&r.id))
+            .map(|r| (r.id, PathBuf::from(&r.path)))
+            .collect::<Vec<_>>();
+        cx.spawn(async move |this, cx| {
+            let durations = cx
+                .background_executor()
+                .spawn(async move {
+                    rows.into_iter()
+                        .map(|(id, path)| (id, Cast::playback_duration(&path)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                for (id, result) in durations {
+                    match result {
+                        Ok(duration) => s.set_duration(id, duration),
+                        Err(error) => {
+                            s.errors.insert(id, error);
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+    fn set_duration(&mut self, id: i64, duration: f64) {
+        if let Some(row) = self.recordings.iter_mut().find(|r| r.id == id)
+            && row.duration != duration
+        {
+            row.duration = duration;
+            if let Err(error) = self
+                .store
+                .borrow_mut()
+                .finish_recording(row.id, duration, row.size)
+            {
+                self.error = Some(format!("无法更新录制时长：{error}"));
+            }
+        }
     }
     fn load(&mut self, cx: &mut Context<Self>) {
         self.play.playing = false;
@@ -200,6 +248,7 @@ impl RecordsWindow {
                     s.loading = false;
                     match result {
                         Ok(cast) => {
+                            s.set_duration(id, cast.duration);
                             s.terminal
                                 .update(cx, |t, _| t.replay_reset(cast.header.cols, cast.header.rows));
                             s.timeline = Some(Timeline::new(cast));

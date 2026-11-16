@@ -69,7 +69,7 @@ impl Workspace {
             ] {
                 writer.output(at, text.as_bytes()).unwrap();
             }
-            let writer = writer.finish(10.).unwrap();
+            let (writer, duration) = writer.finish(10.).unwrap();
             let size = writer.get_ref().metadata().unwrap().len();
             let row = Recording {
                 id: 0,
@@ -78,7 +78,7 @@ impl Workspace {
                 label: host.into(),
                 path: path.to_string_lossy().into_owned(),
                 started_at: now - i as i64 * 86400,
-                duration: 10.,
+                duration,
                 size,
                 cols: 100,
                 rows: 28,
@@ -88,13 +88,15 @@ impl Workspace {
         let mut log = shellmate_term::session_log::LogWriter::new(self.log_root.clone(), "prod-web-01");
         log.lines(
             &[
-                "nginx: configuration file syntax is ok".into(),
-                "systemctl reload nginx".into(),
-                "nginx.service: Reloaded successfully".into(),
-                "health check: 200 OK".into(),
-                "进度 99%".into(),
-            ],
-            now,
+                "nginx: configuration file syntax is ok",
+                "systemctl reload nginx",
+                "nginx.service: Reloaded successfully",
+                "health check: 200 OK",
+                "进度 99%",
+            ]
+            .into_iter()
+            .map(|text| shellmate_term::session_log::LogLine::new(text, now))
+            .collect::<Vec<_>>(),
         )
         .unwrap();
         log.flush().unwrap();

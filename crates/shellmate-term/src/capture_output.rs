@@ -1,6 +1,5 @@
 //! Per-terminal output tap. Lives across backend generations; never sees keyboard input.
 use crate::{
-    archive,
     cast::{self, Header},
     session_log::{LineTracker, LogWriter},
 };
@@ -40,12 +39,14 @@ impl OutputCapture {
     pub fn seconds(&self) -> Option<f64> {
         self.recording.as_ref().map(|r| r.start.elapsed().as_secs_f64())
     }
+    pub fn playback_duration(&self) -> Option<f64> {
+        self.recording.as_ref().map(|r| r.writer.duration())
+    }
     pub fn stop(&mut self) -> io::Result<Option<RecordingResult>> {
         let Some(r) = self.recording.take() else {
             return Ok(None);
         };
-        let duration = r.start.elapsed().as_secs_f64();
-        let writer = r.writer.finish(duration)?;
+        let (writer, duration) = r.writer.finish(r.start.elapsed().as_secs_f64())?;
         let size = writer.get_ref().metadata()?.len();
         Ok(Some(RecordingResult {
             path: r.path,
@@ -73,9 +74,7 @@ impl OutputCapture {
     pub fn stop_logging(&mut self) {
         self.pending_log = None;
         if let Some((mut tracker, mut writer)) = self.logger.take() {
-            let result = writer
-                .lines(&tracker.finish(), archive::now())
-                .and_then(|_| writer.flush());
+            let result = writer.lines(&tracker.finish()).and_then(|_| writer.flush());
             if let Err(e) = result {
                 self.error = Some(format!("会话日志保存失败：{e}"));
             }
@@ -89,7 +88,7 @@ impl OutputCapture {
             self.recording = None;
         }
         if let Some((tracker, writer)) = &mut self.logger
-            && let Err(e) = writer.lines(&tracker.feed(bytes), archive::now())
+            && let Err(e) = writer.lines(&tracker.feed(bytes))
         {
             self.error = Some(format!("会话日志已停止：{e}"));
             self.logger = None;
@@ -98,7 +97,7 @@ impl OutputCapture {
     /// Application notices and local clear affect the log's grid, but are not remote recording output.
     pub fn log_output(&mut self, bytes: &[u8]) {
         if let Some((tracker, writer)) = &mut self.logger
-            && let Err(e) = writer.lines(&tracker.feed(bytes), archive::now())
+            && let Err(e) = writer.lines(&tracker.feed(bytes))
         {
             self.error = Some(format!("会话日志已停止：{e}"));
             self.logger = None;
@@ -112,7 +111,7 @@ impl OutputCapture {
             self.recording = None;
         }
         if let Some((tracker, writer)) = &mut self.logger
-            && let Err(e) = writer.lines(&tracker.resize(cols, rows), archive::now())
+            && let Err(e) = writer.lines(&tracker.resize(cols, rows))
         {
             self.error = Some(format!("会话日志已停止：{e}"));
             self.logger = None;
@@ -146,6 +145,7 @@ impl Drop for OutputCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive;
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("shellmate-output-{}", shellmate_core::HostId::generate()))
     }
@@ -165,11 +165,28 @@ mod tests {
         assert!(capture.seconds().is_none());
         let cast = cast::Cast::open(&path).unwrap();
         assert_eq!(cast.events.len(), 2);
+        assert_eq!(result.duration, cast.duration);
+        assert_eq!(cast::Cast::playback_duration(&path).unwrap(), cast.duration);
         assert_eq!(
             cast.events[0].data,
             cast::Data::Output("\x1b[31mhello\x1b[0m\r\n".into())
         );
         assert_eq!(cast.events[1].data, cast::Data::Resize(100, 30));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn stop_returns_compressed_event_duration_for_the_catalog() {
+        let dir = root();
+        let (path, file) = archive::recording_file(&dir, "host", 1_700_000_000).unwrap();
+        let mut capture = OutputCapture::default();
+        capture.start(path.clone(), file, &Header::new(80, 24)).unwrap();
+        let recording = capture.recording.as_mut().unwrap();
+        recording.writer.output(1., b"first").unwrap();
+        recording.writer.output(5., b"last").unwrap();
+        assert_eq!(capture.playback_duration(), Some(3.));
+        let stopped = capture.stop().unwrap().unwrap();
+        assert_eq!(stopped.duration, 3.);
+        assert_eq!(cast::Cast::open(&path).unwrap().duration, 3.);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

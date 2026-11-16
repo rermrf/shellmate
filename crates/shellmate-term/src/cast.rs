@@ -1,6 +1,5 @@
 //! Streaming asciinema v2 output/resize writer and validated reader.
-// Use the JSON implementation already exposed by our pinned gpui dependency; no new dependency.
-use gpui::private::serde_json::{self as json, Value, json};
+use serde_json::{self as json, Value, json};
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, Write},
@@ -88,7 +87,22 @@ impl Utf8 {
 pub struct Writer<W: Write> {
     writer: W,
     utf8: Utf8,
+    clock: EventClock,
+}
+
+/// One convention for writer metadata and reader/player time: cap each inter-event gap at 2 s.
+#[derive(Default)]
+struct EventClock {
     last: f64,
+    duration: f64,
+}
+impl EventClock {
+    fn advance(&mut self, at: f64) -> f64 {
+        let at = at.max(self.last);
+        self.duration += (at - self.last).min(2.);
+        self.last = at;
+        at
+    }
 }
 impl<W: Write> Writer<W> {
     pub fn new(mut writer: W, header: &Header) -> io::Result<Self> {
@@ -97,14 +111,15 @@ impl<W: Write> Writer<W> {
         Ok(Self {
             writer,
             utf8: Utf8::default(),
-            last: 0.,
+            clock: EventClock::default(),
         })
     }
     fn event(&mut self, at: f64, kind: &str, text: &str) -> io::Result<()> {
-        let at = at.max(self.last);
-        self.last = at;
+        let at = at.max(self.clock.last);
         json::to_writer(&mut self.writer, &json!([at, kind, text]))?;
-        self.writer.write_all(b"\n")
+        self.writer.write_all(b"\n")?;
+        self.clock.advance(at);
+        Ok(())
     }
     pub fn output(&mut self, at: f64, bytes: &[u8]) -> io::Result<()> {
         let text = self.utf8.push(bytes, false);
@@ -119,13 +134,16 @@ impl<W: Write> Writer<W> {
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
-    pub fn finish(mut self, at: f64) -> io::Result<W> {
+    pub fn duration(&self) -> f64 {
+        self.clock.duration
+    }
+    pub fn finish(mut self, at: f64) -> io::Result<(W, f64)> {
         let tail = self.utf8.push(&[], true);
         if !tail.is_empty() {
             self.event(at, "o", &tail)?;
         }
         self.writer.flush()?;
-        Ok(self.writer)
+        Ok((self.writer, self.clock.duration))
     }
 }
 #[derive(Clone)]
@@ -136,6 +154,20 @@ pub struct Cast {
 }
 impl Cast {
     pub fn read(reader: impl BufRead) -> Result<Self, String> {
+        let mut events = Vec::new();
+        let (header, duration) = Self::read_events(reader, |event| events.push(event))?;
+        Ok(Self {
+            header,
+            events,
+            duration,
+        })
+    }
+    /// Scan old catalog entries without retaining their output events in memory.
+    pub fn playback_duration(path: &Path) -> Result<f64, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("无法打开录制：{e}"))?;
+        Self::read_events(std::io::BufReader::new(file), |_| {}).map(|(_, duration)| duration)
+    }
+    fn read_events(reader: impl BufRead, mut emit: impl FnMut(Event)) -> Result<(Header, f64), String> {
         let mut lines = reader.lines();
         let header: Value = json::from_str(&lines.next().ok_or("录制文件为空")?.map_err(|e| e.to_string())?)
             .map_err(|_| "录制头部无效")?;
@@ -161,8 +193,7 @@ impl Cast {
                 }
             }
         }
-        let mut events = vec![];
-        let (mut previous, mut duration) = (0., 0.);
+        let mut clock = EventClock::default();
         for (index, line) in lines.enumerate() {
             let line = line.map_err(|e| e.to_string())?;
             if line.trim().is_empty() {
@@ -173,12 +204,11 @@ impl Cast {
             let a = v.as_array().filter(|a| a.len() == 3).ok_or_else(err)?;
             let at = a[0]
                 .as_f64()
-                .filter(|t| t.is_finite() && *t >= previous)
+                .filter(|t| t.is_finite() && *t >= clock.last)
                 .ok_or_else(err)?;
             let kind = a[1].as_str().ok_or_else(err)?;
             let text = a[2].as_str().ok_or_else(err)?;
-            duration += (at - previous).min(2.);
-            previous = at;
+            clock.advance(at);
             let data = match kind {
                 "o" => Data::Output(text.into()),
                 "r" => {
@@ -195,13 +225,12 @@ impl Cast {
                 "i" | "m" => continue,
                 _ => return Err(err()),
             };
-            events.push(Event { at: duration, data });
+            emit(Event {
+                at: clock.duration,
+                data,
+            });
         }
-        Ok(Self {
-            header: h,
-            events,
-            duration,
-        })
+        Ok((h, clock.duration))
     }
     pub fn open(path: &Path) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("无法打开录制：{e}"))?;
@@ -243,9 +272,10 @@ mod tests {
         }
         w.output(1., b"\xff\xe4").unwrap();
         w.resize(1.2, 100, 30).unwrap();
-        let bytes = w.finish(1.4).unwrap();
+        let (bytes, duration) = w.finish(1.4).unwrap();
         let c = Cast::read(bytes.as_slice()).unwrap();
         assert_eq!(c.header, h);
+        assert_eq!(duration, c.duration);
         let text: String = c
             .events
             .iter()
@@ -267,6 +297,43 @@ mod tests {
         assert_eq!(c.duration, 3.);
         assert_eq!(c.events[2].at, 3.);
     }
+    #[test]
+    fn writer_duration_matches_playback_including_resize_and_final_utf8_fragment() {
+        for events in [vec![], vec![0.5], vec![0., 5., 5.5, 20.]] {
+            let mut writer = Writer::new(Vec::new(), &Header::new(80, 24)).unwrap();
+            for at in events {
+                writer.output(at, b"output").unwrap();
+            }
+            writer.resize(25., 100, 30).unwrap();
+            let before = writer.duration();
+            writer.output(26., b"\xe4").unwrap();
+            assert_eq!(
+                writer.duration(),
+                before,
+                "an incomplete UTF-8 fragment is not an event yet"
+            );
+            let (bytes, duration) = writer.finish(30.).unwrap();
+            assert_eq!(duration, Cast::read(bytes.as_slice()).unwrap().duration);
+            assert_eq!(duration, before + 2.);
+        }
+    }
+    #[test]
+    fn stopping_without_output_does_not_add_idle_time() {
+        let mut writer = Writer::new(Vec::new(), &Header::new(80, 24)).unwrap();
+        writer.output(1., b"first").unwrap();
+        writer.output(5., b"last").unwrap();
+        assert_eq!(writer.duration(), 3.);
+        let (bytes, duration) = writer.finish(60.).unwrap();
+        assert_eq!(duration, 3.);
+        assert_eq!(Cast::read(bytes.as_slice()).unwrap().duration, 3.);
+        let (bytes, duration) = Writer::new(Vec::new(), &Header::new(80, 24))
+            .unwrap()
+            .finish(60.)
+            .unwrap();
+        assert_eq!(duration, 0.);
+        assert_eq!(Cast::read(bytes.as_slice()).unwrap().duration, 0.);
+    }
+
     #[test]
     fn corrupt_input_is_an_error() {
         for text in [

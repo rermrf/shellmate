@@ -111,7 +111,7 @@ impl Render for SettingsWindow {
                         .child("凭据存储方式"),
                 )
                 .child(
-                    div().flex().gap(px(10.)).children(
+                    div().w_full().min_w_0().flex().gap(px(10.)).children(
                         [
                             (
                                 true,
@@ -128,6 +128,8 @@ impl Render for SettingsWindow {
                         .map(|(selected, title, description)| {
                             div()
                                 .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
                                 .p(px(16.))
                                 .rounded(px(18.))
                                 .border_1()
@@ -141,6 +143,8 @@ impl Render for SettingsWindow {
                                 )
                                 .child(
                                     div()
+                                        .w_full()
+                                        .whitespace_normal()
                                         .mt(px(8.))
                                         .text_size(px(12.))
                                         .text_color(p.tx2)
@@ -170,13 +174,19 @@ impl Render for SettingsWindow {
                         .flex()
                         .items_center()
                         .child(
-                            div().flex_1().text_size(px(13.)).child(label).child(
-                                div()
-                                    .mt(px(4.))
-                                    .text_size(px(12.))
-                                    .text_color(p.tx3)
-                                    .child("后续版本提供"),
-                            ),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(px(13.))
+                                .child(label)
+                                .child(
+                                    div()
+                                        .mt(px(4.))
+                                        .text_size(px(12.))
+                                        .text_color(p.tx3)
+                                        .child("后续版本提供"),
+                                ),
                         )
                         .child(Switch::new(("future-pref", i)).checked(false).disabled(true)),
                 );
@@ -184,6 +194,9 @@ impl Render for SettingsWindow {
         } else if self.section == 1 {
             content = content.child(
                 div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
                     .p(px(24.))
                     .rounded(px(18.))
                     .bg(p.card)
@@ -226,6 +239,7 @@ impl Render for SettingsWindow {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .whitespace_normal()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(key.label())
@@ -279,6 +293,8 @@ impl Render for SettingsWindow {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .w_full()
                     .flex()
                     .gap(px(20.))
                     .child(nav)

@@ -38,7 +38,7 @@ impl Workspace {
                     let (duration, size) = match result {
                         Ok(Some(r)) => (r.duration, r.size),
                         _ => (
-                            r.start.elapsed().as_secs_f64(),
+                            r.row.duration,
                             std::fs::metadata(&r.row.path).map_or(0, |m| m.len()),
                         ),
                     };
@@ -159,7 +159,7 @@ impl Workspace {
         let Some(running) = self.running_recordings.remove(&id) else {
             return Ok(None);
         };
-        let mut duration = running.start.elapsed().as_secs_f64();
+        let mut duration = running.row.duration;
         let mut size = std::fs::metadata(&running.row.path).map_or(0, |m| m.len());
         let mut error = None;
         if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
@@ -216,16 +216,16 @@ impl Workspace {
             if let Some(e) = error {
                 window.push_notification(Notification::error(e), cx);
             }
-            if let Some(r) = self.running_recordings.get(&s.id) {
+            if let Some(r) = self.running_recordings.get_mut(&s.id) {
                 if s.terminal.read(cx).recording_seconds().is_none() {
                     stopped.push(s.id);
                 } else {
                     let size = std::fs::metadata(&r.row.path).map_or(0, |m| m.len());
-                    let _ = self.store.borrow_mut().finish_recording(
-                        r.row.id,
-                        r.start.elapsed().as_secs_f64(),
-                        size,
-                    );
+                    r.row.duration = s.terminal.read(cx).recording_duration().unwrap_or(r.row.duration);
+                    let _ = self
+                        .store
+                        .borrow_mut()
+                        .finish_recording(r.row.id, r.row.duration, size);
                 }
             }
         }
