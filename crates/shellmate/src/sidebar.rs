@@ -74,6 +74,7 @@ pub enum SidebarEvent {
     ActivateHost(HostId),
     /// 搜索主机 on the rail: show the sidebar and put the cursor in its search field.
     SearchHosts,
+    Settings,
     ToggleSidebar,
     /// Open the editor for a new host.
     NewHost,
@@ -552,9 +553,10 @@ impl Sidebar {
                     .items_center()
                     .justify_center()
                     .rounded(px(7.))
-                    .opacity(0.5)
+                    .cursor_pointer().hover(|d|d.bg(p.card2))
+                    .on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::Settings)))
                     .child(Icon::new(Lucide::Settings).size(px(15.)).text_color(p.tx2))
-                    .tooltip(|window, cx| Tooltip::new("设置（后续阶段实现）").build(window, cx)),
+                    .tooltip(|window, cx| Tooltip::new("设置").build(window, cx)),
             )
     }
 }

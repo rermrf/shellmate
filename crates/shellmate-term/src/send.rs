@@ -20,9 +20,13 @@ pub(crate) fn validate(command: &str, mode: &TermMode) -> Result<(), &'static st
     Ok(())
 }
 
+pub(crate) fn effective_mode(mut mode:TermMode,enabled:bool)->TermMode{if !enabled{mode.remove(TermMode::BRACKETED_PASTE);}mode}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preference_off_overrides_remote_bracketed_mode(){let mode=effective_mode(TermMode::BRACKETED_PASTE,false);assert!(!mode.contains(TermMode::BRACKETED_PASTE));assert!(validate("a\nb",&mode).is_err());assert_eq!(crate::keys::paste_payload("abc",&mode),"abc");assert!(effective_mode(TermMode::BRACKETED_PASTE,true).contains(TermMode::BRACKETED_PASTE));}
     #[test]
     fn paste_and_return_are_separate_ordered_frames() {
         for (mode, text, expected) in [

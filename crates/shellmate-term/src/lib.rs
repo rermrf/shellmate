@@ -16,3 +16,11 @@ pub use pty::PtyOptions;
 pub use shellmate_core::io::{OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 pub use terminal::{SessionEnd, Terminal, TerminalEvent, TerminalSize};
 pub use view::{TerminalView, init};
+
+pub mod archive;
+pub mod cast;
+pub mod session_log;
+mod capture_output;
+pub mod replay;
+pub use capture_output::RecordingResult;
+mod behavior;

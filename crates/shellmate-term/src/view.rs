@@ -287,9 +287,7 @@ impl TerminalView {
             return;
         }
         let keystroke = &event.keystroke;
-        if self.history_shortcut && keystroke.key == "r" && keystroke.modifiers.control
-            && !keystroke.modifiers.platform && !keystroke.modifiers.alt && !keystroke.modifiers.shift
-        {
+        if crate::behavior::history_shortcut(self.history_shortcut,keystroke) {
             self.terminal.update(cx, |_, cx| cx.emit(TerminalEvent::HistoryRequested));
             cx.stop_propagation();
             return;
@@ -362,18 +360,16 @@ impl TerminalView {
         if !std::mem::take(&mut self.selecting) {
             return;
         }
-        match self.terminal.read(cx).selection_text() {
-            Some(text) if self.copy_on_select => cx.write_to_clipboard(ClipboardItem::new_string(text)),
-            Some(_) => {}
-            None => self.terminal.read(cx).term().lock().selection = None,
-        }
+        let selected=self.terminal.read(cx).selection_text();
+        if selected.is_none(){self.terminal.read(cx).term().lock().selection=None;}
+        if let Some(text)=crate::behavior::selection_copy(self.copy_on_select,selected){cx.write_to_clipboard(ClipboardItem::new_string(text));}
         cx.notify();
     }
 
     fn right_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
         self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
-        if self.right_click_paste {
+        if crate::behavior::right_paste(self.right_click_paste) {
             self.paste_clipboard(cx);
         }
     }
@@ -524,6 +520,7 @@ impl Render for TerminalView {
             .on_scroll(cx.listener(Self::scroll_wheel))
             .size_full()
             .relative()
+            .overflow_hidden()
             .rounded_tl(self.top_radius)
             .rounded_tr(self.top_radius)
             .bg(to_hsla(self.style.palette.background))
@@ -583,6 +580,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.terminal.read(cx).is_replay(){return;}
         self.marked_text = (!new_text.is_empty()).then(|| new_text.to_string());
         cx.notify();
     }

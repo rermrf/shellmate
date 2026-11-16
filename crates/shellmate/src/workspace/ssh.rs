@@ -330,6 +330,7 @@ impl Workspace {
             kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
             _subscription: subscription,
         });
+        self.start_session_archives(session_id,window,cx);
         self.activate(self.sessions.len() - 1, window, cx);
         session_id
     }

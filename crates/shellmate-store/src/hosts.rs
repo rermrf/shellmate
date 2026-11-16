@@ -92,6 +92,9 @@ const MIGRATIONS: &[&str] = &[
         size INTEGER NOT NULL DEFAULT 0
     );
     ",
+    // v5: recording geometry is required for standalone replay.
+    "ALTER TABLE recordings ADD COLUMN cols INTEGER NOT NULL DEFAULT 80;
+     ALTER TABLE recordings ADD COLUMN rows INTEGER NOT NULL DEFAULT 24;",
 ];
 
 /// The host library.
@@ -707,9 +710,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 5, supported: 4 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v5），当前 Shellmate 只支持到 v4，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 6, supported: 5 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v6），当前 Shellmate 只支持到 v5，请升级后再试");
     }
 }

@@ -132,9 +132,11 @@ pub enum Action {
     Sidebar,
     Import,
     History,
+    Settings,
+    Records,
 }
 impl Action {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Local,
         Self::NewHost,
         Self::Duplicate,
@@ -146,6 +148,8 @@ impl Action {
         Self::Sidebar,
         Self::Import,
         Self::History,
+        Self::Settings,
+        Self::Records,
     ];
     pub fn label(self, sidebar_open: bool, split: bool) -> &'static str {
         match self {
@@ -162,6 +166,8 @@ impl Action {
             Self::Sidebar => "展开侧边栏",
             Self::Import => "导入 ~/.ssh/config",
             Self::History => "搜索命令历史",
+            Self::Settings => "打开设置",
+            Self::Records => "会话记录与回放",
         }
     }
     pub fn shortcut(self) -> &'static str {
@@ -265,7 +271,7 @@ pub fn palette(
         .collect();
     let actions: Vec<_> = Action::ALL
         .into_iter()
-        .take(if empty { 5 } else { 11 })
+        .take(if empty { 5 } else { 13 })
         .map(|a| Item {
             group: "操作",
             title: a.label(sidebar_open, split).into(),

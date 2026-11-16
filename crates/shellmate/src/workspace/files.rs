@@ -321,6 +321,7 @@ impl Workspace {
         let Some(runtime) = runtime::get(cx) else { return false };
         let (session_id, terminal) = (self.sessions[ix].id, self.sessions[ix].terminal.clone());
         let panel = cx.new(|cx| FilesPanel::new(&terminal, runtime, window, cx));
+        panel.update(cx,|p,cx|p.set_follow(self.preferences.get(shellmate_store::Preference::FollowDirectory),cx));
         let subscription =
             cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
                 FilesEvent::RetrySession => this.retry_sftp(session_id, cx),

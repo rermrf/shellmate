@@ -14,3 +14,6 @@ pub use hosts::HostStore;
 pub use secrets::{KEYCHAIN_SERVICE, KeychainStore, MemoryStore, SecretError, SecretKey, SecretStore};
 
 pub use productivity::{Snippet, SnippetGroup, HistoryEntry, HISTORY_ENABLED, HISTORY_SHORTCUT, HISTORY_LIMIT};
+
+mod recordings;
+pub use recordings::{Recording,Preference,Preferences};

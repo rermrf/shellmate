@@ -152,8 +152,8 @@ impl Sidebar {
                     .rounded(px(13.))
                     .bg(p.card)
                     .shadow(card_shadow(&p))
-                    // Settings come with a later phase: the button is there, dimmed like the one in the sidebar.
-                    .child(Icon::new(Lucide::Settings).size(px(16.)).text_color(p.tx2).opacity(0.6))
+                    .cursor_pointer().on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::Settings)))
+                    .child(Icon::new(Lucide::Settings).size(px(16.)).text_color(p.tx2))
                     .child(
                         // The sync state: none yet, so grey.
                         div()

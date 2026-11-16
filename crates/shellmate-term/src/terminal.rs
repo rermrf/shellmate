@@ -158,6 +158,7 @@ struct GridSink {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
     capture: Arc<Mutex<Capture>>,
+    output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
     osc7: Mutex<Osc7Scanner>,
@@ -172,6 +173,7 @@ impl OutputHandler for GridSink {
         if self.current.load(Ordering::Acquire) != self.generation {
             return;
         }
+        self.output_capture.lock().output(bytes);
         let reported = self.osc7.lock().feed_with_offsets(bytes);
         {
             let mut term = self.term.lock();
@@ -189,6 +191,7 @@ impl OutputHandler for GridSink {
                 let _ = self.tx.try_send(Msg::Cwd { generation: self.generation, path });
             }
             emit(capture.advance(&mut *term, &mut parser, &bytes[at..]));
+            self.output_capture.lock().sync_logger(&*term);
         }
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.tx.try_send(Msg::Output);
@@ -210,6 +213,7 @@ pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
     capture: Arc<Mutex<Capture>>,
+    output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     backend: Option<Box<dyn TerminalBackend>>,
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
     local: Option<PtyOptions>,
@@ -228,6 +232,8 @@ pub struct Terminal {
     tx: async_channel::Sender<Msg>,
     output_pending: Arc<AtomicBool>,
     foreground: Option<(Instant, Option<ProcessInfo>)>,
+    bracketed_paste: bool,
+    replay: bool,
     _io: Task<()>,
 }
 
@@ -269,6 +275,7 @@ impl Terminal {
             term: Arc::new(FairMutex::new(term)),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: Arc::new(Mutex::new(Capture::default())),
+            output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             backend: None,
             local,
             size,
@@ -281,6 +288,8 @@ impl Terminal {
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
             foreground: None,
+            bracketed_paste: true,
+            replay: false,
             _io: io,
         }
     }
@@ -323,6 +332,7 @@ impl Terminal {
             term: self.term.clone(),
             parser: self.parser.clone(),
             capture: self.capture.clone(),
+            output_capture: self.output_capture.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: self.output_pending.clone(),
             tx: self.tx.clone(),
@@ -457,6 +467,7 @@ impl Terminal {
     }
 
     fn handle_alac_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
+        if self.replay{return;}
         match event {
             AlacEvent::PtyWrite(text) => self.write_raw(text.as_bytes()),
             AlacEvent::Title(title) => {
@@ -488,6 +499,7 @@ impl Terminal {
 
     /// Feeds bytes to the grid as if the process had printed them.
     fn inject(&self, text: &str) {
+        self.output_capture.lock().log_output(text.as_bytes());
         let mut term = self.term.lock();
         self.parser.lock().advance(&mut *term, text.as_bytes());
     }
@@ -502,6 +514,7 @@ impl Terminal {
 
     /// Sends user input to the process, snapping the view back to the prompt.
     pub fn input(&mut self, bytes: &[u8]) {
+        if self.replay{return;}
         if self.try_input(bytes).is_err() {
             log::warn!("terminal input write failed");
         }
@@ -521,21 +534,49 @@ impl Terminal {
     }
 
     pub fn paste(&mut self, text: &str) {
-        let mode = self.mode();
+        let mode = self.paste_mode();
         self.input(paste_payload(text, &mode).as_bytes());
     }
 
     /// Checks connection and paste mode before a multi-target send starts.
     pub fn validate_command(&self, command: &str) -> Result<(), &'static str> {
         if self.backend.is_none() || self.ended.is_some() { return Err("会话未连接，无法发送"); }
-        crate::send::validate(command, &self.mode())
+        crate::send::validate(command, &self.paste_mode())
     }
 
     /// Sends a reviewed command as a paste followed by a separate carriage return.
     pub fn send_command(&mut self, command: &str) -> Result<(), &'static str> {
         self.validate_command(command)?;
-        crate::send::send(command, &self.mode(), |bytes| self.try_input(bytes))
+        crate::send::send(command, &self.paste_mode(), |bytes| self.try_input(bytes))
     }
+
+    pub fn set_bracketed_paste(&mut self,enabled:bool){self.bracketed_paste=enabled;}
+    fn paste_mode(&self)->TermMode{crate::send::effective_mode(self.mode(),self.bracketed_paste)}
+    pub fn start_local(&mut self,options:PtyOptions,cx:&mut Context<Self>){self.local=Some(options);self.spawn_local(cx);}
+    pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{self.output_capture.lock().start(path,file,header)}
+    pub fn stop_recording(&mut self)->std::io::Result<Option<crate::capture_output::RecordingResult>>{self.output_capture.lock().stop()}
+    pub fn recording_seconds(&self)->Option<f64>{self.output_capture.lock().seconds()}
+    pub fn flush_archives(&mut self)->Option<String>{let mut c=self.output_capture.lock();c.flush();c.error()}
+    pub fn set_logging(&mut self,root:Option<std::path::PathBuf>,host:&str){
+        self.output_capture.lock().stop_logging();
+        if let Some(root)=root{
+            let term=self.term.lock();
+            let writer=crate::session_log::LogWriter::new(root,host);
+            if term.mode().contains(TermMode::ALT_SCREEN){
+                // The primary grid is private to alacritty. Seed once it becomes visible again;
+                // swapping the live grid to inspect it would destroy an application's screen.
+                self.output_capture.lock().defer_logging(writer);
+            }else{
+                let mut tracker=crate::session_log::LineTracker::new(self.size.cols,self.size.rows);
+                tracker.seed(&*term);self.output_capture.lock().logging(tracker,writer);
+            }
+        }
+    }
+    pub fn finalize_log(&mut self){self.output_capture.lock().stop_logging();}
+    pub fn is_replay(&self)->bool{self.replay}
+    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
+    pub fn replay_output(&mut self,bytes:&[u8],cx:&mut Context<Self>){self.parser.lock().advance(&mut *self.term.lock(),bytes);cx.notify();}
+    pub fn screen_text(&self)->String{crate::replay::screen_text(&*self.term.lock())}
 
     /// Called when the user presses Enter on an ended session. A local terminal
     /// respawns its shell in place, keeping the scrollback; any other terminal
@@ -558,6 +599,7 @@ impl Terminal {
         let grid_changed = (size.cols, size.rows) != (self.size.cols, self.size.rows);
         self.size = size;
         if grid_changed {
+            self.output_capture.lock().resize(size.cols,size.rows);
             self.term.lock().resize(size);
             let dims = size.dims();
             if let Some(backend) = self.backend.as_mut()
@@ -594,6 +636,7 @@ impl Terminal {
 
     /// Clears the screen and scrollback, like ⌘K in Terminal.app.
     pub fn clear(&mut self) {
+        if self.replay{return;}
         // ED 3 (scrollback) + clear screen + home, then a form feed so the
         // shell redraws its prompt.
         self.inject("\x1b[3J\x1b[2J\x1b[H");
@@ -763,6 +806,7 @@ mod sink_tests {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: Arc::new(Mutex::new(Capture::default())),
+            output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,

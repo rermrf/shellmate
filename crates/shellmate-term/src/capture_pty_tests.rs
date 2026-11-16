@@ -93,6 +93,7 @@ impl Shell {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: capture.clone(),
+            output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: Arc::new(AtomicBool::new(false)),
             tx,

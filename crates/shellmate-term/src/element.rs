@@ -187,8 +187,14 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (cell_width, line_height) = self.cell_metrics(window);
-        let grid = TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height);
+        let (mut cell_width, mut line_height) = self.cell_metrics(window);
+        let replay=self.terminal.read(cx).is_replay();
+        let recorded=self.terminal.read(cx).size();
+        if replay {
+            self.style.font_size=px(crate::replay::fit_font(f32::from(self.style.font_size),f32::from(bounds.size.width),f32::from(bounds.size.height),recorded.cols,recorded.rows,f32::from(cell_width),f32::from(line_height)));
+            (cell_width,line_height)=self.cell_metrics(window);
+        }
+        let grid = if replay { TerminalSize {cell_width,line_height,..recorded} } else {TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height)};
         let (cols, rows) = (grid.cols, grid.rows);
         if self.terminal.read(cx).size()!=grid {
             self.terminal.update(cx, |t, cx| {

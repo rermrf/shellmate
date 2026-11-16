@@ -43,6 +43,7 @@ impl Workspace {
             store.save_host(&host).unwrap();
         }
         // Existing startup sessions are closed; all demo terminal backends discard input.
+        for id in self.sessions.iter().map(|s|s.id).collect::<Vec<_>>(){self.finalize_archives(id,cx);}
         self.sessions.clear();
         self.active = None;
         self.store = Rc::new(RefCell::new(store));

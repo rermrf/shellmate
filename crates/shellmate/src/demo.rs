@@ -34,6 +34,7 @@ pub const NAMES: &[&str] = &[
     "p6:manage", "p6:confirm", "p6:confirm-risk", "p6:history", "p6:history-host",
     "p6:broadcast-off", "p6:broadcast-on", "p6:broadcast-suggestions", "p6:broadcast-confirm",
     "p6:split-right", "p6:split-vertical", "p6:split-menu", "p6:tabs",
+    "p6:records", "p6:records-delete", "p6:logs", "p6:recording", "p6:settings-cred", "p6:settings-sync", "p6:settings-term", "p6:settings-local", "p6:settings-conn",
 ];
 
 fn key(algorithm: &str, fingerprint: &str) -> HostKeyInfo {
@@ -56,10 +57,12 @@ fn challenge(round: u32, attempt: u32, prompts: &[(&str, bool)]) -> ChallengeReq
 /// Opens the demo named `name`, or logs the valid names.
 pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     if let Some(args) = name.strip_prefix("p6live:") {
+        if args.starts_with("record:")||args.starts_with("log:"){workspace.update(cx,|w,cx|w.demo_archive_live(args,window,cx));return;}
         workspace.update(cx, |workspace,cx|workspace.demo_productivity_live(args,window,cx));
         return;
     }
     if let Some(scenario) = name.strip_prefix("p6:") {
+        if matches!(scenario,"records"|"records-delete"|"logs"|"recording")||scenario.starts_with("settings-"){workspace.update(cx,|w,cx|w.demo_archives(scenario,window,cx));return;}
         workspace.update(cx, |workspace, cx| workspace.demo_productivity(scenario, window, cx));
         return;
     }

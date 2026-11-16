@@ -17,6 +17,8 @@ mod sidebar;
 mod theme;
 mod ui;
 mod workspace;
+mod settings;
+mod records;
 
 use std::borrow::Cow;
 

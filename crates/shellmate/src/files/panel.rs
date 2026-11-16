@@ -427,7 +427,7 @@ impl FilesPanel {
         cx.notify();
     }
 
-    pub(super) fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         let request = self.model.set_follow(on);
         self.start(request, cx);
         cx.notify();

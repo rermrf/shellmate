@@ -35,6 +35,9 @@ mod hosts;
 mod monitor;
 mod productivity;
 mod multi;
+mod archive;
+#[cfg(debug_assertions)]
+mod archive_demo;
 mod ssh;
 
 actions!(
@@ -152,6 +155,12 @@ pub struct Workspace {
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
+    preferences: shellmate_store::Preferences,
+    data_root: PathBuf,
+    log_root: PathBuf,
+    running_recordings: HashMap<usize,archive::RunningRecording>,
+    archive_task: Option<gpui::Task<()>>,
+    records_window: Option<gpui::WeakEntity<crate::records::panel::RecordsWindow>>,
     temporary_hosts: HashMap<HostId, shellmate_core::Host>,
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
@@ -218,7 +227,11 @@ impl Workspace {
             cx.subscribe_in(&commands, window, Self::on_command_event),
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
         ];
+        let preferences=store.preferences().unwrap_or_default();
         let mut this = Self {
+            preferences,
+            data_root:shellmate_term::archive::data_root(),log_root:shellmate_term::archive::log_root(),
+            running_recordings:HashMap::new(),archive_task:None,records_window:None,
             store: Rc::new(RefCell::new(store)),
             secrets: Arc::new(KeychainStore::new()),
             book,
@@ -251,6 +264,7 @@ impl Workspace {
         }
         this.reload_book(window, cx);
         this.open_local(window, cx);
+        this.archive_timer(window,cx);
         this
     }
 
@@ -306,6 +320,7 @@ impl Workspace {
             SidebarEvent::Connect(id) => self.connect_host(id, window, cx),
             SidebarEvent::ActivateHost(id) => self.activate_host(id, window, cx),
             SidebarEvent::SearchHosts => self.open_palette(&OpenPalette, window, cx),
+            SidebarEvent::Settings => self.open_settings(0,window,cx),
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::EditHost(id) => self.edit_host(id, false, window, cx),
             SidebarEvent::DuplicateHost(id) => self.edit_host(id, true, window, cx),
@@ -330,8 +345,8 @@ impl Workspace {
     fn open_local_in(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let style = cx.terminal_style();
         let palette = style.palette.clone();
-        let options = PtyOptions { cwd, ..PtyOptions::default() };
-        let terminal = cx.new(|cx| Terminal::local(options, palette, cx));
+        let options = PtyOptions { cwd, login:self.preferences.get(shellmate_store::Preference::LoginShell), ..PtyOptions::default() };
+        let terminal = cx.new(|cx| Terminal::new(palette, cx));
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx);
             view.top_radius = CARD_RADIUS;
@@ -359,6 +374,8 @@ impl Workspace {
             kind: SessionKind::Local,
             _subscription: subscription,
         });
+        self.start_session_archives(id,window,cx);
+        self.sessions.last().unwrap().terminal.update(cx,|t,cx|t.start_local(options,cx));
         self.activate(self.sessions.len() - 1, window, cx);
     }
 
@@ -434,6 +451,9 @@ impl Workspace {
         // connection that is still being made is cancelled together with the dialog it asked.
         let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
         let closed=self.sessions[ix].id;
+        let was_recording=self.running_recordings.contains_key(&closed);
+        if let Some(error)=self.finalize_archives(closed,cx){window.push_notification(Notification::error(error),cx);}
+        else if was_recording{window.push_notification(Notification::success("已保存 .cast · 可在「记录」中回放"),cx);}
         self.split.close_session(self.main_id(),closed);
         self.broadcast.checked.remove(&closed);
         self.recent_sessions.retain(|id|*id!=closed);
@@ -786,6 +806,8 @@ impl Workspace {
             None => format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY", size.cols, size.rows),
         };
         let view = focused.view.clone();
+        let recording=self.running_recordings.get(&focused.id);
+        let recording_label=recording.map_or_else(||"● 录制".to_string(),|r|format!("REC {} · .cast",shellmate_term::archive::mmss(r.display_seconds())));
 
         let pill = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool| {
             div()
@@ -837,8 +859,10 @@ impl Workspace {
                             .text_color(p.tx3)
                             .child(status),
                     )
-                    .child(pill("rec", "● 录制", "录制为 asciinema .cast（P6 实现）", false))
-                    .child(pill("logs", "记录", "会话日志与录像（P6 实现）", false))
+                    .child(div().id("record-session").h(px(24.)).px(px(9.)).flex().items_center().rounded(px(7.)).cursor_pointer().text_size(px(11.5))
+                        .bg(if recording.is_some(){p.err}else{p.card2}).text_color(if recording.is_some(){gpui::white()}else{p.tx2}).child(recording_label)
+                        .on_click(cx.listener(|this,_,w,cx|this.toggle_recording(w,cx))))
+                    .child(pill("logs", "记录", "会话记录与回放", true).on_click(cx.listener(|this,_,w,cx|this.open_records(None,false,w,cx))))
                     .child(
                         pill("history", if focused.view.read(cx).history_shortcut { "历史 ⌃R" } else { "历史" }, "跨主机命令历史", true)
                             .on_click(cx.listener(|this, _, window, cx| this.open_history(window, cx))),

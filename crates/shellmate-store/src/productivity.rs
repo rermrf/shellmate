@@ -160,7 +160,7 @@ mod tests {
         tx.commit().unwrap();
         drop(conn);
         let store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         assert!(!store.history_enabled().unwrap());
         assert!(store.history_shortcut().unwrap());
         assert!(store.snippets().unwrap().is_empty());
