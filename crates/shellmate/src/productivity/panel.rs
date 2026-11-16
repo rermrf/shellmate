@@ -8,8 +8,9 @@ use crate::{
 use gpui::{
     App, Context, Entity, EventEmitter, Focusable, FontWeight, KeyBinding, ScrollHandle, SharedString,
     Subscription, Window, actions,
+    assets::IconName as Lucide,
     component::{
-        Sizable as _,
+        Icon, Sizable as _,
         button::{Button, ButtonVariants as _},
         input::{Input, InputEvent, InputState},
     },
@@ -124,7 +125,12 @@ impl Picker {
         match &self.source {
             Source::Palette(data) => {
                 self.items = model::palette(
-                    &query, &data.book, &data.sessions, data.active, &data.snippets, data.sidebar_open,
+                    &query,
+                    &data.book,
+                    &data.sessions,
+                    data.active,
+                    &data.snippets,
+                    data.sidebar_open,
                 )
             }
             Source::History { store, host, current } => match store.borrow().history(
@@ -203,6 +209,8 @@ impl Render for Picker {
                     .text_color(p.tx2)
                     .child("(reverse-i-search)"),
             );
+        } else {
+            header = header.child(Icon::new(Lucide::Search).size(px(17.)).text_color(p.tx3));
         }
         header = header.child(
             div()
@@ -360,13 +368,34 @@ impl Render for Picker {
             .w_full()
             .rounded(px(if history { 16. } else { 22. }))
             .bg(p.card)
-            .shadow(vec![gpui::BoxShadow {
-                color: gpui::rgba(0x0000004d).into(),
-                offset: gpui::point(px(0.), px(if history { 16. } else { 30. })),
-                blur_radius: px(if history { 44. } else { 80. }),
-                spread_radius: px(0.),
-                inset: false,
-            }])
+            .when(!history, |d| d.border_1().border_color(p.line))
+            .shadow(if history {
+                vec![gpui::BoxShadow {
+                    color: gpui::rgba(0x0000004d).into(),
+                    offset: gpui::point(px(0.), px(if history { 16. } else { 30. })),
+                    blur_radius: px(if history { 44. } else { 80. }),
+                    spread_radius: px(0.),
+                    inset: false,
+                }]
+            } else {
+                // Match the component dialog surface; a real border stays visible in dark mode.
+                vec![
+                    gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.1),
+                        offset: gpui::point(px(0.), px(20.)),
+                        blur_radius: px(25.),
+                        spread_radius: px(-5.),
+                        inset: false,
+                    },
+                    gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.1),
+                        offset: gpui::point(px(0.), px(8.)),
+                        blur_radius: px(10.),
+                        spread_radius: px(-6.),
+                        inset: false,
+                    },
+                ]
+            })
             .overflow_hidden()
             .on_action(cx.listener(|this, _: &PickUp, _, cx| {
                 this.selected = this.selected.saturating_sub(1);

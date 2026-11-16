@@ -863,7 +863,8 @@ impl Render for Workspace {
             }));
         let palette = self.picker.as_ref().filter(|picker| !picker.read(cx).is_history()).map(|picker| {
             div().id("palette-overlay").occlude().absolute().inset_0()
-                .bg(gpui::rgba(0x0a0c1029)).flex().justify_center().items_start().pt(px(110.))
+                .bg(if cx.is_dark() { p.scrim } else { gpui::rgba(0x0a0c1029).into() })
+                .flex().justify_center().items_start().pt(px(110.))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.picker = None;
                     this.focus_active(window, cx);

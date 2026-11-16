@@ -504,9 +504,7 @@ impl Terminal {
             let mut term = self.term.lock();
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
-            if let Some(command) = self.capture.lock().input(&term, bytes) {
-                let _ = self.tx.try_send(Msg::Command { generation: self.current_generation(), command, time: unix_time() });
-            }
+            self.capture.lock().input(&term, bytes);
         }
         self.backend.as_mut().ok_or(std::io::ErrorKind::NotConnected)?.write(bytes)
     }
@@ -844,3 +842,7 @@ mod sink_tests {
         assert!(drain(&f.rx).is_empty());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "capture_pty_tests.rs"]
+mod capture_pty_tests;

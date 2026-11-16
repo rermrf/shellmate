@@ -125,17 +125,12 @@ pub fn rule(kind: ForwardKind, listen: &str, target: &str) -> ForwardRule {
         .unwrap_or_else(|err| panic!("{listen}: {err}"))
 }
 
-/// A loopback port nothing listens on, on either loopback.
-///
-/// Taken from a range (41000-48999) below the one the system uses for the ports of outgoing connections and
-/// for `bind(0)` (49152 and up), where the connections of tests running at the same time could
-/// take the number between choosing it and listening on it; the numbers differ per call and per
-/// process.
+/// A loopback port nothing listens on, on either loopback. Never reused within this test
+/// process, even after a listener closes. Exhaustion fails instead of wrapping into another test.
 pub fn free_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(41_000);
     loop {
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let port = 41_000 + (std::process::id().wrapping_mul(37).wrapping_add(n.wrapping_mul(13)) % 8_000) as u16;
+        let port = next_port(&NEXT).expect("exhausted the process's unique test ports (41000–48999)");
         // `AddrNotAvailable` (no IPv6) is as good as free.
         let free = |host: &str| match std::net::TcpListener::bind((host, port)) {
             Ok(_) => true,
@@ -145,6 +140,32 @@ pub fn free_port() -> u16 {
             return port;
         }
     }
+}
+
+fn next_port(cursor: &std::sync::atomic::AtomicU16) -> Option<u16> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut port = cursor.load(Relaxed);
+    while port < 49_000 {
+        match cursor.compare_exchange_weak(port, port + 1, Relaxed, Relaxed) {
+            Ok(_) => return Some(port),
+            Err(next) => port = next,
+        }
+    }
+    None
+}
+
+#[test]
+fn port_cursor_is_unique_across_threads_and_never_wraps() {
+    let cursor = std::sync::atomic::AtomicU16::new(41_000);
+    let mut ports = std::thread::scope(|scope| {
+        let tasks: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+            std::iter::from_fn(|| next_port(&cursor)).collect::<Vec<_>>()
+        })).collect();
+        tasks.into_iter().flat_map(|task| task.join().unwrap()).collect::<Vec<_>>()
+    });
+    ports.sort_unstable();
+    assert_eq!(ports, (41_000..49_000).collect::<Vec<_>>());
+    assert_eq!(next_port(&cursor), None);
 }
 
 pub async fn dial(port: u16) -> TcpStream {
