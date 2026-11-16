@@ -24,6 +24,7 @@ shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }
 shellmate-vault = { path = "crates/shellmate-vault" }
+shellmate-ai = { path = "crates/shellmate-ai" }
 shellmate-store = { path = "crates/shellmate-store" }
 shellmate-sftp = { path = "crates/shellmate-sftp" }
 shellmate-forward = { path = "crates/shellmate-forward" }
@@ -56,6 +57,8 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 keyring = "4.2"
 # keyring-core is what keyring 4 wraps; needed for Entry::search (enumerating our own items)
 keyring-core = "1"
+# AI assistant (P7 M5): multi-provider LLM client, user-chosen; exact pin because its API moves fast
+rig-core = { version = "=0.46.0", default-features = false, features = ["reqwest", "rustls"] }
 
 # russh with per-channel flow control (see vendor/russh/SHELLMATE-PATCH.md)
 [patch.crates-io]
