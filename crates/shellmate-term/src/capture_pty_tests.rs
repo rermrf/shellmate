@@ -153,7 +153,38 @@ impl Shell {
             .to_string()
     }
     fn prompt(&self) -> bool {
-        self.row() == "SM>"
+        let term = self.term.lock();
+        let cursor = term.grid().cursor.point;
+        let row = &term.grid()[cursor.line];
+        // A prompt redraw may arrive in several reads. Wait through the final trailing space,
+        // not just the trimmed text that can already look like the finished prompt.
+        cursor.column.0 == 4
+            && (0..term.columns())
+                .map(|col| row[Column(col)].c)
+                .collect::<String>()
+                .trim_end()
+                == "SM>"
+    }
+    fn echo_disabled(&self) -> bool {
+        let fd = self.master.as_raw_fd().expect("local PTY exposes termios");
+        let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: fd belongs to this fixture's live PTY. tcgetattr initializes mode on success.
+        assert_eq!(
+            unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) },
+            0,
+            "read fixture PTY mode"
+        );
+        unsafe { mode.assume_init() }.c_lflag & libc::ECHO == 0
+    }
+    fn has_line(&self, expected: &str) -> bool {
+        let term = self.term.lock();
+        (0..term.screen_lines()).any(|line| {
+            (0..term.columns())
+                .map(|col| term.grid()[Line(line as i32)][Column(col)].c)
+                .collect::<String>()
+                .trim_end()
+                == expected
+        })
     }
     fn alternate(&self) -> bool {
         self.term.lock().mode().contains(TermMode::ALT_SCREEN)
@@ -163,6 +194,9 @@ impl Shell {
         loop {
             self.drain();
             if check(self) {
+                // GridSink publishes capture messages under the grid lock. The predicate may
+                // have observed output produced after the first drain; settle those messages too.
+                self.drain();
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -237,7 +271,9 @@ fn exercise(name: &str) {
     shell.run("echo plain");
     // Recall exactly the previous command: it executes, but consecutive history is deduplicated.
     shell.input(b"\x1b[A");
-    shell.wait("recalled command on screen", |s| s.row() == "SM> echo plain");
+    shell.wait("recalled command on screen", |s| {
+        s.row() == "SM> echo plain"
+    });
     shell.input(b"\r");
     shell.wait("prompt after recall", |s| s.prompt());
     assert_eq!(shell.history, expected);
@@ -245,7 +281,9 @@ fn exercise(name: &str) {
     expected.push("echo other".into());
     shell.input(b"\x1b[A");
     shell.input(b"\x1b[A");
-    shell.wait("nonconsecutive recalled command", |s| s.row() == "SM> echo plain");
+    shell.wait("nonconsecutive recalled command", |s| {
+        s.row() == "SM> echo plain"
+    });
     shell.input(b"\r");
     expected.push("echo plain".into());
     shell.wait("history after recall", |s| {
@@ -269,11 +307,20 @@ fn exercise(name: &str) {
     shell.type_text(read);
     shell.input(b"\r");
     expected.push(read.into());
-    shell.wait("echo disabled password prompt", |s| s.row() == "Password:");
+    // printf writes the prompt before read changes termios. Under scheduler load the two
+    // operations can be far apart: prompt visibility alone does not mean echo is disabled.
+    shell.wait("read command captured and PTY echo disabled", |s| {
+        s.row() == "Password:" && s.echo_disabled() && s.history == expected
+    });
     shell.type_text("synthetic-unrecorded-password");
     shell.input(b"\r");
-    shell.wait("prompt after secret", |s| s.prompt());
-    assert_eq!(shell.history, expected, "echo-off input must never enter history");
+    shell.wait("read completed and full prompt redrawn", |s| {
+        s.has_line("READ-DONE") && s.prompt()
+    });
+    assert_eq!(
+        shell.history, expected,
+        "echo-off input must never enter history"
+    );
 
     let pager = if executable("less").is_some() {
         Some(("less capture-pager.txt", false))

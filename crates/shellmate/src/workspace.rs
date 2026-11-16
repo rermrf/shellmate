@@ -25,7 +25,7 @@ use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
 
 use crate::connect;
 use crate::editor::view::FileEditor;
-use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent};
+use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH, RAIL_WIDTH};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
@@ -604,15 +604,78 @@ impl Workspace {
 
     // ---- rendering -----------------------------------------------------
 
-    fn render_tab_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let preferred=crate::productivity::multi::tab_limit(self.sidebar_open,self.commands_open);
-        let limit=crate::layout::tabs_that_fit(f32::from(window.viewport_size().width)-if self.sidebar_open {284.} else {76.}-12.,preferred);
-        let visible=crate::productivity::multi::visible_tabs(self.sessions.len(),self.active,limit);
-        let tabs = visible.into_iter().map(|ix| { let s=&self.sessions[ix];
+        // Shape the same fonts/weights the strip renders; titles are capped, chips are not.
+        let measure = |text: &str, size: f32, weight: FontWeight, window: &mut Window| {
+            let font = gpui::Font { weight, ..gpui::font(theme::UI_FONT) };
+            let run = gpui::TextRun {
+                len: text.len(),
+                font,
+                color: p.tx,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(window.text_system().shape_line(text.to_string().into(), px(size), &[run], None).width).ceil()
+        };
+        let widths = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(ix, session)| {
+                let title = measure(
+                    &session.title,
+                    13.,
+                    if Some(ix) == self.active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
+                    window,
+                );
+                let reconnect =
+                    session.ssh().and_then(|ssh| ssh.badge()).map(|badge| measure(&badge, 10., FontWeight::BOLD, window));
+                let broadcast = (self.broadcast.enabled && self.broadcast.checked.contains(&session.id)).then(|| {
+                    measure(
+                        "广播",
+                        10.,
+                        if Some(ix) == self.active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
+                        window,
+                    )
+                });
+                crate::tabs::tab_width(title, matches!(session.kind, SessionKind::Local), reconnect, broadcast)
+            })
+            .collect::<Vec<_>>();
+        let toolbar_width = 32.
+            + [("广播", 15.), ("AI", 14.), ("快捷命令", 14.)]
+                .iter()
+                .map(|(label, icon)| 24. + icon + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window))
+                .sum::<f32>();
+        let content_width =
+            f32::from(window.viewport_size().width) - if self.sidebar_open { SIDEBAR_WIDTH } else { RAIL_WIDTH } - 12.;
+        let available = (content_width - toolbar_width - 4. * 8.).max(0.);
+        let overflow_label = format!("{} 个标签 ▾", self.sessions.len());
+        let overflow_width = measure(&overflow_label, 12., FontWeight::NORMAL, window) + 16.;
+        let cap = None;
+        #[cfg(debug_assertions)]
+        let cap = if crate::proto::requested()
+            && std::env::var("SHELLMATE_DEMO").is_ok_and(|s| !s.starts_with("proto:stress-"))
+        {
+            // Ordinary prototype scenes use a count-based sliding window, even when another
+            // tab physically fits. Real sessions and stress fixtures use only measured widths.
+            Some((if self.sidebar_open { 4 } else { 5 }) - usize::from(self.commands_open))
+        } else {
+            cap
+        };
+        let fit = crate::tabs::fit_tabs(&widths, available, overflow_width, self.active, cap);
+        let visible = fit.visible;
+        let strip_width = visible.iter().map(|ix| widths[*ix].min(fit.single_tab_max)).sum::<f32>()
+            + crate::tabs::TAB_GAP * visible.len().saturating_sub(1) as f32;
+        let has_tabs = !visible.is_empty();
+        let tabs = visible.into_iter().map(|ix| {
+            let s = &self.sessions[ix];
             let active = Some(ix) == self.active;
             div()
-                .id(("tab", s.id)).max_w(px(190.)).min_w_0()
+                .id(("tab", s.id))
+                .w(px(widths[ix].min(fit.single_tab_max)))
+                .min_w_0()
                 .flex()
                 .flex_none()
                 .items_center()
@@ -622,19 +685,34 @@ impl Workspace {
                 .pr(px(6.))
                 .rounded(px(12.))
                 .cursor_pointer()
-                .text_size(px(13.)).line_height(px(16.))
+                .text_size(px(13.))
+                .line_height(px(16.))
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
                 .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
-                .when(matches!(s.kind,SessionKind::Local),|d|d.child(AppIcon::Laptop.icon().text_color(session_dot(s,&p))))
-                .when(!matches!(s.kind,SessionKind::Local),|d|d.child(dot(session_dot(s,&p),7.)))
-                .child(crate::ui::ellipsis(("tab-title",s.id),s.title.clone()).flex_1())
-                .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id),|d|d.child(div().px(px(5.)).rounded(px(4.)).bg(p.warns).text_color(p.warn).text_size(px(10.)).child("广播")))
+                .when(matches!(s.kind, SessionKind::Local), |d| {
+                    d.child(AppIcon::Laptop.icon().text_color(session_dot(s, &p)))
+                })
+                .when(!matches!(s.kind, SessionKind::Local), |d| d.child(dot(session_dot(s, &p), 7.)))
+                .child(crate::ui::ellipsis(("tab-title", s.id), s.title.clone()).flex_1().max_w(px(crate::tabs::TITLE_MAX)))
+                .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id), |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .rounded(px(4.))
+                            .bg(p.warns)
+                            .text_color(p.warn)
+                            .text_size(px(10.))
+                            .child("广播"),
+                    )
+                })
                 .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
                     let failed = status == ssh::SshStatus::Failed;
                     let color = if failed { p.err } else { p.warn };
                     let id = s.id;
                     div()
                         .id(("tab-badge", id))
+                        .flex_none()
                         .h(px(16.))
                         .px(px(5.))
                         .flex()
@@ -642,7 +720,8 @@ impl Workspace {
                         .rounded(px(5.))
                         .bg(color.opacity(0.14))
                         .text_color(color)
-                        .text_size(px(10.)).line_height(px(12.))
+                        .text_size(px(10.))
+                        .line_height(px(12.))
                         .font_weight(FontWeight::BOLD)
                         .child(badge)
                         .tooltip(|window, cx| Tooltip::new("点击或按回车立即重试").build(window, cx))
@@ -653,14 +732,18 @@ impl Workspace {
                 }))
                 .child(
                     div()
-                        .id(("close-tab", s.id)).flex_none()
+                        .id(("close-tab", s.id))
+                        .flex_none()
                         .size(px(22.))
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded(px(5.))
                         .hover(|d| d.bg(p.card3))
-                        .text_size(px(15.)).line_height(px(15.)).text_color(p.tx3).child("×")
+                        .text_size(px(15.))
+                        .line_height(px(15.))
+                        .text_color(p.tx3)
+                        .child("×")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close(ix, window, cx);
@@ -671,7 +754,7 @@ impl Workspace {
 
         let new_tab = div()
             .id("new-tab")
-            .size(px(22.))
+            .size(px(crate::tabs::PLUS_WIDTH))
             .flex()
             .flex_none()
             .items_center()
@@ -685,21 +768,67 @@ impl Workspace {
 
         let theme_icon = if cx.is_dark() { AppIcon::Sun } else { AppIcon::Moon };
         div()
-            .h(px(58.)).flex_none().pt(px(4.))
+            .h(px(58.))
+            .flex_none()
+            .pt(px(4.))
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(div().flex().items_center().gap(px(6.)).min_w_0().overflow_hidden().children(tabs))
-            .child(new_tab)
-            .when(crate::productivity::multi::tab_overflow(self.sessions.len(),self.sidebar_open,self.commands_open)||self.sessions.len()>limit,|d|d.child(
-                div().id("tab-list-button").flex_none().cursor_pointer().px(px(8.)).py(px(5.)).rounded(px(8.)).text_size(px(12.)).text_color(p.tx2)
-                    .child(format!("{} 个标签 ▾",self.sessions.len()))
-                    .on_click(cx.listener(|this,event: &gpui::ClickEvent,w,cx|this.open_session_menu(crate::productivity::session_menu::Kind::Tabs,event.position(),w,cx)))
-            ))
-            .child(window_drag_area(div().id("tabbar-drag")).flex_1().h_full())
-            .child(toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
-                .when(self.broadcast.enabled,|b|b.bg(p.warns).text_color(p.warn))
-                .on_click(cx.listener(|this,_,_,cx|{this.commands_open=true;this.sync_productivity(cx);cx.notify();})))
+            .child(
+                div()
+                    .w(px(available))
+                    .flex_none()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(strip_width))
+                            .flex_none()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(crate::tabs::TAB_GAP))
+                            .children(tabs),
+                    )
+                    .child(div().flex_none().when(has_tabs, |d| d.ml(px(crate::tabs::TAB_GAP))).child(new_tab))
+                    .child(window_drag_area(div().id("tabbar-drag")).flex_1().min_w_0().h_full())
+                    .when(fit.overflow, |d| {
+                        d.child(
+                            div()
+                                .id("tab-list-button")
+                                .w(px(overflow_width))
+                                .ml(px(crate::tabs::OVERFLOW_GAP))
+                                .flex_none()
+                                .cursor_pointer()
+                                .px(px(8.))
+                                .py(px(5.))
+                                .rounded(px(8.))
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(p.tx2)
+                                .child(overflow_label)
+                                .on_click(cx.listener(|this, event: &gpui::ClickEvent, w, cx| {
+                                    this.open_session_menu(
+                                        crate::productivity::session_menu::Kind::Tabs,
+                                        event.position(),
+                                        w,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
+                    .when(self.broadcast.enabled, |b| b.bg(p.warns).text_color(p.warn))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commands_open = true;
+                        this.sync_productivity(cx);
+                        cx.notify();
+                    })),
+            )
             .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手（P7 实现）", false, cx))
             .child(
                 toolbar_button("snippets", AppIcon::Commands, Some("快捷命令"), "快捷命令", true, cx)

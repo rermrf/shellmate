@@ -2,6 +2,7 @@
 //! narrow rail of the same things ([`rail`]).
 
 mod rail;
+pub(crate) use rail::RAIL_WIDTH;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

@@ -41,11 +41,6 @@ pub fn middle_ellipsis(text: &str, budget: usize) -> String {
     chars[..head].iter().chain(std::iter::once(&'…')).chain(chars[tail_start..].iter()).collect()
 }
 
-/// Reserve toolbar, overflow menu and new-tab controls before fitting capped tab widths.
-pub fn tabs_that_fit(content_width: f32, preferred: usize) -> usize {
-    (((content_width - 440.).max(0.) / 190.).floor() as usize).max(1).min(preferred)
-}
-
 /// Decisions use the measured panel width, never the OS window width or intrinsic text width.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Responsive {
@@ -190,11 +185,5 @@ mod tests {
                 }
             }
         }
-    }
-    #[test]
-    fn narrow_window_keeps_tab_list_and_toolbar_reachable() {
-        assert_eq!(tabs_that_fit(1100. - 284. - 12., 4), 1);
-        assert_eq!(tabs_that_fit(1776. - 284. - 12., 4), 4);
-        assert_eq!(tabs_that_fit(300., 4), 1);
     }
 }

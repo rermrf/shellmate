@@ -237,23 +237,6 @@ impl Split {
     }
 }
 
-pub fn tab_limit(sidebar: bool, drawer: bool) -> usize {
-    (if sidebar { 4 } else { 5 }) - usize::from(drawer)
-}
-pub fn tab_overflow(count: usize, sidebar: bool, drawer: bool) -> bool {
-    count > tab_limit(sidebar, drawer)
-}
-/// Keep the main session visible even when it is beyond the abbreviated tab strip.
-pub fn visible_tabs(count: usize, active: Option<usize>, limit: usize) -> Vec<usize> {
-    let mut indices: Vec<_> = (0..count.min(limit)).collect();
-    if let Some(active) = active.filter(|i| *i < count && *i >= limit)
-        && let Some(last) = indices.last_mut()
-    {
-        *last = active;
-    }
-    indices
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,17 +395,7 @@ mod tests {
         assert_eq!(s.other, None);
     }
     #[test]
-    fn tab_overflow_and_subtitles() {
-        for (side, drawer, limit) in [
-            (true, false, 4),
-            (false, false, 5),
-            (true, true, 3),
-            (false, true, 4),
-        ] {
-            assert!(!tab_overflow(limit, side, drawer));
-            assert!(tab_overflow(limit + 1, side, drawer));
-        }
-        assert_eq!(visible_tabs(7, Some(6), 4), [0, 1, 2, 6]);
+    fn session_menu_subtitles() {
         for (status, text) in [
             (Status::Connected, "SSH"),
             (Status::Reconnecting, "重连中"),
