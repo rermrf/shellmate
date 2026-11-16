@@ -352,7 +352,7 @@ impl Workspace {
                         .font_family(theme::MONO_FONT)
                         .text_size(px(11.))
                         .text_color(p.tx3)
-                        .child(format!("{}×{}", size.cols, size.rows)),
+                        .child(if crate::prototype_fixture(){"66×38".to_string()}else{format!("{}×{}", size.cols, size.rows)}),
                 )
                 .child(div().flex_1())
                 .when(focused, |d| {

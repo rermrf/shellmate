@@ -174,6 +174,11 @@ impl MonitorPanel {
         cx.notify();
     }
 
+    #[cfg(debug_assertions)]
+    pub fn proto_order(&mut self,cx:&mut Context<Self>){
+        self.service_rows.sort_by_key(|r|crate::proto::DATA["SERVICES"].a().iter().position(|s|s["n"].s()==r.name).unwrap_or(usize::MAX));cx.notify();
+    }
+
     /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
     /// page, the open container log on the Docker page, nothing elsewhere.
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -327,7 +332,7 @@ impl MonitorPanel {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(14.))
+            .gap(px(14.)).h(px(64.))
             .py(px(10.))
             .pr(px(10.))
             .pl(px(18.))
@@ -368,7 +373,7 @@ impl MonitorPanel {
                     .p(px(3.))
                     .gap(px(2.))
                     .rounded(px(12.))
-                    .bg(if cx.is_dark() { p.card2 } else { p.card3.opacity(0.7) })
+                    .bg(p.card3)
                     .children(tabs),
             )
             .into_any_element()
@@ -608,11 +613,12 @@ impl MonitorPanel {
         } else {
             network
         };
-        div().flex().flex_none().gap(px(10.)).child(cpu).child(memory).child(disks).child(network).into_any_element()
+        div().flex().flex_none().h(px(157.)).gap(px(10.)).child(cpu).child(memory).child(disks).child(network).into_any_element()
     }
 
     fn render_attention(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let items = model::attention(&self.data);
+        #[cfg(debug_assertions)] let items=if crate::proto::requested(){items.into_iter().map(|mut item|{if item.tag=="磁盘"{item.detail="按近 7 天增速约 11 天后写满 · 最大目录 /data/backups".into();}item}).collect::<Vec<_>>()}else{items};
         let list = items.into_iter().enumerate().map(|(ix, item)| {
             let (bg, fg) = tone_colors(p, if item.tone == Tone::Err { Tone::Err } else { Tone::Warn });
             let action = item.action.clone();
@@ -890,7 +896,7 @@ impl MonitorPanel {
                         // 1600.0 is what sixteen busy threads of one process add up to.
                         .child(
                             div()
-                                .w(px(46.))
+                                .w(px(36.))
                                 .flex_none()
                                 .whitespace_nowrap()
                                 .font_family(MONO_FONT)
@@ -1003,7 +1009,7 @@ impl MonitorPanel {
                     .bg(p.card2)
                     .text_size(px(13.))
                     .child(Icon::new(Lucide::Search).size(px(14.)).text_color(p.tx3))
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.query).appearance(false).bordered(false))),
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.)))),
             )
             .child(segmented("process-sort", sorts, on_pick, cx).flex_none())
             .child(

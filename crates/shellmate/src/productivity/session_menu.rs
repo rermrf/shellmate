@@ -69,7 +69,7 @@ impl Render for SessionMenu {
                     .items_center()
                     .gap(px(10.))
                     .px(px(10.))
-                    .py(px(9.))
+                    .h(px(34.))
                     .rounded(px(9.))
                     .cursor_pointer()
                     .when(self.active == Some(id), |d| d.bg(p.accs))

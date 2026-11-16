@@ -152,7 +152,7 @@ impl FilesPanel {
         }
         let (summary, has_finished) = (list.summary(), list.has_finished());
         // Newest on top, as in the prototype.
-        let items: Vec<TransferView> = list.items().iter().rev().cloned().collect();
+        let items: Vec<TransferView> = list.items().to_vec();
         let rows: Vec<AnyElement> = items.iter().map(|view| self.render_transfer_row(view, p, cx)).collect();
         let clear = Self::card_button("tq-clear", "清除已完成", None, p).text_color(p.tx2);
         let clear = if has_finished {

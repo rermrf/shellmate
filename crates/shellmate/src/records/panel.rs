@@ -75,7 +75,11 @@ impl RecordsWindow {
             let logs = session_log::list(&log_root).unwrap_or_default();
             let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette, cx));
             terminal.update(cx, |t, _| t.replay_reset(80, 24));
-            let view = cx.new(|cx| TerminalView::new(terminal.clone(), cx.terminal_style(), cx));
+            let view = cx.new(|cx| {
+                let mut view = TerminalView::new(terminal.clone(), cx.terminal_style(), cx);
+                view.top_radius = px(18.);
+                view
+            });
             let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索日志"));
             let subscription = cx.subscribe(&query, |this: &mut Self, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -474,7 +478,14 @@ impl DialogBody for RecordsWindow {
     }
 }
 fn date_label(unix: i64) -> String {
-    if archive::local_time(unix, "%Y-%m-%d") == archive::local_time(archive::now(), "%Y-%m-%d") {
+    let now = archive::now();
+    #[cfg(debug_assertions)]
+    let now = if crate::proto::requested() {
+        crate::proto::now()
+    } else {
+        now
+    };
+    if archive::local_time(unix, "%Y-%m-%d") == archive::local_time(now, "%Y-%m-%d") {
         format!("今天 {}", archive::local_time(unix, "%H:%M"))
     } else {
         archive::local_time(unix, "%m-%d %H:%M")
@@ -515,40 +526,46 @@ impl Render for RecordsWindow {
             }
         } else {
             for (i, row) in self.recordings.iter().enumerate() {
-                let error =
-                    self.errors.get(&row.id).cloned().or_else(|| {
-                        (!std::path::Path::new(&row.path).is_file()).then(|| "文件不存在".into())
-                    });
+                let error = self.errors.get(&row.id).cloned().or_else(|| {
+                    (!crate::prototype_fixture() && !std::path::Path::new(&row.path).is_file())
+                        .then(|| "文件不存在".into())
+                });
                 list = list.child(
                     div()
                         .id(("recording", row.id as usize))
-                        .p(px(12.))
+                        .h(px(58.))
+                        .mb(px(2.))
+                        .px(px(12.))
+                        .py(px(10.))
                         .rounded(px(13.))
                         .cursor_pointer()
                         .when(self.selected == i, |d| d.bg(p.card).shadow(card_shadow(&p)))
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(px(13.5))
+                                .line_height(px(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(row.title.clone()),
                         )
                         .child(
                             div()
-                                .mt(px(4.))
-                                .text_size(px(11.))
+                                .mt(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .text_size(px(11.5))
+                                .line_height(px(13.))
                                 .text_color(p.tx2)
-                                .child(format!("{} · {}", row.label, date_label(row.started_at))),
-                        )
-                        .child(
-                            div()
-                                .mt(px(3.))
-                                .text_size(px(11.))
-                                .text_color(p.tx2)
-                                .child(format!(
+                                .child(div().flex_1().min_w_0().truncate().child(format!(
+                                    "{} · {}",
+                                    row.label,
+                                    date_label(row.started_at)
+                                )))
+                                .child(div().flex_none().child(format!(
                                     "{} · {}",
                                     archive::mmss(row.duration),
                                     shellmate_sftp::format_size(row.size)
-                                )),
+                                ))),
                         )
                         .children(error.map(|e| div().text_size(px(11.)).text_color(p.err).child(e)))
                         .on_click(cx.listener(move |s, _, _, cx| s.select(i, cx))),
@@ -557,11 +574,20 @@ impl Render for RecordsWindow {
         }
         let nav =
             div()
-                .w(px(245.))
+                .w(px(246.))
                 .flex_none()
                 .flex()
                 .flex_col()
                 .gap(px(10.))
+                .child(
+                    div()
+                        .h(px(30.))
+                        .px(px(8.))
+                        .text_size(px(22.))
+                        .line_height(px(30.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("会话记录"),
+                )
                 .child(
                     div()
                         .flex()
@@ -574,10 +600,19 @@ impl Render for RecordsWindow {
                                 div()
                                     .id(("archive-tab", usize::from(logs)))
                                     .flex_1()
-                                    .py(px(7.))
-                                    .rounded(px(9.))
+                                    .h(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(8.))
                                     .text_center()
-                                    .text_size(px(12.))
+                                    .text_size(px(12.5))
+                                    .line_height(px(15.))
+                                    .font_weight(if self.logs_tab == logs {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
                                     .cursor_pointer()
                                     .when(self.logs_tab == logs, |d| d.bg(p.card))
                                     .child(label)
@@ -594,7 +629,13 @@ impl Render for RecordsWindow {
                         .text_color(p.tx2)
                         .child("录制保存为 asciinema v2 .cast，日志为纯文本，按主机和日期归档"),
                 );
-        let mut body = div().flex_1().min_w_0().flex().flex_col().gap(px(12.));
+        let mut body = div()
+            .flex_1()
+            .min_w_0()
+            .pt(px(36.))
+            .flex()
+            .flex_col()
+            .gap(px(12.));
         if self.logs_tab {
             let selected = self.logs.get(self.selected);
             let heading =
@@ -603,19 +644,35 @@ impl Render for RecordsWindow {
             body = body
                 .child(
                     div()
+                        .h(px(38.))
+                        .flex_none()
                         .flex()
                         .items_center()
                         .gap(px(10.))
                         .child(
                             div()
                                 .flex_1()
-                                .text_size(px(14.))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(17.))
+                                .line_height(px(20.))
                                 .font_weight(FontWeight::BOLD)
                                 .child(heading),
                         )
                         .child(
+                            div().w(px(218.)).child(
+                                Input::new(&self.query)
+                                    .appearance(false)
+                                    .h(px(34.))
+                                    .text_size(px(13.)),
+                            ),
+                        )
+                        .child(
                             Button::new("reveal-log")
-                                .small()
+                                .h(px(34.))
+                                .px(px(12.))
+                                .text_size(px(12.5))
+                                .rounded(px(10.))
                                 .label("在 Finder 中显示")
                                 .disabled(path.is_none())
                                 .on_click(move |_, _, cx| {
@@ -625,7 +682,6 @@ impl Render for RecordsWindow {
                                 }),
                         ),
                 )
-                .child(Input::new(&self.query).small())
                 .when(self.truncated, |d| {
                     d.child(
                         div()
@@ -671,7 +727,7 @@ impl Render for RecordsWindow {
             let sub = row.map_or_else(String::new, |r| {
                 format!("{} · {} · asciinema v2", r.label, date_label(r.started_at))
             });
-            let mut header = div().flex().items_center().gap(px(10.));
+            let mut header = div().h(px(28.)).flex_none().flex().items_center().gap(px(10.));
             if let Some(input) = &self.rename {
                 header = header
                     .child(div().flex_1().child(Input::new(input).small()))
@@ -687,13 +743,24 @@ impl Render for RecordsWindow {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap(px(10.))
                             .child(
                                 div()
-                                    .text_size(px(15.))
+                                    .text_size(px(17.))
+                                    .line_height(px(20.))
                                     .font_weight(FontWeight::BOLD)
                                     .child(title),
                             )
-                            .child(div().text_size(px(11.5)).text_color(p.tx2).child(sub)),
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(16.))
+                                    .text_color(p.tx2)
+                                    .truncate()
+                                    .child(sub),
+                            ),
                     )
                     .child(
                         Button::new("rename-recording")
@@ -716,9 +783,11 @@ impl Render for RecordsWindow {
                     .flex_1()
                     .min_h_0()
                     .rounded(px(18.))
-                    .bg(p.card)
+                    .bg(shellmate_term::colors::to_hsla(
+                        cx.terminal_style().palette.background,
+                    ))
                     .overflow_hidden()
-                    .shadow(card_shadow(&p))
+                    .shadow(crate::ui::terminal_shadow(&p))
                     .when(self.timeline.is_some(), |d| d.child(self.view.clone()))
                     .when(self.timeline.is_none(), |d| {
                         d.child(div().p(px(22.)).text_size(px(13.)).text_color(p.tx2).child(
@@ -777,7 +846,10 @@ impl Render for RecordsWindow {
                     .shadow(card_shadow(&p))
                     .child(
                         Button::new("play-recording")
-                            .small()
+                            .h(px(34.))
+                            .px(px(18.))
+                            .rounded(px(11.))
+                            .text_size(px(13.))
                             .primary()
                             .label(if self.play.playing {
                                 "暂停"
@@ -801,20 +873,43 @@ impl Render for RecordsWindow {
                                 archive::mmss(self.duration())
                             )),
                     )
-                    .children([1, 2, 4].into_iter().map(|speed| {
-                        Button::new(("replay-speed", speed as usize))
-                            .xsmall()
-                            .label(format!("{speed}×"))
-                            .when(self.play.speed == speed, |b| b.primary())
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.tick(cx);
-                                s.play.speed = speed;
-                                cx.notify();
-                            }))
-                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .rounded(px(9.))
+                            .bg(p.card3)
+                            .children([1, 2, 4].into_iter().map(|speed| {
+                                div()
+                                    .id(("replay-speed", speed as usize))
+                                    .h(px(24.))
+                                    .px(px(9.))
+                                    .rounded(px(7.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(11.5))
+                                    .line_height(px(13.))
+                                    .text_color(p.tx2)
+                                    .cursor_pointer()
+                                    .when(self.play.speed == speed, |d| {
+                                        d.bg(p.card).text_color(p.tx).font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .child(format!("{speed}×"))
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        s.tick(cx);
+                                        s.play.speed = speed;
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
                     .child(
                         Button::new("copy-recording")
-                            .small()
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(10.))
+                            .text_size(px(12.5))
                             .label("复制文本")
                             .disabled(self.timeline.is_none())
                             .on_click(cx.listener(|s, _, _, cx| {
@@ -825,7 +920,10 @@ impl Render for RecordsWindow {
                     )
                     .child(
                         Button::new("export-recording")
-                            .small()
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(10.))
+                            .text_size(px(12.5))
                             .label("导出 .cast")
                             .disabled(self.timeline.is_none())
                             .on_click(cx.listener(|s, _, w, cx| s.export(w, cx))),
@@ -838,26 +936,115 @@ impl Render for RecordsWindow {
                 .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
         );
         div()
-            .h((window.viewport_size().height - px(250.)).clamp(px(260.), px(610.)))
+            .relative()
+            .h((window.viewport_size().height - px(40.)).min(px(740.)))
+            .pt(px(22.))
+            .pb(px(20.))
+            .pl(px(12.))
+            .pr(px(20.))
             .flex()
-            .flex_col()
-            .gap(px(10.))
+            .gap(px(18.))
+            .child(nav)
+            .child(body)
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
+                    .id("records-close")
+                    .absolute()
+                    .right(px(20.))
+                    .top(px(20.))
+                    .size(px(30.))
+                    .rounded(px(10.))
+                    .bg(p.card)
+                    .text_color(p.tx2)
+                    .text_size(px(16.))
+                    .line_height(px(16.))
+                    .cursor_pointer()
                     .flex()
-                    .gap(px(18.))
-                    .child(nav)
-                    .child(body),
+                    .items_center()
+                    .justify_center()
+                    .child("×")
+                    .on_click(cx.listener(|s, _, w, cx| s.dismiss(w, cx))),
             )
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("records-close")
-                        .small()
-                        .label("关闭")
-                        .on_click(cx.listener(|s, _, w, cx| s.dismiss(w, cx))),
-                ),
-            )
+    }
+}
+
+#[cfg(debug_assertions)]
+impl RecordsWindow {
+    /// In-memory recording/log fixtures: no scratch file reads, timers, or catalog repair.
+    pub fn proto_scene(&mut self, logs: bool, cx: &mut Context<Self>) {
+        use crate::proto::{self, DATA};
+        self.generation += 1;
+        self.logs_tab = logs;
+        self.error = None;
+        self.loading = false;
+        self.play.playing = false;
+        self.play.speed = 2;
+        self.recordings = DATA["REC"]
+            .a()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Recording {
+                id: i as i64,
+                title: r["title"].s().into(),
+                host: r["host"].s().into(),
+                label: r["host"].s().into(),
+                path: String::new(),
+                started_at: if i == 2 {
+                    proto::timestamp("11-10 21:05")
+                } else {
+                    proto::timestamp(if i == 0 { "09:41" } else { "09:30" })
+                },
+                duration: r["frames"].a().last().map_or(0., |f| f["at"].n()) + 2.,
+                size: proto::bytes(r["size"].s()),
+                cols: 100,
+                rows: 28,
+            })
+            .collect();
+        let frames = DATA["REC"][0]["frames"].a();
+        let mut header = shellmate_term::cast::Header::new(100, 28);
+        header.timestamp = Some(proto::timestamp("09:41"));
+        let events = frames
+            .iter()
+            .map(|f| {
+                let segs = f["segs"];
+                let line = proto::ansi_line(&segs, cx.is_dark());
+                shellmate_term::cast::Event {
+                    at: f["at"].n(),
+                    data: Data::Output(format!("{line}\r\n")),
+                }
+            })
+            .collect();
+        self.terminal.update(cx, |t, _| t.replay_reset(100, 28));
+        self.timeline = Some(Timeline::new(Cast {
+            header,
+            events,
+            duration: self.recordings[0].duration,
+        }));
+        self.seek(0., true, cx);
+        self.logs = DATA["LOGS"]
+            .a()
+            .iter()
+            .map(|l| LogFile {
+                host: l["host"].s().into(),
+                date: format!("{}.log", l["date"].s()),
+                path: PathBuf::new(),
+                size: proto::bytes(l["size"].s()),
+            })
+            .collect();
+        self.log_lines = DATA["LOGS"][0]["lines"]
+            .a()
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                format!(
+                    "09:{:02}:{:02}  {}",
+                    30 + (i * 7 + 60) / 60,
+                    (i * 7) % 60,
+                    line.a().iter().map(|s| s["t"].s()).collect::<String>()
+                )
+            })
+            .collect();
+        self.filter(cx);
+        cx.notify();
     }
 }

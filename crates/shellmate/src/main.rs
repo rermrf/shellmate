@@ -1,6 +1,8 @@
 //! Shellmate — a gpui SSH client. P0/P1: UI skeleton and local terminal; P2: host library, SSH.
 
 mod assets;
+#[cfg(debug_assertions)]
+mod proto;
 mod connect;
 mod dialogs;
 mod editor;
@@ -41,6 +43,7 @@ const FONTS: [&[u8]; 4] = [
 /// database), else `~/Library/Application Support/Shellmate/shellmate.db`. If that fails the
 /// app runs on a temporary in-memory library and returns the reason to show to the user.
 fn open_store() -> (HostStore, Option<String>) {
+    #[cfg(debug_assertions)] if proto::requested(){return (HostStore::open_in_memory().expect("fixture database"),None);}
     let path = std::env::var_os("SHELLMATE_DB").map(std::path::PathBuf::from).or_else(HostStore::default_path);
     let opened = match &path {
         Some(path) => HostStore::open(path),
@@ -54,6 +57,11 @@ fn open_store() -> (HostStore, Option<String>) {
             (store, Some(format!("{err}。本次运行使用临时主机库，新建的主机不会被保存。")))
         }
     }
+}
+
+pub(crate) fn prototype_fixture()->bool {
+    #[cfg(debug_assertions)] {proto::requested()}
+    #[cfg(not(debug_assertions))] {false}
 }
 
 fn main() {
@@ -92,12 +100,13 @@ fn main() {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        #[cfg(debug_assertions)] let bounds=if proto::requested(){Bounds::new(point(px(60.),px(60.)),size(px(1440.),px(900.)))}else{bounds};
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
                 title: Some("Shellmate".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(18.), px(19.))),
+                traffic_light_position: Some(point(px(12.), px(21.))),
             }),
             app_owns_titlebar_drag: true,
             window_min_size: Some(size(px(980.), px(620.))),

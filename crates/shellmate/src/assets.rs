@@ -7,16 +7,31 @@ use gpui::{AssetSource, Result, SharedString};
 
 const EXTRA_ICONS: &[(&str, &[u8])] = &[
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
-    ("icons/radio-tower.svg", include_bytes!("../assets/icons/radio-tower.svg")),
-    ("icons/sparkles.svg", include_bytes!("../assets/icons/sparkles.svg")),
+    (
+        "icons/radio-tower.svg",
+        include_bytes!("../assets/icons/radio-tower.svg"),
+    ),
+    (
+        "icons/sparkles.svg",
+        include_bytes!("../assets/icons/sparkles.svg"),
+    ),
     ("icons/zap.svg", include_bytes!("../assets/icons/zap.svg")),
-    ("icons/ellipsis.svg", include_bytes!("../assets/icons/ellipsis.svg")),
+    (
+        "icons/ellipsis.svg",
+        include_bytes!("../assets/icons/ellipsis.svg"),
+    ),
     ("icons/pencil.svg", include_bytes!("../assets/icons/pencil.svg")),
     ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
     ("icons/trash.svg", include_bytes!("../assets/icons/trash.svg")),
     ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
-    ("icons/folder-open.svg", include_bytes!("../assets/icons/folder-open.svg")),
-    ("icons/arrow-up.svg", include_bytes!("../assets/icons/arrow-up.svg")),
+    (
+        "icons/folder-open.svg",
+        include_bytes!("../assets/icons/folder-open.svg"),
+    ),
+    (
+        "icons/arrow-up.svg",
+        include_bytes!("../assets/icons/arrow-up.svg"),
+    ),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
 ];
 
@@ -24,10 +39,22 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        match EXTRA_ICONS.iter().find(|(p, _)| *p == path) {
-            Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
-            None => gpui::assets::Assets.load(path),
-        }
+        let asset = match EXTRA_ICONS.iter().find(|(p, _)| *p == path) {
+            Some((_, bytes)) => Some(Cow::Borrowed(*bytes)),
+            None => gpui::assets::Assets.load(path)?,
+        };
+        // Lucide sources use a 24-unit viewBox; 2.4 units yields 1.6px at 16px display size.
+        Ok(asset.map(|asset| {
+            if path.starts_with("icons/") && path.ends_with(".svg") {
+                Cow::Owned(
+                    String::from_utf8_lossy(&asset)
+                        .replace("stroke-width=\"2\"", "stroke-width=\"2.4\"")
+                        .into_bytes(),
+                )
+            } else {
+                asset
+            }
+        }))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {

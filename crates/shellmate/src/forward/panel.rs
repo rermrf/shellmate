@@ -3,7 +3,7 @@
 //! [`ForwardPanelEvent`]s (which saves rules, starts and stops them).
 
 use gpui::component::input::{Input, InputEvent, InputState};
-use gpui::component::switch::Switch;
+use crate::ui::Toggle as Switch;
 use gpui::prelude::*;
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, SharedString, Subscription, Window, div,
@@ -163,7 +163,7 @@ impl ForwardPanel {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(12.))
+            .gap(px(12.)).min_h(px(72.))
             .px(px(18.))
             .py(px(16.))
             .bg(p.card)
@@ -330,7 +330,7 @@ impl ForwardPanel {
         let toggle_id = id.clone();
         let delete_id = id.clone();
         div()
-            .id(("fwd-rule", ix))
+            .id(("fwd-rule", ix)).min_h(px(76.))
             .flex()
             .flex_none()
             .items_center()
@@ -391,14 +391,14 @@ impl ForwardPanel {
                     .flex()
                     .flex_col()
                     .items_start()
-                    .gap(px(4.))
+                    .gap(px(4.)).relative().top(px(2.5))
                     .child(
                         div()
                             .w_full()
                             .flex()
                             .items_start()
                             .gap(px(6.))
-                            .text_size(px(12.5))
+                            .text_size(px(12.5)).line_height(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(status_color)
                             .child(div().mt(px(5.)).child(dot(Self::tone_color(p, card.tone), 7.)))

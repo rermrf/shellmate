@@ -24,6 +24,7 @@ impl SessionRow {
     pub fn subtitle(&self) -> &'static str {
         match self.status {
             Status::Connected if self.local => "本机",
+            Status::Connected if crate::prototype_fixture()&&self.title=="ESP32-DevKit"=>"串口",
             Status::Connected => "SSH",
             Status::Connecting => "连接中",
             Status::Reconnecting => "重连中",

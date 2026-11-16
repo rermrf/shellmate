@@ -11,7 +11,7 @@ use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputState};
 use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::tooltip::Tooltip;
-use gpui::component::{Icon, Sizable as _};
+use gpui::component::Icon;
 use gpui::prelude::*;
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, FontWeight, KeyBinding, SharedString, Subscription,
@@ -22,7 +22,7 @@ use shellmate_core::{Host, HostBook, HostFilter, HostId, HostSection, minutes_si
 use crate::theme::{ActivePalette, Palette};
 use crate::ui::{card_shadow, dot, item_shadow, kbd, segmented, window_drag_area, SegmentItem};
 
-pub const SIDEBAR_WIDTH: f32 = 272.;
+pub const SIDEBAR_WIDTH: f32 = 284.;
 
 /// What the sidebar and the rail say about the connection state of the footer: no sync yet.
 pub const SYNC_STATUS: &str = "本地配置 · 未开启同步";
@@ -200,12 +200,12 @@ impl Sidebar {
                 .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
         };
         let top = window_drag_area(div().id("sidebar-drag"))
-            .h(px(52.))
+            .h(px(54.))
             .flex()
             .items_center()
             .justify_end()
-            .gap(px(2.))
-            .pr(px(4.))
+            .gap(px(4.))
+            .pr(px(5.))
             .child(
                 icon_button("toggle-sidebar", Lucide::PanelLeft, "隐藏侧栏 ⌃⌘S")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))),
@@ -216,19 +216,19 @@ impl Sidebar {
             );
 
         let host_count = self.book.hosts.len();
-        div()
+        div().h(px(124.)).flex_none()
             .child(top)
             .child(
                 div()
                     .px(px(6.))
-                    .pt(px(4.))
-                    .pb(px(14.))
-                    .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(p.tx).child("主机"))
+                    .pt(px(2.))
+                    .pb(px(13.))
+                    .child(div().line_height(px(37.)).text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(p.tx).child("主机"))
                     .child(
                         div()
-                            .mt(px(2.))
+                            .mt(px(3.)).line_height(px(15.))
                             .text_size(px(12.))
-                            .text_color(p.tx3)
+                            .text_color(p.tx2)
                             .child(format!("{host_count} 台 · {} 个会话", self.session_count)),
                     ),
             )
@@ -246,7 +246,8 @@ impl Sidebar {
             .bg(p.card)
             .shadow(card_shadow(&p))
             .child(Icon::new(Lucide::Search).size(px(15.)).text_color(p.tx3))
-            .child(div().flex_1().child(Input::new(&self.search).small().appearance(false).cleanable(true)))
+            .child(div().flex_1().min_w_0().child(Input::new(&self.search).appearance(false).cleanable(true).p_0().h(px(18.)).text_size(px(13.)).line_height(px(18.))))
+            .child(div().id("sidebar-palette").cursor_pointer().child(kbd("⌘K",cx)).on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::SearchHosts))))
 
     }
 
@@ -268,7 +269,7 @@ impl Sidebar {
             },
             cx,
         )
-        .mt(px(12.))
+        .mt(px(12.)).h(px(34.)).flex_none()
     }
 
     fn render_local(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -276,11 +277,11 @@ impl Sidebar {
         let selected = self.selected.as_deref() == Some("local");
         div()
             .id("local-terminal")
-            .mt(px(14.))
+            .mt(px(12.))
             .flex()
             .items_center()
             .gap(px(10.))
-            .h(px(48.))
+            .h(px(50.)).mb(px(2.))
             .px(px(10.))
             .rounded(px(12.))
             .cursor_pointer()
@@ -292,10 +293,8 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(9.))
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.line)
+                    .rounded(px(10.))
+                    .bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
                     .child(Icon::new(Lucide::SquareTerminal).size(px(16.)).text_color(p.tx)),
             )
             .child(
@@ -321,12 +320,12 @@ impl Sidebar {
             .id(SharedString::from(format!("group-{key}")))
             .flex()
             .items_center()
-            .gap(px(4.))
-            .h(px(30.))
+            .gap(px(6.5))
+            .h(px(31.))
             .px(px(6.))
             .mt(px(6.))
             .cursor_pointer()
-            .text_size(px(12.5))
+            .text_size(px(12.)).font_weight(FontWeight::SEMIBOLD)
             .text_color(p.tx2)
             .child(
                 Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
@@ -334,7 +333,7 @@ impl Sidebar {
                     .text_color(p.tx3),
             )
             .child(div().flex_1().child(title))
-            .child(div().text_size(px(11.5)).text_color(p.tx3).child(section.hosts.len().to_string()))
+            .child(div().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.tx3).child(section.hosts.len().to_string()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.collapsed.remove(&key) {
                     this.collapsed.insert(key.clone());
@@ -370,7 +369,7 @@ impl Sidebar {
         };
         let id = host.id.clone();
 
-        let avatar = host_avatar(host, tone, live, Avatar { size: 32., radius: 9., dot: 10. }, p);
+        let avatar = host_avatar(host, tone, live, Avatar { size: 32., radius: 10., dot: 12. }, p);
 
         let name_line = div()
             .flex()
@@ -384,10 +383,11 @@ impl Sidebar {
                     .truncate()
                     .child(host.name.clone()),
             )
-            .when(host.favorite, |d| d.child(Icon::new(Lucide::Star).size(px(11.)).text_color(p.warn)));
+            .when(host.favorite, |d| d.child(div().flex_none().text_size(px(13.)).line_height(px(13.)).font_weight(FontWeight::NORMAL).text_color(p.warn).child("★")));
 
         div()
             .id(SharedString::from(format!("host-{}", host.id)))
+            .relative().top(px(-2.))
             .flex()
             .items_center()
             .gap(px(10.))
@@ -416,7 +416,7 @@ impl Sidebar {
                     .text_color(p.tx2)
                     .child(b)
             }))
-            .children(selected.then(|| {
+            .children((selected&&!self.live.contains_key(host.id.as_str())).then(|| {
                 let connect_id = host.id.clone();
                 div()
                     .id(SharedString::from(format!("connect-{}", host.id)))
@@ -443,7 +443,7 @@ impl Sidebar {
                 let host_id = host.id.clone();
                 Button::new(SharedString::from(format!("menu-{}", host.id)))
                     .ghost()
-                    .compact()
+                    .compact().w(px(24.)).h(px(24.)).bg(p.card2).rounded(px(7.))
                     .icon(Icon::new(Lucide::Ellipsis).size(px(15.)))
                     .tooltip("更多")
                     .dropdown_menu(move |menu, _, _| {
@@ -537,14 +537,14 @@ impl Sidebar {
             .flex()
             .items_center()
             .gap(px(8.))
-            .h(px(44.))
+            .h(px(48.))
             .px(px(12.))
             .mt(px(8.))
             .rounded(px(12.))
             .bg(p.card)
             .shadow(card_shadow(&p))
-            .child(dot(p.tx3, 7.))
-            .child(div().flex_1().text_size(px(12.)).text_color(p.tx2).child(SYNC_STATUS))
+            .child(dot(if crate::prototype_fixture(){p.ok}else{p.tx3}, 7.))
+            .child(div().flex_1().text_size(px(12.)).text_color(p.tx2).child(if crate::prototype_fixture(){"已同步 · WebDAV · 2 分钟前"}else{SYNC_STATUS}))
             .child(
                 div()
                     .id("settings")
@@ -589,7 +589,7 @@ pub(crate) fn host_avatar(
         .rounded(px(avatar.radius))
         .bg(tone_bg)
         .text_color(tone_fg)
-        .text_size(px(11.))
+        .text_size(px(11.)).line_height(px(13.))
         .font_weight(FontWeight::BOLD)
         .child(host.monogram())
         .children(live.map(|status| {
@@ -643,7 +643,7 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .pl(px(12.))
-            .pr(px(4.))
+            .pr(px(12.))
             .pb(px(12.))
             .child(self.render_header(cx))
             .child(self.render_search(cx))
@@ -657,7 +657,7 @@ impl Render for Sidebar {
                     .on_action(cx.listener(Self::connect_selected))
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
+                    .overflow_y_scroll().pt(px(1.))
                     .pb(px(8.))
                     .children(list),
             )

@@ -26,7 +26,7 @@ impl Workspace {
     pub(super) fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         self.open_palette_query("", window, cx);
     }
-    fn open_palette_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_palette_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         let data = PaletteData {
             book: self.book.clone(),
             sessions: self
@@ -35,7 +35,7 @@ impl Workspace {
                 .map(|s| SessionItem {
                     id: s.id,
                     title: s.title.to_string(),
-                    detail: if s.ssh().is_some() { "SSH" } else { "本机终端" }.into(),
+                    detail: s.ssh().map_or("本机终端",|s|s.host.protocol.label()).into(),
                     host: s.ssh().map(|s| s.host.id.clone()),
                 })
                 .collect(),

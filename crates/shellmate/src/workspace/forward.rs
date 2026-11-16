@@ -25,7 +25,7 @@ use crate::runtime;
 /// The forwarding panel of a tab and what keeps it wired to the workspace.
 pub struct ForwardTab {
     pub panel: Entity<ForwardPanel>,
-    _subscription: Subscription,
+    pub(super) _subscription: Subscription,
 }
 
 impl Workspace {

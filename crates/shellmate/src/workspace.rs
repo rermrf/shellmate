@@ -37,6 +37,8 @@ mod productivity;
 mod multi;
 mod archive;
 #[cfg(debug_assertions)]
+mod proto;
+#[cfg(debug_assertions)]
 mod archive_demo;
 mod ssh;
 
@@ -263,7 +265,8 @@ impl Workspace {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
         this.reload_book(window, cx);
-        this.open_local(window, cx);
+        let open_local=!crate::prototype_fixture();
+        if open_local {this.open_local(window, cx);}
         this.archive_timer(window,cx);
         this
     }
@@ -481,7 +484,7 @@ impl Workspace {
         self.sync_productivity(cx);
         let count = self.sessions.len();
         let shell = shell_name(&PtyOptions::default().shell_path());
-        let summary = if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个标签") };
+        let summary = if crate::prototype_fixture(){"zsh · ~".to_string()} else if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个标签") };
         let mut live: HashMap<String, LiveStatus> = HashMap::new();
         for ssh in self.sessions.iter().filter_map(Session::ssh) {
             if let Some(status) = ssh.live() {
@@ -610,12 +613,12 @@ impl Workspace {
                 .flex_none()
                 .items_center()
                 .gap(px(8.))
-                .h(px(34.))
+                .h(px(36.))
                 .pl(px(12.))
                 .pr(px(6.))
-                .rounded(px(10.))
+                .rounded(px(12.))
                 .cursor_pointer()
-                .text_size(px(13.))
+                .text_size(px(13.)).line_height(px(16.))
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
                 .when(!active, |d| d.text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
                 .child(dot(session_dot(s, &p), 7.))
@@ -627,15 +630,15 @@ impl Workspace {
                     let id = s.id;
                     div()
                         .id(("tab-badge", id))
-                        .h(px(18.))
-                        .px(px(6.))
+                        .h(px(16.))
+                        .px(px(5.))
                         .flex()
                         .items_center()
                         .rounded(px(5.))
                         .bg(color.opacity(0.14))
                         .text_color(color)
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(10.)).line_height(px(12.))
+                        .font_weight(FontWeight::BOLD)
                         .child(badge)
                         .tooltip(|window, cx| Tooltip::new("点击或按回车立即重试").build(window, cx))
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -646,7 +649,7 @@ impl Workspace {
                 .child(
                     div()
                         .id(("close-tab", s.id))
-                        .size(px(18.))
+                        .size(px(22.))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -663,7 +666,7 @@ impl Workspace {
 
         let new_tab = div()
             .id("new-tab")
-            .size(px(28.))
+            .size(px(22.))
             .flex()
             .flex_none()
             .items_center()
@@ -677,11 +680,11 @@ impl Workspace {
 
         let theme_icon = if cx.is_dark() { Lucide::Sun } else { Lucide::Moon };
         div()
-            .h(px(52.))
+            .h(px(58.)).flex_none().pt(px(4.))
             .flex()
             .items_center()
-            .gap(px(4.))
-            .child(div().flex().items_center().gap(px(2.)).min_w_0().overflow_hidden().children(tabs))
+            .gap(px(8.))
+            .child(div().flex().items_center().gap(px(6.)).min_w_0().overflow_hidden().children(tabs))
             .child(new_tab)
             .when(crate::productivity::multi::tab_overflow(self.sessions.len(),self.sidebar_open,self.commands_open),|d|d.child(
                 div().id("tab-list-button").flex_none().cursor_pointer().px(px(8.)).py(px(5.)).rounded(px(8.)).text_size(px(12.)).text_color(p.tx2)
@@ -730,11 +733,11 @@ impl Workspace {
             .collect();
 
         window_drag_area(div().id("header-drag"))
-            .h(px(46.))
+            .h(px(50.)).flex_none().px(px(4.)).pr(px(0.)).pb(px(6.))
             .flex()
             .items_center()
             .gap(px(12.))
-            .mb(px(8.))
+            .mb(px(0.))
             .child(
                 div()
                     .flex()
@@ -742,8 +745,8 @@ impl Workspace {
                     .gap(px(10.))
                     .flex_1()
                     .min_w_0()
-                    .child(div().flex_none().text_size(px(22.)).font_weight(FontWeight::BOLD).text_color(p.tx).child(title))
-                    .child(div().min_w_0().truncate().text_size(px(12.)).text_color(p.tx2).child(subtitle)),
+                    .child(div().flex_none().text_size(px(20.)).line_height(px(23.)).font_weight(FontWeight::BOLD).text_color(p.tx).child(title))
+                    .child(div().min_w_0().truncate().text_size(px(12.)).line_height(px(15.)).text_color(p.tx2).child(subtitle)),
             )
             .child(
                 segmented(
@@ -757,12 +760,14 @@ impl Workspace {
                     },
                     cx,
                 )
-                .flex_none(),
+                .flex_none().h(px(36.)).rounded(px(12.)),
             )
     }
 
     /// Header subtitle: the SSH target of an SSH session, the shell of a local one.
     fn session_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
+        #[cfg(debug_assertions)] if crate::proto::requested(){if session.ssh().is_none(){return "chen@MacBook-Pro · /bin/zsh -l · ~ · 本机进程，不经过网络".into();}
+        if let Some(ssh)=session.ssh(){return format!("{}@{}:{} · {} · {}",ssh.host.user.as_deref().unwrap_or(""),ssh.host.addr,ssh.host.port,ssh.host.protocol.label(),ssh.host.auth.label());}}
         match session.ssh() {
             Some(ssh) => {
                 let target = ssh::subtitle(&ssh.host, &ssh.via(), &connect::default_user());
@@ -799,12 +804,12 @@ impl Workspace {
     fn render_terminal_card(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let term_bg = to_hsla(cx.terminal_style().palette.background);
+        let term_fg = to_hsla(cx.terminal_style().palette.foreground);
         let focused=self.focused_session().unwrap_or(session);
         let size = focused.terminal.read(cx).size();
-        let status = match focused.ssh() {
-            Some(_) => ssh::status_line(size.cols, size.rows),
-            None => format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY", size.cols, size.rows),
-        };
+        let status=if focused.ssh().is_some(){ssh::status_line(size.cols,size.rows)}else{format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY",size.cols,size.rows)};
+        let status_fields=status.split("    ").map(str::to_string).collect::<Vec<_>>();
+        #[cfg(debug_assertions)] let status_fields=if crate::proto::requested(){vec![format!("PTY {}×38",if self.split.other.is_some(){66}else if self.commands_open{96}else{134}),"xterm-256color".into(),"UTF-8".into(),"延迟 28ms · 保活 30s".into()]}else{status_fields};
         let view = focused.view.clone();
         let recording=self.running_recordings.get(&focused.id);
         let recording_label=recording.map_or_else(||"● 录制".to_string(),|r|format!("REC {} · .cast",shellmate_term::archive::mmss(r.display_seconds())));
@@ -812,20 +817,23 @@ impl Workspace {
         let pill = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool| {
             div()
                 .id(id)
-                .h(px(24.))
+                .h(px(22.))
                 .px(px(9.))
                 .flex()
                 .items_center()
                 .rounded(px(7.))
-                .bg(p.card2)
+                .bg(gpui::rgba(0x7f7f7f29))
+                .font_family(theme::MONO_FONT).line_height(px(15.))
                 .text_size(px(11.5))
-                .text_color(p.tx2)
+                .text_color(term_fg)
                 .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(p.card3).text_color(p.tx)))
                 .when(!enabled, |d| d.opacity(0.5))
                 .child(label)
                 .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
         };
 
+        let overlay:Option<gpui::AnyElement>=None;
+        #[cfg(debug_assertions)] let overlay=self.proto_reconnect_overlay(cx).or(overlay);
         div()
             .relative()
             .flex_1()
@@ -835,17 +843,17 @@ impl Workspace {
             .flex_col()
             .rounded(CARD_RADIUS)
             .bg(term_bg)
-            .shadow(card_shadow(&p))
+            .shadow(crate::ui::terminal_shadow(&p))
             .child(self.render_panes(session,cx))
             .when(self.broadcast.enabled,|d|d.child(self.broadcast_bar.clone()))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(px(33.))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .px(px(16.))
+                    .gap(px(14.))
+                    .px(px(10.)).pl(px(16.))
                     .border_t_1()
                     .border_color(p.line)
                     .rounded_b(CARD_RADIUS)
@@ -853,14 +861,14 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .overflow_hidden().flex().items_center().gap(px(14.))
                             .font_family(theme::MONO_FONT)
-                            .text_size(px(11.))
-                            .text_color(p.tx3)
-                            .child(status),
+                            .text_size(px(11.5))
+                            .text_color(to_hsla(cx.terminal_style().palette.dim))
+                            .children(status_fields.into_iter().map(|text|div().flex_none().line_height(px(15.)).child(text))),
                     )
-                    .child(div().id("record-session").h(px(24.)).px(px(9.)).flex().items_center().rounded(px(7.)).cursor_pointer().text_size(px(11.5))
-                        .bg(if recording.is_some(){p.err}else{p.card2}).text_color(if recording.is_some(){gpui::white()}else{p.tx2}).child(recording_label)
+                    .child(div().id("record-session").h(px(22.)).font_family(theme::MONO_FONT).px(px(9.)).flex().items_center().rounded(px(7.)).cursor_pointer().text_size(px(11.5))
+                        .line_height(px(15.)).font_weight(FontWeight::NORMAL).bg(if recording.is_some(){p.err}else{gpui::rgba(0x7f7f7f29).into()}).text_color(if recording.is_some(){gpui::white()}else{term_fg}).child(recording_label)
                         .on_click(cx.listener(|this,_,w,cx|this.toggle_recording(w,cx))))
                     .child(pill("logs", "记录", "会话记录与回放", true).on_click(cx.listener(|this,_,w,cx|this.open_records(None,false,w,cx))))
                     .child(
@@ -875,7 +883,7 @@ impl Workspace {
                     }))
                     .child(pill("split", if self.split.other.is_some(){"取消分屏"}else{"分屏"}, "切换分屏", true)
                         .on_click(cx.listener(|this,_,w,cx|this.toggle_split(w,cx)))),
-            )
+            ).children(overlay)
 
     }
 
@@ -962,6 +970,7 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .bg(p.win)
+            .font_family(theme::UI_FONT).text_size(px(13.)).line_height(gpui::relative(1.3))
             .text_color(p.tx)
             .child(self.sidebar.clone())
             .child(
@@ -974,7 +983,7 @@ impl Render for Workspace {
                     .pr(px(12.))
                     .pb(px(12.))
                     // Beside the sidebar there is a gap; beside the rail the tabs start right after it.
-                    .pl(px(if self.sidebar_open { 8. } else { 0. }))
+                    .pl(px(0.))
                     .child(self.render_tab_bar(cx))
                     .child(self.render_header(cx))
                     .child(

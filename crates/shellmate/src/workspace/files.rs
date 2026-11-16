@@ -32,7 +32,7 @@ use crate::runtime;
 /// The files panel of a tab and what keeps it wired to the workspace.
 pub struct FilesTab {
     pub panel: Entity<FilesPanel>,
-    _subscription: Subscription,
+    pub(super) _subscription: Subscription,
 }
 
 /// What a panel shows about the session, given the link and the state of its own tab.

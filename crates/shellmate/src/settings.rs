@@ -1,4 +1,5 @@
 //! Preferences are persisted before the workspace applies their runtime effects.
+use crate::ui::Toggle as Switch;
 use crate::{
     dialogs::{self, DialogBody},
     theme::ActivePalette,
@@ -6,11 +7,7 @@ use crate::{
 };
 use gpui::{
     App, Context, Entity, FontWeight, WeakEntity, Window,
-    component::{
-        Disableable as _, Sizable as _,
-        button::{Button, ButtonVariants as _},
-        switch::Switch,
-    },
+    component::{Sizable as _, button::Button},
     div,
     prelude::*,
     px,
@@ -71,19 +68,31 @@ impl Render for SettingsWindow {
         let p = cx.palette().clone();
         let names = ["凭据与安全", "同步与备份", "终端", "本地终端", "连接与保活"];
         let nav = div()
-            .w(px(185.))
+            .w(px(186.))
             .flex_none()
             .flex()
             .flex_col()
             .gap(px(4.))
+            .child(
+                div()
+                    .h(px(47.))
+                    .px(px(10.))
+                    .text_size(px(24.))
+                    .line_height(px(33.))
+                    .font_weight(FontWeight::BOLD)
+                    .child("设置"),
+            )
             .children(names.into_iter().enumerate().map(|(index, name)| {
                 div()
                     .id(("setting-section", index))
                     .px(px(12.))
-                    .py(px(12.))
+                    .h(px(38.))
+                    .flex()
+                    .items_center()
                     .rounded(px(12.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(px(13.5))
+                    .line_height(px(16.))
                     .text_color(if self.section == index { p.tx } else { p.tx2 })
                     .when(self.section == index, |d| {
                         d.bg(p.card).font_weight(FontWeight::SEMIBOLD)
@@ -96,6 +105,8 @@ impl Render for SettingsWindow {
             }));
         let mut content = div()
             .id("settings-content")
+            .pt(px(42.))
+            .pr(px(0.))
             .flex_1()
             .min_w_0()
             .overflow_y_scroll()
@@ -106,8 +117,9 @@ impl Render for SettingsWindow {
             content = content
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .font_weight(FontWeight::BOLD)
                         .child("凭据存储方式"),
                 )
                 .child(
@@ -131,22 +143,25 @@ impl Render for SettingsWindow {
                                 .min_w_0()
                                 .whitespace_normal()
                                 .p(px(16.))
+                                .min_h(px(100.))
                                 .rounded(px(18.))
                                 .border_1()
                                 .border_color(if selected { p.acc } else { p.line })
                                 .bg(if selected { p.accs } else { p.card })
                                 .child(
                                     div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(14.))
+                                        .line_height(px(17.))
+                                        .font_weight(FontWeight::BOLD)
                                         .child(format!("{}  {title}", if selected { "◉" } else { "○" })),
                                 )
                                 .child(
                                     div()
                                         .w_full()
                                         .whitespace_normal()
-                                        .mt(px(8.))
-                                        .text_size(px(12.))
+                                        .mt(px(12.))
+                                        .text_size(px(12.5))
+                                        .line_height(px(18.))
                                         .text_color(p.tx2)
                                         .child(description),
                                 )
@@ -178,7 +193,7 @@ impl Render for SettingsWindow {
                                 .flex_1()
                                 .min_w_0()
                                 .whitespace_normal()
-                                .text_size(px(13.))
+                                .text_size(px(13.5))
                                 .child(label)
                                 .child(
                                     div()
@@ -240,8 +255,9 @@ impl Render for SettingsWindow {
                                 .flex_1()
                                 .min_w_0()
                                 .whitespace_normal()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .line_height(px(16.))
                                 .child(key.label())
                                 .when(!key.description().is_empty(), |d| {
                                     d.child(
@@ -285,33 +301,40 @@ impl Render for SettingsWindow {
             }
         }
         div()
-            .h((window.viewport_size().height - px(250.)).clamp(px(260.), px(560.)))
+            .relative()
+            .h((window.viewport_size().height - px(40.)).min(px(640.)))
+            .pt(px(24.))
+            .pb(px(24.))
+            .pl(px(12.))
+            .pr(px(24.))
             .flex()
-            .flex_col()
-            .gap(px(14.))
+            .gap(px(20.))
+            .child(nav)
+            .child(
+                content.children(
+                    self.error
+                        .clone()
+                        .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
+                ),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .w_full()
+                    .id("settings-close")
+                    .absolute()
+                    .right(px(24.))
+                    .top(px(24.))
+                    .size(px(30.))
+                    .rounded(px(10.))
+                    .bg(p.card)
                     .flex()
-                    .gap(px(20.))
-                    .child(nav)
-                    .child(content),
-            )
-            .children(
-                self.error
-                    .clone()
-                    .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
-            )
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("settings-close")
-                        .primary()
-                        .label("完成")
-                        .on_click(cx.listener(|this, _, w, cx| this.dismiss(w, cx))),
-                ),
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(16.))
+                    .line_height(px(16.))
+                    .text_color(p.tx2)
+                    .child("×")
+                    .on_click(cx.listener(|s, _, w, cx| s.dismiss(w, cx))),
             )
     }
 }

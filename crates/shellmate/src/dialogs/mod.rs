@@ -63,12 +63,44 @@ pub fn open<V: DialogBody>(
         let on_ok = body.clone();
         let on_cancel = body.clone();
         // A little above the middle: clear of the tab bar and header, with the scrim over the rest.
-        let margin_top = (window.viewport_size().height * 0.17).max(px(110.));
+        let records = title.as_ref() == "会话记录";
+        let settings = title.as_ref() == "设置";
+        let host_editor = matches!(title.as_ref(), "新建连接" | "编辑主机");
+        let host_key = title.contains("主机密钥已变更") || title.contains("主机指纹");
+        let margin_top = if records {
+            (window.viewport_size().height - px(740.)) / 2.
+        } else if settings {
+            (window.viewport_size().height - px(640.)) / 2.
+        } else if host_editor {
+            px(30.)
+        } else if host_key {
+            (window.viewport_size().height - px(402.)) / 2.
+        } else {
+            (window.viewport_size().height * 0.17).max(px(110.))
+        };
         dialog
-            .margin_top(margin_top)
-            .title(title.clone())
+            .margin_top(margin_top.max(px(20.)))
+            .rounded(px(if records || settings || host_key { 26. } else { 22. }))
+            .p(px(if records || settings { 0. } else { 24. }))
+            .when(records, |d| d.h(px(740.)).bg(cx.palette().win).border_0())
+            .when(settings, |d| d.h(px(640.)).bg(cx.palette().win).border_0())
+            .when(host_editor, |d| {
+                d.h((window.viewport_size().height - px(60.)).min(px(840.)))
+            })
+            .when(!records && !settings, |d| {
+                d.title(
+                    div()
+                        .text_size(px(if records || settings || host_editor || host_key {
+                            22.
+                        } else {
+                            18.
+                        }))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.clone()),
+                )
+            })
             .w(px(width))
-            .close_button(false)
+            .close_button(host_editor)
             .overlay_closable(false)
             .on_ok(move |_, window, cx| on_ok.update(cx, |body, cx| body.confirm(window, cx)))
             .on_cancel(move |_, window, cx| {
@@ -89,7 +121,12 @@ pub enum Tone {
 
 /// A dialog button.
 pub fn button(id: &'static str, label: impl Into<SharedString>, tone: Tone, enabled: bool) -> Button {
-    let button = Button::new(id).label(label).disabled(!enabled);
+    let button = Button::new(id)
+        .label(label)
+        .disabled(!enabled)
+        .h(px(34.))
+        .rounded(px(11.))
+        .text_size(px(13.));
     match tone {
         Tone::Primary => button.primary(),
         Tone::Danger => button.danger(),
@@ -99,7 +136,13 @@ pub fn button(id: &'static str, label: impl Into<SharedString>, tone: Tone, enab
 
 /// The row of buttons at the bottom of a dialog, right aligned.
 pub fn actions(buttons: Vec<Button>) -> impl IntoElement {
-    div().flex().items_center().justify_end().gap(px(8.)).pt(px(6.)).children(buttons)
+    div()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(8.))
+        .pt(px(6.))
+        .children(buttons)
 }
 
 /// A caption above a control.
@@ -108,7 +151,13 @@ pub fn field(label: impl Into<SharedString>, p: &Palette, control: impl IntoElem
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.tx2).child(label.into()))
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.tx2)
+                .child(label.into()),
+        )
         .child(control)
 }
 
@@ -130,7 +179,7 @@ pub fn notice(kind: Notice, text: impl Into<SharedString>, p: &Palette) -> impl 
     div()
         .px(px(12.))
         .py(px(9.))
-        .rounded(px(10.))
+        .rounded(px(14.))
         .bg(bg)
         .text_color(fg)
         .text_size(px(12.5))
@@ -138,24 +187,13 @@ pub fn notice(kind: Notice, text: impl Into<SharedString>, p: &Palette) -> impl 
         .child(text.into())
 }
 
-/// Monospaced value in a soft box (fingerprints, paths).
-pub fn mono(text: impl Into<SharedString>, p: &Palette, color: Hsla) -> impl IntoElement {
-    div()
-        .px(px(12.))
-        .py(px(9.))
-        .rounded(px(10.))
-        .bg(p.card2)
-        .font_family(crate::theme::MONO_FONT)
-        .text_size(px(12.))
-        .line_height(px(18.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(color)
-        .child(text.into())
-}
-
 /// Small muted text.
 pub fn hint(text: impl Into<SharedString>, p: &Palette) -> impl IntoElement {
-    div().text_size(px(12.5)).line_height(px(19.)).text_color(p.tx2).child(text.into())
+    div()
+        .text_size(px(12.5))
+        .line_height(px(19.))
+        .text_color(p.tx2)
+        .child(text.into())
 }
 
 /// A dialog's vertical stack.

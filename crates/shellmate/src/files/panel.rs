@@ -917,6 +917,24 @@ impl FilesPanel {
     }
 }
 
+#[cfg(debug_assertions)]
+impl FilesPanel {
+    pub fn proto_fixture(&mut self,scene:&str,cx:&mut Context<Self>){
+        use shellmate_sftp::{Entry,EntryKind};
+        use crate::theme::ActivePalette;
+        use shellmate_sftp::transfer::{TransferView,TransferEvent,TransferState,Direction,PauseReason,ItemId};
+        let data=&crate::proto::DATA;
+        self.model.on_terminal_cwd("/var/www/app");
+        let request=self.model.set_link(LinkStatus::Ready).expect("first fixture listing");
+        let entries=data["FILES"].a().iter().map(|f|Entry{name:f["n"].s().into(),path:format!("/var/www/app/{}",f["n"].s()),kind:if f["t"].s()=="d"{EntryKind::Dir}else{EntryKind::File},size:if f["n"].s()=="nginx.conf"{2316}else{crate::proto::bytes(f["s"].s())},modified:Some(crate::proto::timestamp(f["m"].s())),mode:u32::from_str_radix(f["p"].s(),8).ok(),uid:Some(1000),gid:Some(33),owner:"deploy".into(),group:"www".into(),link:None}).collect();
+        self.model.apply_listed(request.id,super::model::Listed{dir:Some("/var/www/app".into()),entries:Ok(entries),stat:None});self.model.select_name("nginx.conf");
+        let mut list=super::transfers::TransferList::new();let measured=crate::proto::reading(scene,cx.is_dark());
+        for(i,t)in data["TRANSFERS"].a().iter().enumerate(){let total=(t["size"].n()*1_048_576.)as u64;let done=if i==0{(measured.transfer*1_048_576.) as u64}else{(total as f64*t["pct"].n()/100.)as u64};list.apply(&TransferEvent::Added(TransferView{id:ItemId(i as u64),direction:if t["dir"].s()=="up"{Direction::Upload}else{Direction::Download},name:t["n"].s().into(),destination:"/var/www/app".into(),state:match t["st"].s(){"run"=>TransferState::Running,"pause"=>TransferState::Paused(PauseReason::User),"done"=>TransferState::Done,_=>TransferState::Queued},bytes_done:done,bytes_total:total,files_done:0,files_total:1,scanning:false,speed:if i==0{measured.transfer_speed*1_048_576.}else{0.},current:None,skipped:Default::default(),in_place:0,failures:vec![],failure_total:0,clash:None,result:None,temp:None}));}
+        self.transfers=Some(cx.new(|_|list));cx.notify();
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use gpui::Keystroke;

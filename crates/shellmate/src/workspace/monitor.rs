@@ -32,7 +32,7 @@ pub struct MonitorTab {
     pub panel: Entity<MonitorPanel>,
     /// The sub-page the panel shows (what the monitor of the connection asks about follows it).
     pub page: Page,
-    _subscription: Subscription,
+    pub(super) _subscription: Subscription,
 }
 
 /// The title of the toasts of the monitor.

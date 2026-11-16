@@ -4,9 +4,8 @@
 use std::ops::Range;
 
 use gpui::assets::IconName as Lucide;
-use gpui::component::Disableable as _;
 use gpui::component::input::Input;
-use gpui::component::switch::Switch;
+use crate::ui::Toggle as Switch;
 use gpui::component::{Icon, tooltip::Tooltip};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, px, uniform_list};
@@ -259,7 +258,7 @@ impl MonitorPanel {
             .py(px(10.))
             .rounded(px(12.))
             .bg(p.card2)
-            .child(div().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(switch.label.clone()))
+            .child(div().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if switch.enabled{format!("开机自启 {}",if switch.on{"enable"}else{"disable"})}else{switch.label.clone()}))
             .child({
                 let unit = name.clone();
                 let mut element = div().id("service-autostart").flex_none().child(
@@ -339,7 +338,7 @@ impl MonitorPanel {
                     )
                     .child(div().text_size(px(12.)).text_color(p.tx2).child(detail.since.clone())),
             )
-            .when_some(detail.failure.clone(), |d, why| {
+            .when_some(detail.failure.clone().filter(|why|!self.service_log.as_ref().is_some_and(|log|log.lines.iter().any(|line|line.text==*why))), |d, why| {
                 d.child(
                     div()
                         .px(px(12.))
@@ -419,7 +418,7 @@ impl MonitorPanel {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&self.service_query).appearance(false).bordered(false)),
+                            .child(Input::new(&self.service_query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.))),
                     ),
             )
             .child(segmented("service-filter", filters, on_pick, cx).flex_none())

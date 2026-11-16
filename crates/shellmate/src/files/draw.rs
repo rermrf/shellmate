@@ -519,7 +519,7 @@ impl FilesPanel {
             .min_w_0()
             .rounded(crate::theme::CARD_RADIUS)
             .bg(p.card)
-            .border_2()
+            .border_0()
             .border_color(transparent_black())
             .when(dragging, |d| d.bg(hot_bg).border_color(hot_border))
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hot_bg).border_color(hot_border))
@@ -547,8 +547,8 @@ impl FilesPanel {
     fn info_row(label: &'static str, value: String, p: &Palette) -> impl IntoElement {
         div()
             .flex()
-            .gap(px(12.))
-            .child(div().w(px(30.)).flex_none().text_color(p.tx2).child(label))
+            .gap(px(12.)).line_height(px(17.))
+            .child(div().w(px(25.)).flex_none().text_color(p.tx2).child(label))
             .child(div().flex_1().min_w_0().child(value))
     }
 
@@ -604,7 +604,7 @@ impl FilesPanel {
             .rounded(crate::theme::CARD_RADIUS)
             .bg(p.card)
             .shadow(card_shadow(p))
-            .child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).child(title))
+            .child(div().text_size(px(17.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child(title))
             .child(
                 div()
                     .flex()

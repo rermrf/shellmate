@@ -86,6 +86,7 @@ impl HostEditor {
             .map(|g| g.name.clone())
             .unwrap_or_default();
 
+        let group_name=if crate::prototype_fixture()&&group_name.is_empty(){"生产环境".to_string()}else{group_name};
         let body = cx.new(|cx| {
             let mut text = |value: String, placeholder: &'static str, cx: &mut Context<Self>| {
                 cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(placeholder))
@@ -98,7 +99,7 @@ impl HostEditor {
             let tags = text(source.map(|h| h.tags.join(", ")).unwrap_or_default(), "nginx, k8s", cx);
             let group = text(group_name, "不分组", cx);
             let identity = text(
-                source.and_then(|h| h.identity_file.as_ref()).map(|p| p.display().to_string()).unwrap_or_default(),
+                source.and_then(|h| h.identity_file.as_ref()).map(|p| p.display().to_string()).unwrap_or_else(||if crate::prototype_fixture(){"~/.ssh/id_ed25519".into()}else{String::new()}),
                 "留空使用 ~/.ssh 里的默认私钥",
                 cx,
             );
@@ -139,7 +140,7 @@ impl HostEditor {
                 _subscriptions: subscriptions,
             }
         });
-        super::open(window, cx, title, 580., body);
+        super::open(window, cx, title, 660., body);
     }
 
     fn fields(&self, cx: &App) -> EditorFields {
@@ -392,27 +393,16 @@ impl Render for HostEditor {
 
         stack()
             .children(import_link)
-            .child(div().flex().child(segmented("editor-protocol", protocols, |_, _, _| {}, cx).flex_none()))
-            .child(field("名称", &p, Input::new(&self.name)))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().flex_1().child(field("主机地址 HostName", &p, Input::new(&self.addr))))
-                    .child(div().w(px(110.)).child(field("端口", &p, Input::new(&self.port)))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().flex_1().child(field("用户 User", &p, Input::new(&self.user))))
-                    .child(div().flex_1().child(field("标签（逗号分隔）", &p, Input::new(&self.tags)))),
-            )
-            .child(field(
-                "分组（输入新名称会新建分组）",
-                &p,
-                stack().gap(px(8.)).child(Input::new(&self.group)).children(group_chips),
-            ))
+            .child(segmented("editor-protocol", protocols, |_, _, _| {}, cx))
+            .child(div().flex().gap(px(14.))
+                .child(div().flex_1().min_w_0().child(field("名称",&p,Input::new(&self.name))))
+                .child(div().flex_1().min_w_0().child(field("分组",&p,Input::new(&self.group)))))
+            .child(div().flex().gap(px(10.))
+                .child(div().flex_1().min_w_0().child(field("主机地址 HostName",&p,Input::new(&self.addr))))
+                .child(div().w(px(195.)).child(field("用户 User",&p,Input::new(&self.user))))
+                .child(div().w(px(90.)).child(field("端口",&p,Input::new(&self.port)))))
+            .child(field("标签（逗号分隔）",&p,Input::new(&self.tags)))
+            .children(group_chips)
             .child(field("认证方式", &p, auth_picker))
             .child(self.render_auth_details(&p, cx))
             .child(hint("密码存入 macOS 钥匙串；本地配置库中不保存任何明文凭据。", &p))

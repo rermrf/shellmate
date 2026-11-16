@@ -56,6 +56,7 @@ fn challenge(round: u32, attempt: u32, prompts: &[(&str, bool)]) -> ChallengeReq
 
 /// Opens the demo named `name`, or logs the valid names.
 pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    if let Some(scene)=name.strip_prefix("proto:"){workspace.update(cx,|w,cx|w.proto_scene(scene,window,cx));return;}
     if let Some(args) = name.strip_prefix("p6live:") {
         if args.starts_with("record:")||args.starts_with("log:"){workspace.update(cx,|w,cx|w.demo_archive_live(args,window,cx));return;}
         workspace.update(cx, |workspace,cx|workspace.demo_productivity_live(args,window,cx));

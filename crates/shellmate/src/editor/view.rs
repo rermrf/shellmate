@@ -387,7 +387,7 @@ impl Render for FileEditor {
         let saving = self.model.is_saving();
         let footer = self.model.footer(self.lines(cx));
         // The prototype's modal is 1200 × 800; a smaller window gets a smaller one.
-        let height = (window.viewport_size().height - px(120.)).clamp(px(320.), px(800.));
+        let height = (window.viewport_size().height - px(100.)).clamp(px(320.), px(800.));
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)

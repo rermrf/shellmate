@@ -6,6 +6,7 @@ use gpui::{App, Global, Hsla, Pixels, Rgba, SharedString, px};
 use shellmate_core::GroupTone;
 use shellmate_term::{TerminalPalette, TerminalStyle};
 
+pub const UI_FONT: &str = ".SystemUIFont";
 pub const MONO_FONT: &str = "JetBrains Mono";
 pub const CJK_FALLBACK: &str = "PingFang SC";
 
@@ -15,6 +16,11 @@ pub const CJK_FALLBACK: &str = "PingFang SC";
 pub struct Palette {
     /// Window ground (`--win`).
     pub win: Hsla,
+    pub desk: Hsla,
+    pub shadow_near: Hsla,
+    pub shadow_far: Hsla,
+    pub shadow_y: f32,
+    pub shadow_blur: f32,
     pub card: Hsla,
     pub card2: Hsla,
     pub card3: Hsla,
@@ -48,7 +54,7 @@ fn rgba(v: u32, a: f32) -> Hsla {
 impl Palette {
     pub fn light() -> Self {
         Self {
-            win: hex(0xEEF0F4),
+            win: hex(0xEEF0F4),desk:hex(0xD9DDE4),shadow_near:rgba(0x101828,0.05),shadow_far:rgba(0x101828,0.06),shadow_y:4.,shadow_blur:14.,
             card: hex(0xFFFFFF),
             card2: hex(0xF4F5F8),
             card3: hex(0xE6E8ED),
@@ -64,14 +70,14 @@ impl Palette {
             warns: rgba(0xE08A00, 0.13),
             err: hex(0xE5484D),
             errs: rgba(0xE5484D, 0.11),
-            shadow: rgba(0x101828, 0.07),
+            shadow: rgba(0x101828, 0.06),
             scrim: rgba(0x141820, 0.32),
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            win: hex(0x111215),
+            win: hex(0x111215),desk:hex(0x2A2D33),shadow_near:rgba(0,0.3),shadow_far:rgba(0,0.25),shadow_y:6.,shadow_blur:18.,
             card: hex(0x1C1D21),
             card2: hex(0x25262B),
             card3: hex(0x2C2E34),
@@ -87,7 +93,7 @@ impl Palette {
             warns: rgba(0xF2A93B, 0.15),
             err: hex(0xFF6369),
             errs: rgba(0xFF6369, 0.15),
-            shadow: rgba(0x000000, 0.28),
+            shadow: rgba(0x000000, 0.25),
             scrim: rgba(0x000000, 0.55),
         }
     }
@@ -161,7 +167,7 @@ fn sync_component_colors(c: &mut ThemeColor, p: &Palette, dark: bool) {
     c.border = p.line;
     c.input = p.line;
     c.ring = p.acc;
-    c.caret = p.acc;
+    c.caret = if crate::prototype_fixture(){gpui::transparent_black()}else{p.acc};
     c.selection = p.accs;
     c.accent = p.card3;
     c.accent_foreground = p.tx;
@@ -297,11 +303,16 @@ pub fn apply(dark: bool, cx: &mut App) {
     Theme::change(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
     let p = palette.clone();
     Theme::update(cx, |theme| {
-        theme.font_size = px(14.);
+        theme.font_family=UI_FONT.into();
+        theme.font_size = px(13.);
         theme.mono_font_family = MONO_FONT.into();
-        theme.radius = px(8.);
-        theme.radius_lg = px(12.);
+        theme.radius = px(11.);
+        theme.radius_lg = px(22.);
         theme.shadow = true;
+        let ms=if crate::prototype_fixture(){0}else{180};
+        theme.motion.duration_fast=std::time::Duration::from_millis(ms);
+        theme.motion.duration_normal=std::time::Duration::from_millis(ms);
+        theme.motion.duration_slow=std::time::Duration::from_millis(if ms==0{0}else{220});
 
         sync_component_colors(&mut theme.colors, &p, dark);
     });

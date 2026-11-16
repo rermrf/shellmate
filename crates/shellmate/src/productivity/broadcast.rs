@@ -5,7 +5,7 @@ use crate::{
     ui::card_shadow,
 };
 use gpui::component::{
-    Disableable as _, Sizable as _,
+    Disableable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
 };
@@ -197,14 +197,20 @@ impl Render for BroadcastBar {
                             .child(self.chip.clone()),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.input).small().appearance(false)),
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.input)
+                                .appearance(false)
+                                .h(px(32.))
+                                .text_size(px(12.5))
+                                .p_0(),
+                        ),
                     )
                     .child(
                         Button::new("broadcast-send")
-                            .small()
+                            .h(px(32.))
+                            .px(px(14.))
+                            .rounded(px(10.))
+                            .text_size(px(12.5))
                             .primary()
                             .label("发送")
                             .disabled(self.targets == 0 || self.input.read(cx).value().trim().is_empty())

@@ -202,7 +202,8 @@ impl Render for Picker {
             .items_center()
             .gap(px(10.))
             .px(px(if history { 14. } else { 18. }))
-            .py(px(if history { 10. } else { 14. }))
+            .h(px(if history { 49. } else { 50. }))
+            .flex_none()
             .border_b_1()
             .border_color(p.line);
         if history {
@@ -218,10 +219,13 @@ impl Render for Picker {
             header = header.child(Icon::new(Lucide::Search).size(px(17.)).text_color(p.tx3));
         }
         header = header.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(Input::new(&self.input).appearance(false)),
+            div().flex_1().min_w_0().child(
+                Input::new(&self.input)
+                    .appearance(false)
+                    .p_0()
+                    .h(px(22.))
+                    .text_size(px(if history { 13. } else { 15. })),
+            ),
         );
         if let Source::History { current, .. } = &self.source {
             let selected = *current;
@@ -273,9 +277,10 @@ impl Render for Picker {
             .id("picker-rows")
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
-            .max_h(px(if history { 272. } else { 480. }))
-            .px(px(8.))
-            .py(px(4.));
+            .max_h(px(if history { 260. } else { 510. }))
+            .px(px(if history { 6. } else { 8. }))
+            .pt(px(4.))
+            .pb(px(if history { 6. } else { 8. }));
         let mut group = "";
         for index in 0..self.count() {
             let (title, detail, badge) = if history {
@@ -290,6 +295,7 @@ impl Render for Picker {
                             .pt(px(10.))
                             .pb(px(4.))
                             .text_size(px(11.5))
+                            .line_height(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.tx2)
                             .child(item.group),
@@ -302,7 +308,7 @@ impl Render for Picker {
                 div()
                     .id(("picker-row", index))
                     .h(px(if history { 34. } else { 40. }))
-                    .px(px(12.))
+                    .px(px(if history { 10. } else { 12. }))
                     .flex()
                     .items_center()
                     .gap(px(12.))
@@ -325,7 +331,12 @@ impl Render for Picker {
                             .min_w_0()
                             .when(history, |d| d.flex_1().font_family(MONO_FONT))
                             .text_size(px(if history { 12.5 } else { 13.5 }))
-                            .font_weight(FontWeight::MEDIUM)
+                            .font_weight(if history {
+                                FontWeight::NORMAL
+                            } else {
+                                FontWeight::SEMIBOLD
+                            })
+                            .line_height(px(if history { 17. } else { 16. }))
                             .truncate()
                             .child(title),
                     )
@@ -343,7 +354,12 @@ impl Render for Picker {
                         div()
                             .flex_none()
                             .text_size(px(11.))
+                            .line_height(px(13.))
                             .text_color(p.tx2)
+                            .when(history, |d| d.w(px(40.)).text_right())
+                            .when(!history && !badge.is_empty(), |d| {
+                                d.bg(p.card2).px(px(7.)).py(px(3.)).rounded(px(6.))
+                            })
                             .child(badge),
                     ),
             );
@@ -426,7 +442,8 @@ impl Render for Picker {
                     .items_center()
                     .gap(px(16.))
                     .px(px(18.))
-                    .py(px(10.))
+                    .py(px(if history { 7. } else { 10. }))
+                    .line_height(px(16.))
                     .border_t_1()
                     .border_color(p.line)
                     .text_size(px(11.))
@@ -450,6 +467,10 @@ impl Render for Picker {
 }
 
 fn time_label(time: i64) -> String {
+    #[cfg(debug_assertions)]
+    if crate::proto::requested() && time < crate::proto::timestamp("11-12 00:00") {
+        return "昨天".into();
+    }
     let time = time as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers reference valid values for the duration of localtime_r.
@@ -492,7 +513,10 @@ impl Render for Drawer {
                     )
                     .child(
                         Button::new("manage")
-                            .small()
+                            .h(px(26.))
+                            .px(px(10.))
+                            .rounded(px(8.))
+                            .text_size(px(12.))
                             .label("管理")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Manage))),
                     ),
@@ -520,6 +544,7 @@ impl Render for Drawer {
                     .px(px(4.))
                     .pb(px(2.))
                     .text_size(px(12.))
+                    .line_height(px(15.))
                     .text_color(p.tx2)
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(group.name.clone()),
@@ -542,6 +567,7 @@ impl Render for Drawer {
                                 .child(
                                     div()
                                         .text_size(px(13.))
+                                        .line_height(px(18.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(command.name.clone()),
                                 )
@@ -549,6 +575,7 @@ impl Render for Drawer {
                                     div()
                                         .font_family(MONO_FONT)
                                         .text_size(px(11.5))
+                                        .line_height(px(14.))
                                         .text_color(p.tx2)
                                         .truncate()
                                         .child(command.command.clone()),
@@ -559,7 +586,10 @@ impl Render for Drawer {
                                 .id(SharedString::from(format!("send-{}-{index}", group.name)))
                                 .cursor_pointer()
                                 .px(px(12.))
-                                .py(px(6.))
+                                .h(px(28.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded(px(9.))
                                 .bg(p.accs)
                                 .text_color(p.acc)
@@ -578,6 +608,7 @@ impl Render for Drawer {
             .flex_col()
             .gap(px(10.))
             .p(px(16.))
+            .pb(px(14.))
             .rounded(px(18.))
             .bg(p.card)
             .shadow(card_shadow(&p))
@@ -592,6 +623,7 @@ impl Render for Drawer {
                             .child(
                                 div()
                                     .text_size(px(15.))
+                                    .line_height(px(21.))
                                     .font_weight(FontWeight::BOLD)
                                     .child("广播输入"),
                             )
@@ -599,12 +631,13 @@ impl Render for Drawer {
                                 div()
                                     .mt(px(2.))
                                     .text_size(px(12.))
+                                    .line_height(px(17.))
                                     .text_color(p.tx2)
                                     .child("同一条命令同时发往勾选的会话"),
                             ),
                     )
                     .child(
-                        gpui::component::switch::Switch::new("broadcast-enabled")
+                        crate::ui::Toggle::new("broadcast-enabled")
                             .checked(self.broadcast.state.enabled)
                             .color(p.ok)
                             .on_click(
@@ -626,7 +659,7 @@ impl Render for Drawer {
                     .items_center()
                     .gap(px(10.))
                     .px(px(8.))
-                    .py(px(8.))
+                    .h(px(38.))
                     .rounded(px(10.))
                     .when(!row.connected(), |d| d.opacity(0.5))
                     .when(row.connected(), |d| d.cursor_pointer().hover(|d| d.bg(p.card2)))
@@ -675,6 +708,7 @@ type TargetAvailable = Box<dyn Fn(usize, &App) -> bool>;
 type SendCommand = Box<dyn Fn(&str, &mut Window, &mut App) -> Result<(), String>>;
 
 pub struct Confirmation {
+    title: String,
     input: Entity<InputState>,
     request: SendRequest,
     available: TargetAvailable,
@@ -706,6 +740,7 @@ impl Confirmation {
                 cx.observe(workspace, |_, _, cx| cx.notify()),
             ];
             Self {
+                title: command.name,
                 input,
                 request: request.clone(),
                 available: Box::new(move |id, cx| {
@@ -731,30 +766,12 @@ impl Confirmation {
             }
             let ok = body.clone();
             let cancel = body.clone();
-            let p = cx.palette().clone();
             dialog
                 .w(px(540.))
+                .border_0()
                 .rounded(px(24.))
-                .margin_top((window.viewport_size().height * 0.5 - px(150.)).max(px(110.)))
-                .title(
-                    div()
-                        .flex()
-                        .items_baseline()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .text_size(px(19.))
-                                .font_weight(FontWeight::BOLD)
-                                .child(command.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(p.tx2)
-                                .child(body.read(cx).mode(cx)),
-                        ),
-                )
+                .centered()
+                .p(px(24.))
                 .close_button(false)
                 .overlay_closable(false)
                 .on_ok(move |_, w, cx| ok.update(cx, |b, cx| b.confirm(w, cx)))
@@ -818,6 +835,29 @@ impl Render for Confirmation {
             .iter()
             .any(|t| t.production && (self.available)(t.id, cx));
         stack()
+            .pb_0()
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex_none()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .text_size(px(19.))
+                            .line_height(px(22.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(self.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(15.))
+                            .text_color(p.tx2)
+                            .child(self.mode(cx)),
+                    ),
+            )
             .child(
                 div()
                     .font_family(MONO_FONT)
@@ -828,8 +868,17 @@ impl Render for Confirmation {
                     .text_color(shellmate_term::colors::to_hsla(
                         cx.terminal_style().palette.foreground,
                     ))
-                    .p(px(6.))
-                    .child(Input::new(&self.input).appearance(false)),
+                    .h(px(44.))
+                    .px(px(14.))
+                    .flex()
+                    .items_center()
+                    .child(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .p_0()
+                            .h(px(44.))
+                            .text_size(px(13.5)),
+                    ),
             )
             .child(
                 div()
@@ -889,6 +938,9 @@ impl Render for Confirmation {
                     .child(div().flex_1().child(hint("可修改后再发送 · 回车执行", &p)))
                     .child(
                         button("qc-cancel", "取消", Tone::Plain, true)
+                            .h(px(40.))
+                            .px(px(18.))
+                            .rounded(px(13.))
                             .on_click(cx.listener(|this, _, w, cx| this.dismiss(w, cx))),
                     )
                     .child(
@@ -898,6 +950,9 @@ impl Render for Confirmation {
                             if risky { Tone::Danger } else { Tone::Primary },
                             available && !self.input.read(cx).value().trim().is_empty(),
                         )
+                        .h(px(40.))
+                        .px(px(20.))
+                        .rounded(px(13.))
                         .on_click(cx.listener(|this, _, w, cx| this.submit(w, cx))),
                     ),
             )
