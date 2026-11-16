@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 
-use gpui::assets::IconName as Lucide;
-use gpui::component::Icon;
 use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{ClickEvent, Context, SharedString, Stateful, div, px};
@@ -12,6 +10,7 @@ use shellmate_core::{GroupTone, Host, HostBook, HostFilter, sections};
 
 use super::{Active, Avatar, LiveStatus, SYNC_STATUS, Sidebar, SidebarEvent, host_avatar};
 use crate::theme::{ActivePalette, Palette};
+use crate::icons::AppIcon;
 use crate::ui::{card_shadow, window_drag_area};
 
 /// The width of the rail.
@@ -32,7 +31,7 @@ pub fn rail_hosts<'a>(book: &'a HostBook, live: &HashMap<String, LiveStatus>) ->
 }
 
 /// A 40 × 34 button of the rail's shortcut column.
-fn key(id: &'static str, icon: Lucide, size: f32, on: bool, tip: &'static str, p: &Palette) -> Stateful<gpui::Div> {
+fn key(id: &'static str, icon: AppIcon, size: f32, on: bool, tip: &'static str, p: &Palette) -> Stateful<gpui::Div> {
     div()
         .id(id)
         .relative()
@@ -46,7 +45,7 @@ fn key(id: &'static str, icon: Lucide, size: f32, on: bool, tip: &'static str, p
         .cursor_pointer()
         .when(on, |d| d.bg(p.card).shadow(card_shadow(p)))
         .hover(|d| d.bg(p.card3))
-        .child(Icon::new(icon).size(px(size)).text_color(p.tx2))
+        .child(icon.icon().size(px(size)).text_color(p.tx2))
         .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
 }
 
@@ -83,7 +82,7 @@ impl Sidebar {
     pub(super) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let local_on = self.active == Active::Local;
-        let local = key("rail-local", Lucide::SquareTerminal, 17., local_on, "本机终端 ⌘T", &p)
+        let local = key("rail-local", AppIcon::LocalTerminal, 17., local_on, "本机终端 ⌘T", &p)
             .children(
                 self.local_alive
                     .then(|| div().absolute().right(px(7.)).bottom(px(6.)).size(px(6.)).rounded_full().bg(p.ok)),
@@ -107,7 +106,7 @@ impl Sidebar {
             // The traffic lights are the window's own, at the same place as with the sidebar open.
             .child(window_drag_area(div().id("rail-drag")).w_full().h(px(26.)))
             .child(
-                key("rail-expand", Lucide::PanelLeft, 16., true, "展开侧边栏 ⌃⌘S", &p)
+                key("rail-expand", AppIcon::Sidebar, 16., true, "展开侧边栏 ⌃⌘S", &p)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))),
             )
             .child(
@@ -116,11 +115,11 @@ impl Sidebar {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        key("rail-search", Lucide::Search, 15., false, "命令面板 ⌘K", &p)
+                        key("rail-search", AppIcon::Search, 15., false, "命令面板 ⌘K", &p)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::SearchHosts))),
                     )
                     .child(
-                        key("rail-new-host", Lucide::Plus, 16., false, "新建连接", &p)
+                        key("rail-new-host", AppIcon::Plus, 16., false, "新建连接", &p)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
                     )
                     .child(local),
@@ -153,9 +152,9 @@ impl Sidebar {
                     .bg(p.card)
                     .shadow(card_shadow(&p))
                     .cursor_pointer().on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::Settings)))
-                    .child(Icon::new(Lucide::Settings).size(px(16.)).text_color(p.tx2))
+                    .child(AppIcon::Settings.icon().text_color(p.tx2))
                     .child(
-                        // The sync state: none yet, so grey.
+                        // The real sync state is unavailable; the prototype fixture shows its mock green dot.
                         div()
                             .absolute()
                             .top(px(5.))
@@ -164,7 +163,7 @@ impl Sidebar {
                             .rounded_full()
                             .border_1()
                             .border_color(p.card)
-                            .bg(p.tx3),
+                            .bg(if crate::prototype_fixture(){p.ok}else{p.tx3}),
                     )
                     .tooltip(|window, cx| Tooltip::new(format!("设置 · {SYNC_STATUS}")).build(window, cx)),
             )

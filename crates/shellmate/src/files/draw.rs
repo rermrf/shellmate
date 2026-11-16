@@ -261,14 +261,12 @@ impl FilesPanel {
             .child(Self::header_cell("权限", Some(104.), false))
     }
 
-    fn entry_icon(entry: &Entry, p: &Palette) -> Icon {
+    fn entry_icon(entry: &Entry, p: &Palette) -> AnyElement {
         match entry.kind {
-            EntryKind::Dir => Icon::new(Lucide::Folder).text_color(p.acc),
-            EntryKind::Symlink if entry.opens_as_dir() => Icon::new(Lucide::Link).text_color(p.acc),
-            EntryKind::Symlink => Icon::new(Lucide::Link).text_color(p.tx2),
-            _ => Icon::new(Lucide::File).text_color(p.tx3),
+            EntryKind::Dir => crate::icons::folder(p).into_any_element(),
+            EntryKind::Symlink => Icon::new(Lucide::Link).size(px(17.)).text_color(if entry.opens_as_dir(){p.acc}else{p.tx2}).into_any_element(),
+            _ => crate::icons::AppIcon::File.icon().text_color(p.tx3).into_any_element(),
         }
-        .size(px(17.))
     }
 
     fn render_row(&self, index: usize, p: &Palette, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -276,7 +274,7 @@ impl FilesPanel {
         let selected = self.model.selected_index() == Some(index);
         let (icon, name, note, size, time, perms) = match row {
             Row::Parent => (
-                Icon::new(Lucide::Folder).size(px(17.)).text_color(p.acc),
+                crate::icons::folder(p).into_any_element(),
                 "..".to_string(),
                 None,
                 String::new(),

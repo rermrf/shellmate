@@ -3,10 +3,9 @@
 
 use std::ops::Range;
 
-use gpui::assets::IconName as Lucide;
 use gpui::component::input::Input;
 use crate::ui::Toggle as Switch;
-use gpui::component::{Icon, tooltip::Tooltip};
+use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, px, uniform_list};
 use shellmate_monitor::commands::ServiceAction;
@@ -411,7 +410,7 @@ impl MonitorPanel {
                     .rounded(px(11.))
                     .bg(p.card2)
                     .text_size(px(13.))
-                    .child(Icon::new(Lucide::Search).size(px(14.)).text_color(p.tx3))
+                    .child(crate::icons::AppIcon::Search.at(14.).text_color(p.tx3))
                     .child(
                         div()
                             .flex_1()

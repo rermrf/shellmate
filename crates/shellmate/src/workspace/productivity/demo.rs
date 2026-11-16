@@ -71,7 +71,7 @@ impl Workspace {
                 Ok(Box::new(DemoBackend))
             }, cx); });
             let view = cx.new(|cx| {
-                let mut v = TerminalView::new(terminal.clone(), cx.terminal_style(), cx);
+                let mut v = TerminalView::new(terminal.clone(), cx.terminal_style(), cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
                 v.top_radius = CARD_RADIUS;
                 v
             });

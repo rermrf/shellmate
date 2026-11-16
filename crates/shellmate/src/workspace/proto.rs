@@ -154,7 +154,7 @@ impl Workspace {
                 }
             });
             let view = cx.new(|cx| {
-                let mut v = TerminalView::new(terminal.clone(), cx.terminal_style(), cx);
+                let mut v = TerminalView::new(terminal.clone(), cx.terminal_style(), cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
                 v.top_radius = CARD_RADIUS;
                 v
             });
@@ -269,7 +269,7 @@ impl Workspace {
         let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette, cx));
         let palette = cx.terminal_style().palette;
         terminal.update(cx,|t,cx|{t.attach(move|sink,_|{let dim=palette.dim;let green=palette.ansi[2];let blue=palette.ansi[4];let text=format!("\x1b[38;2;{};{};{}mLast login: Thu Nov 12 09:12:40 on ttys002\r\n\x1b[1;38;2;{};{};{}mchen@MacBook-Pro\x1b[0m \x1b[1;38;2;{};{};{}m~\x1b[0m % \x1b[?25l",dim.r,dim.g,dim.b,green.r,green.g,green.b,blue.r,blue.g,blue.b);sink.output(text.as_bytes());Ok(Box::new(Inert))},cx);});
-        let view = cx.new(|cx| TerminalView::new(terminal.clone(), cx.terminal_style(), cx));
+        let view = cx.new(|cx| TerminalView::new(terminal.clone(), cx.terminal_style(), cx).with_search_icon(crate::icons::AppIcon::Search.at(14.)));
         let id = 5;
         let subscription = self.watch_terminal(id, &terminal, window, cx);
         self.sessions.push(Session {

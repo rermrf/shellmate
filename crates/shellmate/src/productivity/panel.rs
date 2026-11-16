@@ -9,9 +9,8 @@ use crate::{
 use gpui::{
     App, Context, Entity, EventEmitter, Focusable, FontWeight, KeyBinding, ScrollHandle, SharedString,
     Subscription, Window, actions,
-    assets::IconName as Lucide,
     component::{
-        Icon, Sizable as _,
+        Sizable as _,
         button::{Button, ButtonVariants as _},
         input::{Input, InputEvent, InputState},
     },
@@ -216,7 +215,7 @@ impl Render for Picker {
                     .child("(reverse-i-search)"),
             );
         } else {
-            header = header.child(Icon::new(Lucide::Search).size(px(17.)).text_color(p.tx3));
+            header = header.child(crate::icons::AppIcon::Search.at(17.).text_color(p.tx3));
         }
         header = header.child(
             div().flex_1().min_w_0().child(

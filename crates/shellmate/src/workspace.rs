@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::assets::IconName as Lucide;
+use crate::icons::AppIcon;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::notification::Notification;
 use gpui::component::tooltip::Tooltip;
@@ -353,7 +354,7 @@ impl Workspace {
         let options = PtyOptions { cwd, login:self.preferences.get(shellmate_store::Preference::LoginShell), ..PtyOptions::default() };
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
         let view = cx.new(|cx| {
-            let mut view = TerminalView::new(terminal.clone(), style, cx);
+            let mut view = TerminalView::new(terminal.clone(), style, cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
             view.top_radius = CARD_RADIUS;
             view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view
@@ -624,7 +625,8 @@ impl Workspace {
                 .text_size(px(13.)).line_height(px(16.))
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
                 .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
-                .child(dot(session_dot(s, &p), 7.))
+                .when(matches!(s.kind,SessionKind::Local),|d|d.child(AppIcon::Laptop.icon().text_color(session_dot(s,&p))))
+                .when(!matches!(s.kind,SessionKind::Local),|d|d.child(dot(session_dot(s,&p),7.)))
                 .child(crate::ui::ellipsis(("tab-title",s.id),s.title.clone()).flex_1())
                 .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id),|d|d.child(div().px(px(5.)).rounded(px(4.)).bg(p.warns).text_color(p.warn).text_size(px(10.)).child("广播")))
                 .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
@@ -677,11 +679,11 @@ impl Workspace {
             .rounded(px(7.))
             .cursor_pointer()
             .hover(|d| d.bg(p.card3.opacity(0.7)))
-            .child(Icon::new(Lucide::Plus).size(px(15.)).text_color(p.tx2))
+            .child(AppIcon::Plus.at(15.).text_color(p.tx2))
             .tooltip(|window, cx| Tooltip::new("新建本机终端 ⌘T").build(window, cx))
             .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx)));
 
-        let theme_icon = if cx.is_dark() { Lucide::Sun } else { Lucide::Moon };
+        let theme_icon = if cx.is_dark() { AppIcon::Sun } else { AppIcon::Moon };
         div()
             .h(px(58.)).flex_none().pt(px(4.))
             .flex()
@@ -695,12 +697,12 @@ impl Workspace {
                     .on_click(cx.listener(|this,event: &gpui::ClickEvent,w,cx|this.open_session_menu(crate::productivity::session_menu::Kind::Tabs,event.position(),w,cx)))
             ))
             .child(window_drag_area(div().id("tabbar-drag")).flex_1().h_full())
-            .child(toolbar_button("broadcast", Lucide::RadioTower, Some("广播"), "向多个会话按行广播", true, cx)
+            .child(toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
                 .when(self.broadcast.enabled,|b|b.bg(p.warns).text_color(p.warn))
                 .on_click(cx.listener(|this,_,_,cx|{this.commands_open=true;this.sync_productivity(cx);cx.notify();})))
-            .child(toolbar_button("ai", Lucide::Sparkles, Some("AI"), "AI 助手（P7 实现）", false, cx))
+            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手（P7 实现）", false, cx))
             .child(
-                toolbar_button("snippets", Lucide::Zap, Some("快捷命令"), "快捷命令", true, cx)
+                toolbar_button("snippets", AppIcon::Commands, Some("快捷命令"), "快捷命令", true, cx)
                     .when(self.commands_open, |b| b.bg(p.accs).text_color(p.acc))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.commands_open = !this.commands_open;

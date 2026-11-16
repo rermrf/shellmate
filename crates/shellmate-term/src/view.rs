@@ -8,7 +8,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, point_to_viewport, viewport_to_point};
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{Input, InputEvent, InputState};
-use gpui::component::{ActiveTheme as _, IconName, Sizable as _, h_flex};
+use gpui::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, FocusHandle, Focusable,
@@ -88,6 +88,7 @@ pub struct TerminalView {
     selecting: bool,
     scroll_remainder: f32,
     search: Option<Search>,
+    search_icon: Option<Icon>,
     /// Copy the selection to the clipboard as soon as the mouse is released.
     pub copy_on_select: bool,
     /// Right click pastes the clipboard (prototype default).
@@ -117,12 +118,19 @@ impl TerminalView {
             selecting: false,
             scroll_remainder: 0.,
             search: None,
+            search_icon: None,
             copy_on_select: true,
             right_click_paste: true,
             history_shortcut: true,
             top_radius: px(0.),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Supply the host application's search glyph without coupling the terminal to its asset paths.
+    pub fn with_search_icon(mut self, icon: Icon) -> Self {
+        self.search_icon=Some(icon);
+        self
     }
 
     pub fn terminal(&self) -> &gpui::Entity<Terminal> {
@@ -437,6 +445,7 @@ impl TerminalView {
             .border_color(theme.border)
             .rounded_lg()
             .shadow_md()
+            .children(self.search_icon.clone().map(|icon|icon.text_color(theme.foreground)))
             .child(div().flex_1().child(Input::new(&search.input).small().appearance(false)))
             .child(div().text_xs().text_color(theme.muted_foreground).px_1().child(status))
             .child(
@@ -459,7 +468,7 @@ impl TerminalView {
                 Button::new("search-close")
                     .ghost()
                     .xsmall()
-                    .icon(IconName::Close)
+                    .label("×").text_size(px(14.)).line_height(px(14.))
                     .tooltip("关闭 Esc")
                     .on_click(cx.listener(|this, _, window, cx| this.close_search(&CloseSearch, window, cx))),
             )

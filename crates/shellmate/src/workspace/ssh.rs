@@ -308,7 +308,7 @@ impl Workspace {
         let palette = style.palette.clone();
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
         let view = cx.new(|cx| {
-            let mut view = TerminalView::new(terminal.clone(), style, cx);
+            let mut view = TerminalView::new(terminal.clone(), style, cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
             view.top_radius = CARD_RADIUS;
             view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view

@@ -76,7 +76,7 @@ impl RecordsWindow {
             let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette, cx));
             terminal.update(cx, |t, _| t.replay_reset(80, 24));
             let view = cx.new(|cx| {
-                let mut view = TerminalView::new(terminal.clone(), cx.terminal_style(), cx);
+                let mut view = TerminalView::new(terminal.clone(), cx.terminal_style(), cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
                 view.top_radius = px(18.);
                 view
             });
@@ -659,7 +659,7 @@ impl Render for RecordsWindow {
                             div().w(px(264.)).child(
                                 Input::new(&self.query)
                                     .bordered(false).bg(p.card).rounded(px(11.))
-                                    .prefix(gpui::component::Icon::new(gpui::assets::IconName::Search).size(px(14.)).text_color(p.tx3))
+                                    .prefix(crate::icons::AppIcon::Search.at(14.).text_color(p.tx3))
                                     .h(px(34.))
                                     .text_size(px(13.)),
                             ),

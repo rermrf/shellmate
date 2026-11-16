@@ -1,6 +1,7 @@
 //! Shellmate — a gpui SSH client. P0/P1: UI skeleton and local terminal; P2: host library, SSH.
 
 mod assets;
+mod icons;
 #[cfg(debug_assertions)]
 mod proto;
 mod connect;

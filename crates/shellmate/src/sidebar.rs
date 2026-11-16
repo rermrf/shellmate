@@ -20,6 +20,7 @@ use gpui::{
 use shellmate_core::{Host, HostBook, HostFilter, HostId, HostSection, minutes_since, relative_time, sections};
 
 use crate::theme::{ActivePalette, Palette};
+use crate::icons::AppIcon;
 use crate::ui::{card_shadow, dot, item_shadow, kbd, segmented, window_drag_area, SegmentItem};
 
 pub const SIDEBAR_WIDTH: f32 = 284.;
@@ -186,7 +187,7 @@ impl Sidebar {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let icon_button = |id: &'static str, icon: Lucide, tip: &'static str| {
+        let icon_button = |id: &'static str, icon: AppIcon, tip: &'static str| {
             div()
                 .id(id)
                 .size(px(28.))
@@ -196,7 +197,7 @@ impl Sidebar {
                 .rounded(px(7.))
                 .cursor_pointer()
                 .hover(|d| d.bg(p.card3.opacity(0.7)))
-                .child(Icon::new(icon).size(px(16.)).text_color(p.tx2))
+                .child(icon.icon().text_color(p.tx2))
                 .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
         };
         let top = window_drag_area(div().id("sidebar-drag"))
@@ -207,11 +208,11 @@ impl Sidebar {
             .gap(px(4.))
             .pr(px(5.))
             .child(
-                icon_button("toggle-sidebar", Lucide::PanelLeft, "隐藏侧栏 ⌃⌘S")
+                icon_button("toggle-sidebar", AppIcon::Sidebar, "隐藏侧栏 ⌃⌘S")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleSidebar))),
             )
             .child(
-                icon_button("new-host", Lucide::Plus, "新建主机")
+                icon_button("new-host", AppIcon::Plus, "新建主机")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::NewHost))),
             );
 
@@ -245,7 +246,7 @@ impl Sidebar {
             .rounded(px(12.))
             .bg(p.card)
             .shadow(card_shadow(&p))
-            .child(Icon::new(Lucide::Search).size(px(15.)).text_color(p.tx3))
+            .child(AppIcon::Search.icon().text_color(p.tx3))
             .child(div().flex_1().min_w_0().child(Input::new(&self.search).appearance(false).cleanable(true).p_0().h(px(18.)).text_size(px(13.)).line_height(px(18.)).relative().top(px(-1.)).left(px(2.5))))
             .child(div().id("sidebar-palette").cursor_pointer().child(kbd("⌘K",cx)).on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::SearchHosts))))
 
@@ -288,14 +289,15 @@ impl Sidebar {
             .when(selected, |d| d.bg(p.card).shadow(item_shadow(&p)))
             .when(!selected, |d| d.hover(|d| d.bg(p.card.opacity(0.55))))
             .child(
-                div()
-                    .size(px(32.))
+                div().relative()
+                    .size(px(32.)).flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(10.))
                     .bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
-                    .child(Icon::new(Lucide::SquareTerminal).size(px(16.)).text_color(p.tx)),
+                    .child(AppIcon::LocalTerminal.icon().text_color(shellmate_term::colors::to_hsla(cx.terminal_style().palette.foreground)))
+                    .when(self.local_alive,|tile|tile.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(12.)).rounded_full().bg(p.ok).border_2().border_color(p.win))),
             )
             .child(
                 div()
@@ -327,9 +329,7 @@ impl Sidebar {
             .text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::SEMIBOLD)
             .text_color(p.tx2)
             .child(
-                div().w(px(10.)).h(px(10.)).flex_none().flex().items_center().justify_center().relative().top(px(-2.)).left(px(-1.)).child(Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
-                    .size(px(12.))
-                    .text_color(p.tx3)),
+                div().w(px(10.)).h(px(15.)).flex_none().child(crate::icons::group_chevron(open).text_color(p.tx2)),
             )
             .child(crate::ui::ellipsis(SharedString::from(format!("group-label-{key}")),title).flex_1())
             .child(div().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.tx3).child(section.hosts.len().to_string()))
@@ -441,7 +441,7 @@ impl Sidebar {
                 Button::new(SharedString::from(format!("menu-{}", host.id)))
                     .ghost()
                     .compact().w(px(24.)).h(px(24.)).bg(p.card2).rounded(px(7.))
-                    .icon(Icon::new(Lucide::Ellipsis).size(px(15.)))
+                    .label("⋯").text_size(px(13.)).line_height(px(13.)).font_weight(FontWeight::NORMAL).text_color(p.tx2)
                     .tooltip("更多")
                     .dropdown_menu(move |menu, _, _| {
                         let item = |label: &'static str, icon: Lucide, event: fn(HostId) -> SidebarEvent| {
@@ -533,11 +533,11 @@ impl Sidebar {
         div()
             .flex()
             .items_center()
-            .gap(px(8.))
+            .gap(px(10.))
             .h(px(48.))
-            .px(px(12.))
+            .pl(px(12.)).pr(px(10.))
             .mt(px(8.))
-            .rounded(px(12.))
+            .rounded(px(14.))
             .bg(p.card)
             .shadow(card_shadow(&p))
             .child(dot(if crate::prototype_fixture(){p.ok}else{p.tx3}, 8.))
@@ -545,14 +545,14 @@ impl Sidebar {
             .child(
                 div()
                     .id("settings")
-                    .size(px(26.))
+                    .size(px(28.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(7.))
+                    .rounded(px(9.)).bg(p.card2)
                     .cursor_pointer().hover(|d|d.bg(p.card2))
                     .on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::Settings)))
-                    .child(Icon::new(Lucide::Settings).size(px(15.)).text_color(p.tx2))
+                    .child(AppIcon::Settings.icon().text_color(p.tx2))
                     .tooltip(|window, cx| Tooltip::new("设置").build(window, cx)),
             )
     }

@@ -1,6 +1,5 @@
 //! Small presentational helpers shared by the sidebar and workspace.
 
-use gpui::component::Icon;
 use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{
@@ -192,7 +191,7 @@ pub fn segmented(
 /// Text + icon button used in the top toolbar (广播 / AI / 快捷命令).
 pub fn toolbar_button(
     id: impl Into<ElementId>,
-    icon: impl Into<Icon>,
+    icon: crate::icons::AppIcon,
     label: Option<&'static str>,
     tooltip: impl Into<SharedString>,
     enabled: bool,
@@ -202,23 +201,23 @@ pub fn toolbar_button(
     let tooltip: SharedString = tooltip.into();
     div()
         .id(id.into())
-        .flex()
+        .flex().flex_none()
         .items_center()
         .gap(px(6.))
         .h(px(32.))
-        .px(px(if label.is_some() { 12. } else { 8.5 }))
+        .when(label.is_some(),|d|d.px(px(12.))).when(label.is_none(),|d|d.w(px(32.)).justify_center())
         .rounded(px(10.))
         .text_size(px(12.5))
         .line_height(px(15.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.tx2)
-        .child(icon.into().size(px(14.)).text_color(p.tx2))
+        .child(icon.icon())
         .children(label)
         .when(enabled, |d| {
             d.cursor_pointer()
                 .hover(|d| d.bg(p.card3.opacity(0.6)).text_color(p.tx))
         })
-        .when(!enabled, |d| d.opacity(0.45))
+        .when(!enabled, |d| d.cursor_not_allowed())
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
 }
 

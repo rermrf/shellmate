@@ -10,9 +10,8 @@ mod services;
 
 use std::ops::Range;
 
-use gpui::assets::IconName as Lucide;
 use gpui::component::input::{Input, InputEvent, InputState};
-use gpui::component::{Icon, tooltip::Tooltip};
+use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, ScrollHandle, ScrollStrategy,
@@ -962,7 +961,7 @@ impl MonitorPanel {
                     .rounded(px(11.))
                     .bg(p.card2)
                     .text_size(px(13.))
-                    .child(Icon::new(Lucide::Search).size(px(14.)).text_color(p.tx3))
+                    .child(crate::icons::AppIcon::Search.at(14.).text_color(p.tx3))
                     .child(div().flex_1().min_w_0().child(Input::new(&self.query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.)).relative().left(px(2.5)))),
             )
             .child(segmented("process-sort", sorts, on_pick, cx).flex_none())
