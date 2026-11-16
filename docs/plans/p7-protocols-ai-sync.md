@@ -92,3 +92,14 @@
 2. Mosh：同意在本机执行 `brew install mosh`，并在测试机 `shellmate-mon` 上安装 mosh-server，做真实环境测试。
 3. 同步：~~只做 WebDAV，并且必须先开启主密码库才能同步~~ → **暂缓**（2026-11-16）：用户后续可能引入用户 / 账号模块，同步到时再设计。本阶段设置里的同步选项（WebDAV、Git）显示为“后续版本提供”，侧边栏底部继续如实显示“本地配置 · 未开启同步”。加密配置包的导出 / 导入属于备份，仍在 M3 里做；用户确认（2026-11-16）：没有账号时就用它在设备之间手动同步，所以导入要能稳妥地合并另一台设备导出的内容（预览新增 / 覆盖 / 冲突，逐项选择跳过 / 覆盖 / 另存一份）。
 4. 顺序：Telnet/串口 → Mosh → 主密码库（含配置包导出 / 导入）→ AI（开始前先与用户确认库和架构）。同步暂缓。
+
+## M1 review 结论（2026-11-16，通过）
+
+提交：M1（本节之前的一个提交，含两轮修复）。
+
+- Telnet：自己实现的客户端，对 GNU inetutils telnetd 2.5 的开场协商（WILL AUTHENTICATION / ENCRYPT → DONT；DO TTYPE → WILL；DO TSPEED / XDISPLOC / NEW-ENVIRON / ENVIRON → WONT）有逐字节测试。自动登录的 10 秒窗口从收到服务器第一个字节算起，总上限 30 秒（真实 telnetd 会先反查客户端域名，可能延迟 10 秒才出第一个字节）。
+- 真实服务器：测试机 `shellmate-mon` 装了 inetutils-telnetd（经 inetutils-inetd，平时停用，只在测试时启动），并在 `/etc/hosts` 加了 Mac 的 IP 以避开反查延迟。e2e（`cargo test -p shellmate-telnet --test e2e -- --ignored`，需 `SHELLMATE_TELNET_PASSWORD`）5/5 连续两次通过：自动登录只填一次、`stty size` 随窗口大小变化（30 100 → 40 132）、命令往返、密码错误不自动重试、`exit` 后服务器关闭。
+- 串口：PTY 模拟设备覆盖读写、关闭重开、设备消失与重现；macOS 的 PTY 不支持真实的波特率与 DTR/RTS，硬件相关项目写进 `docs/manual-tests.md`（S1–S12），等用户有 ESP32 等设备再测。
+- 主机库升到 **schema v6**（串口参数、Telnet 端口；v5 程序打不开 v6 库）。
+- 与原型的对比：串口会话约 1.9%、Telnet 会话约 1.2%、新建串口连接 2.8–5.0%（字段值已改为左对齐）。接受的差异：HEX 显示为完整的"偏移 + 十六进制 + ASCII"（原型是截断的十六进制）；新建 Telnet 连接多了密码与"存入钥匙串"两行（自动登录需要）；"复位 EN"为菜单，附"下载模式"；串口会话里原型的"AI 解释这个报错"属于 M5。
+- 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1143 通过；e2e SSH 8/8、SFTP 17/17、forward 7/7。
