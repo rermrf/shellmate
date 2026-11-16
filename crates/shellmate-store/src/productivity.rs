@@ -8,12 +8,14 @@ pub const HISTORY_LIMIT: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snippet {
+    pub id: String,
     pub name: String,
     pub command: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnippetGroup {
+    pub id: String,
     pub name: String,
     pub items: Vec<Snippet>,
 }
@@ -29,6 +31,8 @@ pub struct HistoryEntry {
     pub time: i64,
 }
 
+fn identity(id: &str) -> String { if id.is_empty() { uuid::Uuid::new_v4().to_string() } else { id.to_owned() } }
+
 impl HostStore {
     pub fn history_enabled(&self) -> Result<bool> {
         Ok(self.setting(HISTORY_ENABLED)?.as_deref() != Some("0"))
@@ -41,23 +45,23 @@ impl HostStore {
     pub fn snippets(&self) -> Result<Vec<SnippetGroup>> {
         let groups = self
             .conn
-            .prepare("SELECT id, name FROM snippet_groups ORDER BY sort, id")?
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .prepare("SELECT id, name, stable_id FROM snippet_groups ORDER BY sort, id")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         groups
             .into_iter()
-            .map(|(id, name)| {
+            .map(|(id, name, stable_id)| {
                 let items = self
                     .conn
-                    .prepare("SELECT name, command FROM snippets WHERE group_id=?1 ORDER BY sort, id")?
+                    .prepare("SELECT name, command, stable_id FROM snippets WHERE group_id=?1 ORDER BY sort, id")?
                     .query_map([id], |r| {
-                        Ok(Snippet {
+                        Ok(Snippet { id: r.get(2)?,
                             name: r.get(0)?,
                             command: r.get(1)?,
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
-                Ok(SnippetGroup { name, items })
+                Ok(SnippetGroup { id: stable_id, name, items })
             })
             .collect()
     }
@@ -68,14 +72,14 @@ impl HostStore {
         tx.execute("DELETE FROM snippet_groups", [])?;
         for (sort, group) in groups.iter().enumerate() {
             tx.execute(
-                "INSERT INTO snippet_groups (name, sort) VALUES (?1, ?2)",
-                params![group.name, sort as i64],
+                "INSERT INTO snippet_groups (name, sort, stable_id) VALUES (?1, ?2, ?3)",
+                params![group.name, sort as i64, identity(&group.id)],
             )?;
             let id = tx.last_insert_rowid();
             for (sort, item) in group.items.iter().enumerate() {
                 tx.execute(
-                    "INSERT INTO snippets (group_id, name, command, sort) VALUES (?1, ?2, ?3, ?4)",
-                    params![id, item.name, item.command, sort as i64],
+                    "INSERT INTO snippets (group_id, name, command, sort, stable_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, item.name, item.command, sort as i64, identity(&item.id)],
                 )?;
             }
         }
@@ -158,7 +162,7 @@ mod tests {
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES(?1,?2,?3,22,'ssh','private_key')",rusqlite::params![host.id.as_str(),host.name,host.addr]).unwrap();
         drop(conn);
         let store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         assert!(!store.history_enabled().unwrap());
         assert!(store.history_shortcut().unwrap());
         assert!(store.snippets().unwrap().is_empty());
@@ -172,20 +176,20 @@ mod tests {
     fn snippets_crud_and_order_roundtrip() {
         let mut store = HostStore::open_in_memory().unwrap();
         let mut groups = vec![
-            SnippetGroup {
+            SnippetGroup { id: uuid::Uuid::new_v4().to_string(),
                 name: "服务".into(),
                 items: vec![
-                    Snippet {
+                    Snippet { id: uuid::Uuid::new_v4().to_string(),
                         name: "负载".into(),
                         command: "uptime".into(),
                     },
-                    Snippet {
+                    Snippet { id: uuid::Uuid::new_v4().to_string(),
                         name: "磁盘".into(),
                         command: "df -h".into(),
                     },
                 ],
             },
-            SnippetGroup {
+            SnippetGroup { id: uuid::Uuid::new_v4().to_string(),
                 name: "空组".into(),
                 items: vec![],
             },

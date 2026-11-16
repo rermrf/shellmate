@@ -28,7 +28,8 @@ impl Workspace {
         self.active = None;
         self.monitor_frozen = true;
         self.preferences = Default::default();
-        self.store = Rc::new(RefCell::new(HostStore::open_in_memory().expect("fixture")));
+        self.store = shellmate_store::SharedStore::new(HostStore::open_in_memory().expect("fixture"));
+        self.secrets=crate::security::fixture_coordinator(self.store.clone());
         for (i, (name, tone)) in [
             ("生产环境", GroupTone::Accent),
             ("测试环境", GroupTone::Warn),
@@ -258,6 +259,11 @@ impl Workspace {
             "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "set-cred" => self.open_settings(0, window, cx),
+            "set-cred-master" => {let settings=crate::settings::SettingsWindow::open(cx.entity().downgrade(),self.preferences.clone(),self.secrets.clone(),0,window,cx);settings.update(cx,|s,cx|s.fixture_master(cx));},
+            "vault-unlock" => {self.secrets.switch_to_master("Fixture9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).expect("fixture vault");self.secrets.set_touch_id(true).expect("fixture device key");self.secrets.lock();crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Unlock("连接 prod-web-01".into()),None,Box::new(|_,_,_|{}),window,cx);},
+            "bundle-export" => {crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Export,None,Box::new(|_,_,_|{}),window,cx);},
+            "bundle-preview" => {let mut incoming=self.secrets.export_bundle(shellmate_store::bundle::Contents{credentials:false,..Default::default()}).expect("fixture bundle");if let Some(host)=incoming.items.iter_mut().find(|i|i.kind==shellmate_store::bundle::Kind::Host){host.fields.insert("addr".into(),serde_json::json!("10.0.1.99"));}
+                if let Some(mut host)=incoming.items.iter().find(|i|i.kind==shellmate_store::bundle::Kind::Host).cloned(){host.id="fixture-import-new".into();host.fields.insert("name".into(),serde_json::json!("新设备"));incoming.items.push(host);}let preview=self.secrets.preview_bundle(incoming).expect("fixture preview");crate::security::PreviewDialog::open_with_manager(preview,self.secrets.clone(),None,window,cx);},
             "set-sync" => self.open_settings(1, window, cx),
             "set-term" => self.open_settings(2, window, cx),
             "set-local" => self.open_settings(3, window, cx),
@@ -270,7 +276,7 @@ impl Workspace {
     fn proto_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let request = self.send_request(vec![1], false, false);
         self.open_confirmation(
-            shellmate_store::Snippet {
+            shellmate_store::Snippet { id: String::new(),
                 name: "负载".into(),
                 command: "uptime".into(),
             },

@@ -26,12 +26,13 @@ impl Workspace {
 
     /// Asks before deleting a host.
     pub(super) fn confirm_delete_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if shellmate_store::SecretStore::is_locked(self.secrets.as_ref()) {let id=id.clone();let this=cx.entity().downgrade();crate::security::ensure_unlocked(self.secrets.clone(),"删除主机及其凭据",window,cx,move|ok,w,cx|{if ok{this.update(cx,|s,cx|s.confirm_delete_host(&id,w,cx)).ok();}});return;}
         let Some(host) = self.book.host(id) else { return };
         let (name, id) = (host.name.clone(), id.clone());
         let workspace = cx.entity().downgrade();
         ConfirmDialog::open(
             format!("删除主机 {name}？"),
-            "已打开的会话不受影响。保存在钥匙串里的此主机的密码会一并移除。",
+            "已打开的会话不受影响。保存在凭据存储中的此主机的密码会一并移除。",
             "删除主机",
             true,
             move |window, cx| {
@@ -46,12 +47,13 @@ impl Workspace {
 
     fn delete_host_now(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
         let name = self.book.host(id).map(|h| h.name.clone()).unwrap_or_default();
-        let warning = library::delete_host(&mut self.store.borrow_mut(), self.secrets.as_ref(), id)?;
+        self.store.borrow_mut().delete_host(id).map_err(|e|e.to_string())?;
+        let warning = shellmate_store::SecretStore::delete(self.secrets.as_ref(), &shellmate_store::SecretKey::HostPassword(id.clone())).err().map(|e|e.to_string());
         self.reload_book(window, cx);
         window.push_notification(Notification::success(format!("已删除 {name}")), cx);
         if let Some(warning) = warning {
             window.push_notification(
-                Notification::warning(format!("主机已删除，但钥匙串里的密码没有清除：{warning}")),
+                Notification::warning(format!("主机已删除，但凭据存储中的密码没有清除：{warning}")),
                 cx,
             );
         }
@@ -73,7 +75,7 @@ impl Workspace {
         let outcome = library::save_host(&mut self.store.borrow_mut(), self.secrets.as_ref(), draft)?;
         if let Some(credential) = credential {
             if let Err(e)=library::save_telnet_password(self.secrets.as_ref(),&host,&credential.answer.secret,credential.answer.save) {
-                window.push_notification(Notification::warning(format!("主机已保存，但密码没有存入钥匙串：{e}")),cx);
+                window.push_notification(Notification::warning(format!("主机已保存，但密码没有保存到凭据存储：{e}")),cx);
             }
             self.pending_forms.insert(id, (endpoint, credential));
         }
@@ -81,7 +83,7 @@ impl Workspace {
         self.reload_book(window, cx);
         window.push_notification(Notification::success(format!("已保存 {name}")), cx);
         if let Some(warning) = outcome.keychain_warning {
-            window.push_notification(Notification::warning(format!("主机已保存，但密码没有存入钥匙串：{warning}")), cx);
+            window.push_notification(Notification::warning(format!("主机已保存，但密码没有保存到凭据存储：{warning}")), cx);
         }
         Ok(())
     }

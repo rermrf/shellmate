@@ -1,6 +1,6 @@
 //! SQLite host library: groups, hosts, jump chains.
 //!
-//! The database holds no secrets. The schema version is kept in
+//! The database holds only encrypted secrets. The schema version is kept in
 //! `PRAGMA user_version`; opening a database brings it up to date.
 
 use std::collections::{HashMap, HashSet};
@@ -102,6 +102,23 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE hosts ADD COLUMN serial_stop INTEGER NOT NULL DEFAULT 1;
      ALTER TABLE hosts ADD COLUMN serial_flow TEXT NOT NULL DEFAULT 'none';
      ALTER TABLE hosts ADD COLUMN serial_newline TEXT NOT NULL DEFAULT 'CRLF';",
+    // v7: encrypted credentials and portable identities for quick commands.
+    "CREATE TABLE vault_meta (
+        id INTEGER PRIMARY KEY CHECK(id=1), format_version INTEGER NOT NULL,
+        salt BLOB NOT NULL, memory_kib INTEGER NOT NULL, iterations INTEGER NOT NULL,
+        parallelism INTEGER NOT NULL, wrapped_key BLOB NOT NULL,
+        created_at INTEGER NOT NULL, changed_at INTEGER NOT NULL,
+        device_id TEXT NOT NULL, check_nonce BLOB NOT NULL, check_ciphertext BLOB NOT NULL
+    );
+    CREATE TABLE vault_secrets (credential_id TEXT PRIMARY KEY NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL);
+    CREATE TABLE bundle_aliases(kind TEXT NOT NULL, remote_id TEXT NOT NULL, local_id TEXT NOT NULL, PRIMARY KEY(kind,remote_id));
+    ALTER TABLE snippet_groups ADD COLUMN stable_id TEXT;
+    ALTER TABLE snippets ADD COLUMN stable_id TEXT;
+    UPDATE snippet_groups SET stable_id=lower(hex(randomblob(16)));
+    UPDATE snippets SET stable_id=lower(hex(randomblob(16)));
+    CREATE UNIQUE INDEX snippet_group_identity ON snippet_groups(stable_id);
+    CREATE UNIQUE INDEX snippet_identity ON snippets(stable_id);",
+
 ];
 
 /// The host library.
@@ -404,7 +421,7 @@ fn raw_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHost> {
 }
 
 /// Loads every host (or just `only`) with tags and jumps.
-fn load_hosts(conn: &Connection, only: Option<&HostId>) -> Result<Vec<Host>> {
+pub(crate) fn load_hosts(conn: &Connection, only: Option<&HostId>) -> Result<Vec<Host>> {
     let filter = if only.is_some() { "WHERE id = ?1" } else { "WHERE ?1 IS NULL" };
     let raws = conn
         .prepare(&format!("SELECT {HOST_COLUMNS} FROM hosts {filter} ORDER BY rowid"))?
@@ -547,7 +564,7 @@ fn write_jumps(tx: &Transaction<'_>, host: &Host) -> Result<()> {
 // ---- jump chains -----------------------------------------------------------
 
 /// Expands `id` into its connection chain; see [`HostStore::resolve_route`].
-fn resolve(conn: &Connection, id: &HostId) -> Result<Vec<Host>> {
+pub(crate) fn resolve(conn: &Connection, id: &HostId) -> Result<Vec<Host>> {
     let target = load_host(conn, id)?.ok_or_else(|| StoreError::HostNotFound(id.clone()))?;
     let mut chain = Vec::new();
     expand(conn, target, &mut Vec::new(), &mut chain)?;
@@ -644,7 +661,7 @@ mod tests {
     fn v5_to_v6_retains_ssh_and_round_trips_telnet_and_serial() {
         let mut conn=Connection::open_in_memory().unwrap();migrate(&mut conn,&MIGRATIONS[..5]).unwrap();
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES('old','ssh','example.test',22,'ssh','agent')",[]).unwrap();
-        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),6);
+        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),7);
         let old=store.host(&HostId::from_raw("old")).unwrap().unwrap();assert_eq!(old.protocol,Protocol::Ssh);assert_eq!(old.serial,shellmate_core::SerialSettings::default());
         let mut serial=Host::new("ESP32","/dev/cu.fixture");serial.protocol=Protocol::Serial;serial.port=0;
         serial.serial=shellmate_core::SerialSettings{baud:460800,data_bits:7,parity:'E',stop_bits:2,flow:"hardware".into(),newline:shellmate_core::Newline::Lf};
@@ -744,9 +761,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 7, supported: 6 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v7），当前 Shellmate 只支持到 v6，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 8, supported: 7 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v8），当前 Shellmate 只支持到 v7，请升级后再试");
     }
 }

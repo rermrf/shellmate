@@ -534,10 +534,12 @@ impl HostEditor {
         }
         let join = runtime.spawn(connect::test_connection(chain, secrets, bridge));
         self.test_abort = Some(join.abort_handle());
+        let credentials=self.workspace.update(cx,|w,_|w.credentials()).ok();
         let pump = cx.spawn_in(window, async move |this, cx| {
             while let Ok(message) = rx.recv().await {
                 if this
                     .update_in(cx, |_, window, cx| match message {
+                        UiMsg::VaultUnlock { reason, reply } => {if let Some(manager)=&credentials{crate::security::ensure_unlocked(manager.clone(),reason,window,cx,move|ok,_,_|{let _=reply.send(ok);});}},
                         UiMsg::HostKey { request, reply } => {
                             super::hostkey::HostKeyDialog::open(request, reply, window, cx)
                         }
@@ -571,7 +573,7 @@ impl HostEditor {
                             if saves.errors.is_empty() {
                                 String::new()
                             } else {
-                                format!(" · 钥匙串：{}", saves.errors.join("；"))
+                                format!(" · 凭据：{}", saves.errors.join("；"))
                             }
                         ),
                     ),
@@ -838,6 +840,11 @@ impl DialogBody for HostEditor {
             return false;
         }
         let credential = self.credential(&draft.host, cx);
+        if credential.as_ref().is_some_and(|c|c.answer.save) && let Ok(manager)=self.workspace.update(cx,|w,_|w.credentials()) && shellmate_store::SecretStore::is_locked(manager.as_ref()) {
+            let this=cx.entity().downgrade();
+            crate::security::ensure_unlocked(manager,"保存凭据",window,cx,move|ok,w,cx|{this.update(cx,|s,cx|{if ok{s.submit(w,cx);}else{s.error=Some("已取消保存凭据与主机".into());cx.notify();}}).ok();});
+            return false;
+        }
         let saved = self.workspace.update(cx, |workspace, cx| {
             workspace.save_host_draft(draft, credential, window, cx)
         });
@@ -1028,7 +1035,7 @@ impl Render for HostEditor {
                     .child(self.field("标签（逗号分隔）", &p, self.input(&self.tags, &p, false)))
                     )
                     .children((self.protocol==Protocol::Serial).then(||self.render_serial_fields(&p,cx)))
-                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。登录密码仍会存入钥匙串。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
+                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。登录密码保存在所选凭据存储中。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
                     .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d
                     .child(
                         div().flex_none()
@@ -1069,7 +1076,7 @@ impl Render for HostEditor {
                                             .text_size(px(13.))
                                             .line_height(px(18.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("密码与口令存入 macOS 钥匙串"),
+                                            .child(if self.workspace.update(cx,|w,_|w.credentials().backend()==shellmate_store::Backend::Master).unwrap_or(false){"密码与口令存入主密码凭据库"}else{"密码与口令存入 macOS 钥匙串"}),
                                     )
                                     .child(
                                         div()

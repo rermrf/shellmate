@@ -350,6 +350,7 @@ dependencies = [
  "blake2 0.10.6",
  "cpufeatures 0.2.17",
  "password-hash 0.5.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -7315,8 +7316,10 @@ dependencies = [
  "shellmate-store",
  "shellmate-telnet",
  "shellmate-term",
+ "shellmate-vault",
  "similar",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -7419,11 +7422,16 @@ name = "shellmate-store"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "keyring-core",
  "rusqlite",
+ "serde_json",
  "shellmate-core",
  "shellmate-forward",
+ "shellmate-vault",
  "tempfile",
  "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

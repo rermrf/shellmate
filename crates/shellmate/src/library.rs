@@ -74,6 +74,7 @@ pub fn editor_route(book: &shellmate_core::HostBook, host: &Host) -> Result<Vec<
 
 /// Deletes a host and its keychain password. Refused while other hosts jump through it.
 /// Returns a warning if the keychain entry could not be removed.
+#[cfg(test)]
 pub fn delete_host(store: &mut HostStore, secrets: &dyn SecretStore, id: &HostId) -> Result<Option<String>, String> {
     store.delete_host(id).map_err(|e| e.to_string())?;
     Ok(secrets.delete(&SecretKey::HostPassword(id.clone())).err().map(|e| e.to_string()))

@@ -5,6 +5,7 @@
 //! [`ConnGroup`] shared by every tab on that connection. All connecting, waiting and retrying
 //! happens per group; a tab only reacts to what its group decides.
 
+use shellmate_store::SecretStore as _;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -621,6 +622,7 @@ impl Workspace {
             }
         }
         match msg {
+            UiMsg::VaultUnlock { reason, reply } => crate::security::ensure_unlocked(self.secrets.clone(),reason,window,cx,move|ok,_,_|{let _=reply.send(ok);}),
             UiMsg::Event(event) => {
                 let line = connect::format_event(&event, names);
                 self.notice_participants(group_id, &line, cx);
@@ -1025,7 +1027,7 @@ impl Workspace {
     /// Tells the user what went to the keychain (or why not) after an attempt.
     fn announce_saved(&mut self, saves: &SaveReport, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(error) = saves.errors.first() {
-            window.push_notification(Notification::warning(format!("无法存入钥匙串：{error}")).title("钥匙串"), cx);
+            window.push_notification(Notification::warning(format!("无法保存凭据：{error}")).title("凭据"), cx);
         } else if !saves.saved.is_empty() {
             let what = if saves.saved.iter().any(|k| matches!(k, SecretKey::KeyPassphrase(_))) {
                 "私钥口令"
@@ -1033,7 +1035,7 @@ impl Workspace {
                 "密码"
             };
             window.push_notification(
-                Notification::success(format!("{what}已存入 macOS 钥匙串，下次自动填写")).title("钥匙串"),
+                Notification::success(format!("{what}已保存到凭据存储，下次自动填写")).title("凭据"),
                 cx,
             );
         }

@@ -1,7 +1,4 @@
-//! Secret storage: the macOS keychain in the app, memory in tests.
-//!
-//! Nothing here (or anywhere in the host database) writes secrets to disk
-//! outside the keychain.
+//! Credential storage adapters. Tests never open the production keychain service.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +12,8 @@ pub const KEYCHAIN_SERVICE: &str = "Shellmate";
 /// What a stored secret is for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SecretKey {
+    /// Stable account of a future credential type (also preserves orphaned app entries).
+    Account(String),
     /// The login password of a saved host.
     HostPassword(HostId),
     /// The passphrase of a private key file.
@@ -22,9 +21,25 @@ pub enum SecretKey {
 }
 
 impl SecretKey {
+    pub fn from_account(account: &str) -> Self {
+        if let Some(id) = account
+            .strip_prefix("host:")
+            .and_then(|s| s.strip_suffix(":password"))
+        {
+            Self::HostPassword(HostId::from_raw(id))
+        } else if let Some(path) = account
+            .strip_prefix("key:")
+            .and_then(|s| s.strip_suffix(":passphrase"))
+        {
+            Self::KeyPassphrase(path.into())
+        } else {
+            Self::Account(account.into())
+        }
+    }
     /// Keychain account name: `host:<id>:password` or `key:<path>:passphrase`.
     pub fn account(&self) -> String {
         match self {
+            SecretKey::Account(id) => id.clone(),
             SecretKey::HostPassword(id) => format!("host:{id}:password"),
             SecretKey::KeyPassphrase(path) => format!("key:{}:passphrase", path.display()),
         }
@@ -33,11 +48,20 @@ impl SecretKey {
 
 /// A secret store operation failed.
 #[derive(Debug, thiserror::Error)]
-#[error("钥匙串访问失败：{0}")]
+#[error("凭据访问失败：{0}")]
 pub struct SecretError(pub String);
 
 /// Reads and writes secrets by [`SecretKey`].
 pub trait SecretStore: Send + Sync {
+    /// Enumerates every owned entry, including no-longer-referenced key files.
+    fn keys(&self) -> Result<Vec<SecretKey>, SecretError> {
+        Err(SecretError("凭据后端不支持完整枚举".into()))
+    }
+    /// A locked store must be explicitly unlocked; callers must not treat this as a missing secret.
+    fn is_locked(&self) -> bool {
+        false
+    }
+
     /// The stored secret, or `None` if there is none.
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, SecretError>;
     /// Stores `secret`, replacing any previous one.
@@ -47,17 +71,27 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// The macOS keychain (service `Shellmate`).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeychainStore;
+#[derive(Clone, Copy, Debug)]
+pub struct KeychainStore {
+    service: &'static str,
+}
+
+impl Default for KeychainStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl KeychainStore {
     /// A handle to the user's keychain. Nothing is touched until a method is called.
     pub fn new() -> Self {
-        Self
+        Self {
+            service: KEYCHAIN_SERVICE,
+        }
     }
 
-    fn entry(key: &SecretKey) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, &key.account()).map_err(describe)
+    fn entry(&self, key: &SecretKey) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(self.service, &key.account()).map_err(describe)
     }
 }
 
@@ -77,8 +111,17 @@ fn describe(err: keyring::Error) -> SecretError {
 }
 
 impl SecretStore for KeychainStore {
+    fn keys(&self) -> Result<Vec<SecretKey>, SecretError> {
+        crate::keychain_inventory::accounts(self.service).map(|accounts| {
+            accounts
+                .into_iter()
+                .map(|a| SecretKey::from_account(&a))
+                .collect()
+        })
+    }
+
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, SecretError> {
-        match Self::entry(key)?.get_password() {
+        match self.entry(key)?.get_password() {
             Ok(password) => Ok(Some(Secret::new(password))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(err) => Err(describe(err)),
@@ -86,11 +129,13 @@ impl SecretStore for KeychainStore {
     }
 
     fn set(&self, key: &SecretKey, secret: &Secret) -> Result<(), SecretError> {
-        Self::entry(key)?.set_password(secret.expose()).map_err(describe)
+        self.entry(key)?
+            .set_password(secret.expose())
+            .map_err(describe)
     }
 
     fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-        match Self::entry(key)?.delete_credential() {
+        match self.entry(key)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(describe(err)),
         }
@@ -115,6 +160,9 @@ impl MemoryStore {
 }
 
 impl SecretStore for MemoryStore {
+    fn keys(&self) -> Result<Vec<SecretKey>, SecretError> {
+        Ok(self.lock().keys().cloned().collect())
+    }
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, SecretError> {
         Ok(self.lock().get(key).cloned())
     }
@@ -156,7 +204,11 @@ mod tests {
         store.set(&key, &Secret::new("one")).unwrap();
         assert_eq!(store.get(&key).unwrap().unwrap().expose(), "one");
         store.set(&key, &Secret::new("two")).unwrap();
-        assert_eq!(store.get(&key).unwrap().unwrap().expose(), "two", "set replaces");
+        assert_eq!(
+            store.get(&key).unwrap().unwrap().expose(),
+            "two",
+            "set replaces"
+        );
 
         store.delete(&key).unwrap();
         assert!(store.get(&key).unwrap().is_none());
@@ -183,18 +235,59 @@ mod tests {
         assert!(store.get(&password_key()).unwrap().is_some());
     }
 
-    /// Talks to the real macOS keychain (may show an access prompt): run on demand with
-    /// `cargo test -p shellmate-store -- --ignored keychain`.
+    /// Only accesses the dedicated test service; never run automatically.
     #[test]
-    #[ignore = "touches the real macOS keychain"]
-    fn keychain_round_trip() {
-        let store = KeychainStore::new();
-        let key = SecretKey::HostPassword(HostId::generate());
-        assert!(store.get(&key).unwrap().is_none());
-        store.set(&key, &Secret::new("s3cret")).unwrap();
-        assert_eq!(store.get(&key).unwrap().unwrap().expose(), "s3cret");
-        store.delete(&key).unwrap();
-        assert!(store.get(&key).unwrap().is_none());
-        store.delete(&key).unwrap();
+    #[ignore = "touches only the Shellmate Tests Only macOS keychain service"]
+    fn keychain_enumeration_round_trip() {
+        let store = KeychainStore {
+            service: "Shellmate Tests Only",
+        };
+        assert!(
+            store.keys().unwrap().is_empty(),
+            "test service must start empty"
+        );
+        let keys = [
+            SecretKey::Account(format!("enumeration:{}", HostId::generate())),
+            SecretKey::Account(format!("枚举测试：私钥口令:{}", HostId::generate())),
+        ];
+        struct Cleanup<'a> {
+            store: &'a KeychainStore,
+            keys: &'a [SecretKey],
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                for key in self.keys {
+                    let _ = self.store.delete(key);
+                }
+            }
+        }
+        let cleanup = Cleanup {
+            store: &store,
+            keys: &keys,
+        };
+        for key in &keys {
+            store.set(key, &Secret::new("test-only secret")).unwrap();
+            assert_eq!(
+                store.get(key).unwrap().unwrap().expose(),
+                "test-only secret"
+            );
+        }
+        let found = store.keys().unwrap();
+        assert_eq!(found.len(), keys.len(), "no unrelated accounts may appear");
+        for key in &keys {
+            assert!(found.contains(key));
+        }
+        for entry in
+            keyring_core::Entry::search(&HashMap::from([("service", store.service)])).unwrap()
+        {
+            let (service, account) = entry.get_specifiers().unwrap();
+            assert_eq!(service, "Shellmate Tests Only");
+            assert!(keys.iter().any(|key| key.account() == account));
+        }
+        for key in &keys {
+            store.delete(key).unwrap();
+        }
+        assert!(store.keys().unwrap().is_empty());
+        drop(cleanup);
     }
 }

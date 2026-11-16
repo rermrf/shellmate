@@ -5,10 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+shellmate-vault.workspace = true
+zeroize.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 shellmate-core.workspace = true
 shellmate-forward.workspace = true
 rusqlite.workspace = true
 keyring.workspace = true
+keyring-core.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

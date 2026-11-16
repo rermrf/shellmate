@@ -15,7 +15,7 @@ use gpui::{
     prelude::*,
     px, relative, uniform_list,
 };
-use shellmate_store::{HostStore, Recording};
+use shellmate_store::{Recording};
 use shellmate_term::{
     Terminal, TerminalView, archive,
     cast::{Cast, Data, Playback},
@@ -23,14 +23,14 @@ use shellmate_term::{
     session_log::{self, LogFile},
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
 };
 pub struct RecordsWindow {
-    store: Rc<RefCell<HostStore>>,
+    store: shellmate_store::SharedStore,
     log_root: PathBuf,
     recordings: Vec<Recording>,
     logs: Vec<LogFile>,
@@ -59,7 +59,7 @@ pub struct RecordsWindow {
 }
 impl RecordsWindow {
     pub fn open(
-        store: Rc<RefCell<HostStore>>,
+        store: shellmate_store::SharedStore,
         log_root: PathBuf,
         selected: Option<i64>,
         logs_tab: bool,

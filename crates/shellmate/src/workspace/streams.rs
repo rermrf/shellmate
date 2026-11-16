@@ -69,6 +69,9 @@ impl Workspace {
         if crate::prototype_fixture() {
             return;
         }
+        if self.secrets.is_locked() && self.sessions.iter().any(|s|s.id==id&&s.host().is_some_and(|h|h.protocol==Protocol::Telnet)) {
+            let this=cx.entity().downgrade();crate::security::ensure_unlocked(self.secrets.clone(),"连接 Telnet",window,cx,move|ok,w,cx|{if ok{this.update(cx,|s,cx|s.start_stream(id,w,cx)).ok();}});return;
+        }
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
             return;
         };

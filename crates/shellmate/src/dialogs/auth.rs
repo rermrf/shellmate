@@ -119,10 +119,10 @@ impl Render for SecretDialog {
         let p = palette(cx);
         let (subtitle, caption, retry_error, hint_text) = match &self.kind {
             SecretKind::Password { user, host, port } => {
-                (format!("{user}@{host}:{port}"), "密码", "密码错误，请重试", "钥匙串中没有此主机的密码")
+                (format!("{user}@{host}:{port}"), "密码", "密码错误，请重试", "凭据存储中没有此主机的密码")
             }
             SecretKind::Passphrase { key } => {
-                (key.display().to_string(), "私钥口令", "口令不正确，请重试", "私钥已加密，钥匙串中未找到口令")
+                (key.display().to_string(), "私钥口令", "口令不正确，请重试", "私钥已加密，凭据存储中未找到口令")
             }
         };
         let error = self.error.clone().or_else(|| (self.attempt > 0).then(|| retry_error.into()));
@@ -131,7 +131,7 @@ impl Render for SecretDialog {
             .children((self.attempt == 0).then(|| hint(hint_text, &p)))
             .child(field(caption, &p, Input::new(&self.input).mask_toggle()))
             .children(error.map(|text| notice(Notice::Error, text, &p)))
-            .child(Checkbox::new("save-secret").label("存入 macOS 钥匙串，下次自动填写").checked(self.save).on_click(
+            .child(Checkbox::new("save-secret").label("保存到当前凭据存储，下次自动填写").checked(self.save).on_click(
                 cx.listener(|this, checked: &bool, _, cx| {
                     this.save = *checked;
                     cx.notify();

@@ -23,6 +23,7 @@ shellmate-serial = { path = "crates/shellmate-serial" }
 shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }
+shellmate-vault = { path = "crates/shellmate-vault" }
 shellmate-store = { path = "crates/shellmate-store" }
 shellmate-sftp = { path = "crates/shellmate-sftp" }
 shellmate-forward = { path = "crates/shellmate-forward" }
@@ -53,7 +54,14 @@ uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 rusqlite = { version = "0.42", features = ["bundled"] }
 keyring = "4.2"
+# keyring-core is what keyring 4 wraps; needed for Entry::search (enumerating our own items)
+keyring-core = "1"
 
 # russh with per-channel flow control (see vendor/russh/SHELLMATE-PATCH.md)
 [patch.crates-io]
 russh = { path = "vendor/russh" }
+
+# Keep interactive KDF calibration representative in debug builds, too. Never
+# lower password-hardening work merely to compensate for unoptimized Rust loops.
+[profile.dev.package.argon2]
+opt-level = 3

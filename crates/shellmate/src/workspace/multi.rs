@@ -129,7 +129,7 @@ impl Workspace {
             SendPlan::Confirm(ids) => {
                 let request = self.send_request(ids, true, true);
                 self.open_confirmation(
-                    Snippet {
+                    Snippet { id: String::new(),
                         name: "广播输入".into(),
                         command: text.into(),
                     },

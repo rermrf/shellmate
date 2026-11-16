@@ -1,6 +1,5 @@
 //! Root view: sidebar + session tabs + active session panel.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -18,7 +17,7 @@ use gpui::{
     MouseButton, MouseUpEvent, SharedString, Subscription, Window, actions, div, px,
 };
 use shellmate_core::{HostBook, HostId};
-use shellmate_store::{HostStore, KeychainStore, SecretStore};
+use shellmate_store::{HostStore, SecretStore};
 use shellmate_term::colors::to_hsla;
 use shellmate_term::view::ToggleSearch;
 use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
@@ -157,9 +156,10 @@ impl Session {
 }
 
 pub struct Workspace {
-    store: Rc<RefCell<HostStore>>,
+    store: shellmate_store::SharedStore,
     /// Saved passwords and key passphrases (the macOS keychain).
-    secrets: Arc<dyn SecretStore>,
+    secrets: Arc<shellmate_store::CredentialStore>,
+    security_task: Option<gpui::Task<()>>,
     pending_forms: HashMap<HostId, (connect::Endpoint, connect::FormCredential)>,
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
@@ -237,12 +237,17 @@ impl Workspace {
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
         ];
         let preferences=store.preferences().unwrap_or_default();
+        let store=shellmate_store::SharedStore::new(store);
+        let secrets=crate::security::coordinator(store.clone());
+        let workspace=cx.entity().downgrade();
+        let mut subscriptions=subscriptions;
+        subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
             preferences,
             data_root:shellmate_term::archive::data_root(),log_root:shellmate_term::archive::log_root(),
             running_recordings:HashMap::new(),archive_task:None,records_window:None,
-            store: Rc::new(RefCell::new(store)),
-            secrets: Arc::new(KeychainStore::new()),
+            store,
+            secrets, security_task: None,
             pending_forms: HashMap::new(),
             book,
             sidebar,
@@ -269,6 +274,7 @@ impl Workspace {
             _editor_subscription: None,
             _subscriptions: subscriptions,
         };
+        this.security_task=Some(cx.spawn_in(window,async move|this,cx|{loop{cx.background_executor().timer(std::time::Duration::from_secs(1)).await; if this.update_in(cx,|s,w,cx|{if s.secrets.tick(){w.push_notification(Notification::info("凭据库已闲置锁定；运行中的连接继续保持"),cx);}}).is_err(){break}}}));
         if let Some(message) = store_notice {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
@@ -1073,6 +1079,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
+        let activity=self.secrets.clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
             Some(Session { panel: Panel::Files, files: Some(files), .. }) => {
                 div().flex_1().min_w_0().min_h_0().flex().child(files.panel.clone()).into_any_element()
@@ -1150,6 +1157,9 @@ impl Render for Workspace {
             ).with_priority(3)))
             .children(palette)
             .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
+                let moved=activity.clone();window.on_mouse_event::<gpui::MouseMoveEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{moved.activity();}});
+                let clicked=activity.clone();window.on_mouse_event::<gpui::MouseDownEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{clicked.activity();}});
+                let scrolled=activity.clone();window.on_mouse_event::<gpui::ScrollEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{scrolled.activity();}});
                 // Paint at the window layer, independent of a dialog content box or sidebar clipping.
                 // The component dialog host retains focus trapping and input occlusion above this.
                 if window.has_active_dialog(cx) {

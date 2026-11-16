@@ -133,10 +133,11 @@ pub enum Action {
     Import,
     History,
     Settings,
+    LockVault,
     Records,
 }
 impl Action {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Local,
         Self::NewHost,
         Self::Duplicate,
@@ -149,6 +150,7 @@ impl Action {
         Self::Import,
         Self::History,
         Self::Settings,
+        Self::LockVault,
         Self::Records,
     ];
     pub fn label(self, sidebar_open: bool, split: bool) -> &'static str {
@@ -167,6 +169,7 @@ impl Action {
             Self::Import => "导入 ~/.ssh/config",
             Self::History => "搜索命令历史",
             Self::Settings => "打开设置",
+            Self::LockVault => "立即锁定凭据库",
             Self::Records => "会话记录与回放",
         }
     }
@@ -319,11 +322,11 @@ pub fn samples() -> Vec<SnippetGroup> {
         ),
     ]
     .into_iter()
-    .map(|(name, items)| SnippetGroup {
+    .map(|(name, items)| SnippetGroup { id: String::new(),
         name: name.into(),
         items: items
             .into_iter()
-            .map(|(name, command)| Snippet {
+            .map(|(name, command)| Snippet { id: String::new(),
                 name: name.into(),
                 command: command.into(),
             })

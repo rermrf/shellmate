@@ -1,7 +1,7 @@
 //! Persistence for Shellmate: the SQLite host library and secret storage.
 //!
-//! Hosts and groups live in a SQLite database (never any secret); passwords and
-//! key passphrases go to the macOS keychain through [`SecretStore`].
+//! Hosts and groups live in SQLite. Credentials use the selected [`SecretStore`]:
+//! the macOS keychain or authenticated ciphertext in the same SQLite library.
 
 mod error;
 mod forwards;
@@ -17,3 +17,10 @@ pub use productivity::{Snippet, SnippetGroup, HistoryEntry, HISTORY_ENABLED, HIS
 
 mod recordings;
 pub use recordings::{Recording,Preference,Preferences};
+
+mod vault;
+pub use vault::{SharedStore, CredentialStore, VaultStore, Backend, SecurityStatus};
+pub mod bundle;
+
+mod keychain_inventory;
+pub use vault::LoginDeviceKeyStore;

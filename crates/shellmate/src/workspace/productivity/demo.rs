@@ -46,7 +46,8 @@ impl Workspace {
         for id in self.sessions.iter().map(|s|s.id).collect::<Vec<_>>(){self.finalize_archives(id,cx);}
         self.sessions.clear();
         self.active = None;
-        self.store = Rc::new(RefCell::new(store));
+        self.store = shellmate_store::SharedStore::new(store);
+        self.secrets=crate::security::fixture_coordinator(self.store.clone());
         self.reload_book(window, cx);
         let count = if scenario == "tabs" {
             7
@@ -158,7 +159,7 @@ impl Workspace {
                 cx,
             ),
             "confirm" => self.confirm_command(
-                Snippet {
+                Snippet { id: String::new(),
                     name: "负载".into(),
                     command: "uptime".into(),
                 },
@@ -166,7 +167,7 @@ impl Workspace {
                 cx,
             ),
             "confirm-risk" => self.confirm_command(
-                Snippet {
+                Snippet { id: String::new(),
                     name: "清理悬空镜像".into(),
                     command: "docker image prune -f".into(),
                 },

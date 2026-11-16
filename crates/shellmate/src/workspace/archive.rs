@@ -281,10 +281,13 @@ impl Workspace {
         cx.notify();
         Ok(())
     }
+    pub(crate) fn credentials(&self)->std::sync::Arc<shellmate_store::CredentialStore>{self.secrets.clone()}
+    pub(crate) fn refresh_bundle(&mut self,w:&mut Window,cx:&mut Context<Self>){self.reload_book(w,cx);self.refresh_snippets(cx);}
     pub(super) fn open_settings(&mut self, section: usize, window: &mut Window, cx: &mut Context<Self>) {
         crate::settings::SettingsWindow::open(
             cx.entity().downgrade(),
             self.preferences.clone(),
+            self.secrets.clone(),
             section,
             window,
             cx,

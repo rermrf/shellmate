@@ -26,6 +26,8 @@ pub trait DialogBody: Render + Sized + 'static {
     /// Enter or the primary button. Returns whether the dialog may close.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool;
 
+    fn can_cancel(&self) -> bool { true }
+
     /// Esc or the cancel button. Runs before the dialog closes.
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>);
 
@@ -42,6 +44,7 @@ pub trait DialogBody: Render + Sized + 'static {
 
     /// The cancel button was used: cancels and closes.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_cancel() { return; }
         self.cancel(window, cx);
         window.close_dialog(cx);
         window.refresh();
@@ -138,8 +141,7 @@ pub fn open<V: DialogBody>(
             .overlay_closable(false)
             .on_ok(move |_, window, cx| on_ok.update(cx, |body, cx| body.confirm(window, cx)))
             .on_cancel(move |_, window, cx| {
-                on_cancel.update(cx, |body, cx| body.cancel(window, cx));
-                true
+                on_cancel.update(cx, |body, cx| { if !body.can_cancel() { return false; } body.cancel(window, cx); true })
             })
             .map(|d| if records || settings { fixed_shell(d, body.clone(), custom_height) } else { d.child(body.clone()) })
     });

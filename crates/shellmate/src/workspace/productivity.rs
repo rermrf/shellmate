@@ -99,6 +99,7 @@ impl Workspace {
                 Action::Theme => self.toggle_theme(&ToggleTheme, window, cx),
                 Action::Sidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
                 Action::Import => self.open_import(window, cx),
+                Action::LockVault => {self.secrets.lock();window.push_notification(Notification::info("凭据库已锁定；运行中的连接不受影响"),cx);},
                 Action::Settings => self.open_settings(0,window,cx),
                 Action::Records => self.open_records(None,false,window,cx),
                 Action::History => self.open_history(window, cx),

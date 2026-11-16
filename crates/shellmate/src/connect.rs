@@ -33,6 +33,7 @@ pub struct Answer {
 
 /// What the SSH task wants from the UI, in the order it happened.
 pub enum UiMsg {
+    VaultUnlock { reason: &'static str, reply: oneshot::Sender<bool> },
     /// Progress to print in the terminal.
     Event(ConnectEvent),
     /// Trust this host key?
@@ -194,6 +195,13 @@ enum Candidate {
 }
 
 impl UiBridge {
+    async fn unlock_store(&self, store: &dyn SecretStore, reason: &'static str) -> Result<(), SshError> {
+        if !store.is_locked() { return Ok(()); }
+        let (reply, answer)=oneshot::channel();
+        self.tx.send(UiMsg::VaultUnlock { reason, reply }).await.map_err(|_|SshError::AuthCancelled)?;
+        if answer.await.unwrap_or(false) { Ok(()) } else { Err(SshError::AuthCancelled) }
+    }
+
     /// A bridge for the hosts of one route; messages go to `tx`.
     pub fn new(
         tx: async_channel::Sender<UiMsg>,
@@ -418,18 +426,22 @@ pub fn build_route(
     secrets: &dyn SecretStore,
     default_user: &str,
 ) -> Result<(Route, HashMap<Endpoint, Secret>), SshError> {
+    if secrets.is_locked() { return Err(SshError::Unsupported("凭据库已锁定，请重新解锁后连接".into())); }
     let mut known = HashMap::new();
+    let mut storage_error=None;
+    let mut read=|key:&SecretKey|match secrets.get(key){Ok(secret)=>secret,Err(e)=>{storage_error=Some(e.to_string());None}};
     let route = Route::from_hosts(chain, default_user, |host| {
-        let password = secrets.get(&SecretKey::HostPassword(host.id.clone())).ok().flatten();
+        let password = read(&SecretKey::HostPassword(host.id.clone()));
         let passphrase = host
             .identity_file
             .as_ref()
-            .and_then(|path| secrets.get(&SecretKey::KeyPassphrase(path.clone())).ok().flatten());
+            .and_then(|path| read(&SecretKey::KeyPassphrase(path.clone())));
         if let Some(password) = &password {
             known.insert(Endpoint::of(host, default_user), password.clone());
         }
         HostSecrets { password, passphrase }
     })?;
+    if let Some(error)=storage_error { return Err(SshError::Unsupported(error)); }
     Ok((route, known))
 }
 
@@ -469,6 +481,7 @@ pub async fn connect_attempt(
     tabs: Vec<(usize, PtyDims)>,
 ) -> Result<Connected, ConnectFailure> {
     let attempt = async {
+        bridge.unlock_store(secrets.as_ref(),"连接主机").await?;
         let user = default_user();
         let (mut route, mut known) = {
             let (chain, secrets, user) = (chain.clone(), secrets.clone(), user.clone());
@@ -518,6 +531,7 @@ pub async fn test_connection(
 ) -> Result<(Option<AuthMethod>, SaveReport), ConnectFailure> {
     let mosh=chain.last().is_some_and(|h|h.protocol==shellmate_core::Protocol::Mosh);
     let attempt = async {
+        bridge.unlock_store(secrets.as_ref(),"测试连接").await?;
         if mosh {
             shellmate_ssh::mosh::validate_direct(chain.len()!=1 || !chain[0].jump.is_empty()).map_err(SshError::Unsupported)?;
             shellmate_ssh::mosh::find_client().map_err(SshError::Unsupported)?;
@@ -549,6 +563,9 @@ async fn persist_confirmed(bridge: &UiBridge, secrets: Arc<dyn SecretStore>) -> 
     let saves = bridge.take_confirmed_saves();
     if saves.is_empty() {
         return SaveReport::default();
+    }
+    if bridge.unlock_store(secrets.as_ref(),"保存凭据").await.is_err() {
+        return SaveReport { saved:Vec::new(),errors:vec!["已取消解锁，凭据未保存".into()] };
     }
     tokio::task::spawn_blocking(move || {
         let mut report = SaveReport::default();
@@ -1288,4 +1305,16 @@ mod tests {
         );
         assert!(saved(&bridge).is_empty());
     }
+    #[tokio::test]
+    async fn locked_store_unlock_cancel_aborts_before_reading_credentials() {
+        let manager=crate::security::fixture_coordinator(shellmate_store::SharedStore::new(shellmate_store::HostStore::open_in_memory().unwrap()));
+        manager.switch_to_master("Master9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).unwrap();manager.lock();
+        let(bridge,rx)=bridge_for(&[]);let task_bridge=bridge.clone();let task_manager=manager.clone();
+        let task=tokio::spawn(async move{task_bridge.unlock_store(task_manager.as_ref(),"连接主机").await});
+        let UiMsg::VaultUnlock{reason,reply}=rx.recv().await.unwrap()else{panic!("expected unlock")};assert_eq!(reason,"连接主机");reply.send(false).unwrap();assert!(matches!(task.await.unwrap(),Err(SshError::AuthCancelled)));assert!(manager.is_locked());
+        assert!(build_route(&[Host::new("web","example.test")],manager.as_ref(),"me").is_err());
+        let task_bridge=bridge.clone();let task_manager=manager.clone();let task=tokio::spawn(async move{task_bridge.unlock_store(task_manager.as_ref(),"测试连接").await});
+        let UiMsg::VaultUnlock{reply,..}=rx.recv().await.unwrap()else{panic!("expected unlock")};manager.unlock("Master9!Meadow").unwrap();reply.send(true).unwrap();task.await.unwrap().unwrap();assert!(!manager.is_locked());
+    }
+
 }

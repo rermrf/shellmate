@@ -19,8 +19,8 @@ use gpui::{
     px,
 };
 use shellmate_core::HostBook;
-use shellmate_store::{HistoryEntry, HostStore, Snippet, SnippetGroup};
-use std::{cell::RefCell, rc::Rc};
+use shellmate_store::{HistoryEntry, Snippet, SnippetGroup};
+use std::rc::Rc;
 
 actions!(productivity, [PickUp, PickDown, PickConfirm, PickClose]);
 pub fn init(cx: &mut App) {
@@ -56,7 +56,7 @@ pub struct PaletteData {
 enum Source {
     Palette(PaletteData),
     History {
-        store: Rc<RefCell<HostStore>>,
+        store: shellmate_store::SharedStore,
         host: Option<String>,
         current: bool,
     },
@@ -77,7 +77,7 @@ impl Picker {
         Self::new(Source::Palette(data), query, window, cx)
     }
     pub fn history(
-        store: Rc<RefCell<HostStore>>,
+        store: shellmate_store::SharedStore,
         host: Option<String>,
         current: bool,
         window: &mut Window,
@@ -179,7 +179,7 @@ impl Picker {
     fn pick(&mut self, cx: &mut Context<Self>) {
         let choice = if self.is_history() {
             self.history.get(self.selected).map(|h| {
-                Choice::Command(Snippet {
+                Choice::Command(Snippet { id: String::new(),
                     name: "历史命令".into(),
                     command: h.command.clone(),
                 })
@@ -934,19 +934,21 @@ impl Render for Confirmation {
 }
 
 struct EditGroup {
+    id: String,
+    item_ids: Vec<String>,
     name: Entity<InputState>,
     items: Vec<(Entity<InputState>, Entity<InputState>)>,
 }
 pub struct Manager {
     groups: Vec<EditGroup>,
-    store: Rc<RefCell<HostStore>>,
+    store: shellmate_store::SharedStore,
     workspace: gpui::WeakEntity<crate::workspace::Workspace>,
     error: Option<String>,
 }
 impl Manager {
     pub fn open(
         groups: Vec<SnippetGroup>,
-        store: Rc<RefCell<HostStore>>,
+        store: shellmate_store::SharedStore,
         workspace: gpui::WeakEntity<crate::workspace::Workspace>,
         window: &mut Window,
         cx: &mut App,
@@ -966,12 +968,12 @@ impl Manager {
     fn values(&self, cx: &App) -> Vec<SnippetGroup> {
         self.groups
             .iter()
-            .map(|g| SnippetGroup {
+            .map(|g| SnippetGroup { id: g.id.clone(),
                 name: g.name.read(cx).value().to_string(),
                 items: g
                     .items
                     .iter()
-                    .map(|(n, c)| Snippet {
+                    .enumerate().map(|(i, (n, c))| Snippet { id: g.item_ids[i].clone(),
                         name: n.read(cx).value().to_string(),
                         command: c.read(cx).value().to_string(),
                     })
@@ -984,6 +986,8 @@ impl Manager {
         self.groups = groups
             .into_iter()
             .map(|g| EditGroup {
+                id: g.id,
+                item_ids: g.items.iter().map(|s|s.id.clone()).collect(),
                 name: input(g.name),
                 items: g
                     .items
@@ -1164,7 +1168,7 @@ impl Render for Manager {
                 cx.listener(move |this, _, w, cx| {
                     this.edit(
                         |gs| {
-                            gs[g].items.push(Snippet {
+                            gs[g].items.push(Snippet { id: String::new(),
                                 name: "新命令".into(),
                                 command: String::new(),
                             })
@@ -1185,7 +1189,7 @@ impl Render for Manager {
                     .on_click(cx.listener(|this, _, w, cx| {
                         this.edit(
                             |gs| {
-                                gs.push(SnippetGroup {
+                                gs.push(SnippetGroup { id: String::new(),
                                     name: "新分组".into(),
                                     items: vec![],
                                 })
