@@ -324,6 +324,7 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
         let Some((point, side)) = self.grid_point(event.position, cx) else { return };
         let ty = match event.click_count {
             2 => SelectionType::Semantic,
@@ -371,6 +372,7 @@ impl TerminalView {
 
     fn right_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
         if self.right_click_paste {
             self.paste_clipboard(cx);
         }

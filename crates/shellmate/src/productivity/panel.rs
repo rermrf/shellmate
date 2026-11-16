@@ -1,5 +1,6 @@
 //! Palette, history picker, quick-command drawer, and editable confirmation/management dialogs.
 use super::model::{self, Choice, Item, SessionItem};
+use super::{broadcast::BroadcastView, multi::SendRequest};
 use crate::{
     dialogs::{self, DialogBody, Tone, button, field, hint, stack},
     theme::{ActivePalette, MONO_FONT},
@@ -41,6 +42,8 @@ pub enum Event {
     Manage,
     Samples,
     Send(Snippet),
+    Broadcast(bool),
+    CheckSession(usize),
 }
 
 pub struct PaletteData {
@@ -49,6 +52,7 @@ pub struct PaletteData {
     pub active: Option<usize>,
     pub snippets: Vec<SnippetGroup>,
     pub sidebar_open: bool,
+    pub split: bool,
 }
 enum Source {
     Palette(PaletteData),
@@ -131,6 +135,7 @@ impl Picker {
                     data.active,
                     &data.snippets,
                     data.sidebar_open,
+                    data.split,
                 )
             }
             Source::History { store, host, current } => match store.borrow().history(
@@ -456,6 +461,7 @@ fn time_label(time: i64) -> String {
 
 pub struct Drawer {
     pub groups: Vec<SnippetGroup>,
+    pub broadcast: BroadcastView,
 }
 impl EventEmitter<Event> for Drawer {}
 impl Render for Drawer {
@@ -463,9 +469,8 @@ impl Render for Drawer {
         let p = cx.palette().clone();
         let mut body = div()
             .id("commands-drawer")
-            .w(px(300.))
-            .flex_none()
-            .h_full()
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .p(px(16.))
             .flex()
@@ -567,17 +572,112 @@ impl Render for Drawer {
             }
             body = body.child(section);
         }
-        body
+        let mut broadcast = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(16.))
+            .rounded(px(18.))
+            .bg(p.card)
+            .shadow(card_shadow(&p))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("广播输入"),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.))
+                                    .text_size(px(12.))
+                                    .text_color(p.tx2)
+                                    .child("同一条命令同时发往勾选的会话"),
+                            ),
+                    )
+                    .child(
+                        gpui::component::switch::Switch::new("broadcast-enabled")
+                            .checked(self.broadcast.state.enabled)
+                            .color(p.ok)
+                            .on_click(
+                                cx.listener(|_, enabled: &bool, _, cx| cx.emit(Event::Broadcast(*enabled))),
+                            ),
+                    ),
+            );
+        let mut sessions = div()
+            .id("broadcast-session-list")
+            .max_h(px(240.))
+            .overflow_y_scroll();
+        for row in &self.broadcast.sessions {
+            let id = row.id;
+            let checked = self.broadcast.state.checked.contains(&id);
+            sessions = sessions.child(
+                div()
+                    .id(("broadcast-check", id))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .py(px(8.))
+                    .rounded(px(10.))
+                    .when(!row.connected(), |d| d.opacity(0.5))
+                    .when(row.connected(), |d| d.cursor_pointer().hover(|d| d.bg(p.card2)))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(Event::CheckSession(id))))
+                    .child(
+                        div()
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(if checked { p.acc } else { p.tx3 })
+                            .when(checked, |d| d.bg(p.acc))
+                            .text_color(gpui::white())
+                            .text_size(px(12.))
+                            .child(if checked { "✓" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .child(row.title.clone()),
+                    )
+                    .child(div().text_size(px(11.5)).text_color(p.tx2).child(row.subtitle())),
+            );
+        }
+        broadcast = broadcast.child(sessions);
+        div()
+            .w(px(300.))
+            .flex_none()
+            .h_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(broadcast)
+            .child(body)
     }
 }
 
+type TargetAvailable = Box<dyn Fn(usize, &App) -> bool>;
 type SendCommand = Box<dyn Fn(&str, &mut Window, &mut App) -> Result<(), String>>;
 
 pub struct Confirmation {
     input: Entity<InputState>,
-    label: String,
-    production: bool,
-    available: Box<dyn Fn(&App) -> bool>,
+    request: SendRequest,
+    available: TargetAvailable,
     send: SendCommand,
     error: Option<String>,
     sent: bool,
@@ -586,13 +686,11 @@ pub struct Confirmation {
 impl Confirmation {
     pub fn open(
         command: Snippet,
-        label: String,
-        production: bool,
+        request: SendRequest,
         workspace: &Entity<crate::workspace::Workspace>,
-        session: Option<usize>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Entity<Self> {
         let weak = workspace.downgrade();
         let check = weak.clone();
         let body = cx.new(|cx| {
@@ -609,15 +707,14 @@ impl Confirmation {
             ];
             Self {
                 input,
-                label,
-                production,
-                available: Box::new(move |cx| {
+                request: request.clone(),
+                available: Box::new(move |id, cx| {
                     check
                         .upgrade()
-                        .is_some_and(|w| w.read(cx).command_available(session, cx))
+                        .is_some_and(|w| w.read(cx).command_available(Some(id), cx))
                 }),
                 send: Box::new(move |text, window, cx| {
-                    weak.update(cx, |w, cx| w.send_reviewed(session, text, window, cx))
+                    weak.update(cx, |w, cx| w.send_reviewed(&request, text, window, cx))
                         .unwrap_or_else(|_| Err("会话已关闭".into()))
                 }),
                 error: None,
@@ -625,6 +722,7 @@ impl Confirmation {
                 _subscriptions: subscriptions,
             }
         });
+        let opened = body.clone();
         let first = std::cell::Cell::new(true);
         use gpui::component::WindowExt as _;
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -654,7 +752,7 @@ impl Confirmation {
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::NORMAL)
                                 .text_color(p.tx2)
-                                .child("发送到当前会话"),
+                                .child(body.read(cx).mode(cx)),
                         ),
                 )
                 .close_button(false)
@@ -666,6 +764,21 @@ impl Confirmation {
                 })
                 .child(body.clone())
         });
+        opened
+    }
+    fn count(&self, cx: &App) -> usize {
+        self.request
+            .targets
+            .iter()
+            .filter(|t| (self.available)(t.id, cx))
+            .count()
+    }
+    fn mode(&self, cx: &App) -> String {
+        if self.request.broadcast {
+            format!("广播到 {} 个会话", self.count(cx))
+        } else {
+            "发送到当前会话".into()
+        }
     }
 }
 impl DialogBody for Confirmation {
@@ -678,7 +791,7 @@ impl DialogBody for Confirmation {
             return true;
         }
         let value = self.input.read(cx).value().to_string();
-        if value.trim().is_empty() || !(self.available)(cx) {
+        if value.trim().is_empty() || self.count(cx) == 0 {
             return false;
         }
         match (self.send)(&value, window, cx) {
@@ -698,7 +811,12 @@ impl Render for Confirmation {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let risky = model::risky(&self.input.read(cx).value());
-        let available = (self.available)(cx);
+        let available = self.count(cx) > 0;
+        let production = self
+            .request
+            .targets
+            .iter()
+            .any(|t| t.production && (self.available)(t.id, cx));
         stack()
             .child(
                 div()
@@ -714,35 +832,42 @@ impl Render for Confirmation {
                     .child(Input::new(&self.input).appearance(false)),
             )
             .child(
-                div().flex().gap(px(6.)).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .px(px(10.))
-                        .h(px(28.))
-                        .rounded(px(9.))
-                        .bg(p.card2)
-                        .text_size(px(12.5))
-                        .child(self.label.clone())
-                        .when(self.production, |d| {
-                            d.child(
-                                div()
-                                    .px(px(6.))
-                                    .rounded(px(5.))
-                                    .bg(p.accs)
-                                    .text_color(p.acc)
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("生产"),
-                            )
-                        }),
-                ),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .children(self.request.targets.iter().map(|target| {
+                        let connected = (self.available)(target.id, cx);
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(10.))
+                            .h(px(28.))
+                            .rounded(px(9.))
+                            .bg(p.card2)
+                            .text_size(px(12.5))
+                            .when(!connected, |d| d.opacity(0.5))
+                            .child(target.title.clone())
+                            .when(target.production, |d| {
+                                d.child(
+                                    div()
+                                        .px(px(6.))
+                                        .rounded(px(5.))
+                                        .bg(p.accs)
+                                        .text_color(p.acc)
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("生产"),
+                                )
+                            })
+                            .when(!connected, |d| d.child("离线 · 将跳过"))
+                    })),
             )
             .when(risky, |d| {
                 d.child(dialogs::notice(
                     dialogs::Notice::Error,
-                    if self.production {
+                    if production {
                         "会修改系统状态，且目标包含生产环境主机。请再次核对命令和目标。"
                     } else {
                         "该命令会修改系统状态，请核对后执行。"

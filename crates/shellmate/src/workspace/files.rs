@@ -435,7 +435,7 @@ impl Workspace {
             (Some(files), _, _, Panel::Files) => files.panel.focus_handle(cx),
             (_, Some(forward), _, Panel::Forward) => forward.panel.focus_handle(cx),
             (_, _, Some(monitor), Panel::Monitor) => monitor.panel.focus_handle(cx),
-            _ => session.view.focus_handle(cx),
+            _ => self.focused_session().unwrap_or(session).view.focus_handle(cx),
         };
         window.focus(&handle, cx);
     }

@@ -47,7 +47,22 @@ impl Workspace {
         self.active = None;
         self.store = Rc::new(RefCell::new(store));
         self.reload_book(window, cx);
-        for host in self.book.hosts.iter().take(2).cloned().collect::<Vec<_>>() {
+        let count = if scenario == "tabs" {
+            7
+        } else if scenario.starts_with("broadcast-") || scenario == "split-menu" {
+            3
+        } else {
+            2
+        };
+        let mut demo_hosts = self.book.hosts.iter().take(count).cloned().collect::<Vec<_>>();
+        while demo_hosts.len() < count {
+            demo_hosts.push(Host::new(format!("dev-box-{}", demo_hosts.len()), "demo.invalid"));
+        }
+        if scenario == "broadcast-confirm" {
+            demo_hosts[1].group = Some(staging.id.clone());
+            demo_hosts[1].name = "staging-api".into();
+        }
+        for host in demo_hosts {
             let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette.clone(), cx));
             let title = host.name.clone();
             terminal.update(cx, |t, cx| { t.attach(|sink: OutputSink, _| {
@@ -159,8 +174,60 @@ impl Workspace {
             ),
             "history" => self.open_history_scope(false, window, cx),
             "history-host" => self.open_history_scope(true, window, cx),
+            "broadcast-off" => {
+                self.commands_open = true;
+            }
+            "broadcast-on" | "broadcast-suggestions" | "broadcast-confirm" => {
+                self.broadcast.checked = self.sessions.iter().map(|s| s.id).collect();
+                if let SessionKind::Ssh(ssh) = &mut self.sessions[2].kind {
+                    ssh.status = ssh::SshStatus::Reconnecting(2);
+                }
+                self.set_broadcast(true, window, cx);
+                if scenario == "broadcast-suggestions" {
+                    self.broadcast_bar.update(cx, |b, cx| {
+                        b.set_text("docker", window, cx);
+                        b.focus(window, cx);
+                    });
+                }
+                if scenario == "broadcast-confirm" {
+                    self.submit_broadcast("docker image prune -f", window, cx);
+                }
+            }
+            "split-right" | "split-vertical" | "split-menu" => {
+                self.toggle_split(window, cx);
+                self.focus_pane(crate::productivity::multi::Pane::Other, window, cx);
+                if scenario == "split-vertical" {
+                    self.flip_split(window, cx);
+                }
+                if scenario == "split-menu" {
+                    self.open_session_menu(
+                        crate::productivity::session_menu::Kind::Split,
+                        gpui::point(window.viewport_size().width * 0.6, px(148.)),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "tabs" => {
+                for (ix, status) in [
+                    (4, ssh::SshStatus::Reconnecting(2)),
+                    (5, ssh::SshStatus::Failed),
+                    (6, ssh::SshStatus::Ended),
+                ] {
+                    if let SessionKind::Ssh(ssh) = &mut self.sessions[ix].kind {
+                        ssh.status = status;
+                    }
+                }
+                self.open_session_menu(
+                    crate::productivity::session_menu::Kind::Tabs,
+                    gpui::point(window.viewport_size().width - px(500.), px(50.)),
+                    window,
+                    cx,
+                );
+            }
             _ => log::warn!("unknown productivity demo scenario"),
         }
+        self.sync_productivity(cx);
         cx.notify();
     }
 }

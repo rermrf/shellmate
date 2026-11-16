@@ -6,12 +6,18 @@ pub(crate) fn send(
     mode: &TermMode,
     mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
 ) -> Result<(), &'static str> {
-    if command.contains(['\n', '\r']) && !mode.contains(TermMode::BRACKETED_PASTE) {
-        return Err("当前终端未启用括号粘贴，无法安全发送多行命令");
-    }
+    validate(command, mode)?;
     let paste = crate::keys::paste_payload(command, mode);
     write(paste.as_bytes()).map_err(|_| "命令粘贴失败，未发送回车")?;
     write(b"\r").map_err(|_| "回车发送失败，请检查会话状态")
+}
+
+/// Preflight a fan-out before any target receives bytes.
+pub(crate) fn validate(command: &str, mode: &TermMode) -> Result<(), &'static str> {
+    if command.contains(['\n', '\r']) && !mode.contains(TermMode::BRACKETED_PASTE) {
+        return Err("当前终端未启用括号粘贴，无法安全发送多行命令");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

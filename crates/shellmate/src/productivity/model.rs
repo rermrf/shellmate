@@ -124,6 +124,7 @@ pub enum Action {
     Local,
     NewHost,
     Duplicate,
+    Split,
     Files,
     Monitor,
     Forward,
@@ -133,10 +134,11 @@ pub enum Action {
     History,
 }
 impl Action {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Local,
         Self::NewHost,
         Self::Duplicate,
+        Self::Split,
         Self::Files,
         Self::Monitor,
         Self::Forward,
@@ -145,11 +147,13 @@ impl Action {
         Self::Import,
         Self::History,
     ];
-    pub fn label(self, sidebar_open: bool) -> &'static str {
+    pub fn label(self, sidebar_open: bool, split: bool) -> &'static str {
         match self {
             Self::Local => "打开本地终端",
             Self::NewHost => "新建连接",
             Self::Duplicate => "复制当前会话",
+            Self::Split if split => "取消分屏",
+            Self::Split => "分屏",
             Self::Files => "打开文件面板",
             Self::Monitor => "打开监控",
             Self::Forward => "打开端口转发",
@@ -201,6 +205,7 @@ pub fn palette(
     active: Option<usize>,
     snippets: &[SnippetGroup],
     sidebar_open: bool,
+    split: bool,
 ) -> Vec<Item> {
     let empty = query.trim().is_empty();
     let mut items = Vec::new();
@@ -260,10 +265,10 @@ pub fn palette(
         .collect();
     let actions: Vec<_> = Action::ALL
         .into_iter()
-        .take(if empty { 5 } else { 10 })
+        .take(if empty { 5 } else { 11 })
         .map(|a| Item {
             group: "操作",
-            title: a.label(sidebar_open).into(),
+            title: a.label(sidebar_open, split).into(),
             detail: String::new(),
             hint: a.shortcut().into(),
             choice: Choice::Action(a),
@@ -437,16 +442,16 @@ mod tests {
             h.last_connected_at = Some(i as i64);
         }
         let book = HostBook::new(vec![], hosts);
-        let rows = palette("", &book, &[], None, &samples(), true);
+        let rows = palette("", &book, &[], None, &samples(), true, false);
         assert_eq!(rows[0].title, "prod-19");
         assert_eq!(rows.iter().filter(|i| i.group == "最近主机").count(), 4);
-        assert_eq!(palette("prd", &book, &[], None, &[], true).len(), 12);
+        assert_eq!(palette("prd", &book, &[], None, &[], true, false).len(), 12);
         assert_eq!(
-            palette("root@new:2222", &book, &[], None, &[], true)[0].group,
+            palette("root@new:2222", &book, &[], None, &[], true, false)[0].group,
             "快速连接"
         );
         assert_eq!(
-            palette("upt", &book, &[], None, &samples(), true)[0].group,
+            palette("upt", &book, &[], None, &samples(), true, false)[0].group,
             "快捷命令"
         );
         assert!(fuzzy("xx", "prod").is_none());

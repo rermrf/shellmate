@@ -188,10 +188,15 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let (cell_width, line_height) = self.cell_metrics(window);
-        let cols = ((bounds.size.width / cell_width).floor() as u16).max(2);
-        let rows = ((bounds.size.height / line_height).floor() as u16).max(1);
-        let grid = TerminalSize { cols, rows, cell_width, line_height };
-        self.terminal.update(cx, |t, _| t.set_size(grid));
+        let grid = TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height);
+        let (cols, rows) = (grid.cols, grid.rows);
+        if self.terminal.read(cx).size()!=grid {
+            self.terminal.update(cx, |t, cx| {
+                t.set_size(grid);
+                let terminal=cx.entity();
+                cx.defer(move |cx|terminal.update(cx,|_,cx|cx.emit(crate::TerminalEvent::SizeChanged)));
+            });
+        }
         self.view.update(cx, |v, _| v.geometry = Some(Geometry { origin: bounds.origin, size: grid }));
 
         let palette = &self.style.palette;

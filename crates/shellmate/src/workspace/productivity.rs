@@ -2,9 +2,11 @@
 use super::*;
 #[cfg(debug_assertions)]
 mod demo;
+#[cfg(debug_assertions)]
+mod live;
 use crate::productivity::{
     model::{self, Action, Choice, SessionItem},
-    panel::{Confirmation, Drawer, Event, Manager, PaletteData, Picker},
+    panel::{Drawer, Event, Manager, PaletteData, Picker},
 };
 use shellmate_store::{HistoryEntry, Snippet};
 
@@ -17,6 +19,7 @@ impl Workspace {
             }),
             Err(_) => log::warn!("could not read quick commands"),
         }
+        self.refresh_suggestions(cx);
         cx.notify();
     }
 
@@ -39,6 +42,7 @@ impl Workspace {
             active: self.active.and_then(|i| self.sessions.get(i)).map(|s| s.id),
             snippets: self.commands.read(cx).groups.clone(),
             sidebar_open: self.sidebar_open,
+            split: self.split.other.is_some(),
         };
         let picker = cx.new(|cx| Picker::palette(data, query, window, cx));
         self.install_picker(picker, window, cx);
@@ -49,8 +53,7 @@ impl Workspace {
     fn open_history_scope(&mut self, current: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.show_panel(Panel::Terminal, window, cx);
         let host = self
-            .active
-            .and_then(|i| self.sessions.get(i))
+            .focused_session()
             .map(|s| s.ssh().map_or_else(|| "local".into(), |s| s.host.id.to_string()));
         let picker = cx.new(|cx| Picker::history(self.store.clone(), host, current, window, cx));
         self.install_picker(picker, window, cx);
@@ -88,6 +91,7 @@ impl Workspace {
             Choice::Action(action) => match action {
                 Action::Local => self.open_local(window, cx),
                 Action::NewHost => self.new_host(window, cx),
+                Action::Split => self.toggle_split(window, cx),
                 Action::Duplicate => self.duplicate_active(window, cx),
                 Action::Files => self.show_panel(Panel::Files, window, cx),
                 Action::Monitor => self.show_panel(Panel::Monitor, window, cx),
@@ -107,6 +111,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
+            Event::Broadcast(enabled) => self.set_broadcast(*enabled, window, cx),
+            Event::CheckSession(id) => {
+                self.broadcast.toggle(*id, &self.session_rows(cx));
+                self.sync_productivity(cx);
+                cx.notify();
+            }
             Event::Send(command) => self.confirm_command(command.clone(), window, cx),
             Event::Manage => Manager::open(
                 self.commands.read(cx).groups.clone(),
@@ -126,19 +136,13 @@ impl Workspace {
         }
     }
     fn confirm_command(&mut self, command: Snippet, window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.active.and_then(|i| self.sessions.get(i));
-        let id = session.map(|s| s.id);
-        let label = session.map_or_else(|| "无会话".into(), |s| s.title.to_string());
-        let production = session.and_then(Session::ssh).is_some_and(|s| {
-            let group = s
-                .host
-                .group
-                .as_ref()
-                .and_then(|id| self.book.group(id))
-                .map_or("", |g| g.name.as_str());
-            model::production(group, &s.host.tags)
-        });
-        Confirmation::open(command, label, production, &cx.entity(), id, window, cx);
+        let ids = if self.broadcast.enabled {
+            self.broadcast.targets(&self.session_rows(cx))
+        } else {
+            self.focused_session().map(|s| s.id).into_iter().collect()
+        };
+        let request = self.send_request(ids, self.broadcast.enabled, false);
+        self.open_confirmation(command, request, window, cx);
     }
     pub(crate) fn command_available(&self, id: Option<usize>, cx: &App) -> bool {
         self.sessions.iter().find(|s| Some(s.id) == id).is_some_and(|s| {
@@ -149,28 +153,77 @@ impl Workspace {
     }
     pub(crate) fn send_reviewed(
         &mut self,
-        id: Option<usize>,
+        request: &crate::productivity::multi::SendRequest,
         command: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if !self.command_available(id, cx) {
-            return Err("会话未连接，无法发送".into());
+        let checked = request.targets.iter().map(|t| t.id).collect();
+        let ids = crate::productivity::multi::connected_targets(&checked, &self.session_rows(cx));
+        if ids.is_empty() {
+            return Err("没有已连接的目标会话，无法发送".into());
         }
-        let ix = self
-            .sessions
-            .iter()
-            .position(|s| Some(s.id) == id)
-            .ok_or("会话已关闭")?;
-        self.sessions[ix]
-            .terminal
-            .update(cx, |t, _| t.send_command(command))
-            .map_err(str::to_string)?;
-        self.activate(ix, window, cx);
+        // Validate every currently connected target before writing to the first one.
+        for id in &ids {
+            if let Some(session) = self.sessions.iter().find(|s| s.id == *id) {
+                session
+                    .terminal
+                    .read(cx)
+                    .validate_command(command)
+                    .map_err(|error| format!("{}：{error}", session.title))?;
+            }
+        }
+        let mut failed = Vec::new();
+        let mut sent = 0;
+        let results = crate::productivity::multi::fan_out(&ids, |id| {
+            let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+                return Err("会话已关闭");
+            };
+            #[cfg(debug_assertions)]
+            if self.live_review {
+                log::info!("p6live send → {}", session.title);
+            }
+            session.terminal.update(cx, |t, _| t.send_command(command))
+        });
+        for (id, result) in results {
+            if result.is_ok() {
+                sent += 1;
+            } else if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+                failed.push(session.title.to_string());
+            }
+        }
+        // Do not offer to retry a partial fan-out: a failed return can follow a successful paste.
+        if !failed.is_empty() {
+            window.push_notification(
+                Notification::error(format!("发送失败：{}；请检查目标会话后再操作", failed.join("、"))),
+                cx,
+            );
+        }
+        if sent > 0 && request.clear_input {
+            self.broadcast_bar.update(cx, |b, cx| b.clear(window, cx));
+        }
+        if !request.broadcast
+            && let Some(target) = request.targets.first()
+        {
+            if self.split.other == Some(target.id) {
+                self.split.focus = crate::productivity::multi::Pane::Other;
+            } else if self.main_id() != Some(target.id)
+                && let Some(ix) = self.sessions.iter().position(|s| s.id == target.id)
+            {
+                self.activate(ix, window, cx);
+            }
+        }
         self.show_panel(Panel::Terminal, window, cx);
         Ok(())
     }
-    pub(super) fn save_command_history(&mut self, id: usize, command: &str, cwd: Option<String>, time: i64) {
+    pub(super) fn save_command_history(
+        &mut self,
+        id: usize,
+        command: &str,
+        cwd: Option<String>,
+        time: i64,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
@@ -188,6 +241,9 @@ impl Workspace {
         };
         if self.store.borrow_mut().add_history(&entry).is_err() {
             log::warn!("could not save command history");
+        }
+        if self.broadcast.enabled {
+            self.refresh_suggestions(cx);
         }
     }
 }

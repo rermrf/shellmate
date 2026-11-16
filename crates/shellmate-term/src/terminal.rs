@@ -48,6 +48,13 @@ impl Default for TerminalSize {
 }
 
 impl TerminalSize {
+    /// Grid dimensions from the actual terminal content rectangle, excluding pane chrome/padding.
+    pub fn from_geometry(width: f32, height: f32, cell_width: Pixels, line_height: Pixels) -> Self {
+        let cols = (width.max(0.) / f32::from(cell_width).max(1.)).floor().clamp(2., u16::MAX as f32) as u16;
+        let rows = (height.max(0.) / f32::from(line_height).max(1.)).floor().clamp(1., u16::MAX as f32) as u16;
+        Self { cols, rows, cell_width, line_height }
+    }
+
     /// The size as PTY dimensions (cells and pixels).
     pub fn dims(&self) -> PtyDims {
         PtyDims {
@@ -129,6 +136,10 @@ pub enum TerminalEvent {
     /// A command read from the primary screen, after privacy filtering.
     Command { command: String, cwd: Option<String>, time: i64 },
     HistoryRequested,
+    /// The user focused this terminal view.
+    Focused,
+    /// The painted content rectangle changed the PTY dimensions.
+    SizeChanged,
 }
 
 /// Why the attached backend is no longer running.
@@ -514,11 +525,15 @@ impl Terminal {
         self.input(paste_payload(text, &mode).as_bytes());
     }
 
+    /// Checks connection and paste mode before a multi-target send starts.
+    pub fn validate_command(&self, command: &str) -> Result<(), &'static str> {
+        if self.backend.is_none() || self.ended.is_some() { return Err("会话未连接，无法发送"); }
+        crate::send::validate(command, &self.mode())
+    }
+
     /// Sends a reviewed command as a paste followed by a separate carriage return.
     pub fn send_command(&mut self, command: &str) -> Result<(), &'static str> {
-        if self.backend.is_none() || self.ended.is_some() {
-            return Err("会话未连接，无法发送");
-        }
+        self.validate_command(command)?;
         crate::send::send(command, &self.mode(), |bytes| self.try_input(bytes))
     }
 
@@ -693,6 +708,18 @@ fn regex_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{end_hint, regex_escape};
+
+    #[test]
+    fn geometry_drives_full_split_flipped_and_resized_pty_dimensions() {
+        let grid = |w, h| super::TerminalSize::from_geometry(w, h, gpui::px(8.), gpui::px(20.)).dims();
+        // Width/height here are each terminal element's measured content area.
+        assert_eq!((grid(960.,600.).cols,grid(960.,600.).rows),(120,30));
+        assert_eq!((grid(480.,600.).cols,grid(480.,600.).rows),(60,30));
+        assert_eq!((grid(960.,300.).cols,grid(960.,300.).rows),(120,15));
+        assert_eq!((grid(400.,240.).cols,grid(400.,240.).rows),(50,12));
+        assert_eq!((grid(0.,-1.).cols,grid(0.,-1.).rows),(2,1));
+        assert_eq!((grid(479.9,299.9).cols,grid(479.9,299.9).rows),(59,14));
+    }
 
     #[test]
     fn the_enter_hint_is_left_out_when_a_reconnect_follows() {

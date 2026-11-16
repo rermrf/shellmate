@@ -34,6 +34,7 @@ mod group;
 mod hosts;
 mod monitor;
 mod productivity;
+mod multi;
 mod ssh;
 
 actions!(
@@ -59,6 +60,8 @@ const SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
 
 pub fn init(cx: &mut App) {
     crate::productivity::panel::init(cx);
+    crate::productivity::broadcast::init(cx);
+    crate::productivity::session_menu::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewLocalTerminal, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-t", DuplicateSession, Some(CONTEXT)),
@@ -152,6 +155,15 @@ pub struct Workspace {
     temporary_hosts: HashMap<HostId, shellmate_core::Host>,
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
+    broadcast: crate::productivity::multi::Broadcast,
+    broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
+    split: crate::productivity::multi::Split,
+    recent_sessions: Vec<usize>,
+    session_menu: Option<multi::OpenSessionMenu>,
+    #[cfg(debug_assertions)]
+    review_confirmation: Option<gpui::WeakEntity<crate::productivity::panel::Confirmation>>,
+    #[cfg(debug_assertions)]
+    live_review: bool,
     picker: Option<Entity<crate::productivity::panel::Picker>>,
     picker_subscription: Option<Subscription>,
     /// The host library is a temporary in-memory one (the saved file could not be opened): nothing
@@ -198,10 +210,13 @@ impl Workspace {
         sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(collapsed, cx));
         let commands = cx.new(|_| crate::productivity::panel::Drawer {
             groups: store.snippets().unwrap_or_default(),
+            broadcast: Default::default(),
         });
+        let broadcast_bar=cx.new(|cx|crate::productivity::broadcast::BroadcastBar::new(window,cx));
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.subscribe_in(&commands, window, Self::on_command_event),
+            cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
         ];
         let mut this = Self {
             store: Rc::new(RefCell::new(store)),
@@ -212,6 +227,9 @@ impl Workspace {
             temporary_hosts: HashMap::new(),
             commands,
             commands_open: false,
+            broadcast: Default::default(), broadcast_bar, split: Default::default(),recent_sessions:Vec::new(),session_menu:None,
+            #[cfg(debug_assertions)] review_confirmation:None,
+            #[cfg(debug_assertions)] live_review:false,
             picker: None,
             picker_subscription: None,
             library_is_temporary: store_notice.is_some(),
@@ -356,10 +374,12 @@ impl Workspace {
     ) -> Subscription {
         cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
             if let TerminalEvent::Command { command, cwd, time } = event {
-                this.save_command_history(id, command, cwd.clone(), *time);
+                this.save_command_history(id, command, cwd.clone(), *time, cx);
                 return;
             }
+            if matches!(event, TerminalEvent::Focused) {this.note_terminal_focus(id,cx);return;}
             if matches!(event, TerminalEvent::HistoryRequested) {
+                this.note_terminal_focus(id,cx);
                 this.open_history(window, cx);
                 return;
             }
@@ -388,11 +408,16 @@ impl Workspace {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(ix) else { return };
+        let new_id=session.id;
+        let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
+        self.split.select_tab(self.main_id(),new_id);
+        self.session_menu=None;
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
-        let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
+        self.touch_session(new_id);
+        self.update_pane_radii(cx);
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);
         self.sync_sidebar(cx);
@@ -408,7 +433,13 @@ impl Workspace {
         // Dropping the session ends its channel; the connection closes with its last tab, and a
         // connection that is still being made is cancelled together with the dialog it asked.
         let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
+        let closed=self.sessions[ix].id;
+        self.split.close_session(self.main_id(),closed);
+        self.broadcast.checked.remove(&closed);
+        self.recent_sessions.retain(|id|*id!=closed);
+        self.session_menu=None;
         self.sessions.remove(ix);
+        self.update_pane_radii(cx);
         if let Some(group) = group {
             self.release_group(group, window, cx);
         }
@@ -427,6 +458,7 @@ impl Workspace {
     }
 
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sync_productivity(cx);
         let count = self.sessions.len();
         let shell = shell_name(&PtyOptions::default().shell_path());
         let summary = if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个标签") };
@@ -548,7 +580,9 @@ impl Workspace {
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let tabs = self.sessions.iter().enumerate().map(|(ix, s)| {
+        let limit=crate::productivity::multi::tab_limit(self.sidebar_open,self.commands_open);
+        let visible=crate::productivity::multi::visible_tabs(self.sessions.len(),self.active,limit);
+        let tabs = visible.into_iter().map(|ix| { let s=&self.sessions[ix];
             let active = Some(ix) == self.active;
             div()
                 .id(("tab", s.id))
@@ -566,6 +600,7 @@ impl Workspace {
                 .when(!active, |d| d.text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
                 .child(dot(session_dot(s, &p), 7.))
                 .child(s.title.clone())
+                .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id),|d|d.child(div().px(px(5.)).rounded(px(4.)).bg(p.warns).text_color(p.warn).text_size(px(10.)).child("广播")))
                 .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
                     let failed = status == ssh::SshStatus::Failed;
                     let color = if failed { p.err } else { p.warn };
@@ -628,8 +663,15 @@ impl Workspace {
             .gap(px(4.))
             .child(div().flex().items_center().gap(px(2.)).min_w_0().overflow_hidden().children(tabs))
             .child(new_tab)
+            .when(crate::productivity::multi::tab_overflow(self.sessions.len(),self.sidebar_open,self.commands_open),|d|d.child(
+                div().id("tab-list-button").flex_none().cursor_pointer().px(px(8.)).py(px(5.)).rounded(px(8.)).text_size(px(12.)).text_color(p.tx2)
+                    .child(format!("{} 个标签 ▾",self.sessions.len()))
+                    .on_click(cx.listener(|this,event: &gpui::ClickEvent,w,cx|this.open_session_menu(crate::productivity::session_menu::Kind::Tabs,event.position(),w,cx)))
+            ))
             .child(window_drag_area(div().id("tabbar-drag")).flex_1().h_full())
-            .child(toolbar_button("broadcast", Lucide::RadioTower, Some("广播"), "向多个会话广播输入（P6 实现）", false, cx))
+            .child(toolbar_button("broadcast", Lucide::RadioTower, Some("广播"), "向多个会话按行广播", true, cx)
+                .when(self.broadcast.enabled,|b|b.bg(p.warns).text_color(p.warn))
+                .on_click(cx.listener(|this,_,_,cx|{this.commands_open=true;this.sync_productivity(cx);cx.notify();})))
             .child(toolbar_button("ai", Lucide::Sparkles, Some("AI"), "AI 助手（P7 实现）", false, cx))
             .child(
                 toolbar_button("snippets", Lucide::Zap, Some("快捷命令"), "快捷命令", true, cx)
@@ -737,12 +779,13 @@ impl Workspace {
     fn render_terminal_card(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let term_bg = to_hsla(cx.terminal_style().palette.background);
-        let size = session.terminal.read(cx).size();
-        let status = match session.ssh() {
+        let focused=self.focused_session().unwrap_or(session);
+        let size = focused.terminal.read(cx).size();
+        let status = match focused.ssh() {
             Some(_) => ssh::status_line(size.cols, size.rows),
             None => format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY", size.cols, size.rows),
         };
-        let view = session.view.clone();
+        let view = focused.view.clone();
 
         let pill = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool| {
             div()
@@ -771,7 +814,8 @@ impl Workspace {
             .rounded(CARD_RADIUS)
             .bg(term_bg)
             .shadow(card_shadow(&p))
-            .child(div().flex_1().min_h_0().child(session.view.clone()))
+            .child(self.render_panes(session,cx))
+            .when(self.broadcast.enabled,|d|d.child(self.broadcast_bar.clone()))
             .child(
                 div()
                     .h(px(38.))
@@ -796,7 +840,7 @@ impl Workspace {
                     .child(pill("rec", "● 录制", "录制为 asciinema .cast（P6 实现）", false))
                     .child(pill("logs", "记录", "会话日志与录像（P6 实现）", false))
                     .child(
-                        pill("history", if session.view.read(cx).history_shortcut { "历史 ⌃R" } else { "历史" }, "跨主机命令历史", true)
+                        pill("history", if focused.view.read(cx).history_shortcut { "历史 ⌃R" } else { "历史" }, "跨主机命令历史", true)
                             .on_click(cx.listener(|this, _, window, cx| this.open_history(window, cx))),
                     )
                     .child(pill("search", "搜索 ⌘F", "在输出中搜索", true).on_click(move |_, window, cx| {
@@ -805,7 +849,8 @@ impl Workspace {
                             v.toggle_search(&ToggleSearch, window, cx);
                         });
                     }))
-                    .child(pill("split", "分屏", "分屏（P6 实现）", false)),
+                    .child(pill("split", if self.split.other.is_some(){"取消分屏"}else{"分屏"}, "切换分屏", true)
+                        .on_click(cx.listener(|this,_,w,cx|this.toggle_split(w,cx)))),
             )
 
     }
@@ -913,6 +958,9 @@ impl Render for Workspace {
                             .when(self.commands_open, |d| d.child(self.commands.clone())),
                     ),
             )
+            .children(self.session_menu.as_ref().map(|menu| gpui::deferred(
+                gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(menu.view.clone())
+            ).with_priority(3)))
             .children(palette)
     }
 }
