@@ -21,3 +21,6 @@ serde_json.workspace = true
 [[test]]
 name = "terminal_session"
 harness = false
+
+[dev-dependencies]
+tempfile.workspace = true

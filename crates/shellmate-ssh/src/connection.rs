@@ -1,6 +1,7 @@
 //! A connection to an SSH server, directly or through ProxyJump hops.
 
 use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -49,6 +50,7 @@ pub(crate) struct Inner {
     pub runtime: runtime::Handle,
     /// Every hop from the first jump host to this one.
     hops: Vec<HopInfo>,
+    peer: Option<SocketAddr>,
     /// The previous hop; kept alive because this connection is tunnelled through it.
     _via: Option<Connection>,
 }
@@ -125,6 +127,10 @@ impl Connection {
     pub fn target(&self) -> &HopInfo {
         self.inner.hops.last().expect("a connection has at least one hop")
     }
+
+    /// Actual TCP peer of a direct connection (never re-resolves the hostname).
+    /// A channel through a jump host has no directly reached TCP peer here.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {self.inner.peer}
 
     /// Whether the transport is gone.
     pub fn is_closed(&self) -> bool {
@@ -223,8 +229,9 @@ async fn connect_hop(
                 }
                 Ok(Ok(stream)) => stream,
             };
+            let peer=stream.peer_addr().ok();
             let _ = stream.set_nodelay(true);
-            handshake(stream, host, None, options, runtime, watchdog).await.map_err(|err| as_jump_error(err, host, is_jump))
+            handshake(stream, host, None, options, runtime, watchdog, peer).await.map_err(|err| as_jump_error(err, host, is_jump))
         }
         Some(jump) => {
             let opened =
@@ -246,7 +253,7 @@ async fn connect_hop(
                 }
                 Ok(Ok(channel)) => channel,
             };
-            handshake(channel.into_stream(), host, Some(jump), options, runtime, watchdog)
+            handshake(channel.into_stream(), host, Some(jump), options, runtime, watchdog, None)
                 .await
                 .map_err(|err| as_jump_error(err, host, is_jump))
         }
@@ -275,6 +282,7 @@ async fn handshake<S>(
     options: &ConnectOptions,
     runtime: &runtime::Handle,
     watchdog: &Watchdog,
+    peer: Option<SocketAddr>,
 ) -> Result<Connection, SshError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -328,7 +336,7 @@ where
         auth: auth.method,
         key_file: auth.key_file,
     });
-    Ok(Connection { inner: Arc::new(Inner { watchdog_limit: options.connect_watchdog, handle, shared, runtime: runtime.clone(), hops, _via: via }) })
+    Ok(Connection { inner: Arc::new(Inner { watchdog_limit: options.connect_watchdog, handle, shared, runtime: runtime.clone(), hops, peer, _via: via }) })
 }
 
 /// Moves the algorithms we already have a recorded key for to the front, so

@@ -7,6 +7,8 @@ mod exec;
 mod forward;
 mod host_keys;
 mod jump;
+mod mosh;
+mod mosh_e2e;
 mod pool;
 mod shell;
 mod support;

@@ -63,6 +63,30 @@ pub fn open_modal(
     });
 }
 
+/// Height of a self-contained modal shell, leaving both measured edge margins.
+pub fn shell_height(viewport: f32, preferred: f32, margin: f32) -> f32 {
+    preferred.min((viewport - 2. * margin).max(0.))
+}
+
+/// A custom shell owns its header, scroll panes and footer. `Dialog::child`
+/// adds a whole-body scroll wrapper with an intrinsic-height ancestor; putting
+/// a percentage-height shell there lets its form push the footer out of bounds.
+/// Use the non-scrolling content slot with a definite height instead.
+pub fn fixed_shell<V: Render + 'static>(
+    dialog: gpui::component::dialog::Dialog,
+    body: Entity<V>,
+    height: gpui::Pixels,
+) -> gpui::component::dialog::Dialog {
+    dialog.h(height).content(move |content, _, _| {
+        content
+            .h(height)
+            .min_h_0()
+            .flex_none()
+            .overflow_hidden()
+            .child(body.clone())
+    })
+}
+
 /// Opens `body` as a modal dialog `width` pixels wide.
 pub fn open<V: DialogBody>(
     window: &mut Window,
@@ -84,10 +108,9 @@ pub fn open<V: DialogBody>(
         let settings = title.as_ref() == "设置";
         let host_editor = matches!(title.as_ref(), "新建连接" | "编辑主机");
         let host_key = title.contains("主机密钥已变更") || title.contains("主机指纹");
-        let margin_top = if records {
-            (window.viewport_size().height - px(740.)) / 2.
-        } else if settings {
-            (window.viewport_size().height - px(640.)) / 2.
+        let custom_height = px(shell_height(f32::from(window.viewport_size().height), if records { 740. } else { 640. }, 20.));
+        let margin_top = if records || settings {
+            (window.viewport_size().height - custom_height) / 2.
         } else if host_editor {
             px(30.)
         } else if host_key {
@@ -100,8 +123,7 @@ pub fn open<V: DialogBody>(
             .shadow(modal_shadow(None))
             .rounded(px(if records || settings || host_key { 26. } else { 22. }))
             .p(px(if records || settings { 0. } else { 24. }))
-            .when(records, |d| d.h(px(740.)).bg(cx.palette().win).border_0())
-            .when(settings, |d| d.h(px(640.)).bg(cx.palette().win).border_0())
+            .when(records || settings, |d| d.h(custom_height).bg(cx.palette().win).border_0().gap(px(0.)))
             .when(host_editor, |d| d.h((window.viewport_size().height - px(60.)).min(px(840.))))
             .when(!records && !settings, |d| {
                 d.title(
@@ -119,7 +141,7 @@ pub fn open<V: DialogBody>(
                 on_cancel.update(cx, |body, cx| body.cancel(window, cx));
                 true
             })
-            .child(body.clone())
+            .map(|d| if records || settings { fixed_shell(d, body.clone(), custom_height) } else { d.child(body.clone()) })
     });
 }
 
@@ -216,4 +238,23 @@ pub fn modal_shadow(ring: Option<(Hsla, f32)>) -> Vec<gpui::BoxShadow> {
         });
     }
     shadows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_height;
+
+    #[test]
+    fn custom_dialogs_share_a_bounded_shell_height() {
+        for (preferred, margin, large, small) in [
+            (740., 20., 740., 660.), // records
+            (640., 20., 640., 640.), // settings
+            (800., 50., 800., 600.), // file editor
+        ] {
+            assert_eq!(shell_height(900., preferred, margin), large);
+            assert_eq!(shell_height(901., preferred, margin), large);
+            assert_eq!(shell_height(700., preferred, margin), small);
+        }
+        assert_eq!(shell_height(20., 840., 30.), 0.);
+    }
 }

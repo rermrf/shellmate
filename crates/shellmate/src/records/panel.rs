@@ -492,7 +492,7 @@ fn date_label(unix: i64) -> String {
     }
 }
 impl Render for RecordsWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let mut list = div().id("archive-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(2.));
         if self.logs_tab {
@@ -938,7 +938,9 @@ impl Render for RecordsWindow {
         );
         div()
             .relative()
-            .h((window.viewport_size().height - px(40.)).min(px(740.)))
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
             .pt(px(22.))
             .pb(px(20.))
             .pl(px(12.))

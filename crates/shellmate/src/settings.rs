@@ -64,7 +64,7 @@ impl DialogBody for SettingsWindow {
     fn cancel(&mut self, _: &mut Window, _: &mut Context<Self>) {}
 }
 impl Render for SettingsWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let names = ["凭据与安全", "同步与备份", "终端", "本地终端", "连接与保活"];
         let nav = div()
@@ -293,7 +293,9 @@ impl Render for SettingsWindow {
         }
         div()
             .relative()
-            .h((window.viewport_size().height - px(40.)).min(px(640.)))
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
             .pt(px(24.))
             .pb(px(24.))
             .pl(px(12.))

@@ -240,7 +240,8 @@ pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<
         }
     }
     host.tags = tags;
-    host.jump = if fields.protocol==shellmate_core::Protocol::Ssh {fields.jumps.clone()}else{vec![]};
+    if fields.protocol==shellmate_core::Protocol::Mosh {shellmate_ssh::mosh::validate_direct(!fields.jumps.is_empty())?;}
+    host.jump = if matches!(fields.protocol,shellmate_core::Protocol::Ssh|shellmate_core::Protocol::Mosh) {fields.jumps.clone()}else{vec![]};
 
     let password = Some(fields.password.as_str()).filter(|p| fields.auth == AuthMethod::Password && !p.is_empty());
     Ok(HostDraft { host, group_name: fields.group.clone(), password: password.map(Secret::new) })
@@ -252,6 +253,13 @@ mod tests {
     use shellmate_store::MemoryStore;
 
     use super::*;
+
+    #[test]
+    fn mosh_editor_retains_ssh_auth_and_refuses_jumps(){
+        let mut f=fields("dev","example.test");f.protocol=Protocol::Mosh;f.auth=AuthMethod::PrivateKey;f.identity_file="/tmp/fixture-key".into();
+        let h=build_draft(&f,None,None).unwrap().host;assert_eq!(h.protocol,Protocol::Mosh);assert_eq!(h.identity_file,Some("/tmp/fixture-key".into()));
+        f.jumps.push(HostId::from_raw("jump"));assert_eq!(build_draft(&f,None,None).err().unwrap(),shellmate_ssh::mosh::JUMP_REFUSAL);
+    }
 
     #[test]
     fn telnet_keychain_requires_explicit_opt_in_and_ssh_is_unchanged() {

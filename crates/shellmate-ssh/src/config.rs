@@ -89,7 +89,7 @@ impl SshHost {
     /// Connection settings of a saved host. `default_user` is used when the
     /// host has no user (OpenSSH uses the local user name then).
     pub fn from_host(host: &Host, default_user: &str, secrets: HostSecrets) -> Result<Self, SshError> {
-        if host.protocol != Protocol::Ssh {
+        if !matches!(host.protocol, Protocol::Ssh | Protocol::Mosh) {
             return Err(SshError::Unsupported(format!(
                 "主机「{}」使用 {} 协议，目前只能连接 SSH 主机",
                 host.name,
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn only_ssh_hosts_can_be_connected() {
+    fn ssh_and_mosh_hosts_use_ssh_but_serial_does_not() {
         let mut serial = host("esp", 0, None, AuthMethod::PrivateKey);
         serial.protocol = Protocol::Serial;
         let mut mosh = host("dev", 22, None, AuthMethod::Agent);
@@ -357,9 +357,6 @@ mod tests {
 
         let err = Route::from_hosts(&[serial], "me", |_| HostSecrets::default()).unwrap_err();
         assert_eq!(err.to_string(), "无法连接：主机「esp」使用 串口 协议，目前只能连接 SSH 主机");
-        let jump_err =
-            Route::from_hosts(&[mosh, host("web", 22, None, AuthMethod::Agent)], "me", |_| HostSecrets::default())
-                .unwrap_err();
-        assert!(jump_err.to_string().contains("「dev」"), "{jump_err}");
+        assert!(Route::from_hosts(&[mosh], "me", |_|HostSecrets::default()).is_ok());
     }
 }

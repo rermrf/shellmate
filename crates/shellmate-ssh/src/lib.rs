@@ -18,6 +18,7 @@ mod handler;
 mod interact;
 mod known_hosts;
 mod key_info;
+pub mod mosh;
 mod runtime;
 mod shell;
 mod subsystem;

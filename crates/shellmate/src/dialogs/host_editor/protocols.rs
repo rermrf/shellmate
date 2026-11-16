@@ -7,9 +7,6 @@ impl HostEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if protocol == Protocol::Mosh {
-            return;
-        }
         let previous = self.protocol;
         self.protocol = protocol;
         self.invalidate_test();
@@ -20,7 +17,7 @@ impl HostEditor {
                 self.set_text(&self.port, "23", window, cx);
             }
         }
-        if protocol == Protocol::Ssh && previous != Protocol::Ssh {
+        if matches!(protocol,Protocol::Ssh|Protocol::Mosh) && !matches!(previous,Protocol::Ssh|Protocol::Mosh) {
             self.set_text(&self.port, "22", window, cx);
         }
         if protocol == Protocol::Serial {

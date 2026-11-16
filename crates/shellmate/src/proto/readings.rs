@@ -13,6 +13,10 @@ pub struct Reading {
     pub docker_cpu: &'static [(&'static str, f64)],
 }
 pub const READINGS: &[Reading] = &[
+Reading {scene:"host-mosh",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"host-mosh",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"mosh",dark:false,reconnect:1,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"mosh",dark:true,reconnect:1,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading { scene:"serial", dark:false, reconnect:2, cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[] },
 Reading { scene:"serial", dark:true, reconnect:2, cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[] },
 Reading { scene:"serial-hex", dark:false, reconnect:2, cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[] },

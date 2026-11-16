@@ -139,7 +139,7 @@ impl FileEditor {
                     on_cancel.update(cx, |editor, cx| editor.request_close(window, cx));
                     false
                 })
-                .child(editor.clone())
+                .map(|d| crate::dialogs::fixed_shell(d, editor.clone(), px(crate::dialogs::shell_height(f32::from(window.viewport_size().height), 800., 50.))))
         });
     }
 
@@ -469,7 +469,6 @@ impl Render for FileEditor {
         let saving = self.model.is_saving();
         let footer = self.model.footer(self.lines(cx));
         // The prototype's modal is 1200 × 800; a smaller window gets a smaller one.
-        let height = (window.viewport_size().height - px(100.)).clamp(px(320.), px(800.));
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
@@ -495,7 +494,8 @@ impl Render for FileEditor {
             .flex()
             .flex_col()
             .w_full()
-            .h(height)
+            .h_full()
+            .min_h_0()
             .overflow_hidden()
             .child(
                 div()

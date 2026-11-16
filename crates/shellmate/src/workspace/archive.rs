@@ -211,6 +211,7 @@ impl Workspace {
     }
     fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.poll_streams(window,cx);
+        self.poll_mosh_connections(window,cx);
         let mut stopped = vec![];
         for s in &self.sessions {
             let error = s.terminal.update(cx, |t, _| t.flush_archives());

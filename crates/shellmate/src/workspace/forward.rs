@@ -238,7 +238,7 @@ impl Workspace {
         match event {
             ForwardPanelEvent::Add(rule) => self.add_rule(&host, rule.clone(), window, cx),
             ForwardPanelEvent::Toggle(id, on) => self.toggle_rule(&host, id, *on, window, cx),
-            ForwardPanelEvent::Retry(id, action) => self.retry_rule(&host, id, *action, window, cx),
+            ForwardPanelEvent::Retry(id, action) => {if !self.retry_mosh_panel(session_id,window,cx){self.retry_rule(&host,id,*action,window,cx);}},
             ForwardPanelEvent::Delete(id) => self.confirm_delete_rule(&host, id, window, cx),
         }
     }

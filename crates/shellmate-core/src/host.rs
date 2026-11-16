@@ -50,7 +50,7 @@ pub enum Protocol {
     /// Secure Shell.
     #[default]
     Ssh,
-    /// Mosh (not connectable yet).
+    /// SSH bootstrap with a Mosh UDP terminal.
     Mosh,
     /// Telnet over TCP (plaintext).
     Telnet,

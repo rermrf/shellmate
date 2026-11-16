@@ -10,8 +10,8 @@ use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::{Icon, WindowExt as _};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FontWeight, IntoElement, PathPromptOptions, Render, SharedString,
-    Subscription, WeakEntity, Window, div, px,
+    App, Context, Entity, Focusable as _, FontWeight, IntoElement, PathPromptOptions, Render, SharedString,
+    ScrollHandle, Subscription, WeakEntity, Window, div, px,
 };
 use shellmate_core::{AuthMethod, Host, HostBook, HostId, Protocol};
 use shellmate_ssh::KeyInfo;
@@ -40,6 +40,28 @@ const AUTH_ORDER: [AuthMethod; 4] = [
     AuthMethod::KeyboardInteractive,
 ];
 
+// Prototype shell: title row 66, protocol track 38 + bottom gap 16,
+// footer 1 px hairline + 14 px inset + 40 px buttons + 20 px inset.
+const HEADER_HEIGHT: f32 = 66.;
+const PROTOCOL_HEIGHT: f32 = 54.;
+const FOOTER_HEIGHT: f32 = 75.;
+
+fn editor_height(viewport: f32, protocol: Protocol, advanced: bool) -> f32 {
+    let preferred = match protocol {
+        Protocol::Serial if advanced => 650.,
+        Protocol::Serial => 460.,
+        Protocol::Telnet => 620.,
+        Protocol::Ssh | Protocol::Mosh => 840.,
+    };
+    super::shell_height(viewport, preferred, 30.)
+}
+
+fn focus_scroll_delta(top: f32, bottom: f32, field_top: f32, field_bottom: f32) -> f32 {
+    if field_top < top + 4. { top + 4. - field_top }
+    else if field_bottom > bottom - 4. { bottom - 4. - field_bottom }
+    else { 0. }
+}
+
 /// The form for one host.
 pub struct HostEditor {
     workspace: WeakEntity<Workspace>,
@@ -50,6 +72,7 @@ pub struct HostEditor {
     baud: Entity<InputState>,
     devices: Vec<shellmate_serial::Device>,
     advanced: bool,
+    form_scroll: ScrollHandle,
     name: Entity<InputState>,
     addr: Entity<InputState>,
     port: Entity<InputState>,
@@ -183,6 +206,30 @@ impl HostEditor {
                 passphrase.update(cx, |s, cx| s.set_value("fixture-only", window, cx));
             }
             let mut subscriptions = Vec::new();
+            for input in [&name, &addr, &port, &user, &tags, &group, &identity, &password, &passphrase, &baud] {
+                let input = input.clone();
+                let focus = input.focus_handle(cx);
+                subscriptions.push(cx.on_focus(&focus, window, move |_: &mut Self, window, cx| {
+                    let editor = cx.entity().downgrade();
+                    let input = input.clone();
+                    // Read geometry after layout, including newly expanded advanced fields.
+                    window.on_next_frame(move |window, cx| {
+                        if !input.focus_handle(cx).is_focused(window) {return;}
+                        editor.update(cx, |this, cx| {
+                            let viewport = this.form_scroll.bounds();
+                            let field = input.read(cx).input_bounds();
+                            if viewport.size.height <= px(0.) || field.size.height <= px(0.) { return; }
+                            let delta = focus_scroll_delta(f32::from(viewport.top()), f32::from(viewport.bottom()), f32::from(field.top()), f32::from(field.bottom()));
+                            if delta != 0. {
+                                let mut offset = this.form_scroll.offset();
+                                offset.y = (offset.y + px(delta)).clamp(-this.form_scroll.max_offset().y, px(0.));
+                                this.form_scroll.set_offset(offset);
+                                cx.notify();
+                            }
+                        }).ok();
+                    });
+                }));
+            }
             for input in [
                 &name,
                 &addr,
@@ -235,6 +282,7 @@ impl HostEditor {
                 baud,
                 devices: vec![],
                 advanced: false,
+                form_scroll: ScrollHandle::new(),
                 original,
                 name,
                 addr,
@@ -258,6 +306,8 @@ impl HostEditor {
             if scene.starts_with("proto:host-serial") {
                 body.change_protocol(Protocol::Serial, window, cx);
                 body.set_text(&body.addr, "/dev/cu.usbserial-0001", window, cx);
+            } else if scene.starts_with("proto:host-mosh") {
+                body.change_protocol(Protocol::Mosh,window,cx);
             } else if scene.starts_with("proto:host-telnet") {
                 body.change_protocol(Protocol::Telnet, window, cx);
             }
@@ -276,18 +326,7 @@ impl HostEditor {
             let confirm = body.clone();
             let cancel = body.clone();
             let editor = body.read(cx);
-            let wanted = match editor.protocol {
-                Protocol::Serial => {
-                    if editor.advanced {
-                        650.
-                    } else {
-                        460.
-                    }
-                }
-                Protocol::Telnet => 620.,
-                _ => 840.,
-            };
-            let height = (window.viewport_size().height - px(60.)).min(px(wanted));
+            let height = px(editor_height(f32::from(window.viewport_size().height), editor.protocol, editor.advanced));
             dialog
                 .w(px(660.))
                 .h(height)
@@ -304,7 +343,7 @@ impl HostEditor {
                     cancel.update(cx, |b, cx| b.cancel(w, cx));
                     true
                 })
-                .child(body.clone())
+                .map(|d| super::fixed_shell(d, body.clone(), height))
         });
     }
 
@@ -841,14 +880,7 @@ impl Render for HostEditor {
             Protocol::Serial,
         ]
         .iter()
-        .map(|protocol| {
-            let item = SegmentItem::new(protocol.label(), *protocol == self.protocol);
-            if *protocol != Protocol::Mosh {
-                item
-            } else {
-                item.disabled("后续版本提供")
-            }
-        })
+        .map(|protocol| SegmentItem::new(protocol.label(), *protocol == self.protocol))
         .collect();
         let auth_picker = segmented(
             "editor-auth",
@@ -901,6 +933,8 @@ impl Render for HostEditor {
             .flex()
             .flex_col()
             .size_full()
+            .min_h_0()
+            .overflow_hidden()
             .text_color(p.tx)
             .child(
                 div()
@@ -910,6 +944,7 @@ impl Render for HostEditor {
                     .px(px(24.))
                     .pt(px(22.))
                     .pb(px(14.))
+                    .h(px(HEADER_HEIGHT))
                     .flex_none()
                     .child(
                         div()
@@ -939,7 +974,7 @@ impl Render for HostEditor {
                             .on_click(cx.listener(|this, _, w, cx| this.dismiss(w, cx))),
                     ),
             )
-            .child(div().px(px(24.)).pb(px(16.)).flex_none().child(segmented(
+            .child(div().h(px(PROTOCOL_HEIGHT)).px(px(24.)).pb(px(16.)).flex_none().child(segmented(
                 "editor-protocol",
                 protocols,
                 {let weak=cx.entity().downgrade();move |ix,w,cx|{weak.update(cx,|this,cx|this.change_protocol([Protocol::Ssh,Protocol::Mosh,Protocol::Telnet,Protocol::Serial][ix],w,cx)).ok();}},
@@ -951,8 +986,10 @@ impl Render for HostEditor {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.form_scroll)
                     .mx(px(24.))
                     .pr(px(0.))
+                    .pb(px(20.))
                     .flex()
                     .flex_col()
                     .gap(px(12.))
@@ -992,7 +1029,7 @@ impl Render for HostEditor {
                     )
                     .children((self.protocol==Protocol::Serial).then(||self.render_serial_fields(&p,cx)))
                     .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。登录密码仍会存入钥匙串。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
-                    .when(self.protocol==Protocol::Ssh,|d|d
+                    .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d
                     .child(
                         div().flex_none()
                             .mt(px(6.))
@@ -1045,7 +1082,8 @@ impl Render for HostEditor {
                             .child(toggle),
                     )
 )
-                    .when(self.protocol==Protocol::Ssh,|d|d.child(self.render_jumps(&p,cx)))
+                    .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d.child(self.render_jumps(&p,cx)))
+                    .when(self.protocol==Protocol::Mosh,|d|d.child(div().flex_none().text_size(px(12.5)).line_height(px(20.)).text_color(p.tx2).child("Mosh 先经 SSH 启动 mosh-server（UDP 60000–61000），之后网络漫游、休眠唤醒都无需重连。")))
                     .children(self.error.clone().map(|e| notice(Notice::Error, e, &p)))
                     .children(
                         self.test_result
@@ -1055,7 +1093,7 @@ impl Render for HostEditor {
             )
             .child(
                 div()
-                    .h(px(75.))
+                    .h(px(FOOTER_HEIGHT))
                     .flex_none()
                     .border_t_1()
                     .border_color(p.line)
@@ -1091,5 +1129,41 @@ impl Render for HostEditor {
                             .on_click(cx.listener(|this, _, w, cx| this.submit(w, cx))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn focus_scroll_moves_only_as_far_as_the_field_needs() {
+        assert_eq!(focus_scroll_delta(150., 795., 200., 238.), 0.);
+        assert_eq!(focus_scroll_delta(150., 795., 120., 158.), 34.);
+        assert_eq!(focus_scroll_delta(150., 595., 610., 648.), -57.);
+        assert_eq!(focus_scroll_delta(150., 595., 154., 192.), 0.);
+    }
+
+    #[test]
+    fn every_protocol_reserves_header_and_footer_inside_the_window() {
+        for (protocol, advanced, expected) in [
+            (Protocol::Ssh, false, [840., 840., 640.]),
+            (Protocol::Mosh, false, [840., 840., 640.]),
+            (Protocol::Telnet, false, [620., 620., 620.]),
+            (Protocol::Serial, false, [460., 460., 460.]),
+            (Protocol::Serial, true, [650., 650., 640.]),
+        ] {
+            for ((width, viewport), expected) in [(1440., 900.), (1776., 901.), (1100., 700.)].into_iter().zip(expected) {
+                let height = editor_height(viewport, protocol, advanced);
+                assert_eq!(height, expected, "{protocol:?} at {width}×{viewport}");
+                let top = (viewport - height) / 2.;
+                let body = height - HEADER_HEIGHT - PROTOCOL_HEIGHT - FOOTER_HEIGHT;
+                assert!(top >= 30. && top + height <= viewport - 30.);
+                assert!(body >= 265., "form keeps a usable vertical scroll viewport");
+                assert_eq!(top + HEADER_HEIGHT + PROTOCOL_HEIGHT + body, viewport - top - FOOTER_HEIGHT);
+            }
+        }
+        // Exact reference: the footer starts at y=795, buttons at y=810.
+        assert_eq!(30. + editor_height(900., Protocol::Mosh, false) - FOOTER_HEIGHT, 795.);
     }
 }

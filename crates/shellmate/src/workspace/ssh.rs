@@ -79,6 +79,7 @@ pub struct SshSession {
     pub group: usize,
     /// The shell channel number on the connection (the nth one opened on it).
     pub channel: u32,
+    pub(super) mosh: Option<super::mosh::MoshTab>,
     /// A channel is being opened for this tab on a live connection.
     opening: Option<Opening>,
 }
@@ -92,8 +93,12 @@ impl SshSession {
     }
 
     fn new(host: Host, chain: Vec<Host>, group: usize) -> Self {
-        Self { host, chain, status: SshStatus::Connecting, group, channel: 1, opening: None }
+        let mosh=(host.protocol==shellmate_core::Protocol::Mosh).then(super::mosh::MoshTab::default);
+        Self { host, chain, status: SshStatus::Connecting, group, channel: 1, opening: None,mosh }
     }
+
+    /// A panel transport transition never changes an independent Mosh terminal.
+    fn on_connection_view(&mut self,view:View){if self.mosh.as_ref().is_none_or(|m|!m.independent){self.status=self.status.on_view(view);}}
 
     /// Names of the jump hosts, in order.
     pub fn via(&self) -> Vec<&str> {
@@ -180,8 +185,9 @@ pub fn existing_session<'a>(sessions: impl Iterator<Item = (usize, &'a SshSessio
 /// `deploy@10.0.1.21:22 · SSH · 私钥 · 经由 bastion`
 pub fn subtitle(host: &Host, via: &[&str], default_user: &str) -> String {
     let user = host.user.as_deref().unwrap_or(default_user);
+    if host.protocol==shellmate_core::Protocol::Mosh{return format!("{user}@{}:{} · Mosh",host.addr,host.port);}
     let mut parts =
-        vec![format!("{user}@{}:{}", host.addr, host.port), "SSH".to_string(), host.auth.label().to_string()];
+        vec![format!("{user}@{}:{}", host.addr, host.port), host.protocol.label().to_string(), host.auth.label().to_string()];
     if !via.is_empty() {
         parts.push(format!("经由 {}", via.join(" → ")));
     }
@@ -219,7 +225,7 @@ impl Workspace {
         self.groups.iter_mut().find(|group| group.id == id)
     }
 
-    fn ssh_mut(&mut self, session_id: usize) -> Option<&mut SshSession> {
+    pub(super) fn ssh_mut(&mut self, session_id: usize) -> Option<&mut SshSession> {
         self.sessions.iter_mut().find(|s| s.id == session_id).and_then(|s| match &mut s.kind {
             SessionKind::Ssh(ssh) => Some(&mut **ssh),
             SessionKind::Local | SessionKind::Stream(_) => None,
@@ -230,7 +236,7 @@ impl Workspace {
     fn participants(&self, group_id: usize) -> Vec<(usize, Entity<Terminal>)> {
         self.sessions
             .iter()
-            .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id && ssh.status.wants_channel()))
+            .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id && ssh.status.wants_channel() && ssh.mosh.as_ref().is_none_or(|m|!m.independent)))
             .map(|s| (s.id, s.terminal.clone()))
             .collect()
     }
@@ -249,7 +255,7 @@ impl Workspace {
             if let SessionKind::Ssh(ssh) = &mut session.kind
                 && ssh.group == group_id
             {
-                ssh.status = ssh.status.on_view(view);
+                ssh.on_connection_view(view);
             }
         }
     }
@@ -338,8 +344,8 @@ impl Workspace {
     /// Resolves the route of a saved host for connecting, or tells the user why not.
     fn resolve_for_connect(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) -> Option<(Host, Vec<Host>)> {
         let resolved = self.temporary_hosts.get(id)
-            .map(|h| Ok(vec![h.clone()]))
-            .unwrap_or_else(|| self.store.borrow().resolve_route(id));
+            .map(|h|crate::library::editor_route(&self.book,h))
+            .unwrap_or_else(|| self.store.borrow().resolve_route(id).map_err(|e|e.to_string()));
         let chain = match resolved {
             Ok(chain) => chain,
             Err(err) => {
@@ -348,10 +354,14 @@ impl Workspace {
             }
         };
         let host = chain.last().cloned()?;
-        if host.protocol != shellmate_core::Protocol::Ssh {
+        if !matches!(host.protocol,shellmate_core::Protocol::Ssh|shellmate_core::Protocol::Mosh) {
             let note = format!("{} 将在后续阶段（P7）实现，目前只能连接 SSH 主机。", host.protocol.label());
             window.push_notification(Notification::info(note).title(format!("暂不能连接 {}", host.name)), cx);
             return None;
+        }
+        if host.protocol==shellmate_core::Protocol::Mosh {
+            if chain.len()>1 || !host.jump.is_empty(){self.offer_mosh_ssh(host,chain,window,cx);return None;}
+            if !crate::prototype_fixture() && let Err(e)=shellmate_ssh::mosh::find_client(){window.push_notification(Notification::error(e),cx);return None;}
         }
         Some((host, chain))
     }
@@ -378,6 +388,17 @@ impl Workspace {
         let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new(), window, cx);
         self.push_ssh_tab(host.name.clone(), host, chain, group, window, cx);
         self.launch_attempt(group, window, cx);
+    }
+
+    pub(super) fn open_ssh_fallback(&mut self,host:Host,chain:Vec<Host>,source:HostId,window:&mut Window,cx:&mut Context<Self>){
+        let credential=self.pending_forms.get(&source).map(|(_,c)|c.clone()).or_else(||{
+            self.secrets.get(&SecretKey::HostPassword(source)).ok().flatten().map(|secret|connect::FormCredential{method:shellmate_core::AuthMethod::Password,key:None,answer:connect::Answer{secret,save:false}})
+        });
+        if let Some(c)=credential {self.pending_forms.insert(host.id.clone(),(connect::Endpoint::of(&host,&connect::default_user()),c));}
+        self.temporary_hosts.insert(host.id.clone(),host.clone());
+        let group=self.new_group(&chain,Reconnect::initial(),AuthMemory::new(),window,cx);
+        self.push_ssh_tab(host.name.clone(),host,chain,group,window,cx);
+        self.launch_attempt(group,window,cx);
     }
 
     pub(super) fn connect_temporary(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
@@ -418,7 +439,8 @@ impl Workspace {
             .first()
             .and_then(|(id, _)| self.sessions.iter().find(|s| s.id == *id))
             .and_then(|s| s.ssh())
-            .map(|ssh| ssh.host.id.clone());
+            .map(|ssh| ssh.host.id.clone())
+            .or_else(||self.group(group_id).map(|g|g.key.host().clone()));
         let Some(host_id) = host_id else {
             return self.release_group(group_id, window, cx);
         };
@@ -430,8 +452,8 @@ impl Workspace {
         };
         // The host may have been edited since the last attempt.
         let resolved = self.temporary_hosts.get(&host_id)
-            .map(|h| Ok(vec![h.clone()]))
-            .unwrap_or_else(|| self.store.borrow().resolve_route(&host_id));
+            .map(|h|crate::library::editor_route(&self.book,h))
+            .unwrap_or_else(|| self.store.borrow().resolve_route(&host_id).map_err(|e|e.to_string()));
         let chain = match resolved {
             Ok(chain) => chain,
             Err(err) => return fail(self, err.to_string(), window, cx),
@@ -499,7 +521,7 @@ impl Workspace {
     }
 
     /// Feeds the connection's reconnect loop and carries out what it asks for.
-    fn step_group(&mut self, group_id: usize, input: Input, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn step_group(&mut self, group_id: usize, input: Input, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.group_mut(group_id) else { return };
         let outputs = group.machine.step(input);
         self.sync_statuses(group_id);
@@ -636,17 +658,22 @@ impl Workspace {
     /// The connection is up: every tab that was waiting gets its shell.
     fn on_connected(&mut self, group_id: usize, connected: Connected, window: &mut Window, cx: &mut Context<Self>) {
         let Connected { connection, shells, saves } = connected;
-        // The shells keep the connection open while they are being started; the link only gets to
-        // see it for the moment (it never holds it).
-        let live = connection.upgrade();
+        // SSH shells retain the transport; Mosh's group retains it for panels
+        // because its terminal is a local client PTY, not an SSH channel.
+        let live = Some(connection.clone());
+        let mosh_group=self.sessions.iter().any(|s|s.ssh().is_some_and(|ssh|ssh.group==group_id && ssh.mosh.is_some()));
         let Some(group) = self.group_mut(group_id) else { return };
         let reconnected = matches!(group.machine.step(Input::Succeeded).first(), Some(Output::Connected { reconnected: true }));
         let manual = std::mem::take(&mut group.manual);
         group.stop();
         group.last_failure = None;
         group.declined = false;
-        group.connection = Some(connection);
+        group.connection = Some(connection.downgrade());
+        group.auxiliary=mosh_group.then(||connection.clone());
         group.channels = shells.len() as u32;
+        for session in &self.sessions {
+            if let Some(ssh)=session.ssh().filter(|s|s.group==group_id) && let Some(lease)=ssh.mosh.as_ref().and_then(|m|m.lease.as_ref()){lease.reconnect(connection.clone());}
+        }
 
         let mut first_host = None;
         for (channel, (session_id, shell)) in (1u32..).zip(shells) {
@@ -714,6 +741,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.sessions.iter().find(|s|s.id==session_id).and_then(Session::ssh).is_some_and(|s|s.mosh.is_some()) {
+            self.open_mosh(session_id,connection,window,cx);return;
+        }
         let Some(terminal) = self.sessions.iter().find(|s| s.id == session_id).map(|s| s.terminal.clone()) else {
             return;
         };
@@ -768,7 +798,7 @@ impl Workspace {
     /// (the login banner, the prompt) and then been quiet for [`TYPE_QUIET`], so that a slow login or a long
     /// message of the day cannot swallow the line or print it twice. Gives up waiting after [`TYPE_CAP`] (a
     /// shell that says nothing at all).
-    fn type_pending(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn type_pending(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
         let Some(typed) = session.typed.take() else { return };
         let terminal = session.terminal.clone();
@@ -870,6 +900,7 @@ impl Workspace {
     /// others on it are already covered.
     pub(super) fn on_tab_disconnected(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ssh) = self.ssh_mut(session_id) else { return };
+        if ssh.mosh.is_some() {ssh.status=SshStatus::Failed;self.sync_sidebar(cx);return;}
         // Disconnects the app itself caused (a failed attempt) find the tab already waiting.
         if ssh.status != SshStatus::Connected {
             return;
@@ -906,6 +937,8 @@ impl Workspace {
     pub(super) fn retry_tab(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ssh) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()) else { return };
         let (group_id, status) = (ssh.group, ssh.status);
+        let mosh=ssh.mosh.is_some();
+        if mosh && status!=SshStatus::Connected && let Some(ssh)=self.ssh_mut(session_id){ssh.mosh=Some(super::mosh::MoshTab::default());}
         let Some(phase) = self.group(group_id).map(|group| group.machine.phase()) else { return };
         match phase {
             // Cut the wait short, or start over after giving up. A tab that had ended joins in.
@@ -1012,6 +1045,14 @@ mod tests {
     use shellmate_core::AuthMethod;
 
     use super::*;
+
+    #[test]
+    fn mosh_terminal_survives_panel_transport_loss_and_reconnect(){
+        let mut host=Host::new("dev","example.test");host.protocol=shellmate_core::Protocol::Mosh;
+        let mut s=SshSession::new(host,vec![],1);s.status=SshStatus::Connected;s.mosh.as_mut().unwrap().independent=true;
+        for view in [View::Reconnecting(1),View::Connecting,View::Failed,View::Connected]{s.on_connection_view(view);assert_eq!(s.status,SshStatus::Connected);}
+        s.status=SshStatus::Ended;s.on_connection_view(View::Reconnecting(1));assert_eq!(s.status,SshStatus::Ended);
+    }
 
     fn host(name: &str, user: Option<&str>) -> Host {
         let mut host = Host::new(name, format!("{name}.example.com"));

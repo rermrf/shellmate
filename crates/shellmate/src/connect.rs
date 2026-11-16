@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use shellmate_core::{AuthMethod, FingerprintState, Host, HostId, PtyDims, Secret};
 use shellmate_ssh::{
     ChallengeRequest, ConnectEvent, ConnectOptions, Connection, HostKeyDecision, HostKeyRequest, HostKeyVerifier,
-    HostSecrets, PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError, WeakConnection,
+    HostSecrets, PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError,
 };
 use shellmate_store::{SecretKey, SecretStore};
 use tokio::sync::oneshot;
@@ -443,10 +443,10 @@ pub struct SaveReport {
 }
 
 /// A connection with the shell channels of the tabs that asked for one, opened but not yet
-/// attached to their terminals. The shells keep the connection alive; the connection closes with
-/// its last channel, so `connection` does not hold it open.
+/// attached to their terminals. Mosh has no SSH shell; its ConnGroup retains
+/// the connection for auxiliary panels after taking this result.
 pub struct Connected {
-    pub connection: WeakConnection,
+    pub connection: Connection,
     /// One shell per requested tab, in the order requested.
     pub shells: Vec<(usize, PendingShell)>,
     pub saves: SaveReport,
@@ -483,6 +483,12 @@ pub async fn connect_attempt(
         let events = bridge.clone();
         let options =
             ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |event| events.event(event));
+        if chain.last().is_some_and(|h|h.protocol==shellmate_core::Protocol::Mosh) {
+            shellmate_ssh::mosh::validate_direct(chain.len()!=1 || !chain[0].jump.is_empty()).map_err(SshError::Unsupported)?;
+            shellmate_ssh::mosh::find_client().map_err(SshError::Unsupported)?;
+            let connection=Connection::connect(route,options).await?;
+            return Ok((connection,Vec::new()));
+        }
         let mut tabs = tabs.into_iter();
         let Some((first, dims)) = tabs.next() else {
             return Err(SshError::Unsupported("没有需要连接的标签".into()));
@@ -492,7 +498,7 @@ pub async fn connect_attempt(
         for (id, dims) in tabs {
             shells.push((id, connection.open_shell(dims).await?));
         }
-        Ok((connection.downgrade(), shells))
+        Ok((connection, shells))
     };
     let outcome = attempt.await;
 
@@ -503,13 +509,19 @@ pub async fn connect_attempt(
     }
 }
 
-/// Authenticate the form's route without creating a session channel or running a command.
+/// Authenticate the form's route. SSH tests run no command; Mosh also probes
+/// the executable and installed locales over exec, starting nothing persistent.
 pub async fn test_connection(
     chain: Vec<Host>,
     secrets: Arc<dyn SecretStore>,
     bridge: Arc<UiBridge>,
 ) -> Result<(Option<AuthMethod>, SaveReport), ConnectFailure> {
+    let mosh=chain.last().is_some_and(|h|h.protocol==shellmate_core::Protocol::Mosh);
     let attempt = async {
+        if mosh {
+            shellmate_ssh::mosh::validate_direct(chain.len()!=1 || !chain[0].jump.is_empty()).map_err(SshError::Unsupported)?;
+            shellmate_ssh::mosh::find_client().map_err(SshError::Unsupported)?;
+        }
         let source = secrets.clone();
         let (mut route, mut known) =
             tokio::task::spawn_blocking(move || build_route(&chain, source.as_ref(), &default_user()))
@@ -519,7 +531,11 @@ pub async fn test_connection(
         bridge.set_known_passwords(known);
         let events = bridge.clone();
         let options = ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |e| events.event(e));
-        Connection::test(route, options).await
+        if mosh {
+            let connection=Connection::connect(route,options).await?;
+            shellmate_ssh::mosh::prerequisites(&connection).await.map_err(SshError::Unsupported)?;
+            Ok(connection.target().auth)
+        }else {Connection::test(route, options).await}
     }
     .await;
     let saves = persist_confirmed(&bridge, secrets).await;

@@ -43,6 +43,7 @@ mod proto;
 mod archive_demo;
 mod ssh;
 mod streams;
+mod mosh;
 
 actions!(
     shellmate,
@@ -912,6 +913,7 @@ impl Workspace {
     fn session_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
         if let SessionKind::Stream(s)=&session.kind {return if let Some(state)=&s.snapshot {format!("{} · {} {} · 串口",s.host.addr,state.settings.baud,state.settings.framing())}else{format!("{} · Telnet",s.host.address_line())};}
 
+        if let Some(ssh)=session.ssh().filter(|s|s.mosh.is_some()){return ssh::subtitle(&ssh.host,&ssh.via(),&connect::default_user());}
         #[cfg(debug_assertions)] if crate::proto::requested(){if session.ssh().is_none(){return "chen@MacBook-Pro · /bin/zsh -l · ~ · 本机进程，不经过网络".into();}
         if let Some(ssh)=session.ssh(){return format!("{}@{}:{} · {} · {}",ssh.host.user.as_deref().unwrap_or(""),ssh.host.addr,ssh.host.port,ssh.host.protocol.label(),ssh.host.auth.label());}}
         match session.ssh() {
@@ -958,6 +960,9 @@ impl Workspace {
         #[cfg(debug_assertions)] let status_fields=if crate::proto::requested(){vec![format!("PTY {}×38",if self.split.other.is_some(){66}else if self.commands_open{96}else{134}),"xterm-256color".into(),"UTF-8".into(),"延迟 28ms · 保活 30s".into()]}else{status_fields};
         let status_fields=if let SessionKind::Stream(s)=&focused.kind {
             vec![if crate::prototype_fixture(){"PTY 134×38".into()}else{format!("PTY {}×{}",size.cols,size.rows)},"xterm-256color".into(),"UTF-8".into(),s.snapshot.as_ref().map_or_else(||"Telnet 明文".into(),|s|format!("RX {:.1} KB",s.received as f64/1024.))]
+        }else{status_fields};
+        let status_fields=if let Some(mosh)=focused.ssh().and_then(|s|s.mosh.as_ref()) {
+            vec![format!("PTY {}×{}",size.cols,size.rows),"xterm-256color".into(),"UTF-8".into(),mosh.footer()]
         }else{status_fields};
         let view = focused.view.clone();
         let recording=self.running_recordings.get(&focused.id);

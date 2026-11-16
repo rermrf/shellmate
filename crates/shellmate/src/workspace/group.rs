@@ -6,9 +6,9 @@
 //! attempt with its dialogs, the countdown timer and the secrets that authenticated. One loop per
 //! connection means a lost connection with five tabs reconnects (and asks, if it must) once.
 //!
-//! The group does not hold the connection open: the shell channels in the tabs do, so the
-//! connection closes with its last tab. It only keeps a [`WeakConnection`] to hand the live
-//! connection to new tabs.
+//! SSH shell channels normally hold the connection open, with a [`WeakConnection`]
+//! in the group. A Mosh group instead retains an auxiliary connection for the
+//! SSH panels; its terminal PTY stays independent of that connection's lifetime.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -154,6 +154,8 @@ pub struct ConnGroup {
     pub machine: Reconnect,
     /// The live connection, if any (see the module docs).
     pub connection: Option<WeakConnection>,
+    /// Mosh has no SSH shell channel to retain the connection for its panels.
+    pub auxiliary: Option<Connection>,
     /// How many shell channels were opened on the current connection (the next one is `+ 1`).
     pub channels: u32,
     /// What authenticated on this connection, for the next attempt.
@@ -193,6 +195,7 @@ impl ConnGroup {
             key,
             machine,
             connection: None,
+            auxiliary: None,
             channels: 0,
             memory,
             last_failure: None,

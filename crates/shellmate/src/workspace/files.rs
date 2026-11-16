@@ -267,7 +267,7 @@ impl Workspace {
             .sessions
             .iter()
             .filter_map(|s| s.ssh().filter(|ssh| ssh.group == group_id).zip(s.files.as_ref()))
-            .map(|(ssh, files)| (files.panel.clone(), ssh.status))
+             .map(|(ssh, files)| (files.panel.clone(), if ssh.mosh.is_some(){match group.machine.view(){crate::reconnect::View::Connected=>SshStatus::Connected,crate::reconnect::View::Connecting=>SshStatus::Connecting,crate::reconnect::View::Reconnecting(n)=>SshStatus::Reconnecting(n),crate::reconnect::View::Failed=>SshStatus::Failed}}else{ssh.status}))
             .collect();
         for (panel, tab) in panels {
             let (status, session) = match &state {
@@ -324,7 +324,7 @@ impl Workspace {
         panel.update(cx,|p,cx|p.set_follow(self.preferences.get(shellmate_store::Preference::FollowDirectory),cx));
         let subscription =
             cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
-                FilesEvent::RetrySession => this.retry_sftp(session_id, cx),
+                FilesEvent::RetrySession => this.retry_sftp(session_id, window, cx),
                 FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
                 FilesEvent::HandleClash(id) => this.handle_clash(session_id, *id, window, cx),
                 FilesEvent::OpenEditor(file) => this.open_editor(session_id, (**file).clone(), window, cx),
@@ -419,7 +419,8 @@ impl Workspace {
     }
 
     /// The panel asked for a new session after the last attempt failed.
-    fn retry_sftp(&mut self, session_id: usize, cx: &mut Context<Self>) {
+    fn retry_sftp(&mut self, session_id: usize, window:&mut Window, cx: &mut Context<Self>) {
+        if self.retry_mosh_panel(session_id,window,cx){return;}
         if let Some(group) =
             self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group)
         {

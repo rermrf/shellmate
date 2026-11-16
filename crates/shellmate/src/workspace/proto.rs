@@ -131,6 +131,7 @@ impl Workspace {
 
         let mut session_sources=vec![("h1", "S1"), ("h3", "S2"), ("h10", "S3"), ("h7", "S4")];
         if scene=="telnet" {session_sources.push(("h11","TELNET"));}
+        if scene=="mosh" {session_sources.push(("h8","MOSH"));}
         if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
         for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
             let host = self.book.host(&HostId::from_raw(host_id)).unwrap().clone();
@@ -140,7 +141,7 @@ impl Workspace {
                 size.cols = 160;
                 size.rows = 40;
                 t.set_size(size);
-                let text = if lines=="TELNET" {
+                let text = if lines=="MOSH" {"\x1b[32;1mme@dev-box\x1b[0m:\x1b[34;1m~\x1b[0m$ echo mosh-$((6*7))\r\nmosh-42\r\n\x1b[32;1mme@dev-box\x1b[0m:\x1b[34;1m~\x1b[0m$ \x1b[?25l".into()}else if lines=="TELNET" {
                     "\x1b[90mTrying 192.168.1.1...\x1b[0m\r\nConnected to 192.168.1.1. Escape character is ^].\r\nRT-AX86U login: admin\r\nPassword:\r\n\x1b[32;1madmin@RT-AX86U\x1b[0m:\x1b[34;1m~\x1b[0m$ ".to_string()
                 }else if host.protocol==Protocol::Serial {
                     let mut display=shellmate_serial::transform::Display::default();display.options(scene=="serial-hex",false);
@@ -168,6 +169,7 @@ impl Workspace {
             let id = i + 1;
             let subscription = self.watch_terminal(id, &terminal, window, cx);
             let mut ssh = ssh::SshSession::demo(host.clone());
+            if let Some(mosh)=&mut ssh.mosh {mosh.independent=true;mosh.port=Some(60001);}
             if i == 3 {
                 ssh.status = ssh::SshStatus::Reconnecting(proto::reading(scene, dark).reconnect);
             }
@@ -192,7 +194,7 @@ impl Workspace {
             });
         }
         self.next_id = self.sessions.len()+1;
-        self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if scene=="telnet"{4}else{0}, window, cx);
+        self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if matches!(scene,"telnet"|"mosh"){4}else{0}, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
         match scene {
@@ -253,7 +255,7 @@ impl Workspace {
                 panel.update(cx, |r, cx| r.proto_scene(scene == "rv-log", cx));
                 self.records_window = Some(panel.downgrade());
             }
-            "host-new" | "host-serial" | "host-telnet" => self.new_host(window, cx),
+            "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "set-cred" => self.open_settings(0, window, cx),
             "set-sync" => self.open_settings(1, window, cx),

@@ -248,6 +248,7 @@ impl Workspace {
                 Err(err) => window.push_notification(Notification::error(err.to_string()).title(TOAST_TITLE), cx),
             },
             MonitorPanelEvent::Retry => {
+                if self.retry_mosh_panel(session_id,window,cx){return;}
                 let group =
                     self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group);
                 if let Some(monitor) = group.and_then(|id| self.group(id)).and_then(|group| group.monitor.as_ref()) {

@@ -7299,6 +7299,7 @@ dependencies = [
 name = "shellmate-ssh"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "async-trait",
  "data-encoding",
  "futures",
@@ -7308,6 +7309,7 @@ dependencies = [
  "russh",
  "sha1",
  "shellmate-core",
+ "shellmate-term",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -7349,6 +7351,7 @@ dependencies = [
  "portable-pty",
  "serde_json",
  "shellmate-core",
+ "tempfile",
 ]
 
 [[package]]
