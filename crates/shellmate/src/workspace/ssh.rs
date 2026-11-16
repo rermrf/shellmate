@@ -84,6 +84,13 @@ pub struct SshSession {
 }
 
 impl SshSession {
+    #[cfg(debug_assertions)]
+    pub(super) fn demo(host: Host) -> Self {
+        let mut this = Self::new(host.clone(), vec![host], usize::MAX);
+        this.status = SshStatus::Connected;
+        this
+    }
+
     fn new(host: Host, chain: Vec<Host>, group: usize) -> Self {
         Self { host, chain, status: SshStatus::Connecting, group, channel: 1, opening: None }
     }
@@ -303,6 +310,7 @@ impl Workspace {
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx);
             view.top_radius = CARD_RADIUS;
+            view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view
         });
         let session_id = self.next_id;
@@ -328,7 +336,9 @@ impl Workspace {
 
     /// Resolves the route of a saved host for connecting, or tells the user why not.
     fn resolve_for_connect(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) -> Option<(Host, Vec<Host>)> {
-        let resolved = self.store.borrow().resolve_route(id);
+        let resolved = self.temporary_hosts.get(id)
+            .map(|h| Ok(vec![h.clone()]))
+            .unwrap_or_else(|| self.store.borrow().resolve_route(id));
         let chain = match resolved {
             Ok(chain) => chain,
             Err(err) => {
@@ -362,6 +372,11 @@ impl Workspace {
         let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new(), window, cx);
         self.push_ssh_tab(host.name.clone(), host, chain, group, window, cx);
         self.launch_attempt(group, window, cx);
+    }
+
+    pub(super) fn connect_temporary(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
+        self.temporary_hosts.insert(host.id.clone(), host.clone());
+        self.connect_host(&host.id, window, cx);
     }
 
     /// Connects the saved host called `name` (debug review hook).
@@ -408,7 +423,9 @@ impl Workspace {
             return fail(self, "SSH 运行时未能启动".into(), window, cx);
         };
         // The host may have been edited since the last attempt.
-        let resolved = self.store.borrow().resolve_route(&host_id);
+        let resolved = self.temporary_hosts.get(&host_id)
+            .map(|h| Ok(vec![h.clone()]))
+            .unwrap_or_else(|| self.store.borrow().resolve_route(&host_id));
         let chain = match resolved {
             Ok(chain) => chain,
             Err(err) => return fail(self, err.to_string(), window, cx),
@@ -644,7 +661,7 @@ impl Workspace {
             self.monitor_connected(group_id, &live, cx);
         }
 
-        if !reconnected && let Some(host_id) = first_host {
+        if !reconnected && let Some(host_id) = first_host && !self.temporary_hosts.contains_key(&host_id) {
             if let Err(err) = self.store.borrow_mut().touch_connected(&host_id) {
                 log::warn!("could not record the connection time: {err}");
             }

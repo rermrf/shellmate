@@ -3,7 +3,9 @@
 pub mod colors;
 mod element;
 mod keys;
+pub mod history;
 mod osc7;
+mod send;
 mod pty;
 pub mod terminal;
 pub mod view;

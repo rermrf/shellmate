@@ -116,7 +116,7 @@ impl Sidebar {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        key("rail-search", Lucide::Search, 15., false, "搜索主机", &p)
+                        key("rail-search", Lucide::Search, 15., false, "命令面板 ⌘K", &p)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::SearchHosts))),
                     )
                     .child(

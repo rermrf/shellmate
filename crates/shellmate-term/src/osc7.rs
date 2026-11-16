@@ -46,8 +46,15 @@ impl Osc7Scanner {
 
     /// Feeds the next chunk of output and returns the directories reported in it that differ
     /// from the one reported before (shells repeat the report at every prompt).
+    #[cfg(test)]
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.feed_with_offsets(bytes).into_iter().map(|(_, path)| path).collect()
+    }
+
+    /// End offsets preserve ordering relative to semantic command marks in the same read.
+    pub fn feed_with_offsets(&mut self, bytes: &[u8]) -> Vec<(usize, String)> {
         let mut found = Vec::new();
+        let mut paths = Vec::new();
         let mut rest = bytes;
         while !rest.is_empty() {
             if self.state == State::Ground {
@@ -63,7 +70,8 @@ impl Osc7Scanner {
             }
             let byte = rest[0];
             rest = &rest[1..];
-            self.step(byte, &mut found);
+            self.step(byte, &mut paths);
+            found.extend(paths.drain(..).map(|path| (bytes.len() - rest.len(), path)));
         }
         found
     }

@@ -92,6 +92,7 @@ pub struct TerminalView {
     pub copy_on_select: bool,
     /// Right click pastes the clipboard (prototype default).
     pub right_click_paste: bool,
+    pub history_shortcut: bool,
     /// Rounds the top corners so the view fits inside a rounded card.
     pub top_radius: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -118,6 +119,7 @@ impl TerminalView {
             search: None,
             copy_on_select: true,
             right_click_paste: true,
+            history_shortcut: true,
             top_radius: px(0.),
             _subscriptions: subscriptions,
         }
@@ -285,6 +287,13 @@ impl TerminalView {
             return;
         }
         let keystroke = &event.keystroke;
+        if self.history_shortcut && keystroke.key == "r" && keystroke.modifiers.control
+            && !keystroke.modifiers.platform && !keystroke.modifiers.alt && !keystroke.modifiers.shift
+        {
+            self.terminal.update(cx, |_, cx| cx.emit(TerminalEvent::HistoryRequested));
+            cx.stop_propagation();
+            return;
+        }
         if self.terminal.read(cx).is_exited() {
             if keystroke.key == "enter" && !keystroke.modifiers.modified() {
                 self.terminal.update(cx, |t, cx| t.restart(cx));

@@ -33,6 +33,7 @@ mod forward;
 mod group;
 mod hosts;
 mod monitor;
+mod productivity;
 mod ssh;
 
 actions!(
@@ -46,6 +47,7 @@ actions!(
         ToggleSidebar,
         ToggleTheme,
         FocusHostSearch,
+        OpenPalette,
         Quit
     ]
 );
@@ -56,6 +58,7 @@ const CONTEXT: &str = "Workspace";
 const SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
 
 pub fn init(cx: &mut App) {
+    crate::productivity::panel::init(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewLocalTerminal, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-t", DuplicateSession, Some(CONTEXT)),
@@ -65,7 +68,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-[", PreviousTab, Some(CONTEXT)),
         KeyBinding::new("cmd-ctrl-s", ToggleSidebar, Some(CONTEXT)),
-        KeyBinding::new("cmd-k", FocusHostSearch, Some(CONTEXT)),
+        KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
@@ -146,6 +149,11 @@ pub struct Workspace {
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
+    temporary_hosts: HashMap<HostId, shellmate_core::Host>,
+    commands: Entity<crate::productivity::panel::Drawer>,
+    commands_open: bool,
+    picker: Option<Entity<crate::productivity::panel::Picker>>,
+    picker_subscription: Option<Subscription>,
     /// The host library is a temporary in-memory one (the saved file could not be opened): nothing
     /// saved in it, rules included, survives the run.
     library_is_temporary: bool,
@@ -188,13 +196,24 @@ impl Workspace {
         };
         let sidebar = cx.new(|cx| Sidebar::new(book.clone(), window, cx));
         sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(collapsed, cx));
-        let subscriptions = vec![cx.subscribe_in(&sidebar, window, Self::on_sidebar_event)];
+        let commands = cx.new(|_| crate::productivity::panel::Drawer {
+            groups: store.snippets().unwrap_or_default(),
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
+            cx.subscribe_in(&commands, window, Self::on_command_event),
+        ];
         let mut this = Self {
             store: Rc::new(RefCell::new(store)),
             secrets: Arc::new(KeychainStore::new()),
             book,
             sidebar,
             sessions: Vec::new(),
+            temporary_hosts: HashMap::new(),
+            commands,
+            commands_open: false,
+            picker: None,
+            picker_subscription: None,
             library_is_temporary: store_notice.is_some(),
             forward_grants: shellmate_forward::GrantMemory::new(),
             monitor_frozen: false,
@@ -223,7 +242,7 @@ impl Workspace {
         match step {
             "collapse" => self.set_sidebar_open(false, cx),
             "expand" => self.set_sidebar_open(true, cx),
-            "search" => self.focus_host_search(&FocusHostSearch, window, cx),
+            "search" => self.open_palette(&OpenPalette, window, cx),
             "local" => self.focus_or_open_local(window, cx),
             other if other.starts_with("log:") => {
                 // The size every terminal has just now (the status bar of a tab shows the same).
@@ -268,7 +287,7 @@ impl Workspace {
             SidebarEvent::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             SidebarEvent::Connect(id) => self.connect_host(id, window, cx),
             SidebarEvent::ActivateHost(id) => self.activate_host(id, window, cx),
-            SidebarEvent::SearchHosts => self.focus_host_search(&FocusHostSearch, window, cx),
+            SidebarEvent::SearchHosts => self.open_palette(&OpenPalette, window, cx),
             SidebarEvent::NewHost => self.new_host(window, cx),
             SidebarEvent::EditHost(id) => self.edit_host(id, false, window, cx),
             SidebarEvent::DuplicateHost(id) => self.edit_host(id, true, window, cx),
@@ -298,6 +317,7 @@ impl Workspace {
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx);
             view.top_radius = CARD_RADIUS;
+            view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view
         });
 
@@ -335,6 +355,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
+            if let TerminalEvent::Command { command, cwd, time } = event {
+                this.save_command_history(id, command, cwd.clone(), *time);
+                return;
+            }
+            if matches!(event, TerminalEvent::HistoryRequested) {
+                this.open_history(window, cx);
+                return;
+            }
             let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
             match (&mut session.kind, event) {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
@@ -360,6 +388,8 @@ impl Workspace {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(ix) else { return };
+        self.picker = None;
+        self.picker_subscription = None;
         self.active = Some(ix);
         let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
@@ -601,7 +631,14 @@ impl Workspace {
             .child(window_drag_area(div().id("tabbar-drag")).flex_1().h_full())
             .child(toolbar_button("broadcast", Lucide::RadioTower, Some("广播"), "向多个会话广播输入（P6 实现）", false, cx))
             .child(toolbar_button("ai", Lucide::Sparkles, Some("AI"), "AI 助手（P7 实现）", false, cx))
-            .child(toolbar_button("snippets", Lucide::Zap, Some("快捷命令"), "快捷命令（P6 实现）", false, cx))
+            .child(
+                toolbar_button("snippets", Lucide::Zap, Some("快捷命令"), "快捷命令", true, cx)
+                    .when(self.commands_open, |b| b.bg(p.accs).text_color(p.acc))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.commands_open = !this.commands_open;
+                        cx.notify();
+                    })),
+            )
             .child(
                 toolbar_button("theme", theme_icon, None, "切换浅色 / 深色", true, cx)
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_theme(&ToggleTheme, window, cx))),
@@ -725,7 +762,9 @@ impl Workspace {
         };
 
         div()
+            .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .flex()
             .flex_col()
@@ -756,7 +795,10 @@ impl Workspace {
                     )
                     .child(pill("rec", "● 录制", "录制为 asciinema .cast（P6 实现）", false))
                     .child(pill("logs", "记录", "会话日志与录像（P6 实现）", false))
-                    .child(pill("history", "历史 ⌃R", "跨主机命令历史（P6 实现）", false))
+                    .child(
+                        pill("history", if session.view.read(cx).history_shortcut { "历史 ⌃R" } else { "历史" }, "跨主机命令历史", true)
+                            .on_click(cx.listener(|this, _, window, cx| this.open_history(window, cx))),
+                    )
                     .child(pill("search", "搜索 ⌘F", "在输出中搜索", true).on_click(move |_, window, cx| {
                         view.update(cx, |v, cx| {
                             window.focus(&v.focus_handle(cx), cx);
@@ -765,6 +807,7 @@ impl Workspace {
                     }))
                     .child(pill("split", "分屏", "分屏（P6 实现）", false)),
             )
+
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -813,8 +856,26 @@ impl Render for Workspace {
             None => self.render_empty(cx).into_any_element(),
         };
 
+        let body = div()
+            .relative().flex_1().min_w_0().min_h_0().flex().child(content)
+            .children(self.picker.as_ref().filter(|picker| picker.read(cx).is_history()).map(|picker| {
+                div().absolute().left(px(14.)).right(px(14.)).bottom(px(44.)).child(picker.clone())
+            }));
+        let palette = self.picker.as_ref().filter(|picker| !picker.read(cx).is_history()).map(|picker| {
+            div().id("palette-overlay").occlude().absolute().inset_0()
+                .bg(gpui::rgba(0x0a0c1029)).flex().justify_center().items_start().pt(px(110.))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.picker = None;
+                    this.focus_active(window, cx);
+                    cx.notify();
+                }))
+                .child(div().id("palette-card").w(px(640.))
+                    .on_click(|_, _, cx| cx.stop_propagation()).child(picker.clone()))
+        });
+
         div()
             .id("workspace")
+            .relative()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::new_local_terminal))
@@ -825,6 +886,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::focus_host_search))
+            .on_action(cx.listener(Self::open_palette))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::restore_terminal_focus))
             .size_full()
@@ -845,8 +907,12 @@ impl Render for Workspace {
                     .pl(px(if self.sidebar_open { 8. } else { 0. }))
                     .child(self.render_tab_bar(cx))
                     .child(self.render_header(cx))
-                    .child(content),
+                    .child(
+                        div().flex_1().min_h_0().flex().gap(px(12.)).child(body)
+                            .when(self.commands_open, |d| d.child(self.commands.clone())),
+                    ),
             )
+            .children(palette)
     }
 }
 

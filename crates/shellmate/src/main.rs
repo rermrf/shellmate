@@ -8,6 +8,7 @@ mod files;
 mod forward;
 mod library;
 mod monitor;
+mod productivity;
 mod reconnect;
 #[cfg(debug_assertions)]
 mod demo;

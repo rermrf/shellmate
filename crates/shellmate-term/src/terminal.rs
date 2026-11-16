@@ -23,6 +23,7 @@ use shellmate_core::io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, Termin
 
 use crate::colors::TerminalPalette;
 use crate::keys::paste_payload;
+use crate::history::Capture;
 use crate::osc7::Osc7Scanner;
 use crate::pty::{LocalPty, PtyOptions};
 
@@ -89,6 +90,7 @@ enum Msg {
     Disconnected { generation: u64, reason: String },
     /// The shell reported its working directory (OSC 7).
     Cwd { generation: u64, path: String },
+    Command { generation: u64, command: String, time: i64 },
 }
 
 /// Forwards alacritty's events (title, bell, replies to queries) to the UI.
@@ -124,6 +126,9 @@ pub enum TerminalEvent {
     /// The shell reported a new working directory with OSC 7 (`ESC ] 7 ; file://host/path BEL`);
     /// the path is percent-decoded. Only changes are reported. Shells do not do this by default.
     CwdChanged(String),
+    /// A command read from the primary screen, after privacy filtering.
+    Command { command: String, cwd: Option<String>, time: i64 },
+    HistoryRequested,
 }
 
 /// Why the attached backend is no longer running.
@@ -141,6 +146,7 @@ pub enum SessionEnd {
 struct GridSink {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
+    capture: Arc<Mutex<Capture>>,
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
     osc7: Mutex<Osc7Scanner>,
@@ -155,13 +161,23 @@ impl OutputHandler for GridSink {
         if self.current.load(Ordering::Acquire) != self.generation {
             return;
         }
-        let reported = self.osc7.lock().feed(bytes);
+        let reported = self.osc7.lock().feed_with_offsets(bytes);
         {
             let mut term = self.term.lock();
-            self.parser.lock().advance(&mut *term, bytes);
-        }
-        for path in reported {
-            let _ = self.tx.try_send(Msg::Cwd { generation: self.generation, path });
+            let mut capture = self.capture.lock();
+            let mut parser = self.parser.lock();
+            let mut at = 0;
+            let emit = |commands: Vec<String>| {
+                for command in commands {
+                    let _ = self.tx.try_send(Msg::Command { generation: self.generation, command, time: unix_time() });
+                }
+            };
+            for (end, path) in reported {
+                emit(capture.advance(&mut *term, &mut parser, &bytes[at..end]));
+                at = end;
+                let _ = self.tx.try_send(Msg::Cwd { generation: self.generation, path });
+            }
+            emit(capture.advance(&mut *term, &mut parser, &bytes[at..]));
         }
         if !self.pending.swap(true, Ordering::AcqRel) {
             let _ = self.tx.try_send(Msg::Output);
@@ -182,6 +198,7 @@ impl OutputHandler for GridSink {
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
+    capture: Arc<Mutex<Capture>>,
     backend: Option<Box<dyn TerminalBackend>>,
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
     local: Option<PtyOptions>,
@@ -240,6 +257,7 @@ impl Terminal {
         Self {
             term: Arc::new(FairMutex::new(term)),
             parser: Arc::new(Mutex::new(Processor::new())),
+            capture: Arc::new(Mutex::new(Capture::default())),
             backend: None,
             local,
             size,
@@ -288,10 +306,12 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> bool {
         self.close_backend();
+        *self.capture.lock() = Capture::default();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let sink = OutputSink::new(GridSink {
             term: self.term.clone(),
             parser: self.parser.clone(),
+            capture: self.capture.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: self.output_pending.clone(),
             tx: self.tx.clone(),
@@ -410,7 +430,10 @@ impl Terminal {
                         cx.emit(TerminalEvent::CwdChanged(path));
                     }
                 }
-                Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } => {}
+                Msg::Command { generation, command, time } if generation == self.current_generation() => {
+                    cx.emit(TerminalEvent::Command { command, cwd: self.cwd.clone(), time });
+                }
+                Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } | Msg::Command { .. } => {}
             }
         }
         if output {
@@ -468,20 +491,37 @@ impl Terminal {
 
     /// Sends user input to the process, snapping the view back to the prompt.
     pub fn input(&mut self, bytes: &[u8]) {
+        if self.try_input(bytes).is_err() {
+            log::warn!("terminal input write failed");
+        }
+    }
+
+    fn try_input(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.backend.is_none() {
-            return;
+            return Err(std::io::ErrorKind::NotConnected.into());
         }
         {
             let mut term = self.term.lock();
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
+            if let Some(command) = self.capture.lock().input(&term, bytes) {
+                let _ = self.tx.try_send(Msg::Command { generation: self.current_generation(), command, time: unix_time() });
+            }
         }
-        self.write_raw(bytes);
+        self.backend.as_mut().ok_or(std::io::ErrorKind::NotConnected)?.write(bytes)
     }
 
     pub fn paste(&mut self, text: &str) {
         let mode = self.mode();
         self.input(paste_payload(text, &mode).as_bytes());
+    }
+
+    /// Sends a reviewed command as a paste followed by a separate carriage return.
+    pub fn send_command(&mut self, command: &str) -> Result<(), &'static str> {
+        if self.backend.is_none() || self.ended.is_some() {
+            return Err("会话未连接，无法发送");
+        }
+        crate::send::send(command, &self.mode(), |bytes| self.try_input(bytes))
     }
 
     /// Called when the user presses Enter on an ended session. A local terminal
@@ -625,6 +665,10 @@ impl Terminal {
     }
 }
 
+fn unix_time() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
 /// The hint at the end of the line that closes an ended session: Enter restarts a local shell and
 /// reconnects an SSH one, and says nothing when the owner is about to reconnect by itself (its own
 /// countdown line follows, with its own hint).
@@ -693,6 +737,7 @@ mod sink_tests {
         let sink = OutputSink::new(GridSink {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
+            capture: Arc::new(Mutex::new(Capture::default())),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,
@@ -710,6 +755,14 @@ mod sink_tests {
 
     fn drain(rx: &async_channel::Receiver<Msg>) -> Vec<Msg> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn cwd_and_command_events_preserve_order_in_one_output_chunk() {
+        let f = fixture(1);
+        f.sink.output(b"\x1b]7;file://host/first\x07\x1b]133;A\x07$ \x1b]133;B\x07cd /next\x1b]133;C\x07\r\n\x1b]7;file://host/next\x07");
+        let events: Vec<_> = drain(&f.rx).into_iter().filter_map(|m| match m { Msg::Cwd { path, .. } => Some(path), Msg::Command { command, .. } => Some(command), _ => None }).collect();
+        assert_eq!(events, ["/first", "cd /next", "/next"]);
     }
 
     #[test]

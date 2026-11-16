@@ -246,7 +246,7 @@ impl Sidebar {
             .shadow(card_shadow(&p))
             .child(Icon::new(Lucide::Search).size(px(15.)).text_color(p.tx3))
             .child(div().flex_1().child(Input::new(&self.search).small().appearance(false).cleanable(true)))
-            .child(kbd("⌘K", cx))
+
     }
 
     fn render_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {

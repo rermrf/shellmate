@@ -30,6 +30,8 @@ pub const NAMES: &[&str] = &[
     "host-editor-edit",
     "import",
     "delete",
+    "p6:palette", "p6:palette-prod", "p6:palette-connect", "p6:commands", "p6:commands-empty",
+    "p6:manage", "p6:confirm", "p6:confirm-risk", "p6:history", "p6:history-host",
 ];
 
 fn key(algorithm: &str, fingerprint: &str) -> HostKeyInfo {
@@ -51,6 +53,10 @@ fn challenge(round: u32, attempt: u32, prompts: &[(&str, bool)]) -> ChallengeReq
 
 /// Opens the demo named `name`, or logs the valid names.
 pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    if let Some(scenario) = name.strip_prefix("p6:") {
+        workspace.update(cx, |workspace, cx| workspace.demo_productivity(scenario, window, cx));
+        return;
+    }
     if let Some(host) = name.strip_prefix("connect:") {
         workspace.update(cx, |workspace, cx| workspace.connect_by_name(host, window, cx));
         return;
