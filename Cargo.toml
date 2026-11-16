@@ -11,6 +11,13 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 serialport = "4.7"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+block2 = "0.6"
 shellmate-telnet = { path = "crates/shellmate-telnet" }
 shellmate-serial = { path = "crates/shellmate-serial" }
 shellmate-core = { path = "crates/shellmate-core" }
