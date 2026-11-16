@@ -128,3 +128,16 @@
 - 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1189 通过、0 失败；经用户同意在真实登录钥匙串上跑了枚举测试（只用测试服务名 `Shellmate Tests Only`，写入 2 条、列出、删除，无残留），通过。
 
 需要用户手测（写入 `docs/manual-tests.md` V1–V14）：真实指纹的 Touch ID、存储方式双向切换、闲置 / 合盖锁定、两台设备之间的配置包手动同步等。
+
+## M5 review 结论（2026-11-17，通过；真实接口测试待用户提供 Key）
+
+- 用 rig-core 0.46.0：OpenAI 兼容走 Chat Completions（`OpenAIConfig::new(..).with_base_url(..).chat(model)`），Anthropic 走 rig 的 anthropic provider，统一成一个 `ProviderClient`。测试全部用 rig 的测试 HTTP 客户端，不开端口。rig 自带的 `Secret` 不会清零，所以配置里只放占位值，真实 Key 在发请求前经 HTTP middleware 注入，认证头标记为敏感。
+- 命令卡片：`propose_command` 只是一个"建议"工具，没有任何执行器；不支持工具的服务退回解析回答里的代码块。"插入"进入 P6 的发送确认，危险命令照样标红。
+- 多轮对话：上下文预算约 48k 字符，超出时去掉最早的完整轮次并在抽屉里说明。schema v8 保存对话与消息（只存脱敏后实际发出的内容和回答），可关闭保存、单条删除、清除全部；"清空"开始新对话，旧对话进"历史"可继续问。
+- 上下文只取终端已显示的文字（含回滚，处理软换行），先脱敏再截取最近 40 行，避免私钥块或 `.env` 的开头在 40 行之外时漏掉。第一次向某个地址发请求前说明发送内容；换地址要重新同意。凭据库锁定时先解锁，取消就不发请求。
+- review 中修复：脱敏补上 `*_PWD`、`mysql -p<密码>`、`redis-cli -a`、`sshpass -p`、`--password=` 等长参数、`curl -u user:pass`，私钥块去除后不再残留字符；抽屉标题的上下文不再被截断（"历史"改为图标按钮）；错误提示条与"清除全部对话"按钮样式调整。
+- 界面还原：`ai` 3.1 % / 3.3 %（浅 / 深）；新增界面（多轮对话、历史、错误、未配置、AI 设置、解释报错）在 1440×900 与 1100×700 下截图确认。
+- 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1220 通过、0 失败。
+- 待办：用户提供 API Key 后运行真实接口测试 `cargo test -p shellmate-ai --test e2e real_two_turn_stream_commands_and_invalid_key -- --ignored`（Key 只经 `SHELLMATE_AI_KEY_FILE` 传入）。
+
+需要用户手测（写入 `docs/manual-tests.md` A1–A10）。
