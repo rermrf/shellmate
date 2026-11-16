@@ -10,6 +10,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+serialport = "4.7"
 shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }

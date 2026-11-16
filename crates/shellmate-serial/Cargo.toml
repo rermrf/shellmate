@@ -1,0 +1,7 @@
+[package]
+name = "shellmate-serial"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serialport = { workspace = true }
