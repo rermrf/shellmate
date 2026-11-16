@@ -55,6 +55,35 @@ fn push_history<T>(history: &mut VecDeque<T>, value: T) {
     history.push_back(value);
 }
 
+/// Takes the collector script out of the list, with everything it started (`cut`, `ps`, `sleep`) and the
+/// shell that was started for it, if the login shell did not replace itself with the script: the monitor
+/// is not what the user wants to see on the server. `collector` is the script's own process id (what the
+/// process frames say); the command line `# shellmate-collector ...` finds the shells around it, and
+/// servers whose frames do not name the pid still lose the script itself.
+fn hide_the_collector(processes: &mut Vec<Process>, collector: Option<u32>) {
+    let mut hidden: std::collections::HashSet<u32> = processes
+        .iter()
+        .filter(|process| Some(process.pid) == collector || process.command.contains("shellmate-collector"))
+        .map(|process| process.pid)
+        .collect();
+    if hidden.is_empty() {
+        return;
+    }
+    // Children, grandchildren, and so on.
+    loop {
+        let more: Vec<u32> = processes
+            .iter()
+            .filter(|process| hidden.contains(&process.ppid) && !hidden.contains(&process.pid))
+            .map(|process| process.pid)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        hidden.extend(more);
+    }
+    processes.retain(|process| !hidden.contains(&process.pid));
+}
+
 /// What `ps` said about a process (kept between frames that do not repeat it).
 struct CachedPs {
     /// The start time of the process when `ps` ran: another start time under the same number is another
@@ -295,9 +324,9 @@ impl Engine {
                 threads: stat.threads,
                 nice: stat.nice,
                 start_time: stat.starttime,
-                is_collector: command.contains("shellmate-collector"),
             });
         }
+        hide_the_collector(&mut processes, frame.pid);
         processes.sort_by_key(|process| process.pid);
         self.zombies = processes.iter().filter(|process| process.state == 'Z').count();
         self.processes = processes;
@@ -341,6 +370,7 @@ mod tests {
         Frame {
             kind,
             stamp,
+            pid: None,
             sections: sections
                 .iter()
                 .map(|(name, text)| Section { name: (*name).into(), lines: text.lines().map(str::to_string).collect() })
@@ -618,9 +648,9 @@ mod tests {
     }
 
     #[test]
-    fn zombies_the_tree_and_the_collector() {
+    fn zombies_and_the_tree() {
         let mut engine = Engine::new(probe());
-        let ps = "  5   0 sh -c # shellmate-collector abc\n  6 root [defunct]\n";
+        let ps = "  5   0 sh -c work\n  6 root [defunct]\n";
         let snapshot = engine.apply(&procs_frame(
             1.0,
             &[
@@ -636,11 +666,6 @@ mod tests {
             [(5, 1), (6, 5), (7, 5)],
             "the parents for the tree"
         );
-        assert!(snapshot.process(5).unwrap().is_collector);
-        assert!(
-            snapshot.top_by_cpu(10).iter().all(|p| p.pid != 5),
-            "the monitor does not list itself among the busiest"
-        );
         let unknown = snapshot.process(7).unwrap();
         assert_eq!(
             (unknown.user.as_str(), unknown.command.as_str()),
@@ -648,6 +673,47 @@ mod tests {
             "a process ps did not list shows its short name"
         );
         assert_eq!(snapshot.process(6).unwrap().user, "root", "a name from busybox is used as it is");
+    }
+
+    #[test]
+    fn the_collector_and_what_it_started_are_not_listed_counted_or_busiest() {
+        let mut engine = Engine::new(probe());
+        let ps = "  4   0 bash -c sh -c # shellmate-collector abc\n  5   0 sh -c # shellmate-collector abc\n  7  1000 /usr/bin/editor\n";
+        let mut frame = procs_frame(
+            1.0,
+            &[
+                stat_line(4, "bash", 'S', 1, 1, 1, 8, 1),
+                stat_line(5, "sh", 'S', 4, 1, 1, 9, 1),
+                // `cut` and a zombie `ps` that the collector started.
+                stat_line(6, "cut", 'R', 5, 90, 0, 10, 0),
+                stat_line(8, "ps", 'Z', 5, 0, 0, 11, 0),
+                stat_line(7, "editor", 'S', 1, 0, 0, 12, 1),
+            ],
+            ps,
+        );
+        frame.pid = Some(5);
+        let snapshot = engine.apply(&frame);
+        assert_eq!(
+            snapshot.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            [7],
+            "only the user's process is left"
+        );
+        assert_eq!(snapshot.zombies, 0, "the collector's own zombie is not counted");
+        assert_eq!(snapshot.top_by_cpu(10).len(), 1);
+
+        // The script's pid alone is enough when ps said nothing (no ps on the server): its children go too.
+        let mut frame = procs_frame(
+            2.0,
+            &[
+                stat_line(5, "sh", 'S', 1, 1, 1, 9, 1),
+                stat_line(6, "cut", 'R', 5, 90, 0, 10, 0),
+                stat_line(9, "w", 'S', 1, 0, 0, 13, 1),
+            ],
+            "",
+        );
+        frame.pid = Some(5);
+        let snapshot = Engine::new(probe()).apply(&frame);
+        assert_eq!(snapshot.processes.iter().map(|p| p.pid).collect::<Vec<_>>(), [9]);
     }
 
     #[test]

@@ -44,6 +44,36 @@ pub fn gb_pair(used: u64, total: u64, decimals_below: f64) -> String {
     format!("{} / {} GB", gb_number(used, decimals_below), gb_number(total, decimals_below))
 }
 
+/// A size in decimal units, the way docker writes image sizes: `3.2 GB`, `29 MB`, `7.8 MB`, `812 kB`.
+pub fn decimal_size(value: u64) -> String {
+    let b = value as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e7 {
+        format!("{:.0} MB", b / 1e6)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} kB", b / 1e3)
+    } else {
+        format!("{value} B")
+    }
+}
+
+/// A size without a decimal where it is a whole number of units, for a memory limit: `1 GB`, `256 MB`, `1.5 GB`.
+pub fn bytes_short(value: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = value as f64;
+    if b >= 1024.0 * MB {
+        let gb = b / (1024.0 * MB);
+        if (gb - gb.round()).abs() < 0.05 { format!("{:.0} GB", gb.round()) } else { format!("{gb:.1} GB") }
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        bytes(value)
+    }
+}
+
 /// The resident memory of a process: `532 MB`, `5 MB`, `812 KB`, `1.2 GB`.
 pub fn rss(value: u64) -> String {
     bytes(value)
@@ -148,6 +178,21 @@ mod tests {
         assert_eq!(percent_cell(Some(13.04)), "13.0");
         assert_eq!(percent_cell(Some(143.2)), "143.2", "a process with threads can use more than one core");
         assert_eq!(percent_cell(None), "—");
+    }
+
+    #[test]
+    fn docker_sizes() {
+        assert_eq!(decimal_size(3_200_000_000), "3.2 GB");
+        assert_eq!(decimal_size(1_240_000_000), "1.2 GB");
+        assert_eq!(decimal_size(29_000_000), "29 MB");
+        assert_eq!(decimal_size(7_800_000), "7.8 MB");
+        assert_eq!(decimal_size(812_000), "812 kB");
+        assert_eq!(decimal_size(512), "512 B");
+        assert_eq!(bytes_short(1 << 30), "1 GB");
+        assert_eq!(bytes_short(256 << 20), "256 MB");
+        assert_eq!(bytes_short(3 << 29), "1.5 GB");
+        assert_eq!(bytes_short(33_554_432), "32 MB");
+        assert_eq!(bytes_short(512 * 1024), "512 KB");
     }
 
     #[test]

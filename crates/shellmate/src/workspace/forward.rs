@@ -161,6 +161,8 @@ impl Workspace {
             let view = self.forward_view(group_id, &host);
             panel.update(cx, |panel, cx| panel.set_view(view, cx));
         }
+        // The Docker page shows which container ports are forwarded already.
+        self.sync_monitor_host(host, cx);
     }
 
     /// The view of the tab on connection `group_id` to `host`: the rules of the host as the
@@ -274,7 +276,7 @@ impl Workspace {
         save(&mut self.store.borrow_mut()).map_err(|err| format!("无法保存端口转发规则：{err}"))
     }
 
-    fn add_rule(&mut self, host: &HostId, rule: ForwardRule, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn add_rule(&mut self, host: &HostId, rule: ForwardRule, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(message) = self.persist(host, |store| store.save_forward_rule(host, &rule)) {
             window.push_notification(Notification::error(message).title("端口转发"), cx);
             return;

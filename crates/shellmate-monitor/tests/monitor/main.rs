@@ -9,3 +9,4 @@ mod actions;
 mod e2e;
 mod fake;
 mod lifecycle;
+mod pages;

@@ -6,17 +6,23 @@
 //! reports over an `async-channel`. Every method can be called from any thread. Nothing is sent after
 //! [`shutdown`](Monitor::shutdown) or after the last clone is dropped.
 
+mod pollers;
+
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use shellmate_ssh::{Connection, ExecOptions, SshError, WeakConnection};
 use tokio::runtime::Handle;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::docker::{Dangling, DockerView, Usage};
 use crate::engine::Engine;
 use crate::frame::{FrameParser, Item};
 use crate::probe::{Probe, parse_probe};
 use crate::script::{CollectorConfig, collector_command, new_token, probe_command};
+use crate::services::ServiceList;
 use crate::snapshot::Snapshot;
 
 /// How much of a command's output is kept in an [`ActionReport`], in characters.
@@ -41,6 +47,14 @@ pub struct Options {
     /// How long to wait before starting again after the probe or the collector failed, one delay per
     /// attempt; when they are used up the monitor gives up ([`Phase::Failed`]) until it is asked again.
     pub retry_delays: Vec<Duration>,
+    /// How often the services and the containers are asked about while their page is in front.
+    pub poll_visible: Duration,
+    /// And while another page is in front (the overview and the header still say how many failed).
+    pub poll_hidden: Duration,
+    /// How long after a container event the containers are asked again (a restart makes several events).
+    pub debounce: Duration,
+    /// How often the disk usage of docker (slow to work out) is asked again.
+    pub usage_every: Duration,
     /// The schedule of the collector (its `token` is replaced for every run).
     pub collector: CollectorConfig,
     /// A fixed token for the markers (the in-process tests need to know it); otherwise a new one for
@@ -57,6 +71,10 @@ impl Default for Options {
             action_timeout: Duration::from_secs(30),
             healthy_run: Duration::from_secs(30),
             retry_delays: [1, 3, 10].map(Duration::from_secs).to_vec(),
+            poll_visible: Duration::from_secs(10),
+            poll_hidden: Duration::from_secs(30),
+            debounce: Duration::from_millis(300),
+            usage_every: Duration::from_secs(60),
             collector: CollectorConfig::new(""),
             token: None,
         }
@@ -80,6 +98,30 @@ pub enum Phase {
     Failed(String),
 }
 
+/// Which sub-page of the monitor page is in front: what is asked about depends on it (the container
+/// statistics only run while the Docker page is open, the services and containers are asked about more
+/// often while theirs is).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// 概览
+    Overview,
+    /// 进程
+    Processes,
+    /// 服务
+    Services,
+    /// Docker
+    Docker,
+}
+
+/// What [`Monitor::refresh`] asks again at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Topic {
+    /// The list of services.
+    Services,
+    /// The list of containers (and the disk usage of docker).
+    Docker,
+}
+
 /// A change the UI should hear about.
 #[derive(Clone, Debug)]
 pub enum MonitorEvent {
@@ -89,6 +131,10 @@ pub enum MonitorEvent {
     Probe(Arc<Probe>),
     /// New numbers (after every frame: system data every 2 s, processes every 3 s, disks every 30 s).
     Snapshot(Arc<Snapshot>),
+    /// The list of services changed.
+    Services(Arc<ServiceList>),
+    /// The containers (or what is known about them) changed.
+    Docker(Arc<DockerView>),
     /// An action finished.
     Action(ActionReport),
 }
@@ -151,6 +197,8 @@ struct State {
     probe: Option<Arc<Probe>>,
     engine: Option<Engine>,
     snapshot: Option<Arc<Snapshot>>,
+    services: Option<Arc<ServiceList>>,
+    docker: Option<pollers::DockerState>,
     next_action: u64,
     actions: Vec<AbortOnDrop>,
 }
@@ -161,6 +209,12 @@ struct Inner {
     options: Options,
     slot: Arc<Mutex<Option<WeakConnection>>>,
     state: Mutex<State>,
+    /// The sub-page in front.
+    focus: watch::Sender<Focus>,
+    wake_services: Arc<Notify>,
+    wake_docker: Arc<Notify>,
+    /// The next look at the containers also asks for the disk usage (somebody pressed a button).
+    docker_full: Arc<AtomicBool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -227,6 +281,7 @@ impl Inner {
 }
 
 /// The task of one run: probe if needed, then follow the collector until it ends.
+#[derive(Clone)]
 struct Task {
     inner: std::sync::Weak<Inner>,
     slot: Arc<Mutex<Option<WeakConnection>>>,
@@ -259,6 +314,8 @@ impl Task {
 
     async fn run(self) {
         let mut failures = 0usize;
+        // The tasks that ask about services and containers live as long as this run does.
+        let mut watchers: Option<Vec<AbortOnDrop>> = None;
         loop {
             // The connection is held while a request to the server is in flight and not while waiting.
             let Some(connection) = self.connection() else { return self.finish(Phase::WaitingReconnect) };
@@ -286,6 +343,9 @@ impl Task {
                 },
                 None => return,
             };
+            if watchers.is_none() && probe.can_collect() {
+                watchers = Some(self.start_pollers(&probe));
+            }
             if !probe.can_collect() {
                 let what = if probe.kernel.is_empty() {
                     "无法识别服务器的系统".to_string()
@@ -387,6 +447,23 @@ fn explain(err: &SshError) -> String {
     err.to_string()
 }
 
+/// What a followed command says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowEvent {
+    /// A line of its output (stdout; add `2>&1` to the command for stderr).
+    Line(String),
+    /// The command is over, or could not be run; the text says why (it may be empty).
+    Ended(String),
+}
+
+/// A command that is followed: the lines come out of [`events`](Follow::events). Dropping it closes the
+/// channel on the server.
+pub struct Follow {
+    /// The lines and the end.
+    pub events: async_channel::Receiver<FollowEvent>,
+    _task: AbortOnDrop,
+}
+
 /// The monitor of one connection. Cheap to clone; all clones are the same monitor. Dropping the last
 /// clone shuts it down.
 #[derive(Clone)]
@@ -413,6 +490,8 @@ impl Monitor {
             probe: None,
             engine: None,
             snapshot: None,
+            services: None,
+            docker: None,
             next_action: 0,
             actions: Vec::new(),
         };
@@ -423,6 +502,10 @@ impl Monitor {
                 options,
                 slot: Arc::new(Mutex::new(None)),
                 state: Mutex::new(state),
+                focus: watch::channel(Focus::Overview).0,
+                wake_services: Arc::new(Notify::new()),
+                wake_docker: Arc::new(Notify::new()),
+                docker_full: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -514,6 +597,40 @@ impl Monitor {
     /// Where the monitor stands.
     pub fn phase(&self) -> Phase {
         lock(&self.inner.state).phase.clone()
+    }
+
+    /// The newest list of services (once systemd has been asked; `None` on a server without systemd).
+    pub fn services(&self) -> Option<Arc<ServiceList>> {
+        lock(&self.inner.state).services.clone()
+    }
+
+    /// The newest view of the containers (`None` on a server without a usable docker or podman).
+    pub fn docker(&self) -> Option<Arc<DockerView>> {
+        lock(&self.inner.state).docker.as_ref().and_then(|docker| docker.view())
+    }
+
+    /// Says which sub-page is in front. The services and containers are asked about every
+    /// [`Options::poll_visible`] seconds while theirs is, and the container statistics run only while the
+    /// Docker page is.
+    pub fn set_focus(&self, focus: Focus) {
+        self.inner.focus.send_if_modified(|current| std::mem::replace(current, focus) != focus);
+    }
+
+    /// Asks again at once (after an action, when a page is opened).
+    pub fn refresh(&self, topic: Topic) {
+        match topic {
+            Topic::Services => self.inner.wake_services.notify_one(),
+            Topic::Docker => {
+                self.inner.docker_full.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.inner.wake_docker.notify_one();
+            }
+        }
+    }
+
+    /// Runs `command` on its own exec channel and hands over its output line by line (a followed log). The
+    /// channel closes when the [`Follow`] is dropped; if there is no connection it ends at once.
+    pub fn follow(&self, command: impl Into<String>) -> Follow {
+        pollers::follow(&self.inner, command.into())
     }
 
     /// Runs `command` (a line for the server's shell, built by [`crate::commands`]) on the connection and

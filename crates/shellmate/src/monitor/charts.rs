@@ -5,33 +5,23 @@ use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, canvas, point, px};
 
 use super::model::SPARK_POINTS;
 
-/// The points of a line of `values` (each 0 to `top`) in `bounds`, the oldest at the left. The line fills
-/// the width once it has [`SPARK_POINTS`] values and starts at the right edge before that, so that a new
-/// card is not stretched over the whole width. One value is a flat segment.
+/// The points of a line of `values` (each 0 to `top`) in `bounds`, the oldest at the left and the newest at
+/// the right edge: however many points there are (at most [`SPARK_POINTS`], the newest ones), they are spread
+/// over the whole width, so that a card that has only just started does not draw a dash in the corner. One
+/// value (or none) is no line.
 pub fn line_points(values: &[f64], top: f64, bounds: Bounds<Pixels>) -> Vec<Point<Pixels>> {
-    if values.is_empty() || top <= 0.0 {
+    let n = values.len().min(SPARK_POINTS);
+    if n < 2 || top <= 0.0 {
         return Vec::new();
     }
-    let n = values.len().min(SPARK_POINTS);
     let values = &values[values.len() - n..];
     let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-    let step = w / (SPARK_POINTS.saturating_sub(1)).max(1) as f32;
     let (left, top_edge) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
-    let right = left + w;
+    let step = w / (n - 1) as f32;
     // Leave room for the stroke at the top and the bottom.
     let (pad, usable) = (2.0f32, (h - 4.0).max(1.0));
     let y = |value: f64| top_edge + pad + usable * (1.0 - (value / top).clamp(0.0, 1.0) as f32);
-    let mut points: Vec<Point<Pixels>> = values
-        .iter()
-        .enumerate()
-        .map(|(i, value)| point(px(right - step * (n - 1 - i) as f32), px(y(*value))))
-        .collect();
-    if points.len() == 1 {
-        // A single value is drawn as a short flat line so that there is something to see.
-        let only = points[0];
-        points.insert(0, point(px((f32::from(only.x) - step).max(left)), only.y));
-    }
-    points
+    values.iter().enumerate().map(|(i, value)| point(px(left + step * i as f32), px(y(*value)))).collect()
 }
 
 /// A sparkline: the `fill` area (if any) and the `line`, for `values` between 0 and `top`.
@@ -95,25 +85,21 @@ mod tests {
     }
 
     #[test]
-    fn a_short_history_starts_at_the_right() {
+    fn a_short_history_is_spread_over_the_whole_width() {
         let points = line_points(&[10.0, 20.0, 30.0], 100.0, area());
         assert_eq!(points.len(), 3);
+        assert!((f32::from(points[0].x) - 10.0).abs() < 1e-3, "the oldest is at the left edge");
+        assert!((f32::from(points[1].x) - 160.0).abs() < 1e-3, "evenly spaced");
         assert!((f32::from(points[2].x) - 310.0).abs() < 1e-3, "the newest is at the right edge");
-        assert!(
-            f32::from(points[0].x) > 250.0,
-            "and the line does not stretch over the card: {}",
-            f32::from(points[0].x)
-        );
-        assert!(points[0].x < points[1].x && points[1].x < points[2].x);
+        let two = line_points(&[0.0, 100.0], 100.0, area());
+        assert_eq!((f32::from(two[0].x), f32::from(two[1].x)), (10.0, 310.0), "two points are a line over the width");
     }
 
     #[test]
-    fn nothing_and_one_value() {
+    fn nothing_and_one_value_are_no_line() {
         assert!(line_points(&[], 100.0, area()).is_empty());
-        assert!(line_points(&[1.0], 0.0, area()).is_empty(), "no scale, no line");
-        let one = line_points(&[50.0], 100.0, area());
-        assert_eq!(one.len(), 2, "a flat segment");
-        assert_eq!(one[0].y, one[1].y);
+        assert!(line_points(&[50.0], 100.0, area()).is_empty(), "one point is no line");
+        assert!(line_points(&[1.0, 2.0], 0.0, area()).is_empty(), "no scale, no line");
     }
 
     #[test]

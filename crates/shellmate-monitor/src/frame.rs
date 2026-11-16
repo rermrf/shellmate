@@ -7,6 +7,7 @@
 //! ```text
 //! @@TOKEN tick 7                 every second, so that a stalled script is noticed
 //! @@TOKEN stats 190057.84        a frame: its kind and the server's uptime when it was taken
+//! @@TOKEN procs 190060.84 4711   (a process frame also says the collector's own process id)
 //! @@TOKEN cpu                    a section; its lines follow, raw
 //! cpu  40480 0 84515 ...
 //! @@TOKEN end
@@ -48,6 +49,9 @@ pub struct Frame {
     pub kind: FrameKind,
     /// The server's uptime in seconds when it was taken: a clock that the network does not disturb.
     pub stamp: f64,
+    /// The process id of the collector script itself (`$$`), which the process frames carry so that the
+    /// monitor can leave itself, and what it starts, out of the list.
+    pub pid: Option<u32>,
     /// Its sections in the order they came.
     pub sections: Vec<Section>,
 }
@@ -113,8 +117,10 @@ impl FrameParser {
                     self.dropped += 1;
                 }
                 // A stamp that is not a number makes a frame nobody can compute rates from.
-                let stamp = argument.trim().parse::<f64>().ok().filter(|stamp| stamp.is_finite() && *stamp >= 0.0)?;
-                self.current = Some(Frame { kind, stamp, sections: Vec::new() });
+                let mut words = argument.split_whitespace();
+                let stamp = words.next()?.parse::<f64>().ok().filter(|stamp| stamp.is_finite() && *stamp >= 0.0)?;
+                let pid = words.next().and_then(|word| word.parse::<u32>().ok()).filter(|pid| *pid > 0);
+                self.current = Some(Frame { kind, stamp, pid, sections: Vec::new() });
                 None
             }
             "end" => self.current.take().map(Item::Frame),
@@ -152,6 +158,21 @@ mod tests {
         assert_eq!(frame.text("load"), "0.1 0.2 0.3 1/2 3\n");
         assert_eq!(frame.text("missing"), "");
         assert_eq!(items[2], Item::Tick(1));
+    }
+
+    #[test]
+    fn a_process_frame_names_the_collector() {
+        let mut parser = FrameParser::new("t");
+        let items =
+            feed(&mut parser, "@@t procs 9.5 4711\n@@t end\n@@t procs 12.5\n@@t end\n@@t procs 15.5 x\n@@t end\n");
+        let pids: Vec<_> = items
+            .iter()
+            .map(|item| match item {
+                Item::Frame(frame) => frame.pid,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(pids, [Some(4711), None, None], "older scripts and garbage give no pid, but still a frame");
     }
 
     #[test]

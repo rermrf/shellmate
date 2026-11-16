@@ -75,6 +75,17 @@ pub struct Systemd {
     pub running: bool,
 }
 
+/// How the login user can read the system journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalAccess {
+    /// `journalctl` shows everything to this user (root, or a member of `adm` or `systemd-journal`).
+    Direct,
+    /// Only `sudo -n journalctl` does.
+    Sudo,
+    /// Neither: `journalctl` would only print a hint, and the page says what is needed.
+    None,
+}
+
 /// Everything the probe found out.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Probe {
@@ -92,6 +103,8 @@ pub struct Probe {
     pub user: String,
     /// What sudo allows.
     pub sudo: Sudo,
+    /// The groups of the login user (`id -Gn`).
+    pub groups: Vec<String>,
     /// systemd, if the server has it.
     pub systemd: Option<Systemd>,
     /// docker and podman, as far as they are installed.
@@ -122,6 +135,7 @@ impl Probe {
             uid: None,
             user: String::new(),
             sudo: Sudo::Unavailable,
+            groups: Vec::new(),
             systemd: None,
             containers: Vec::new(),
             page_size: DEFAULT_PAGE_SIZE,
@@ -139,6 +153,19 @@ impl Probe {
     /// before podman.
     pub fn usable_container_runtime(&self) -> Option<&ContainerRuntime> {
         self.containers.iter().find(|runtime| matches!(runtime.access, ContainerAccess::User | ContainerAccess::Sudo))
+    }
+
+    /// Whether and how the login user can read the system journal: as root or a member of `adm` or
+    /// `systemd-journal` directly, otherwise with `sudo -n` if that works.
+    pub fn journal_access(&self) -> JournalAccess {
+        let in_group = self.groups.iter().any(|group| group == "adm" || group == "systemd-journal");
+        if self.uid == Some(0) || in_group {
+            JournalAccess::Direct
+        } else if matches!(self.sudo, Sudo::Root | Sudo::Passwordless) {
+            JournalAccess::Sudo
+        } else {
+            JournalAccess::None
+        }
     }
 
     /// The name of a user id: from `passwd`, or the number if nobody has that id.
@@ -192,6 +219,9 @@ pub fn parse_probe(token: &str, text: &str) -> Probe {
     probe.uid = sections.get("user").and_then(|lines| lines.first()).and_then(|line| line.trim().parse().ok());
     probe.user =
         sections.get("user").and_then(|lines| lines.get(1)).map(|line| line.trim().to_string()).unwrap_or_default();
+
+    probe.groups =
+        first("groups").map(|line| line.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
 
     probe.sudo = if probe.uid == Some(0) {
         Sudo::Root
@@ -283,7 +313,7 @@ fn unquote(value: &str) -> String {
 mod tests {
     use super::*;
 
-    const UBUNTU: &str = "@@t os\nPRETTY_NAME=\"Ubuntu 22.04.3 LTS\"\n@@t kernel\nLinux 5.15.0-91-generic\n@@t procfs\nyes\n@@t uptime\n1234567.89\n@@t user\n1001\ndeploy\n@@t sudo\nnopasswd\n@@t systemd\nsystemd 249\nrunning\n@@t containers\nbin docker /usr/bin/docker\naccess docker user denied\naccess docker sudo ok 24.0.7\nbin podman /usr/bin/podman\naccess podman user nodaemon\n@@t page\n4096\n@@t clk\n100\n@@t passwd\nroot:x:0:0:root:/root:/bin/bash\ndeploy:x:1001:1001::/home/deploy:/bin/bash\n@@t end\n";
+    const UBUNTU: &str = "@@t os\nPRETTY_NAME=\"Ubuntu 22.04.3 LTS\"\n@@t kernel\nLinux 5.15.0-91-generic\n@@t procfs\nyes\n@@t uptime\n1234567.89\n@@t user\n1001\ndeploy\n@@t groups\ndeploy docker\n@@t sudo\nnopasswd\n@@t systemd\nsystemd 249\nrunning\n@@t containers\nbin docker /usr/bin/docker\naccess docker user denied\naccess docker sudo ok 24.0.7\nbin podman /usr/bin/podman\naccess podman user nodaemon\n@@t page\n4096\n@@t clk\n100\n@@t passwd\nroot:x:0:0:root:/root:/bin/bash\ndeploy:x:1001:1001::/home/deploy:/bin/bash\n@@t end\n";
 
     #[test]
     fn a_typical_ubuntu_server() {
@@ -294,6 +324,8 @@ mod tests {
         assert_eq!(probe.uptime_secs, Some(1234567.89));
         assert_eq!((probe.uid, probe.user.as_str()), (Some(1001), "deploy"));
         assert_eq!(probe.sudo, Sudo::Passwordless);
+        assert_eq!(probe.groups, ["deploy", "docker"]);
+        assert_eq!(probe.journal_access(), JournalAccess::Sudo, "not in adm, but sudo works");
         assert_eq!(probe.systemd, Some(Systemd { version: Some(249), running: true }));
         assert_eq!(probe.containers.len(), 2);
         assert_eq!(
@@ -329,6 +361,24 @@ mod tests {
         assert_eq!(probe.sudo, Sudo::NeedsPassword);
         assert_eq!(probe.systemd, None);
         assert!(probe.containers.is_empty() && probe.usable_container_runtime().is_none());
+    }
+
+    #[test]
+    fn who_can_read_the_journal() {
+        let with = |uid: u32, groups: &[&str], sudo: Sudo| Probe {
+            uid: Some(uid),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            sudo,
+            ..Probe::unknown()
+        };
+        assert_eq!(with(0, &[], Sudo::Root).journal_access(), JournalAccess::Direct);
+        assert_eq!(with(1000, &["adm"], Sudo::Unavailable).journal_access(), JournalAccess::Direct);
+        assert_eq!(with(1000, &["x", "systemd-journal"], Sudo::NeedsPassword).journal_access(), JournalAccess::Direct);
+        assert_eq!(with(1000, &["docker"], Sudo::Passwordless).journal_access(), JournalAccess::Sudo);
+        assert_eq!(with(1000, &["docker"], Sudo::NeedsPassword).journal_access(), JournalAccess::None);
+        assert_eq!(with(1000, &[], Sudo::Unavailable).journal_access(), JournalAccess::None);
+        let probe = parse_probe("t", "@@t user\n1000\nme\n@@t groups\nme adm cdrom\n@@t end\n");
+        assert_eq!(probe.journal_access(), JournalAccess::Direct);
     }
 
     #[test]

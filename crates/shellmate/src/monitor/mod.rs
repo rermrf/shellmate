@@ -3,9 +3,11 @@
 //! window; [`panel`] draws it and [`charts`] draws the sparklines.
 
 pub mod charts;
+pub mod containers;
 #[cfg(debug_assertions)]
 pub mod demo;
 pub mod format;
 pub mod model;
 pub mod panel;
 pub mod process;
+pub mod services;

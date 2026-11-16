@@ -133,6 +133,17 @@ pub struct TypedLine {
     pub enter: bool,
 }
 
+/// How long the shell of a new tab must be quiet (after it wrote something) before a line is typed into it.
+pub const TYPE_QUIET: Duration = Duration::from_millis(200);
+/// How long a line waits for its shell at the most.
+pub const TYPE_CAP: Duration = Duration::from_secs(3);
+
+/// Whether it is time to type the pending line: the shell wrote something and has been quiet for
+/// [`TYPE_QUIET`] (as of `now`), or [`TYPE_CAP`] has passed since the tab was opened.
+pub fn typing_time(last_output: Option<std::time::Instant>, waited: Duration, now: std::time::Instant) -> bool {
+    waited >= TYPE_CAP || last_output.is_some_and(|at| now.saturating_duration_since(at) >= TYPE_QUIET)
+}
+
 /// What connecting a host does about tabs that already exist for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Existing {
@@ -725,21 +736,39 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Types what the tab was opened for into its shell, a moment after the shell is there (so that the
-    /// prompt has been drawn and the line does not appear twice).
+    /// Types what the tab was opened for into its shell once the shell has settled: it has written something
+    /// (the login banner, the prompt) and then been quiet for [`TYPE_QUIET`], so that a slow login or a long
+    /// message of the day cannot swallow the line or print it twice. Gives up waiting after [`TYPE_CAP`] (a
+    /// shell that says nothing at all).
     fn type_pending(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
         let Some(typed) = session.typed.take() else { return };
         let terminal = session.terminal.clone();
+        // When the shell last wrote something (anything that happens after the shell was attached).
+        let last_output: Rc<std::cell::Cell<Option<std::time::Instant>>> = Rc::new(std::cell::Cell::new(None));
+        let watcher = {
+            let last_output = last_output.clone();
+            cx.subscribe(&terminal, move |_, _, event: &shellmate_term::TerminalEvent, _| {
+                if matches!(event, shellmate_term::TerminalEvent::Output) {
+                    last_output.set(Some(std::time::Instant::now()));
+                }
+            })
+        };
         cx.spawn_in(window, async move |_, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
-            terminal
-                .update(cx, |terminal, _| {
-                    terminal.paste(&typed.text);
-                    if typed.enter {
-                        terminal.input(b"\r");
-                    }
-                });
+            let started = std::time::Instant::now();
+            loop {
+                cx.background_executor().timer(Duration::from_millis(40)).await;
+                if typing_time(last_output.get(), started.elapsed(), std::time::Instant::now()) {
+                    break;
+                }
+            }
+            drop(watcher);
+            terminal.update(cx, |terminal, _| {
+                terminal.paste(&typed.text);
+                if typed.enter {
+                    terminal.input(b"\r");
+                }
+            });
         })
         .detach();
     }
@@ -1083,6 +1112,27 @@ mod tests {
         for status in [Connecting, Connected, Reconnecting(2), Failed, Ended] {
             assert_eq!(status.on_view(View::Connected), status);
         }
+    }
+
+    #[test]
+    fn a_line_is_typed_when_the_shell_has_said_something_and_gone_quiet() {
+        use std::time::Instant;
+        let start = Instant::now();
+        let after = |ms: u64| start + Duration::from_millis(ms);
+        // Nothing yet: wait (the shell has not said a word, it may still be logging in).
+        assert!(!typing_time(None, Duration::from_millis(500), after(500)));
+        // Output just now, or 150 ms ago: still talking (a motd comes in pieces).
+        assert!(!typing_time(Some(after(1000)), Duration::from_millis(1000), after(1000)));
+        assert!(!typing_time(Some(after(1000)), Duration::from_millis(1150), after(1150)));
+        // 200 ms of quiet after the last output: the prompt is there.
+        assert!(typing_time(Some(after(1000)), Duration::from_millis(1200), after(1200)));
+        // A shell that never says anything is not waited for forever.
+        assert!(!typing_time(None, Duration::from_millis(2999), after(2999)));
+        assert!(typing_time(None, TYPE_CAP, after(3000)));
+        // A shell that keeps on writing is cut off by the same cap.
+        assert!(typing_time(Some(after(2990)), TYPE_CAP, after(3000)));
+        // A clock that went back is not "quiet".
+        assert!(!typing_time(Some(after(2000)), Duration::from_millis(100), after(1000)));
     }
 
     #[test]

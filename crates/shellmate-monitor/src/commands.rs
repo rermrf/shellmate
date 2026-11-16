@@ -1,5 +1,4 @@
-//! The commands the monitor runs on the server (signals, renice, strace, and for later services and
-//! containers), built as pure functions: every value comes in as one word, quoted by [`quote`], and
+//! The commands the monitor runs on the server (signals, renice, strace, services and containers), built as pure functions: every value comes in as one word, quoted by [`quote`], and
 //! a process id is only accepted as a plain number.
 
 use crate::probe::{Probe, Sudo};
@@ -62,14 +61,29 @@ impl Command {
         let mut words = Vec::with_capacity(self.argv.len());
         for (i, word) in self.argv.iter().enumerate() {
             let quoted = quote::quote(word).expect("a command has no NUL bytes");
-            words.push(if i == 0 && word.contains('=') && !quoted.starts_with('\'') { format!("'{word}'") } else { quoted });
+            words.push(if i == 0 && word.contains('=') && !quoted.starts_with('\'') {
+                format!("'{word}'")
+            } else {
+                quoted
+            });
         }
         words.join(" ")
     }
 
+    /// The line for a command whose stderr is part of what is wanted (a followed log: `docker logs` writes
+    /// what the container wrote to stderr to its own stderr): `… 2>&1`.
+    pub fn line_merged(&self) -> String {
+        format!("{} 2>&1", self.line())
+    }
+
     /// The command with `prefix` words in front.
-    fn prefixed(&self, prefix: &[&str]) -> Self {
+    pub fn prefixed(&self, prefix: &[&str]) -> Self {
         Self { argv: prefix.iter().map(|word| (*word).to_string()).chain(self.argv.iter().cloned()).collect() }
+    }
+
+    /// The command as `sudo -n` runs it (no question is asked: it works or it fails).
+    pub fn sudo_n(&self) -> Self {
+        self.prefixed(&["sudo", "-n"])
     }
 }
 
@@ -168,7 +182,7 @@ pub fn strace(pid: u32) -> Result<Command, BuildError> {
     Command::new(["strace".to_string(), "-f".into(), "-p".into(), pid_word(pid)?])
 }
 
-// ---- services and containers (the pages of the next milestone) --------------------------------
+// ---- services and containers ---------------------------------------------------------------
 
 fn name_word(name: &str) -> Result<&str, BuildError> {
     if name.is_empty() {
@@ -216,7 +230,7 @@ pub fn systemctl(action: ServiceAction, unit: &str) -> Result<Command, BuildErro
     Command::new(["systemctl", action.verb(), name_word(unit)?])
 }
 
-/// `journalctl -u nginx.service -n 50 -f --no-pager`, for a terminal tab.
+/// `journalctl -u nginx.service -n 50 -f -o short-iso --no-pager`: the log of a unit, followed.
 pub fn journal_follow(unit: &str, lines: u32) -> Result<Command, BuildError> {
     Command::new([
         "journalctl".to_string(),
@@ -225,6 +239,8 @@ pub fn journal_follow(unit: &str, lines: u32) -> Result<Command, BuildError> {
         "-n".into(),
         lines.to_string(),
         "-f".into(),
+        "-o".into(),
+        "short-iso".into(),
         "--no-pager".into(),
     ])
 }
@@ -264,21 +280,10 @@ pub fn prune_dangling_images(runtime: &str) -> Result<Command, BuildError> {
     Command::new([runtime, "image", "prune", "-f"])
 }
 
-/// `docker logs -f --tail 100 web-1`.
-pub fn container_logs(runtime: &str, name: &str, tail: u32) -> Result<Command, BuildError> {
-    Command::new([
-        runtime.to_string(),
-        "logs".into(),
-        "-f".into(),
-        "--tail".into(),
-        tail.to_string(),
-        name_word(name)?.to_string(),
-    ])
-}
-
-/// `docker exec -it web-1 sh` (or `bash`), for a terminal tab.
-pub fn container_shell(runtime: &str, name: &str, bash: bool) -> Result<Command, BuildError> {
-    Command::new([runtime, "exec", "-it", name_word(name)?, if bash { "bash" } else { "sh" }])
+/// The privilege a container command needs: none when the login user can use the tool, root when only
+/// `sudo -n` gets it through (the probe found that out).
+pub fn container_privilege(runtime: &crate::probe::ContainerRuntime) -> Privilege {
+    if runtime.access == crate::probe::ContainerAccess::Sudo { Privilege::Root } else { Privilege::User }
 }
 
 /// The disk analysis the overview offers for a full mount point, for a terminal tab:
@@ -366,16 +371,21 @@ mod tests {
         assert_eq!(systemctl(ServiceAction::Enable, "nginx.service").unwrap().line(), "systemctl enable nginx.service");
         assert_eq!(
             journal_follow("a b.service", 50).unwrap().line(),
-            "journalctl -u 'a b.service' -n 50 -f --no-pager"
+            "journalctl -u 'a b.service' -n 50 -f -o short-iso --no-pager"
         );
         assert_eq!(container("docker", ContainerAction::Stop, "web-1").unwrap().line(), "docker stop web-1");
         assert_eq!(container("podman", ContainerAction::Remove, "a$b").unwrap().line(), "podman rm 'a$b'");
         assert_eq!(prune_dangling_images("docker").unwrap().line(), "docker image prune -f");
-        assert_eq!(container_logs("docker", "web 1", 100).unwrap().line(), "docker logs -f --tail 100 'web 1'");
-        assert_eq!(container_shell("docker", "web-1", true).unwrap().line(), "docker exec -it web-1 bash");
-        assert_eq!(container_shell("docker", "web-1", false).unwrap().line(), "docker exec -it web-1 sh");
+        assert_eq!(
+            journal_follow("a.service", 50).unwrap().sudo_n().line_merged(),
+            "sudo -n journalctl -u a.service -n 50 -f -o short-iso --no-pager 2>&1"
+        );
         assert_eq!(analyze_directory("/mnt/my data").unwrap(), "du -xh -d 1 '/mnt/my data' | sort -rh | head");
-        assert_eq!(Command::new(["FOO=1", "x"]).unwrap().line(), "'FOO=1' x", "a program with = would be an assignment");
+        assert_eq!(
+            Command::new(["FOO=1", "x"]).unwrap().line(),
+            "'FOO=1' x",
+            "a program with = would be an assignment"
+        );
         assert_eq!(analyze_directory("/"), Ok("du -xh -d 1 / | sort -rh | head".to_string()));
     }
 

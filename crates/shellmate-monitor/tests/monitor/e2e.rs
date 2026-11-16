@@ -287,10 +287,10 @@ on_both! {
         while started.elapsed() < Duration::from_secs(30) {
             let Some(snapshot) = next_snapshot(&receiver, Duration::from_secs(10)).await else { panic!("no snapshot for 10 s") };
             snapshots.push(snapshot.clone());
-            // Once the collector shows up in the process list, start measuring what it costs.
+            // Once the collector runs (and is not in the process list: the monitor hides itself), start measuring what it costs.
             if collector_cpu.is_none() {
                 let pids = t.collector_pids();
-                if !pids.is_empty() && snapshot.processes.iter().any(|p| p.is_collector) {
+                if !pids.is_empty() && snapshot.processes.iter().all(|p| !pids.contains(&p.pid)) && !snapshot.processes.is_empty() {
                     collector_cpu = Some((Instant::now(), pids.clone(), pids.iter().map(|pid| t.cpu_ticks(*pid).unwrap_or(0)).sum::<u64>()));
                 }
             }
@@ -534,4 +534,446 @@ async fn e2e_the_collector_works_with_the_busybox_ps_too() {
     assert_eq!((mine.user.as_str(), mine.command.as_str()), (t.user.as_str(), "sleep 1236"));
     assert!(ps_frames >= 1);
     let _ = t.run(&format!("kill {sleeper}; rm -rf /tmp/p5bb"));
+}
+
+// ---- services and containers ---------------------------------------------------------------------
+
+/// Removes what a test put on the machine, when it ends (also when it fails).
+struct Fixtures<'a> {
+    target: &'a Target,
+    cleanup: Vec<String>,
+}
+
+impl<'a> Fixtures<'a> {
+    fn new(target: &'a Target) -> Self {
+        Self { target, cleanup: Vec::new() }
+    }
+
+    /// Runs `script` now and `undo` when the fixtures are dropped.
+    fn add(&mut self, script: &str, undo: &str) {
+        self.target.run(script);
+        self.cleanup.push(undo.to_string());
+    }
+}
+
+impl Drop for Fixtures<'_> {
+    fn drop(&mut self) {
+        for undo in self.cleanup.iter().rev() {
+            self.target.run(undo);
+        }
+    }
+}
+
+async fn next_matching<T>(
+    receiver: &async_channel::Receiver<MonitorEvent>,
+    what: &str,
+    wait: Duration,
+    mut check: impl FnMut(&MonitorEvent) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left =
+            deadline.checked_duration_since(Instant::now()).unwrap_or_else(|| panic!("timed out waiting for {what}"));
+        match tokio::time::timeout(left, receiver.recv()).await {
+            Ok(Ok(event)) => {
+                if let Some(found) = check(&event) {
+                    return found;
+                }
+            }
+            _ => panic!("timed out waiting for {what}"),
+        }
+    }
+}
+
+/// Runs a command line (as the monitor built it) and returns its report.
+async fn act(
+    monitor: &Monitor,
+    events: &async_channel::Receiver<MonitorEvent>,
+    plan: Plan,
+) -> shellmate_monitor::ActionReport {
+    let Plan::Exec { line } = plan else { panic!("passwordless sudo and the docker group need no terminal: {plan:?}") };
+    let id = monitor.run_action(line);
+    next_report(events, id).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the shellmate-mon machine (see the module docs)"]
+async fn e2e_services_listed_acted_on_and_followed() {
+    use shellmate_monitor::JournalAccess;
+    use shellmate_monitor::commands::{ServiceAction, journal_follow, systemctl};
+    use shellmate_monitor::services::{ActiveState, Autostart, parse_journal_line};
+
+    let _turn = turn().await;
+    let t = Target::ubuntu();
+    let mut fixtures = Fixtures::new(&t);
+    fixtures.add(
+        r#"sudo -n sh -c 'printf "[Unit]\nDescription=Shellmate e2e demo\n\n[Service]\nExecStart=/bin/sh -c \"while :; do echo e2e-tick; sleep 1; done\"\n\n[Install]\nWantedBy=multi-user.target\n" > /etc/systemd/system/shellmate-e2e-demo.service; printf "[Unit]\nDescription=Shellmate e2e broken\n\n[Service]\nType=oneshot\nExecStart=/bin/sh -c \"echo \\\"<3>ERROR: e2e broken on purpose\\\" >&2; exit 1\"\n" > /etc/systemd/system/shellmate-e2e-broken.service; systemctl daemon-reload; systemctl start shellmate-e2e-demo.service; systemctl start shellmate-e2e-broken.service'"#,
+        "sudo -n sh -c 'systemctl stop shellmate-e2e-demo.service shellmate-e2e-broken.service; systemctl disable shellmate-e2e-demo.service; rm -f /etc/systemd/system/shellmate-e2e-demo.service /etc/systemd/system/shellmate-e2e-broken.service; systemctl daemon-reload; systemctl reset-failed shellmate-e2e-broken.service'",
+    );
+
+    let s = session(&t).await;
+    let (events, receiver) = async_channel::unbounded();
+    let monitor = Monitor::with_options(
+        tokio::runtime::Handle::current(),
+        events,
+        Options { poll_visible: Duration::from_secs(2), ..Options::default() },
+    );
+    monitor.connection_restored(&s.connection);
+    monitor.set_focus(shellmate_monitor::Focus::Services);
+    monitor.set_active(true);
+
+    let started = Instant::now();
+    let list = next_matching(&receiver, "the services", Duration::from_secs(30), |event| match event {
+        MonitorEvent::Services(list) if list.get("shellmate-e2e-broken.service").is_some_and(|s| s.is_failed()) => {
+            Some(list.clone())
+        }
+        _ => None,
+    })
+    .await;
+    println!(
+        "ubuntu: {} services listed after {:.2} s ({} running, {} failed)",
+        list.services.len(),
+        started.elapsed().as_secs_f64(),
+        list.running(),
+        list.failed()
+    );
+    let broken = list.get("shellmate-e2e-broken.service").unwrap();
+    assert_eq!(broken.exit_status, Some(1));
+    assert_eq!(broken.result.as_deref(), Some("exit-code"));
+    assert!(broken.since_monotonic_us.is_some() || broken.since_text.is_some(), "when it failed");
+    let probe = monitor.probe().unwrap();
+    println!("ubuntu: the journal is read {:?}", probe.journal_access());
+    assert_eq!(probe.journal_access(), JournalAccess::Sudo, "tester is not in adm, sudo -n reads the journal");
+    assert!(
+        broken.last_error.as_deref().is_some_and(|line| line.contains("e2e broken on purpose")),
+        "{:?}",
+        broken.last_error
+    );
+    let demo = list.get("shellmate-e2e-demo.service").unwrap();
+    assert_eq!(demo.active, ActiveState::Active);
+    assert!(demo.main_pid.is_some_and(|pid| pid > 1), "{demo:?}");
+    assert!(demo.memory.is_some_and(|bytes| bytes > 0), "{demo:?}");
+    assert_eq!(demo.description, "Shellmate e2e demo");
+    assert_eq!(demo.autostart, Autostart::Disabled);
+    assert!(list.services.iter().any(|s| s.name == "cron.service" && s.autostart == Autostart::Enabled));
+
+    // The journal of the unit, followed (the way the page does it).
+    let follow = monitor.follow(journal_follow("shellmate-e2e-demo.service", 50).unwrap().sudo_n().line_merged());
+    let line = loop {
+        match tokio::time::timeout(Duration::from_secs(15), follow.events.recv()).await.expect("a log line").unwrap() {
+            shellmate_monitor::FollowEvent::Line(line) if line.contains("e2e-tick") => break parse_journal_line(&line),
+            shellmate_monitor::FollowEvent::Ended(why) => panic!("the log ended: {why}"),
+            _ => {}
+        }
+    };
+    println!("ubuntu: a log line: time {:?}, text {:?}", line.time, line.text);
+    assert_eq!((line.text.as_str(), line.time.len()), ("e2e-tick", 8));
+    drop(follow);
+
+    // The actions, planned the way the page plans them.
+    let plan = |action| {
+        shellmate_monitor::commands::plan(
+            &systemctl(action, "shellmate-e2e-demo.service").unwrap(),
+            shellmate_monitor::commands::Privilege::Root,
+            &probe,
+        )
+    };
+    let report = act(&monitor, &receiver, plan(ServiceAction::Stop)).await;
+    println!("ubuntu: {} -> {:?}", report.command, report.outcome);
+    assert!(matches!(report.outcome, ActionOutcome::Success { .. }), "{report:?}");
+    assert!(report.command.starts_with("sudo -n systemctl stop"));
+    monitor.refresh(shellmate_monitor::Topic::Services);
+    next_matching(&receiver, "the unit to be stopped", Duration::from_secs(15), |event| match event {
+        MonitorEvent::Services(list)
+            if list.get("shellmate-e2e-demo.service").is_some_and(|s| s.active == ActiveState::Inactive) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    for action in [ServiceAction::Start, ServiceAction::Restart] {
+        let report = act(&monitor, &receiver, plan(action)).await;
+        assert!(matches!(report.outcome, ActionOutcome::Success { .. }), "{report:?}");
+    }
+    let reload = act(&monitor, &receiver, plan(ServiceAction::Reload)).await;
+    println!("ubuntu: a reload of a unit that cannot reload: {:?}", reload.outcome);
+    assert!(matches!(reload.outcome, ActionOutcome::Failure { .. }), "{reload:?}");
+    let enable = act(&monitor, &receiver, plan(ServiceAction::Enable)).await;
+    assert!(matches!(enable.outcome, ActionOutcome::Success { .. }), "{enable:?}");
+    monitor.refresh(shellmate_monitor::Topic::Services);
+    next_matching(&receiver, "the unit to be enabled", Duration::from_secs(15), |event| match event {
+        MonitorEvent::Services(list)
+            if list
+                .get("shellmate-e2e-demo.service")
+                .is_some_and(|s| s.autostart == Autostart::Enabled && s.active.is_running()) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    let disable = act(&monitor, &receiver, plan(ServiceAction::Disable)).await;
+    assert!(matches!(disable.outcome, ActionOutcome::Success { .. }), "{disable:?}");
+    // A stopped unit that systemd forgot is still in the list (it comes from the unit files).
+    let stop = act(&monitor, &receiver, plan(ServiceAction::Stop)).await;
+    assert!(matches!(stop.outcome, ActionOutcome::Success { .. }));
+    monitor.refresh(shellmate_monitor::Topic::Services);
+    next_matching(&receiver, "the stopped unit to stay listed", Duration::from_secs(15), |event| match event {
+        MonitorEvent::Services(list)
+            if list
+                .get("shellmate-e2e-demo.service")
+                .is_some_and(|s| s.active == ActiveState::Inactive && s.autostart == Autostart::Disabled) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    // A followed journal does not stay on the server after the follow and the monitor are gone (the command
+    // writes only when the journal does, so only the wrapper of `watched` can end it).
+    let before = t.run("pgrep -f '[j]ournalctl -u shellmate-e2e-demo' | wc -l").trim().to_string();
+    let follow = monitor.follow(journal_follow("shellmate-e2e-demo.service", 5).unwrap().sudo_n().line_merged());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let running = t.run("pgrep -f '[j]ournalctl -u shellmate-e2e-demo' | wc -l").trim().to_string();
+    drop(follow);
+    monitor.shutdown();
+    drop(s);
+    let mut left = String::new();
+    for _ in 0..50 {
+        left = t.run("pgrep -f '[j]ournalctl -u shellmate-e2e-demo' | wc -l").trim().to_string();
+        if left == "0" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "ubuntu: journalctl processes before the follow {before}, while it ran {running}, after it was dropped {left}"
+    );
+    assert_eq!(left, "0", "no journalctl left on the server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the shellmate-mon machine with the images nginx:alpine, redis:alpine and alpine (see the module docs)"]
+async fn e2e_containers_listed_acted_on_and_followed() {
+    use shellmate_monitor::commands::{ContainerAction, container, container_privilege, plan, prune_dangling_images};
+    use shellmate_monitor::docker::{self, ContainerState};
+
+    let _turn = turn().await;
+    let t = Target::ubuntu();
+    let mut fixtures = Fixtures::new(&t);
+    let labels = "--label com.docker.compose.project=shellmate-e2e --label com.docker.compose.project.config_files=/srv/e2e/compose.yml";
+    fixtures.add(
+        &format!(
+            "docker rm -f shellmate-e2e-web shellmate-e2e-cache shellmate-e2e-oom shellmate-e2e-old >/dev/null 2>&1; \
+             docker run -d --name shellmate-e2e-web {labels} --label com.docker.compose.service=web -p 127.0.0.1:18081:80 nginx:alpine; \
+             docker run -d --name shellmate-e2e-cache {labels} --label com.docker.compose.service=cache redis:alpine; \
+             docker run -d --name shellmate-e2e-oom {labels} --label com.docker.compose.service=oom --memory 32m --memory-swap 32m --restart always alpine sh -c 'a=xxxxxxxxxxxxxxxx; while :; do a=\"$a$a\"; done'; \
+             docker run --name shellmate-e2e-old alpine true; \
+             printf 'FROM alpine\\nRUN echo one > /e2e\\n' | docker build -q -t shellmate-e2e-img:latest - ; \
+             printf 'FROM alpine\\nRUN echo two > /e2e\\n' | docker build -q -t shellmate-e2e-img:latest - ; true"
+        ),
+        "docker rm -f shellmate-e2e-web shellmate-e2e-cache shellmate-e2e-oom shellmate-e2e-old >/dev/null 2>&1; docker rmi shellmate-e2e-img:latest >/dev/null 2>&1; docker image prune -f >/dev/null 2>&1; true",
+    );
+
+    let s = session(&t).await;
+    let (events, receiver) = async_channel::unbounded();
+    let monitor = Monitor::with_options(
+        tokio::runtime::Handle::current(),
+        events,
+        Options { poll_visible: Duration::from_secs(5), ..Options::default() },
+    );
+    monitor.connection_restored(&s.connection);
+    monitor.set_focus(shellmate_monitor::Focus::Docker);
+    monitor.set_active(true);
+
+    let started = Instant::now();
+    let view = next_matching(&receiver, "the containers", Duration::from_secs(40), |event| match event {
+        MonitorEvent::Docker(view)
+            if view.containers.iter().filter(|c| c.name.starts_with("shellmate-e2e-")).count() == 4
+                && view.containers.iter().any(|c| c.cpu_percent.is_some() && c.name == "shellmate-e2e-web")
+                && view.usage.images.is_some() =>
+        {
+            Some(view.clone())
+        }
+        _ => None,
+    })
+    .await;
+    println!(
+        "ubuntu: {} containers, listed with statistics and usage after {:.2} s; {:?} {:?}",
+        view.containers.len(),
+        started.elapsed().as_secs_f64(),
+        view.usage,
+        view.dangling
+    );
+    for c in &view.containers {
+        println!("ubuntu: {} {:?} cpu {:?} mem {:?}", c.name, c.state, c.cpu_percent, c.mem_used);
+    }
+    let find = |view: &shellmate_monitor::docker::DockerView, name: &str| {
+        view.containers.iter().find(|c| c.name == name).cloned().unwrap()
+    };
+    let web = find(&view, "shellmate-e2e-web");
+    assert_eq!(web.state, ContainerState::Running);
+    assert_eq!(
+        (web.project.as_deref(), web.service.as_deref(), web.config_files.as_deref()),
+        (Some("shellmate-e2e"), Some("web"), Some("/srv/e2e/compose.yml"))
+    );
+    assert_eq!(web.ports.len(), 1);
+    assert_eq!(web.ports[0].label(), "127.0.0.1:18081→80");
+    assert_eq!(web.ports[0].published_target(), Some(("127.0.0.1".to_string(), 18081)));
+    assert!(web.mem_used.is_some_and(|bytes| bytes > 100_000), "{web:?}");
+    let cache = find(&view, "shellmate-e2e-cache");
+    assert!(cache.ip().is_some_and(|ip| ip.starts_with("172.")), "{:?}", cache.networks);
+    assert_eq!(cache.ports[0].label(), "6379/tcp");
+    assert!(cache.ports[0].published_target().is_none());
+    let oom = find(&view, "shellmate-e2e-oom");
+    println!(
+        "ubuntu: the OOM container: {:?} {} restarts, oom {}, limit {:?}",
+        oom.state, oom.restart_count, oom.oom_killed, oom.memory_limit
+    );
+    assert!(oom.memory_limit == Some(32 * 1024 * 1024));
+    let old = find(&view, "shellmate-e2e-old");
+    assert_eq!(old.state, ContainerState::Exited);
+    assert!(view.dangling.count >= 1, "the first build of the image is dangling now: {:?}", view.dangling);
+    // The restart loop shows up after some restarts.
+    let looping = next_matching(&receiver, "the OOM container to loop", Duration::from_secs(60), |event| match event {
+        MonitorEvent::Docker(view) => view
+            .containers
+            .iter()
+            .find(|c| c.name == "shellmate-e2e-oom")
+            .filter(|c| c.is_restart_looping() && c.oom_killed && c.restart_count >= 2)
+            .cloned(),
+        _ => None,
+    })
+    .await;
+    println!("ubuntu: loop detected: {} restarts, status {:?}", looping.restart_count, looping.status);
+
+    // The logs, followed like the page does (docker writes the container's stderr to its own).
+    let probe = monitor.probe().unwrap();
+    let runtime = probe.usable_container_runtime().unwrap().clone();
+    let logs = monitor.follow(docker::logs(runtime.kind.command(), "shellmate-e2e-web", true).unwrap().line_merged());
+    let mut seen = String::new();
+    while !seen.contains("start worker processes") {
+        match tokio::time::timeout(Duration::from_secs(15), logs.events.recv()).await.expect("a log line").unwrap() {
+            shellmate_monitor::FollowEvent::Line(line) => seen += &line,
+            shellmate_monitor::FollowEvent::Ended(why) => panic!("the log ended: {why}"),
+        }
+    }
+    drop(logs);
+
+    // The terminal line really starts a shell in the container: run it without a terminal and see which one.
+    let line = docker::exec_shell("docker", "shellmate-e2e-web").unwrap().line().replace("exec -it", "exec -i");
+    assert_eq!(t.run(&format!("echo 'echo shell=$0' | {line}")).trim(), "shell=sh", "alpine has no bash");
+
+    // Actions: the events stream makes the page see them without being asked.
+    let privilege = container_privilege(&runtime);
+    let stop = act(
+        &monitor,
+        &receiver,
+        plan(&container("docker", ContainerAction::Stop, "shellmate-e2e-web").unwrap(), privilege, &probe),
+    )
+    .await;
+    assert!(matches!(stop.outcome, ActionOutcome::Success { .. }), "{stop:?}");
+    let stopped = Instant::now();
+    next_matching(&receiver, "the stopped container", Duration::from_secs(8), |event| match event {
+        MonitorEvent::Docker(view)
+            if view.containers.iter().any(|c| c.name == "shellmate-e2e-web" && c.state == ContainerState::Exited) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    println!(
+        "ubuntu: the stop showed {:.2} s after the command (events, not the timer)",
+        stopped.elapsed().as_secs_f64()
+    );
+    for action in [ContainerAction::Start, ContainerAction::Restart] {
+        let report = act(
+            &monitor,
+            &receiver,
+            plan(&container("docker", action, "shellmate-e2e-web").unwrap(), privilege, &probe),
+        )
+        .await;
+        assert!(matches!(report.outcome, ActionOutcome::Success { .. }), "{report:?}");
+    }
+    let remove = act(
+        &monitor,
+        &receiver,
+        plan(&container("docker", ContainerAction::Remove, "shellmate-e2e-old").unwrap(), privilege, &probe),
+    )
+    .await;
+    assert!(matches!(remove.outcome, ActionOutcome::Success { .. }), "{remove:?}");
+    next_matching(&receiver, "the removed container to go", Duration::from_secs(8), |event| match event {
+        MonitorEvent::Docker(view) if view.containers.iter().all(|c| c.name != "shellmate-e2e-old") => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // The clean-up removes the dangling images and says how many (the page asks, then runs this).
+    monitor.refresh(shellmate_monitor::Topic::Docker);
+    let before = next_matching(&receiver, "the dangling images", Duration::from_secs(20), |event| match event {
+        MonitorEvent::Docker(view) if view.dangling.count >= 1 => Some(view.dangling),
+        _ => None,
+    })
+    .await;
+    println!("ubuntu: {} dangling images, {} bytes before the clean-up", before.count, before.bytes);
+    let prune = act(&monitor, &receiver, plan(&prune_dangling_images("docker").unwrap(), privilege, &probe)).await;
+    assert!(matches!(prune.outcome, ActionOutcome::Success { .. }), "{prune:?}");
+    monitor.refresh(shellmate_monitor::Topic::Docker);
+    next_matching(&receiver, "no dangling images", Duration::from_secs(20), |event| match event {
+        MonitorEvent::Docker(view) if view.dangling.count == 0 => Some(()),
+        _ => None,
+    })
+    .await;
+    // Nothing of the monitor stays on the server: the events and statistics streams and the followed log have
+    // ended with the monitor (they write only when something happens; see `script::watched`).
+    let logs = monitor.follow(docker::logs(runtime.kind.command(), "shellmate-e2e-web", true).unwrap().line_merged());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let running = t.run("pgrep -f '[d]ocker (events|stats|logs)' | wc -l").trim().to_string();
+    drop(logs);
+    monitor.shutdown();
+    drop(s);
+    let mut left = String::new();
+    for _ in 0..50 {
+        left = t.run("pgrep -f '[d]ocker (events|stats|logs)' | wc -l").trim().to_string();
+        if left == "0" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "ubuntu: docker events/stats/logs processes while the monitor ran {running}, after it was shut down {left}"
+    );
+    assert_eq!(left, "0", "no docker stream left on the server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the shellmate-e2e container (see the module docs)"]
+async fn e2e_a_server_without_systemd_and_docker_has_no_services_or_containers() {
+    let _turn = turn().await;
+    let t = Target::alpine();
+    let s = session(&t).await;
+    let (events, receiver) = async_channel::unbounded();
+    let monitor = Monitor::with_options(
+        tokio::runtime::Handle::current(),
+        events,
+        Options { poll_visible: Duration::from_secs(1), poll_hidden: Duration::from_secs(1), ..Options::default() },
+    );
+    monitor.connection_restored(&s.connection);
+    monitor.set_focus(shellmate_monitor::Focus::Services);
+    monitor.set_active(true);
+    let mut services = false;
+    let mut docker = false;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(8) {
+        match tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await {
+            Ok(Ok(MonitorEvent::Services(_))) => services = true,
+            Ok(Ok(MonitorEvent::Docker(_))) => docker = true,
+            _ => {}
+        }
+    }
+    assert!(!services && !docker && monitor.services().is_none() && monitor.docker().is_none());
+    assert!(t.collector_pids().len() == 1, "the collector runs, nothing else asks");
+    monitor.shutdown();
 }

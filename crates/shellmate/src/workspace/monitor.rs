@@ -9,20 +9,29 @@
 use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
 use gpui::{AppContext as _, Context, Entity, Subscription, Window};
-use shellmate_monitor::{ActionOutcome, ActionReport, Monitor, MonitorEvent, Options};
+use shellmate_core::HostId;
+use shellmate_forward::{ForwardKind, ForwardRule, RuleId};
+use shellmate_monitor::commands::{ContainerAction, ServiceAction};
+use shellmate_monitor::{
+    ActionOutcome, ActionReport, ContainerRuntime, Focus, Monitor, MonitorEvent, Options, Probe, Topic,
+};
 use shellmate_ssh::Connection;
 
 use super::group::{GroupMonitor, PendingAction};
 use super::{Panel, Workspace};
 use crate::dialogs::confirm::ConfirmDialog;
-use crate::monitor::model::MonitorData;
+use crate::monitor::containers::{self, ForwardTarget};
+use crate::monitor::model::{ForwardInfo, MonitorData, Page};
 use crate::monitor::panel::{MonitorPanel, MonitorPanelEvent};
-use crate::monitor::process::{self, ProcKey, ProcessAction, Run};
+use crate::monitor::process::{self, Planned, ProcKey, ProcessAction, Run};
+use crate::monitor::services;
 use crate::runtime;
 
 /// The monitor panel of a tab and what keeps it wired to the workspace.
 pub struct MonitorTab {
     pub panel: Entity<MonitorPanel>,
+    /// The sub-page the panel shows (what the monitor of the connection asks about follows it).
+    pub page: Page,
     _subscription: Subscription,
 }
 
@@ -65,30 +74,77 @@ impl Workspace {
         self.sync_monitor_group(group_id, cx);
     }
 
-    /// Tells every connection whether one of its tabs is showing the monitor page: only then it collects.
+    /// Tells every connection whether one of its tabs is showing the monitor page: only then it collects. The
+    /// sub-page in front tells which numbers are wanted (container statistics, how often the lists are asked for).
     pub(super) fn sync_monitor_activity(&mut self) {
         let showing = self
             .active
             .and_then(|ix| self.sessions.get(ix))
             .filter(|session| session.panel == Panel::Monitor)
-            .and_then(|session| session.ssh())
-            .map(|ssh| ssh.group);
+            .and_then(|session| session.ssh().map(|ssh| (ssh.group, session.monitor.as_ref().map(|tab| tab.page))));
         for group in &self.groups {
             if let Some(monitor) = &group.monitor {
-                monitor.monitor.set_active(Some(group.id) == showing);
+                let here = showing.filter(|(id, _)| *id == group.id);
+                monitor.monitor.set_active(here.is_some());
+                if let Some((_, Some(page))) = here {
+                    monitor.monitor.set_focus(match page {
+                        Page::Overview => Focus::Overview,
+                        Page::Processes => Focus::Processes,
+                        Page::Services => Focus::Services,
+                        Page::Docker => Focus::Docker,
+                    });
+                }
             }
         }
+    }
+
+    /// Hands the newest to the monitor panels of every connection to `host` (the forwards changed).
+    pub(super) fn sync_monitor_host(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        let groups: Vec<usize> =
+            self.groups.iter().filter(|group| group.key.host() == host).map(|group| group.id).collect();
+        for group in groups {
+            self.sync_monitor_group(group, cx);
+        }
+    }
+
+    /// The local forwards of `host`, as the Docker page compares them with the ports of containers.
+    fn forward_infos(&self, host: &HostId) -> std::sync::Arc<Vec<ForwardInfo>> {
+        let rules = self
+            .forward_owner(host)
+            .and_then(|owner| self.group(owner))
+            .and_then(|group| group.forward.as_ref())
+            .map(|forward| forward.rules.as_slice())
+            .unwrap_or_default();
+        std::sync::Arc::new(
+            rules
+                .iter()
+                .filter(|rule| rule.kind == ForwardKind::Local)
+                .filter_map(|rule| {
+                    let target = rule.target.as_ref()?;
+                    Some(ForwardInfo {
+                        listen: rule.listen.to_string(),
+                        target_host: target.host.clone(),
+                        target_port: target.port,
+                        enabled: rule.enabled,
+                    })
+                })
+                .collect(),
+        )
     }
 
     // ---- what the panels show ------------------------------------------------------------------
 
     /// What the monitor of connection `group_id` knows now.
     fn monitor_data(&self, group_id: usize) -> MonitorData {
-        match self.group(group_id).and_then(|group| group.monitor.as_ref()) {
-            Some(group) => MonitorData {
-                phase: group.monitor.phase(),
-                probe: group.monitor.probe(),
-                snapshot: group.monitor.snapshot(),
+        let Some(group) = self.group(group_id) else { return MonitorData::empty() };
+        match group.monitor.as_ref() {
+            Some(monitor) => MonitorData {
+                phase: monitor.monitor.phase(),
+                probe: monitor.monitor.probe(),
+                snapshot: monitor.monitor.snapshot(),
+                services: monitor.monitor.services(),
+                docker: monitor.monitor.docker(),
+                forwards: self.forward_infos(group.key.host()),
             },
             None => MonitorData::empty(),
         }
@@ -122,12 +178,13 @@ impl Workspace {
             return false;
         };
         let data = self.monitor_data(group_id);
-        let panel = cx.new(|cx| MonitorPanel::new(host.name.clone(), data, window, cx));
+        let monitor = self.group(group_id).and_then(|group| group.monitor.as_ref()).map(|m| m.monitor.clone());
+        let panel = cx.new(|cx| MonitorPanel::new(host.name.clone(), data, monitor, window, cx));
         let subscription =
             cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &MonitorPanelEvent, window, cx| {
                 this.on_monitor_panel_event(session_id, event, window, cx)
             });
-        self.sessions[ix].monitor = Some(MonitorTab { panel, _subscription: subscription });
+        self.sessions[ix].monitor = Some(MonitorTab { panel, page: Page::Overview, _subscription: subscription });
         true
     }
 
@@ -135,7 +192,10 @@ impl Workspace {
     fn on_monitor_event(&mut self, group_id: usize, event: MonitorEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             MonitorEvent::Phase(phase) => log::debug!("监控 {phase:?}"),
-            MonitorEvent::Probe(_) | MonitorEvent::Snapshot(_) => {}
+            MonitorEvent::Probe(_)
+            | MonitorEvent::Snapshot(_)
+            | MonitorEvent::Services(_)
+            | MonitorEvent::Docker(_) => {}
             MonitorEvent::Action(report) => self.on_action_report(group_id, report, window, cx),
         }
         self.sync_monitor_group(group_id, cx);
@@ -147,6 +207,13 @@ impl Workspace {
             .group_mut(group_id)
             .and_then(|group| group.monitor.as_mut())
             .and_then(|monitor| monitor.pending.remove(&report.id));
+        // What the action changed is asked about again at once, whether it worked or not.
+        if let (Some(topic), Some(monitor)) = (
+            pending.as_ref().and_then(|action| action.topic),
+            self.group(group_id).and_then(|group| group.monitor.as_ref()),
+        ) {
+            monitor.monitor.refresh(topic);
+        }
         let line = &report.command;
         let notification = match &report.outcome {
             ActionOutcome::Success { .. } => {
@@ -187,6 +254,196 @@ impl Workspace {
                     monitor.monitor.restart();
                 }
             }
+            MonitorPanelEvent::PageChanged(page) => {
+                if let Some(tab) =
+                    self.sessions.iter_mut().find(|s| s.id == session_id).and_then(|s| s.monitor.as_mut())
+                {
+                    tab.page = *page;
+                }
+                self.sync_monitor_activity();
+            }
+            MonitorPanelEvent::Service(action, unit) => self.run_service_action(session_id, *action, unit, window, cx),
+            MonitorPanelEvent::Container(action, name) => {
+                self.run_container_action(session_id, *action, name, window, cx)
+            }
+            MonitorPanelEvent::ContainerTerminal(name) => self.open_container_terminal(session_id, name, window, cx),
+            MonitorPanelEvent::PruneImages => self.run_prune(session_id, window, cx),
+            MonitorPanelEvent::ForwardPort(target) => {
+                self.forward_container_port(session_id, target.clone(), window, cx)
+            }
+        }
+    }
+
+    /// The group and monitor of tab `session_id`, and the host it is on.
+    fn monitor_of(&self, session_id: usize) -> Option<(usize, Monitor, HostId)> {
+        let ssh = self.sessions.iter().find(|s| s.id == session_id)?.ssh()?;
+        let monitor = self.group(ssh.group)?.monitor.as_ref()?.monitor.clone();
+        Some((ssh.group, monitor, ssh.host.id.clone()))
+    }
+
+    /// Asks the question of `planned` (if it has one) and then does it.
+    fn run_planned(
+        &mut self,
+        session_id: usize,
+        planned: Planned,
+        topic: Option<Topic>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match planned.confirm {
+            Some(confirm) => {
+                let workspace = cx.entity().downgrade();
+                let run = planned.run;
+                ConfirmDialog::open(
+                    confirm.title,
+                    confirm.text,
+                    confirm.label,
+                    true,
+                    move |window, cx| {
+                        let run = run.clone();
+                        workspace
+                            .update(cx, |workspace, cx| workspace.execute_run(session_id, run, topic, window, cx))
+                            .ok();
+                        Ok(())
+                    },
+                    window,
+                    cx,
+                );
+            }
+            None => self.execute_run(session_id, planned.run, topic, window, cx),
+        }
+    }
+
+    /// Runs a command on its own channel (the toast tells how it went), or types it in a new tab.
+    fn execute_run(
+        &mut self,
+        session_id: usize,
+        run: Run,
+        topic: Option<Topic>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match run {
+            Run::Exec { line, done } => {
+                let Some((group_id, monitor, _)) = self.monitor_of(session_id) else { return };
+                let id = monitor.run_action(line);
+                if let Some(group) = self.group_mut(group_id).and_then(|group| group.monitor.as_mut()) {
+                    group.pending.insert(id, PendingAction { done, topic });
+                }
+            }
+            Run::Terminal { line, enter, title } => self.open_command_tab(session_id, &title, line, enter, window, cx),
+        }
+    }
+
+    fn toast(&self, notification: Notification, window: &mut Window, cx: &mut Context<Self>) {
+        window.push_notification(notification.title(TOAST_TITLE), cx);
+    }
+
+    /// A button of the detail of a service, or its autostart switch.
+    fn run_service_action(
+        &mut self,
+        session_id: usize,
+        action: ServiceAction,
+        unit: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, monitor, _)) = self.monitor_of(session_id) else { return };
+        let (Some(list), Some(probe)) = (monitor.services(), monitor.probe()) else { return };
+        let Some(service) = list.get(unit) else {
+            return self.toast(Notification::warning(format!("服务 {unit} 已经不存在")), window, cx);
+        };
+        let Some(planned) = services::plan(action, service, &probe) else { return };
+        self.run_planned(session_id, planned, Some(Topic::Services), window, cx);
+    }
+
+    /// The probe, the container tool and what is known about the container `name`.
+    fn container_context(
+        &self,
+        session_id: usize,
+        name: &str,
+    ) -> Option<(Probe, ContainerRuntime, shellmate_monitor::docker::Container)> {
+        let (_, monitor, _) = self.monitor_of(session_id)?;
+        let probe = monitor.probe()?;
+        let runtime = probe.usable_container_runtime()?.clone();
+        let container = monitor.docker()?.containers.iter().find(|c| c.name == name)?.clone();
+        Some(((*probe).clone(), runtime, container))
+    }
+
+    /// A button of a container row (start, restart, stop, remove).
+    fn run_container_action(
+        &mut self,
+        session_id: usize,
+        action: ContainerAction,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((probe, runtime, container)) = self.container_context(session_id, name) else {
+            return self.toast(Notification::warning(format!("容器 {name} 已经不存在")), window, cx);
+        };
+        let Some(planned) = containers::plan(action, &container, &runtime, &probe) else {
+            return self.toast(Notification::warning("请先停止容器再删除"), window, cx);
+        };
+        self.run_planned(session_id, planned, Some(Topic::Docker), window, cx);
+    }
+
+    /// 终端 on a container.
+    fn open_container_terminal(&mut self, session_id: usize, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((probe, runtime, container)) = self.container_context(session_id, name) else { return };
+        match containers::exec_plan(&container, &runtime, &probe) {
+            Some(run) => self.execute_run(session_id, run, None, window, cx),
+            None => self.toast(Notification::warning("容器未运行，无法进入"), window, cx),
+        }
+    }
+
+    /// 清理: removes the dangling images after the question.
+    fn run_prune(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, monitor, _)) = self.monitor_of(session_id) else { return };
+        let (Some(probe), Some(view)) = (monitor.probe(), monitor.docker()) else { return };
+        let Some(runtime) = probe.usable_container_runtime().cloned() else { return };
+        match containers::prune_plan(&view, &runtime, &probe) {
+            Some(planned) => self.run_planned(session_id, planned, Some(Topic::Docker), window, cx),
+            None => self.toast(Notification::info("没有悬空镜像可清理"), window, cx),
+        }
+    }
+
+    /// A click on a port chip: a local forward to the container's port, saved with the host's rules and
+    /// started; or the note that it exists already.
+    fn forward_container_port(
+        &mut self,
+        session_id: usize,
+        target: Result<ForwardTarget, &'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match target {
+            Ok(target) => target,
+            Err(why) => return self.toast(Notification::warning(why), window, cx),
+        };
+        let Some((_, _, host)) = self.monitor_of(session_id) else { return };
+        let forwards = self.forward_infos(&host);
+        if let Some(rule) = containers::existing_forward(&forwards, &target) {
+            return self.toast(Notification::info(containers::existing_text(rule)), window, cx);
+        }
+        let Some(local_port) = shellmate_forward::pick_local_port("127.0.0.1", target.local_port) else {
+            return self.toast(Notification::error("本机没有可用的端口"), window, cx);
+        };
+        let rule = ForwardRule::parse(
+            RuleId::generate(),
+            &target.name,
+            ForwardKind::Local,
+            &format!("127.0.0.1:{local_port}"),
+            &target.target_text(),
+            true,
+        );
+        match rule {
+            Ok(rule) => {
+                log::debug!("监控：容器端口转发 本地 127.0.0.1:{local_port} → {}", target.target_text());
+                self.add_rule(&host, rule, window, cx);
+                self.toast(Notification::success(containers::created_text(local_port, &target)), window, cx);
+            }
+            Err(err) => self.toast(Notification::error(format!("无法创建转发：{err}")), window, cx),
         }
     }
 
@@ -242,7 +499,7 @@ impl Workspace {
             Run::Exec { line, done } => {
                 let id = monitor.run_action(line);
                 if let Some(group) = self.group_mut(group_id).and_then(|group| group.monitor.as_mut()) {
-                    group.pending.insert(id, PendingAction { done });
+                    group.pending.insert(id, PendingAction { done, topic: None });
                 }
             }
             Run::Terminal { line, enter, title } => self.open_command_tab(session_id, &title, line, enter, window, cx),
@@ -308,6 +565,122 @@ impl Workspace {
                     panel.update(cx, |panel, cx| panel.show_process(pid, window, cx));
                 }
             }
+            // The journal of the shown service and the log under a container, with made-up lines.
+            "svc-log" => {
+                if let Some(panel) = panel {
+                    panel.update(cx, |panel, cx| panel.demo_service_log(crate::monitor::demo::service_log(), cx));
+                }
+            }
+            "dk-log" => {
+                if let Some(panel) = panel {
+                    let lines = crate::monitor::demo::container_log();
+                    panel.update(cx, |panel, cx| panel.demo_container_log(arg, lines, cx));
+                }
+            }
+            // The overview scrolled to its end (to see that nothing is cut off).
+            "scroll-end" => {
+                if let Some(panel) = panel {
+                    panel.update(cx, |panel, cx| panel.demo_scroll_end(cx));
+                }
+            }
+            // `<query>|<filter>|<unit>`: the search and the filter of the 服务 page, and the unit shown.
+            "services" => {
+                let mut parts = arg.splitn(3, '|');
+                let query = parts.next().unwrap_or_default().to_string();
+                let filter = match parts.next() {
+                    Some("run") => crate::monitor::services::ServiceFilter::Running,
+                    Some("fail") => crate::monitor::services::ServiceFilter::Failed,
+                    Some("off") => crate::monitor::services::ServiceFilter::Stopped,
+                    _ => crate::monitor::services::ServiceFilter::All,
+                };
+                let select = parts.next().filter(|name| !name.is_empty()).map(str::to_string);
+                if let Some(panel) = panel {
+                    panel.update(cx, |panel, cx| panel.demo_services(&query, filter, select.as_deref(), window, cx));
+                }
+            }
+            // The 查看服务 / 查看容器 of 需要关注.
+            "show-service" => {
+                if let Some(panel) = panel {
+                    panel.update(cx, |panel, cx| panel.show_service(arg, window, cx));
+                }
+            }
+            "show-container" => {
+                if let Some(panel) = panel {
+                    panel.update(cx, |panel, cx| panel.show_container(arg, cx));
+                }
+            }
+            // `<action>|<name>`: a button of a service (`start`, `stop`, `restart`, `reload`, `enable`, `disable`) or of a
+            // container (`c-start`, `c-stop`, `c-restart`, `c-rm`, `c-exec`), `prune`, or a port chip (`port|<name>|<n>`).
+            "svc-act" => {
+                let (now, arg) = arg.strip_prefix('!').map_or((false, arg), |rest| (true, rest));
+                let (kind, unit) = arg.split_once('|').unwrap_or((arg, ""));
+                let action = match kind {
+                    "start" => ServiceAction::Start,
+                    "stop" => ServiceAction::Stop,
+                    "restart" => ServiceAction::Restart,
+                    "reload" => ServiceAction::Reload,
+                    "enable" => ServiceAction::Enable,
+                    _ => ServiceAction::Disable,
+                };
+                if now {
+                    let planned = self
+                        .monitor_of(session_id)
+                        .and_then(|(_, monitor, _)| Some((monitor.services()?, monitor.probe()?)))
+                        .and_then(|(list, probe)| services::plan(action, list.get(unit)?, &probe));
+                    if let Some(planned) = planned {
+                        self.execute_run(session_id, planned.run, Some(Topic::Services), window, cx);
+                    }
+                } else {
+                    self.run_service_action(session_id, action, unit, window, cx);
+                }
+            }
+            "ctr-act" => {
+                let (now, arg) = arg.strip_prefix('!').map_or((false, arg), |rest| (true, rest));
+                let (kind, name) = arg.split_once('|').unwrap_or((arg, ""));
+                match kind {
+                    "exec" => self.open_container_terminal(session_id, name, window, cx),
+                    "prune" if now => {
+                        let planned = self.monitor_of(session_id).and_then(|(_, monitor, _)| {
+                            let probe = monitor.probe()?;
+                            let runtime = probe.usable_container_runtime()?.clone();
+                            containers::prune_plan(&*monitor.docker()?, &runtime, &probe)
+                        });
+                        if let Some(planned) = planned {
+                            self.execute_run(session_id, planned.run, Some(Topic::Docker), window, cx);
+                        }
+                    }
+                    "prune" => self.run_prune(session_id, window, cx),
+                    "port" => {
+                        // `port|<name>:<index of the port>`
+                        let (name, index) = name.rsplit_once(':').unwrap_or((name, "0"));
+                        let target = self.container_context(session_id, name).and_then(|(_, _, c)| {
+                            c.ports.get(index.parse::<usize>().unwrap_or(0)).map(|p| containers::forward_target(&c, p))
+                        });
+                        if let Some(target) = target {
+                            self.forward_container_port(session_id, target, window, cx);
+                        }
+                    }
+                    other => {
+                        let action = match other {
+                            "start" => ContainerAction::Start,
+                            "stop" => ContainerAction::Stop,
+                            "restart" => ContainerAction::Restart,
+                            _ => ContainerAction::Remove,
+                        };
+                        if now {
+                            let planned =
+                                self.container_context(session_id, name).and_then(|(probe, runtime, container)| {
+                                    containers::plan(action, &container, &runtime, &probe)
+                                });
+                            if let Some(planned) = planned {
+                                self.execute_run(session_id, planned.run, Some(Topic::Docker), window, cx);
+                            }
+                        } else {
+                            self.run_container_action(session_id, action, name, window, cx);
+                        }
+                    }
+                }
+            }
             // `<action>|<command or pid>`: what pressing the button does; `kill-now` skips the question.
             "act" | "act-now" => {
                 let (kind, target) = arg.split_once('|').unwrap_or((arg, ""));
@@ -340,6 +713,29 @@ impl Workspace {
                 let Some(monitor) = group_id.and_then(|id| self.group(id)).and_then(|g| g.monitor.as_ref()) else {
                     return;
                 };
+                if let Some(list) = monitor.monitor.services() {
+                    let mine: Vec<String> = list
+                        .services
+                        .iter()
+                        .filter(|s| s.name.starts_with("shellmate"))
+                        .map(|s| format!("{}:{:?}/{}/{}", s.name, s.active, s.sub, s.memory.is_some()))
+                        .collect();
+                    log::info!(
+                        "监控 [{arg}] 服务 共{} 运行{} 失败{} {mine:?}",
+                        list.services.len(),
+                        list.running(),
+                        list.failed()
+                    );
+                }
+                if let Some(view) = monitor.monitor.docker() {
+                    let mine: Vec<String> = view
+                        .containers
+                        .iter()
+                        .filter(|c| c.name.starts_with("shellmate"))
+                        .map(|c| format!("{}:{:?}", c.name, c.state))
+                        .collect();
+                    log::info!("监控 [{arg}] 容器 共{} {mine:?} 悬空{}", view.containers.len(), view.dangling.count);
+                }
                 let (phase, snapshot) = (monitor.monitor.phase(), monitor.monitor.snapshot());
                 match snapshot {
                     Some(s) => {

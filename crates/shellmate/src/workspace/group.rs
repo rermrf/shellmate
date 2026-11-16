@@ -119,6 +119,8 @@ impl Drop for GroupForward {
 pub struct PendingAction {
     /// What the toast says after the command line when it worked (`已发送`).
     pub done: &'static str,
+    /// What to ask the monitor about again at once when the action is over (the list it changed).
+    pub topic: Option<shellmate_monitor::Topic>,
 }
 
 /// The monitor of a connection: the engine, the actions it is running, and the task that follows what it says.

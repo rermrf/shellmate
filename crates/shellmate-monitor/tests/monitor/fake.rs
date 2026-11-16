@@ -33,6 +33,44 @@ pub struct FakeState {
     /// How many frames the collectors wrote in all.
     pub frames: AtomicUsize,
     pub actions: Mutex<Vec<String>>,
+    /// Answers to commands that contain the key: the text is written to stdout, exit status 0.
+    pub answers: Mutex<Vec<(&'static str, String)>>,
+    /// Commands that contain the key are streams: lines pushed with [`FakeState::push`] are written to
+    /// them, and they end when the client closes the channel.
+    pub streams: Mutex<std::collections::HashMap<&'static str, std::collections::VecDeque<String>>>,
+    /// Commands that contain the key fail with this on stderr (exit status 1); they win over answers.
+    pub failures: Mutex<Vec<(&'static str, String)>>,
+    /// How many streams are open now.
+    pub open_streams: AtomicUsize,
+}
+
+impl FakeState {
+    /// Sets the answer to the commands that contain `key`.
+    pub fn answer(&self, key: &'static str, text: &str) {
+        let mut answers = lock(&self.answers);
+        answers.retain(|(k, _)| *k != key);
+        answers.push((key, text.to_string()));
+    }
+
+    /// Makes the commands that contain `key` fail with `message`.
+    pub fn fail(&self, key: &'static str, message: &str) {
+        lock(&self.failures).push((key, message.to_string()));
+    }
+
+    /// Makes the commands that contain `key` streams.
+    pub fn stream(&self, key: &'static str) {
+        lock(&self.streams).entry(key).or_default();
+    }
+
+    /// Queues a line for the stream called `key`.
+    pub fn push(&self, key: &'static str, line: &str) {
+        lock(&self.streams).entry(key).or_default().push_back(line.to_string());
+    }
+
+    /// How many times a command that contains `needle` was run.
+    pub fn count(&self, needle: &str) -> usize {
+        lock(&self.actions).iter().filter(|command| command.contains(needle)).count()
+    }
 }
 
 pub fn linux_probe(sudo: &str) -> String {
@@ -86,6 +124,10 @@ pub async fn server(probe: String) -> (TestServer, Arc<FakeState>) {
         collectors_running: AtomicUsize::new(0),
         frames: AtomicUsize::new(0),
         actions: Mutex::new(Vec::new()),
+        answers: Mutex::new(Vec::new()),
+        failures: Mutex::new(Vec::new()),
+        streams: Mutex::new(Default::default()),
+        open_streams: AtomicUsize::new(0),
     });
     let fake = state.clone();
     let runner = exec_runner(move |command, channel: ExecChannel| {
@@ -127,7 +169,34 @@ pub async fn server(probe: String) -> (TestServer, Arc<FakeState>) {
                 fake.collectors_running.fetch_sub(1, Ordering::SeqCst);
             } else {
                 lock(&fake.actions).push(command.clone());
-                if command.contains("hang") {
+                let stream = lock(&fake.streams).keys().find(|key| command.contains(**key)).copied();
+                let failure =
+                    lock(&fake.failures).iter().find(|(key, _)| command.contains(key)).map(|(_, text)| text.clone());
+                let answer =
+                    lock(&fake.answers).iter().find(|(key, _)| command.contains(key)).map(|(_, text)| text.clone());
+                if let Some(key) = stream {
+                    fake.open_streams.fetch_add(1, Ordering::SeqCst);
+                    'open: loop {
+                        loop {
+                            let line = lock(&fake.streams).get_mut(key).and_then(|queue| queue.pop_front());
+                            let Some(line) = line else { break };
+                            if !channel.stdout(format!("{line}\n")).await {
+                                break 'open;
+                            }
+                        }
+                        if channel.is_closed() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    fake.open_streams.fetch_sub(1, Ordering::SeqCst);
+                } else if let Some(message) = failure {
+                    channel.stderr(message).await;
+                    channel.exit(1).await;
+                } else if let Some(text) = answer {
+                    channel.stdout(text).await;
+                    channel.exit(0).await;
+                } else if command.contains("hang") {
                     channel.wait_closed().await;
                 } else if command.contains("fail") {
                     channel.stderr("boom: permission denied\n").await;

@@ -130,8 +130,6 @@ pub struct Process {
     /// When the process started, in clock ticks after boot: with the process id it tells this process from
     /// another one that got the same number later.
     pub start_time: u64,
-    /// This is the monitor's own collector.
-    pub is_collector: bool,
 }
 
 /// Everything the pages show.
@@ -158,7 +156,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// The `n` processes that use the most CPU (processes without a rate yet come last).
     pub fn top_by_cpu(&self, n: usize) -> Vec<&Process> {
-        let mut processes: Vec<&Process> = self.processes.iter().filter(|p| !p.is_collector).collect();
+        let mut processes: Vec<&Process> = self.processes.iter().collect();
         processes.sort_by(|a, b| {
             b.cpu_percent.unwrap_or(-1.0).total_cmp(&a.cpu_percent.unwrap_or(-1.0)).then(a.pid.cmp(&b.pid))
         });

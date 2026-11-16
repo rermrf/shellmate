@@ -7186,6 +7186,7 @@ dependencies = [
  "libc",
  "log",
  "russh",
+ "serde_json",
  "shellmate-core",
  "shellmate-ssh",
  "tempfile",

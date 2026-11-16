@@ -80,8 +80,6 @@ pub struct Row {
     pub prefix: &'static str,
     /// The row is only here because a process below it matches the filter (tree view).
     pub context: bool,
-    /// The monitor's own collector.
-    pub collector: bool,
 }
 
 /// The rows and how many of the processes they are.
@@ -166,7 +164,6 @@ pub fn table(snapshot: &Snapshot, query: &str, sort: SortKey, tree: bool) -> Tab
             depth,
             prefix: if depth > 0 { "└ " } else { "" },
             context,
-            collector: p.is_collector,
         })
         .collect();
     Table { rows, matches: matching.len(), total }
@@ -317,19 +314,12 @@ pub struct ActionButton {
     pub tooltip: Option<String>,
 }
 
-const COLLECTOR_NOTE: &str = "这是监控自己的采集进程：结束它会让监控停下来，关掉监控页即可";
 const ZOMBIE_NOTE: &str = "僵尸进程已经结束，只是还没被父进程回收：对它发信号没有用，需要处理它的父进程";
 const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新终端标签里打好命令，由你回车并输入密码";
 
 /// Why `action` cannot be done to `process`, if it cannot.
 pub fn unavailable(process: &Process) -> Option<&'static str> {
-    if process.is_collector {
-        Some(COLLECTOR_NOTE)
-    } else if process.state == 'Z' {
-        Some(ZOMBIE_NOTE)
-    } else {
-        None
-    }
+    if process.state == 'Z' { Some(ZOMBIE_NOTE) } else { None }
 }
 
 /// Whether the process belongs to somebody else than the login user (the server may want root for it).
@@ -509,7 +499,6 @@ mod tests {
             threads: 1,
             nice: 0,
             start_time: u64::from(pid) * 10,
-            is_collector: false,
         }
     }
 
@@ -561,7 +550,6 @@ mod tests {
         let mut snapshot = sample();
         snapshot.processes[3].state = 'R';
         snapshot.processes[7].state = 'Z';
-        snapshot.processes[0].is_collector = true;
         let t = table(&snapshot, "", SortKey::Pid, false);
         let row = |pid: u32| t.rows.iter().find(|r| r.key.pid == pid).unwrap();
         let busy = row(1186);
@@ -576,7 +564,6 @@ mod tests {
         assert_eq!(row(4416).cpu_bar, 0.0);
         assert!((busy.cpu_bar - 1.0).abs() < 1e-6, "the busiest has the full bar: {}", busy.cpu_bar);
         assert!((row(2207).cpu_bar - 11.5 / 13.0).abs() < 1e-6);
-        assert!(row(1).collector && !row(2207).collector);
         assert_eq!(busy.key, ProcKey { pid: 1186, start: 11860 });
     }
 
@@ -760,11 +747,7 @@ mod tests {
         zombie.state = 'Z';
         let bs = buttons(&zombie, Some(&probe(Sudo::Root)));
         assert!(bs.iter().all(|b| !b.enabled && b.tooltip.as_deref().unwrap().contains("僵尸进程")));
-        let mut own = p(77, 1, "sh -c # shellmate-collector abc");
-        own.is_collector = true;
-        let bs = buttons(&own, Some(&probe(Sudo::Root)));
-        assert!(bs.iter().all(|b| !b.enabled && b.tooltip.as_deref().unwrap().contains("采集进程")));
-        assert!(plan(ProcessAction::Kill, &own, &probe(Sudo::Root)).is_none());
+        assert!(plan(ProcessAction::Kill, &zombie, &probe(Sudo::Root)).is_none());
         // Before the probe nothing can be said about how a command would run.
         let bs = buttons(&p(1, 0, "x"), None);
         assert!(bs.iter().all(|b| !b.enabled));

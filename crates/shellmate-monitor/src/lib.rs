@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod commands;
+pub mod docker;
 pub mod engine;
 pub mod frame;
 mod monitor;
@@ -18,8 +19,11 @@ pub mod parse;
 pub mod probe;
 pub mod quote;
 pub mod script;
+pub mod services;
 pub mod snapshot;
 
-pub use monitor::{ActionId, ActionOutcome, ActionReport, Monitor, MonitorEvent, Options, Phase};
-pub use probe::{ContainerAccess, ContainerRuntime, Probe, RuntimeKind, Sudo, Systemd};
+pub use monitor::{
+    ActionId, ActionOutcome, ActionReport, Focus, Follow, FollowEvent, Monitor, MonitorEvent, Options, Phase, Topic,
+};
+pub use probe::{ContainerAccess, ContainerRuntime, JournalAccess, Probe, RuntimeKind, Sudo, Systemd};
 pub use snapshot::{CpuCard, Disk, HostFacts, MemoryCard, NetworkCard, Process, Snapshot};

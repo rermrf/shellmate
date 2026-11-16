@@ -106,6 +106,11 @@ fn the_script_writes_frames_on_schedule_under_every_shell() {
         // total) comes before the processes.
         assert_eq!(frames[0].kind, FrameKind::Stats, "{shell}");
         assert_eq!(frames[1].kind, FrameKind::Procs, "{shell}");
+        // The process frames say which process the script is (`$$`), and only they: the monitor hides it.
+        let pids: Vec<Option<u32>> = frames.iter().filter(|f| f.kind == FrameKind::Procs).map(|f| f.pid).collect();
+        assert!(pids.iter().all(|pid| pid.is_some_and(|pid| pid > 1)), "{shell}: {pids:?}");
+        assert!(pids.windows(2).all(|w| w[0] == w[1]), "{shell}: the same process every time");
+        assert!(frames.iter().filter(|f| f.kind != FrameKind::Procs).all(|f| f.pid.is_none()), "{shell}");
     }
 }
 
@@ -428,7 +433,10 @@ fn the_command_line_survives_every_login_shell_the_server_may_hand_it_to() {
         assert!(calls.contains("sudo -n true"), "{login}: {calls}");
         assert!(calls.contains("docker version") && calls.contains("podman version"), "{login}: {calls}");
         assert_eq!(parsed.sudo, shellmate_monitor::Sudo::NeedsPassword, "{login}");
-        assert!(parsed.containers.iter().all(|c| c.access == shellmate_monitor::ContainerAccess::Error), "{login}: {parsed:?}");
+        assert!(
+            parsed.containers.iter().all(|c| c.access == shellmate_monitor::ContainerAccess::Error),
+            "{login}: {parsed:?}"
+        );
         assert!(parsed.uid.is_some() && !parsed.user.is_empty(), "{login}");
     }
 }

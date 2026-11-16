@@ -3,12 +3,16 @@
 
 use std::sync::Arc;
 
+use shellmate_monitor::docker::{
+    Container, ContainerNetwork, ContainerState, Dangling, DockerView, PortMapping, Usage,
+};
 use shellmate_monitor::parse::LoadAvg;
 use shellmate_monitor::probe::{ContainerAccess, ContainerRuntime, RuntimeKind, Systemd};
+use shellmate_monitor::services::{ActiveState, Autostart, LogLevel, LogLine, Service, ServiceList};
 use shellmate_monitor::snapshot::{CpuCard, Disk, HostFacts, MemoryCard, NetworkCard, Process};
 use shellmate_monitor::{Phase, Probe, Snapshot, Sudo};
 
-use super::model::MonitorData;
+use super::model::{ForwardInfo, MonitorData};
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -57,7 +61,6 @@ fn process(pid: u32, ppid: u32, user: &str, cpu: f32, rss_mb: u64, state: char, 
         threads: 1,
         nice: 0,
         start_time: u64::from(pid) * 100,
-        is_collector: false,
     }
 }
 
@@ -178,7 +181,7 @@ pub fn data(scenario: &str) -> MonitorData {
             }
         }
         "starting" => {
-            return MonitorData { phase: Phase::Starting, probe: Some(Arc::new(probe)), snapshot: None };
+            return MonitorData { phase: Phase::Starting, probe: Some(Arc::new(probe)), ..MonitorData::empty() };
         }
         "quiet" => {
             snapshot.disks[1] = Disk { percent: 40, used: 80 * GIB, available: 120 * GIB, ..snapshot.disks[1].clone() };
@@ -197,7 +200,7 @@ pub fn data(scenario: &str) -> MonitorData {
             return MonitorData {
                 phase: Phase::Unsupported("暂只支持 Linux 主机的监控（Darwin 23.1.0）".into()),
                 probe: Some(Arc::new(probe)),
-                snapshot: None,
+                ..MonitorData::empty()
             };
         }
         "nosudo" => probe.sudo = Sudo::NeedsPassword,
@@ -206,8 +209,255 @@ pub fn data(scenario: &str) -> MonitorData {
             probe.systemd = None;
             probe.containers.clear();
             probe.sudo = Sudo::NeedsPassword;
+            return MonitorData {
+                phase,
+                probe: Some(Arc::new(probe)),
+                snapshot: Some(Arc::new(snapshot)),
+                ..MonitorData::empty()
+            };
         }
         _ => {}
     }
-    MonitorData { phase, probe: Some(Arc::new(probe)), snapshot: Some(Arc::new(snapshot)) }
+    let forwards = match scenario {
+        // A forward to the port of the cache container exists already.
+        "forwarded" => vec![ForwardInfo {
+            listen: "127.0.0.1:6379".into(),
+            target_host: "172.18.0.3".into(),
+            target_port: 6379,
+            enabled: true,
+        }],
+        _ => Vec::new(),
+    };
+    let (services, docker) = match scenario {
+        "quiet" => (Some(Arc::new(quiet_services())), Some(Arc::new(quiet_containers()))),
+        "services-only" => (Some(Arc::new(services())), None),
+        _ => (Some(Arc::new(services())), Some(Arc::new(containers()))),
+    };
+    MonitorData {
+        phase,
+        probe: Some(Arc::new(probe)),
+        snapshot: Some(Arc::new(snapshot)),
+        services,
+        docker,
+        forwards: Arc::new(forwards),
+    }
+}
+
+fn service(name: &str, description: &str, active: &str, sub: &str, enabled: bool, memory_mb: Option<u64>) -> Service {
+    Service {
+        name: name.into(),
+        description: description.into(),
+        active: ActiveState::parse(active),
+        sub: sub.into(),
+        load: "loaded".into(),
+        autostart: if enabled { Autostart::Enabled } else { Autostart::Disabled },
+        main_pid: memory_mb.map(|mb| 1000 + mb as u32),
+        memory: memory_mb.map(|mb| mb * MIB),
+        cpu_nsec: memory_mb.map(|mb| mb * 61_000_000),
+        since_monotonic_us: None,
+        since_text: Some("09:49:12".into()),
+        result: None,
+        exit_status: None,
+        last_error: None,
+    }
+}
+
+/// The services of the prototype's server.
+pub fn services() -> ServiceList {
+    let mut php = service("php8.2-fpm.service", "The PHP 8.2 FastCGI Process Manager", "failed", "failed", true, None);
+    php.result = Some("exit-code".into());
+    php.exit_status = Some(78);
+    php.last_error = Some("ERROR: [pool www] cannot get uid for user 'www-data2'".into());
+    let mut nginx = service(
+        "nginx.service",
+        "A high performance web server and a reverse proxy server",
+        "active",
+        "running",
+        true,
+        Some(38),
+    );
+    nginx.main_pid = Some(1185);
+    nginx.memory = Some(38 * MIB + 200 * 1024);
+    let mut snapd = service("snapd.service", "Snap Daemon", "inactive", "dead", false, None);
+    snapd.autostart = Autostart::Fixed;
+    ServiceList {
+        services: vec![
+            php,
+            service("cron.service", "Regular background program processing daemon", "active", "running", true, Some(2)),
+            service("containerd.service", "containerd container runtime", "active", "running", true, Some(188)),
+            service("docker.service", "Docker Application Container Engine", "active", "running", true, Some(412)),
+            service("fail2ban.service", "Fail2Ban Service", "active", "running", true, Some(31)),
+            nginx,
+            service("pm2-deploy.service", "PM2 process manager", "active", "running", true, Some(70)),
+            snapd,
+            service("ssh.service", "OpenBSD Secure Shell server", "active", "running", true, Some(9)),
+            service("unattended-upgrades.service", "Unattended Upgrades Shutdown", "inactive", "dead", true, None),
+        ],
+    }
+}
+
+fn quiet_services() -> ServiceList {
+    let mut list = services();
+    list.services.retain(|service| !service.is_failed());
+    list
+}
+
+fn port(host_ip: Option<&str>, host_port: Option<u16>, container_port: u16) -> PortMapping {
+    PortMapping { host_ip: host_ip.map(str::to_string), host_port, container_port, protocol: "tcp".into() }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn container(
+    name: &str,
+    image: &str,
+    project: Option<(&str, &str)>,
+    state: ContainerState,
+    status: &str,
+    ports: Vec<PortMapping>,
+    cpu: Option<f64>,
+    mem_mb: Option<u64>,
+    ip: &str,
+) -> Container {
+    Container {
+        id: format!("{name}-id"),
+        name: name.into(),
+        image: image.into(),
+        state,
+        status: status.into(),
+        ports,
+        project: project.map(|(name, _)| name.to_string()),
+        config_files: project.map(|(_, files)| files.to_string()),
+        service: None,
+        restart_count: 0,
+        oom_killed: false,
+        restarting: false,
+        memory_limit: None,
+        networks: vec![ContainerNetwork { name: "bridge".into(), ip: ip.into() }],
+        up_secs: None,
+        cpu_percent: cpu,
+        mem_used: mem_mb.map(|mb| mb * MIB),
+    }
+}
+
+/// The containers of the prototype's server.
+pub fn containers() -> DockerView {
+    let app = ("app", "/var/www/app/docker-compose.yml");
+    let monitoring = ("monitoring", "/opt/monitoring/compose.yml");
+    let mut web = container(
+        "app",
+        "app:2026.11.12",
+        Some(app),
+        ContainerState::Running,
+        "Up 11 hours",
+        vec![port(Some("127.0.0.1"), Some(3000), 3000)],
+        Some(4.8),
+        Some(412),
+        "172.18.0.2",
+    );
+    web.memory_limit = Some(GIB);
+    web.up_secs = Some(11 * 3600);
+    let cache = container(
+        "cache",
+        "redis:7-alpine",
+        Some(app),
+        ContainerState::Running,
+        "Up 6 days",
+        vec![port(None, None, 6379)],
+        Some(1.2),
+        Some(24),
+        "172.18.0.3",
+    );
+    let mut worker = container(
+        "worker",
+        "app:2026.11.12",
+        Some(app),
+        ContainerState::Restarting,
+        "Restarting (137) 3 seconds ago",
+        Vec::new(),
+        None,
+        None,
+        "",
+    );
+    worker.restart_count = 6;
+    worker.oom_killed = true;
+    worker.restarting = true;
+    worker.memory_limit = Some(256 * MIB);
+    worker.networks.clear();
+    let grafana = container(
+        "grafana",
+        "grafana/grafana:11.3.0",
+        Some(monitoring),
+        ContainerState::Running,
+        "Up 6 days",
+        vec![port(Some("127.0.0.1"), Some(3001), 3000)],
+        Some(1.0),
+        Some(96),
+        "172.19.0.2",
+    );
+    let prometheus = container(
+        "prometheus",
+        "prom/prometheus:v2.55",
+        Some(monitoring),
+        ContainerState::Running,
+        "Up 6 days",
+        vec![port(None, None, 9090)],
+        Some(1.2),
+        Some(188),
+        "172.19.0.3",
+    );
+    let old = container(
+        "old-api",
+        "app:2026.09.30",
+        None,
+        ContainerState::Exited,
+        "Exited (0) 2 weeks ago",
+        Vec::new(),
+        None,
+        None,
+        "",
+    );
+    DockerView {
+        runtime: RuntimeKind::Docker,
+        version: Some("27.3.1".into()),
+        containers: vec![old, web, cache, worker, grafana, prometheus],
+        usage: Usage { images: Some(14), images_size: Some(3_200_000_000), volumes: Some(6) },
+        dangling: Dangling { count: 4, bytes: 1_240_000_000 },
+        error: None,
+    }
+}
+
+fn quiet_containers() -> DockerView {
+    let mut view = containers();
+    view.containers.retain(|c| c.name != "worker");
+    view
+}
+
+fn line(time: &str, text: &str, level: LogLevel) -> LogLine {
+    LogLine { time: time.into(), text: text.into(), level }
+}
+
+/// The journal of the failed unit of the prototype.
+pub fn service_log() -> Vec<LogLine> {
+    vec![
+        line("09:49:11", "Starting php8.2-fpm.service...", LogLevel::Plain),
+        line("09:49:12", "ERROR: [pool www] cannot get uid for user 'www-data2'", LogLevel::Error),
+        line("09:49:12", "ERROR: FPM initialization failed", LogLevel::Error),
+        line("09:49:12", "Main process exited, code=exited, status=78/CONFIG", LogLevel::Error),
+        line("09:49:12", "Failed to start php8.2-fpm.service.", LogLevel::Error),
+    ]
+}
+
+/// The last lines of the container that is killed for its memory.
+pub fn container_log() -> Vec<LogLine> {
+    vec![
+        line("09:51:40", "[queue] consuming jobs from redis://cache:6379", LogLevel::Plain),
+        line("09:51:52", "[export] building report 2026-11 (48,211 rows)", LogLevel::Plain),
+        line("09:51:58", "<--- Last few GCs --->  heap limit reached", LogLevel::Warning),
+        line(
+            "09:51:58",
+            "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+            LogLevel::Error,
+        ),
+        line("09:51:59", "container killed: OOMKilled (exit 137)", LogLevel::Error),
+    ]
 }

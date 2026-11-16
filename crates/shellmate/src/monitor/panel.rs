@@ -1,7 +1,12 @@
 //! The 监控 panel of one tab: the header with its chips and sub-page tabs, the overview with its cards and
-//! the list of what needs attention, the process table with the bar of actions under it, and the pages that
-//! come with the next version. What it says comes from [`super::model`] and [`super::process`]; what the
-//! user does with it goes to the workspace as [`MonitorPanelEvent`]s (which runs commands and opens tabs).
+//! the list of what needs attention, the process table with the bar of actions under it, the list of
+//! services with its detail and journal, and the containers with their logs. What it says comes from
+//! [`super::model`], [`super::process`], [`super::services`] and [`super::containers`]; what the user does
+//! with it goes to the workspace as [`MonitorPanelEvent`]s (which runs commands and opens tabs).
+
+mod docker;
+mod logs;
+mod services;
 
 use std::ops::Range;
 
@@ -10,15 +15,20 @@ use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::{Icon, tooltip::Tooltip};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, ScrollStrategy, SharedString,
-    Subscription, UniformListScrollHandle, Window, div, px, relative, uniform_list,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, ScrollHandle, ScrollStrategy,
+    SharedString, Subscription, UniformListScrollHandle, Window, div, px, relative, uniform_list,
 };
+use shellmate_monitor::Monitor;
+use shellmate_monitor::commands::{ContainerAction, ServiceAction};
 
+use self::logs::LogPane;
 use super::charts::sparkline;
+use super::containers::ForwardTarget;
 use super::model::{self, ALL_WELL, AttentionAction, Banner, Body, Cards, Chip, HeaderView, MonitorData, Page, Tone};
 use super::process::{
     self, ActionButton, ButtonTone, ProcKey, ProcessAction, Row, SortKey, Table, resolve, selection_text,
 };
+use super::services::{ServiceFilter, ServiceRow};
 use crate::theme::{ActivePalette, CARD_RADIUS, MONO_FONT, Palette};
 use crate::ui::{SegmentItem, card_shadow, item_shadow, segmented};
 
@@ -30,6 +40,18 @@ pub enum MonitorPanelEvent {
     AnalyzeDisk(String),
     /// 重试 after the monitor gave up.
     Retry,
+    /// A sub-page was shown: the monitor asks about what is on it.
+    PageChanged(Page),
+    /// A button of the detail of a service (or its autostart switch), for the unit with this name.
+    Service(ServiceAction, String),
+    /// A button of a container row.
+    Container(ContainerAction, String),
+    /// 终端 on a container: a new tab with a shell in it.
+    ContainerTerminal(String),
+    /// 清理 on the Docker page.
+    PruneImages,
+    /// A click on a port chip: where the forward goes, or why it cannot be made.
+    ForwardPort(Result<ForwardTarget, &'static str>),
 }
 
 impl EventEmitter<MonitorPanelEvent> for MonitorPanel {}
@@ -38,6 +60,8 @@ impl EventEmitter<MonitorPanelEvent> for MonitorPanel {}
 pub struct MonitorPanel {
     host: SharedString,
     data: MonitorData,
+    /// What follows the logs (the monitor of the connection).
+    monitor: Option<Monitor>,
     page: Page,
     query: Entity<InputState>,
     sort: SortKey,
@@ -45,8 +69,19 @@ pub struct MonitorPanel {
     selected: Option<ProcKey>,
     table: Table,
     scroll: UniformListScrollHandle,
+    overview_scroll: ScrollHandle,
+    // the 服务 page
+    service_query: Entity<InputState>,
+    service_filter: ServiceFilter,
+    service_selected: Option<String>,
+    service_rows: Vec<ServiceRow>,
+    service_scroll: UniformListScrollHandle,
+    service_log: Option<LogPane>,
+    // the Docker page
+    container_log: Option<(String, LogPane)>,
+    docker_scroll: ScrollHandle,
     focus: FocusHandle,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Focusable for MonitorPanel {
@@ -79,17 +114,33 @@ fn tone_text(p: &Palette, tone: Tone) -> Hsla {
 
 impl MonitorPanel {
     /// A panel for the connection to `host`, showing `data`.
-    pub fn new(host: impl Into<SharedString>, data: MonitorData, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        host: impl Into<SharedString>,
+        data: MonitorData,
+        monitor: Option<Monitor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("过滤命令、用户或 PID"));
-        let subscription = cx.subscribe_in(&query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.refresh(cx);
-                cx.notify();
-            }
-        });
+        let service_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索服务"));
+        let subscriptions = vec![
+            cx.subscribe_in(&query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh(cx);
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&service_query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_services(cx);
+                    cx.notify();
+                }
+            }),
+        ];
         let mut panel = Self {
             host: host.into(),
             data,
+            monitor,
             page: Page::Overview,
             query,
             sort: SortKey::Cpu,
@@ -97,10 +148,20 @@ impl MonitorPanel {
             selected: None,
             table: Table { rows: Vec::new(), matches: 0, total: 0 },
             scroll: UniformListScrollHandle::new(),
+            overview_scroll: ScrollHandle::new(),
+            service_query,
+            service_filter: ServiceFilter::All,
+            service_selected: None,
+            service_rows: Vec::new(),
+            service_scroll: UniformListScrollHandle::new(),
+            service_log: None,
+            container_log: None,
+            docker_scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
-            _subscription: subscription,
+            _subscriptions: subscriptions,
         };
         panel.refresh(cx);
+        panel.refresh_services(cx);
         panel
     }
 
@@ -108,13 +169,32 @@ impl MonitorPanel {
     pub fn set_data(&mut self, data: MonitorData, cx: &mut Context<Self>) {
         self.data = data;
         self.refresh(cx);
+        self.refresh_services(cx);
+        self.sync_container_log(cx);
         cx.notify();
     }
 
-    /// Shows a sub-page.
+    /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
+    /// page, the open container log on the Docker page, nothing elsewhere.
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.page != page {
             self.page = page;
+            self.sync_service_log(cx);
+            self.sync_container_log(cx);
+            cx.emit(MonitorPanelEvent::PageChanged(page));
+            cx.notify();
+        }
+    }
+
+    /// What a followed log said (a batch of lines, or the end of the command): to the pane it belongs to.
+    fn on_log_events(&mut self, key: &str, events: Vec<shellmate_monitor::FollowEvent>, cx: &mut Context<Self>) {
+        let pane = if self.service_log.as_ref().is_some_and(|pane| pane.key == key) {
+            self.service_log.as_mut()
+        } else {
+            self.container_log.as_mut().map(|(_, pane)| pane).filter(|pane| pane.key == key)
+        };
+        if let Some(pane) = pane {
+            pane.push(events);
             cx.notify();
         }
     }
@@ -145,7 +225,7 @@ impl MonitorPanel {
     /// it is cleared first.
     pub fn show_process(&mut self, pid: u32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(key) = self.data.snapshot.as_deref().and_then(|s| s.process(pid)).map(ProcKey::of) else { return };
-        self.page = Page::Processes;
+        self.set_page(Page::Processes, cx);
         if self.table.position(key).is_none() {
             self.query.update(cx, |input, cx| input.set_value("", window, cx));
             self.refresh(cx);
@@ -164,6 +244,14 @@ impl MonitorPanel {
         self.tree = tree;
         self.query.update(cx, |input, cx| input.set_value(query, window, cx));
         self.refresh(cx);
+        cx.notify();
+    }
+
+    /// Debug review hook: the overview scrolled as far as it goes.
+    #[cfg(debug_assertions)]
+    pub fn demo_scroll_end(&mut self, cx: &mut Context<Self>) {
+        let max = self.overview_scroll.max_offset();
+        self.overview_scroll.set_offset(gpui::point(px(0.), -max.y));
         cx.notify();
     }
 
@@ -524,7 +612,7 @@ impl MonitorPanel {
     }
 
     fn render_attention(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let items = model::attention(self.data.snapshot.as_deref());
+        let items = model::attention(&self.data);
         let list = items.into_iter().enumerate().map(|(ix, item)| {
             let (bg, fg) = tone_colors(p, if item.tone == Tone::Err { Tone::Err } else { Tone::Warn });
             let action = item.action.clone();
@@ -591,6 +679,8 @@ impl MonitorPanel {
                 .on_click(cx.listener(move |this, _, window, cx| match &action {
                     AttentionAction::AnalyzeDisk(mount) => cx.emit(MonitorPanelEvent::AnalyzeDisk(mount.clone())),
                     AttentionAction::ShowProcess(pid) => this.show_process(*pid, window, cx),
+                    AttentionAction::ShowService(name) => this.show_service(name, window, cx),
+                    AttentionAction::ShowContainer(name) => this.show_container(name, cx),
                 }))
         });
         let list: Vec<_> = list.collect();
@@ -649,37 +739,35 @@ impl MonitorPanel {
                     .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child("各核占用"))
                     .children(temperature.map(|t| div().text_size(px(12.)).text_color(p.tx2).child(t))),
             )
-            .children(bars.into_iter().map(|bar| {
-                let color = match bar.fraction {
-                    Some(f) if f >= 0.95 => p.err,
-                    Some(f) if f >= 0.8 => p.warn,
-                    _ => p.acc,
-                };
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .text_size(px(12.5))
-                    .child(
-                        div()
-                            .w(px(label_width))
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .font_family(MONO_FONT)
-                            .text_color(p.tx2)
-                            .child(bar.name),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(px(8.))
-                            .rounded(px(4.))
-                            .bg(p.card3)
-                            .overflow_hidden()
-                            .child(div().h_full().w(relative(bar.fraction.unwrap_or(0.))).rounded(px(4.)).bg(color)),
-                    )
-                    .child(div().w(px(38.)).flex_none().text_right().font_family(MONO_FONT).child(bar.text))
-            }))
+            .child(div().flex().gap(px(22.)).children(model::core_columns(bars).into_iter().map(|column| {
+                div().flex_1().min_w_0().flex().flex_col().gap(px(12.)).children(column.into_iter().map(|bar| {
+                    let color = match bar.fraction {
+                        Some(f) if f >= 0.95 => p.err,
+                        Some(f) if f >= 0.8 => p.warn,
+                        _ => p.acc,
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .text_size(px(12.5))
+                        .child(
+                            div()
+                                .w(px(label_width))
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .font_family(MONO_FONT)
+                                .text_color(p.tx2)
+                                .child(bar.name),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().h(px(8.)).rounded(px(4.)).bg(p.card3).overflow_hidden().child(
+                                div().h_full().w(relative(bar.fraction.unwrap_or(0.))).rounded(px(4.)).bg(color),
+                            ),
+                        )
+                        .child(div().w(px(38.)).flex_none().text_right().font_family(MONO_FONT).child(bar.text))
+                }))
+            })))
             .when(per_core.is_empty(), |d| d.child(div().text_size(px(12.5)).text_color(p.tx3).child("—")))
             .child(div().h(px(1.)).bg(p.line).my(px(4.)))
             .child(
@@ -736,6 +824,7 @@ impl MonitorPanel {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&self.overview_scroll)
                     .flex()
                     .flex_col()
                     .gap(px(10.))
@@ -788,7 +877,7 @@ impl MonitorPanel {
                 .whitespace_nowrap()
                 .when(selected, |d| d.bg(p.accs))
                 .when(!selected, |d| d.hover(|d| d.bg(p.card2)))
-                .when(row.context || row.collector, |d| d.opacity(0.55))
+                .when(row.context, |d| d.opacity(0.55))
                 .child(div().w(px(72.)).flex_none().font_family(MONO_FONT).text_color(p.tx2).child(key.pid.to_string()))
                 .child(div().w(px(96.)).flex_none().truncate().child(row.user.clone()))
                 .child(
@@ -1067,12 +1156,20 @@ impl Render for MonitorPanel {
             (_, Body::Message(message)) if unsupported => {
                 self.message_card(&message.title, &message.detail, message.retry, &p, cx)
             }
-            (Page::Services, _) => {
-                let page = model::services_page(probe);
+            (Page::Services, Body::Data { stale, banner }) => match model::services_page(probe) {
+                Some(page) => self.message_card(&page.title, &page.detail, false, &p, cx),
+                None => self.render_services(stale, banner, &p, cx),
+            },
+            (Page::Docker, Body::Data { stale, banner }) => match model::docker_page(probe) {
+                Some(page) => self.message_card(&page.title, &page.detail, false, &p, cx),
+                None => self.render_docker(stale, banner, &p, cx),
+            },
+            (Page::Services, Body::Message(_)) => {
+                let page = model::services_page(probe).unwrap_or_else(|| model::loading("服务列表"));
                 self.message_card(&page.title, &page.detail, false, &p, cx)
             }
-            (Page::Docker, _) => {
-                let page = model::docker_page(probe);
+            (Page::Docker, Body::Message(_)) => {
+                let page = model::docker_page(probe).unwrap_or_else(|| model::loading("容器列表"));
                 self.message_card(&page.title, &page.detail, false, &p, cx)
             }
             (_, Body::Message(message)) => self.message_card(&message.title, &message.detail, message.retry, &p, cx),

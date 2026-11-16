@@ -15,6 +15,8 @@
 //! | process frame, every 3rd  | `cut` (all `/proc/<pid>/stat`), `ps` (see below) |
 //! | slow frame, tick 1 of 30  | `df` (and no process frame: the schedule keeps them apart) |
 //!
+//! * **The collector hides itself.** A process frame says the script's own process id (`$$`); the monitor leaves
+//!   that process and its children (`cut`, `ps`, `sleep`) out of the list, the counts and the top list.
 //! * **Rates are the client's job.** The script writes raw counters and the server's uptime (read from
 //!   `/proc/uptime`, so the clock is the server's and not the network's).
 //! * **Process command lines:** `/proc/<pid>/cmdline` cannot be read in a shell without a fork per process
@@ -120,7 +122,7 @@ stats() {{
 }}
 procs() {{
   up
-  printf "%s procs %s\n" "$T" "$U"
+  printf "%s procs %s %s\n" "$T" "$U" "$$"
   printf "%s stat\n" "$T"
   cut -d" " -f1-{fields} $P/[0-9]*/stat 2>/dev/null
   if [ -n "$PSA" ]; then
@@ -177,6 +179,26 @@ pub fn sh_command(script: &str) -> String {
     format!("sh -c {}", quote::quote(script).expect("a script has no NUL bytes"))
 }
 
+/// `command` (a line for the server's shell) wrapped so that it ends when the channel it runs on is closed.
+///
+/// A command on an exec channel is not stopped by the server when the client closes the channel: it only finds out
+/// when it writes to a pipe nobody reads any more (SIGPIPE). The collector writes every second, but
+/// `docker events`, `journalctl -f` and `docker logs -f` write only when something happens, and would stay on the
+/// server for hours. So the wrapper runs the command as a session of its own (`setsid`, which every Linux has: its
+/// process group is then the job's alone) and watches the standard input, which the server closes together with the
+/// channel: at the end of it the job's group gets TERM. (Job control, `set -m`, would do the same in bash but not
+/// in dash without a terminal.) The command itself gets no standard input. Its exit status is the wrapper's, and
+/// what it prints is not touched. Only the job is signalled, never the group of the wrapper: whatever started it
+/// is left alone. Without `setsid` the command is run as it is and only the one process is signalled.
+pub fn watched(command: &str) -> String {
+    const SCRIPT: &str = "exec 3<&0; if command -v setsid >/dev/null 2>&1; then S=setsid; else S=; fi; $S sh -c \"$1\" </dev/null & p=$!; { cat <&3 >/dev/null; kill -TERM -$p 2>/dev/null || kill -TERM $p 2>/dev/null; } & w=$!; wait $p; s=$?; kill $w 2>/dev/null; exit $s";
+    format!(
+        "sh -c {} sh {}",
+        quote::quote(SCRIPT).expect("no NUL"),
+        quote::quote(command).expect("a command has no NUL bytes")
+    )
+}
+
 /// The command line of the collector.
 pub fn collector_command(config: &CollectorConfig) -> String {
     sh_command(&collector_script(config))
@@ -207,6 +229,8 @@ if [ -r /proc/uptime ]; then read -r u _ < /proc/uptime; printf "%s\n" "$u"; fi
 m user
 id -u 2>/dev/null
 id -un 2>/dev/null
+m groups
+id -Gn 2>/dev/null
 m sudo
 if command -v sudo >/dev/null 2>&1; then
   if tmo 5 sudo -n true >/dev/null 2>&1; then SUDO=1; echo nopasswd; else SUDO=0; echo password; fi
@@ -317,6 +341,70 @@ mod tests {
             }
         }
         assert_eq!(busiest, 3);
+    }
+
+    /// Runs `watched(command)` in a real shell with a pipe as its standard input.
+    fn spawn_watched(command: &str) -> std::process::Child {
+        std::os::unix::process::CommandExt::process_group(&mut std::process::Command::new("sh"), 0)
+            .arg("-c")
+            .arg(watched(command))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_watched_command_ends_when_its_standard_input_does() {
+        // `sleep` never writes: only the closed input can end it.
+        let mut child = spawn_watched("sleep 30");
+        assert!(wait_for(&mut child, 1).is_none(), "it runs while the channel is open");
+        drop(child.stdin.take());
+        let status = wait_for(&mut child, 5);
+        let _ = child.kill();
+        assert!(status.is_some(), "the wrapper and its command are gone soon after the input closed");
+        assert!(!status.unwrap().success());
+    }
+
+    #[test]
+    fn a_watched_command_keeps_its_output_and_its_exit_status() {
+        let mut child = spawn_watched("echo \"it's $((6 * 7))\"; echo oops 1>&2; exit 3");
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        let status = wait_for(&mut child, 5).expect("it ended by itself");
+        assert_eq!(out, "it's 42\n");
+        assert_eq!(status.code(), Some(3));
+        drop(child.stdin.take());
+        // The merged form the pages use: `2>&1` after the line goes through the wrapper's eval.
+        let mut child = spawn_watched("sh -c 'echo to-stderr 1>&2' 2>&1");
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        assert_eq!(out, "to-stderr\n");
+        let _ = wait_for(&mut child, 5);
+    }
+
+    #[test]
+    fn a_watched_command_does_not_read_the_channel() {
+        // The command must not eat the input the watcher is waiting on: `cat` as the command sees an empty input and
+        // ends at once (it would otherwise block until the channel closed).
+        let mut child = spawn_watched("cat; echo done");
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        assert_eq!(out, "done\n");
+        drop(child.stdin.take());
+        let _ = wait_for(&mut child, 5);
     }
 
     #[test]

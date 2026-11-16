@@ -175,14 +175,21 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
         let steps: Vec<(u64, &'static str, String)> = if let Some(rest) = scenario.strip_prefix("fake-") {
             let (page, variant) = rest.split_once('-').unwrap_or((rest, ""));
             let data = match variant {
-                "waiting" | "failed" | "first" | "starting" | "quiet" | "cores" | "notlinux" | "nosudo" => variant,
+                "waiting" | "failed" | "first" | "starting" | "quiet" | "cores" | "notlinux" | "nosudo" | "alpine"
+                | "forwarded" => variant,
+                "coresend" => "cores",
                 "term" => "nosudo",
-                _ if page == "svc" || page == "dk" => if variant == "ubuntu" { "overview" } else { "alpine" },
                 _ => "overview",
             };
             let data = if data == "cores" { "many-cores" } else { data };
             let mut steps = vec![show, (4000, "fake", data.into()), (4300, "page", page.into())];
+            match (page, variant) {
+                ("svc", _) => steps.push((4600, "svc-log", String::new())),
+                ("dk", _) => steps.push((4600, "dk-log", "worker".into())),
+                _ => {}
+            }
             match variant {
+                "coresend" => steps.push((5000, "scroll-end", String::new())),
                 "tree" => steps.push((4600, "table", "|cpu|tree".into())),
                 "filter" => steps.push((4600, "table", "nginx|cpu|list".into())),
                 "sel" => steps.push((4600, "select", "2207".into())),
@@ -203,6 +210,30 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
                     (12000, "log", "after".into()),
                 ],
                 "analyze" => vec![show, (8000, "analyze", arg.clone())],
+                // A button of the 服务 page (`<action>|<unit>`: start, stop, restart, reload, enable, disable) or of a
+                // container (`<action>|<name>`: start, stop, restart, rm, exec, prune, port|<name>:<n>); `-now` skips the
+                // question. The monitor logs how things stand before and after.
+                "svc-act" | "svc-act-now" | "ctr-act" | "ctr-act-now" => vec![
+                    show,
+                    (3800, "page", if scenario.starts_with("svc") { "svc" } else { "dk" }.into()),
+                    (8000, "log", "before".into()),
+                    (9000, if scenario.starts_with("svc") { "svc-act" } else { "ctr-act" }, format!("{}{}", if scenario.ends_with("-now") { "!" } else { "" }, arg)),
+                    (12000, "log", "after".into()),
+                ],
+                // The chips of the ports: the first click makes the forwards, the second says they exist.
+                "ctr-fwd" => vec![
+                    show,
+                    (3800, "page", "dk".into()),
+                    (8000, "log", "before".into()),
+                    (9000, "ctr-act", "port|shellmate-web:0".into()),
+                    (9500, "ctr-act", "port|shellmate-cache:0".into()),
+                    (11500, "ctr-act", "port|shellmate-cache:0".into()),
+                    (13000, "log", "after".into()),
+                    (30000, "log", "later".into()),
+                ],
+                // The log under a container (and what the 查看容器 of 需要关注 does).
+                "ctr-log" => vec![show, (3800, "page", "dk".into()), (5000, "show-container", arg.clone()), (12000, "log", "after".into())],
+                "svc-sel" => vec![show, (3800, "page", "svc".into()), (5000, "services", arg.clone()), (12000, "log", "after".into())],
                 // Collecting only while the monitor page is in front (and 10 s after): the page is shown, left for
                 // the terminal, shown again within the 10 s (the collector stays), and left for good.
                 "gating" => vec![
@@ -222,6 +253,22 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
                     (27000, "log", "later".into()),
                 ],
                 "close-now" => vec![show, (8000, "log", "before".into()), (8500, "close-now", String::new())],
+                // The last tab closed while a log is followed (the Docker page with a container log, the service page with
+                // the journal of a unit): nothing of it may stay on the server.
+                "leak-dk" => vec![
+                    show,
+                    (3800, "page", "dk".into()),
+                    (5000, "show-container", "shellmate-web".into()),
+                    (9000, "log", "before".into()),
+                    (9500, "close-now", String::new()),
+                ],
+                "leak-svc" => vec![
+                    show,
+                    (3800, "page", "svc".into()),
+                    (5000, "services", "|run|shellmate-demo.service".into()),
+                    (9000, "log", "before".into()),
+                    (9500, "close-now", String::new()),
+                ],
                 _ => vec![show, (7000, "log", "live".into())],
             }
         };
