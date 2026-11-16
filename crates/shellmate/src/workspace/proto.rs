@@ -23,6 +23,7 @@ impl Workspace {
         }
         let stress=scene.starts_with("stress-");
         let scene=scene.strip_prefix("stress-").unwrap_or(scene);
+        self.ai_drawer=None;self.ai_open=false;
         self.sessions.clear();
         self.groups.clear();
         self.active = None;
@@ -258,8 +259,11 @@ impl Workspace {
             }
             "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
+            "ai"|"ai-chat"|"ai-history"|"ai-error"|"ai-unconfigured" => {self.open_ai(window,cx);if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|d,cx|d.scene(scene,cx));}},
+            "ai-explain"=>{self.sessions[0].terminal.update(cx,|t,cx|t.notice("[error] connect() failed: Connection refused",cx));},
+            "set-ai"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-4o-mini".into(),..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-cred" => self.open_settings(0, window, cx),
-            "set-cred-master" => {let settings=crate::settings::SettingsWindow::open(cx.entity().downgrade(),self.preferences.clone(),self.secrets.clone(),0,window,cx);settings.update(cx,|s,cx|s.fixture_master(cx));},
+            "set-cred-master" => {let settings=crate::settings::SettingsWindow::open(cx.entity().downgrade(),self.preferences.clone(),self.secrets.clone(),0,self.store.clone(),window,cx);settings.update(cx,|s,cx|s.fixture_master(cx));},
             "vault-unlock" => {self.secrets.switch_to_master("Fixture9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).expect("fixture vault");self.secrets.set_touch_id(true).expect("fixture device key");self.secrets.lock();crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Unlock("连接 prod-web-01".into()),None,Box::new(|_,_,_|{}),window,cx);},
             "bundle-export" => {crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Export,None,Box::new(|_,_,_|{}),window,cx);},
             "bundle-preview" => {let mut incoming=self.secrets.export_bundle(shellmate_store::bundle::Contents{credentials:false,..Default::default()}).expect("fixture bundle");if let Some(host)=incoming.items.iter_mut().find(|i|i.kind==shellmate_store::bundle::Kind::Host){host.fields.insert("addr".into(),serde_json::json!("10.0.1.99"));}

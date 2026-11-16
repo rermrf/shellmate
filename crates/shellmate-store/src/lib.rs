@@ -24,3 +24,5 @@ pub mod bundle;
 
 mod keychain_inventory;
 pub use vault::LoginDeviceKeyStore;
+
+pub mod ai;

@@ -43,6 +43,7 @@ mod archive_demo;
 mod ssh;
 mod streams;
 mod mosh;
+mod ai;
 
 actions!(
     shellmate,
@@ -173,6 +174,8 @@ pub struct Workspace {
     temporary_hosts: HashMap<HostId, shellmate_core::Host>,
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
+    ai_drawer: Option<Entity<crate::ai::panel::Drawer>>,
+    ai_open: bool,
     broadcast: crate::productivity::multi::Broadcast,
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
@@ -254,7 +257,7 @@ impl Workspace {
             sessions: Vec::new(),
             temporary_hosts: HashMap::new(),
             commands,
-            commands_open: false,
+            commands_open: false, ai_drawer:None,ai_open:false,
             broadcast: Default::default(), broadcast_bar, split: Default::default(),recent_sessions:Vec::new(),session_menu:None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -451,6 +454,7 @@ impl Workspace {
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
+        self.sync_ai_context(cx);
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
         self.touch_session(new_id);
         self.update_pane_radii(cx);
@@ -485,6 +489,7 @@ impl Workspace {
         match self.active {
             _ if self.sessions.is_empty() => {
                 self.active = None;
+                self.sync_ai_context(cx);
                 window.focus(&self.focus_handle, cx);
                 self.sidebar.update(cx, |s, cx| s.select(None, cx));
             }
@@ -676,7 +681,7 @@ impl Workspace {
         {
             // Ordinary prototype scenes use a count-based sliding window, even when another
             // tab physically fits. Real sessions and stress fixtures use only measured widths.
-            Some((if self.sidebar_open { 4 } else { 5 }) - usize::from(self.commands_open))
+            Some((if self.sidebar_open { 4 } else { 5 }) - usize::from(self.commands_open||self.ai_open))
         } else {
             cap
         };
@@ -840,17 +845,18 @@ impl Workspace {
                 toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
                     .when(self.broadcast.enabled, |b| b.bg(p.warns).text_color(p.warn))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.commands_open = true;
+                        this.commands_open = true;this.ai_open=false;
                         this.sync_productivity(cx);
                         cx.notify();
                     })),
             )
-            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手（P7 实现）", false, cx))
+            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手", true, cx).when(self.ai_open,|b|b.bg(p.accs).text_color(p.acc)).on_click(cx.listener(|this,_,w,cx|{if this.ai_open{this.close_ai(cx)}else{this.open_ai(w,cx)}})))
             .child(
                 toolbar_button("snippets", AppIcon::Commands, Some("快捷命令"), "快捷命令", true, cx)
                     .when(self.commands_open, |b| b.bg(p.accs).text_color(p.acc))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.commands_open = !this.commands_open;
+                        this.ai_open=false;
                         cx.notify();
                     })),
             )
@@ -963,7 +969,7 @@ impl Workspace {
         let size = focused.terminal.read(cx).size();
         let status=if focused.ssh().is_some(){ssh::status_line(size.cols,size.rows)}else{format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY",size.cols,size.rows)};
         let status_fields=status.split("    ").map(str::to_string).collect::<Vec<_>>();
-        #[cfg(debug_assertions)] let status_fields=if crate::proto::requested(){vec![format!("PTY {}×38",if self.split.other.is_some(){66}else if self.commands_open{96}else{134}),"xterm-256color".into(),"UTF-8".into(),"延迟 28ms · 保活 30s".into()]}else{status_fields};
+        #[cfg(debug_assertions)] let status_fields=if crate::proto::requested(){vec![format!("PTY {}×38",if self.split.other.is_some(){66}else if self.commands_open||self.ai_open{96}else{134}),"xterm-256color".into(),"UTF-8".into(),"延迟 28ms · 保活 30s".into()]}else{status_fields};
         let status_fields=if let SessionKind::Stream(s)=&focused.kind {
             vec![if crate::prototype_fixture(){"PTY 134×38".into()}else{format!("PTY {}×{}",size.cols,size.rows)},"xterm-256color".into(),"UTF-8".into(),s.snapshot.as_ref().map_or_else(||"Telnet 明文".into(),|s|format!("RX {:.1} KB",s.received as f64/1024.))]
         }else{status_fields};
@@ -1005,6 +1011,8 @@ impl Workspace {
             .bg(term_bg)
             .shadow(crate::ui::terminal_shadow(&p))
             .child(self.render_panes(session,cx))
+            .when(crate::ai::model::error_line(&focused.terminal.read(cx).recent_displayed_text(size.rows as usize)).is_some(),|d|d.child(div().absolute().top(px(if focused.host().is_some_and(|h|h.protocol==shellmate_core::Protocol::Serial){56.}else{12.})).right(px(14.))
+                .child(toolbar_button("ai-explain",AppIcon::Ai,Some("AI 解释这个报错"),"解释当前终端报错",true,cx).bg(p.card).text_color(p.acc).on_click(cx.listener(|s,_,w,cx|s.explain_ai(w,cx))))))
             .when(self.broadcast.enabled,|d|d.child(self.broadcast_bar.clone()))
             .child(
                 div()
@@ -1149,7 +1157,7 @@ impl Render for Workspace {
                     .child(self.render_header(cx))
                     .child(
                         div().flex_1().min_h_0().flex().gap(px(12.)).child(body)
-                            .when(self.commands_open, |d| d.child(self.commands.clone())),
+                            .when(self.commands_open, |d| d.child(self.commands.clone())).when(self.ai_open,|d|d.children(self.ai_drawer.clone())),
                     ),
             )
             .children(self.session_menu.as_ref().map(|menu| gpui::deferred(

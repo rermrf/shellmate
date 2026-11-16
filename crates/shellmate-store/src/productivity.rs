@@ -162,7 +162,7 @@ mod tests {
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES(?1,?2,?3,22,'ssh','private_key')",rusqlite::params![host.id.as_str(),host.name,host.addr]).unwrap();
         drop(conn);
         let store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
         assert!(!store.history_enabled().unwrap());
         assert!(store.history_shortcut().unwrap());
         assert!(store.snippets().unwrap().is_empty());

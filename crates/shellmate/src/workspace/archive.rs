@@ -289,6 +289,7 @@ impl Workspace {
             self.preferences.clone(),
             self.secrets.clone(),
             section,
+            self.store.clone(),
             window,
             cx,
         );

@@ -615,6 +615,8 @@ impl Terminal {
     pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
     pub fn replay_output(&mut self,bytes:&[u8],cx:&mut Context<Self>){self.parser.lock().advance(&mut *self.term.lock(),bytes);cx.notify();}
     pub fn screen_text(&self)->String{crate::replay::screen_text(&*self.term.lock())}
+    /// Rendered cells only, including scrollback above the current viewport.
+    pub fn recent_displayed_text(&self,lines:usize)->String{crate::replay::recent_text(&*self.term.lock(),lines)}
 
     /// Called when the user presses Enter on an ended session. A local terminal
     /// respawns its shell in place, keeping the scrollback; any other terminal

@@ -134,10 +134,12 @@ pub enum Action {
     History,
     Settings,
     LockVault,
+    AiAssistant,
+    ExplainError,
     Records,
 }
 impl Action {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Local,
         Self::NewHost,
         Self::Duplicate,
@@ -151,6 +153,8 @@ impl Action {
         Self::History,
         Self::Settings,
         Self::LockVault,
+        Self::AiAssistant,
+        Self::ExplainError,
         Self::Records,
     ];
     pub fn label(self, sidebar_open: bool, split: bool) -> &'static str {
@@ -169,6 +173,8 @@ impl Action {
             Self::Import => "导入 ~/.ssh/config",
             Self::History => "搜索命令历史",
             Self::Settings => "打开设置",
+            Self::AiAssistant => "打开 AI 助手",
+            Self::ExplainError => "解释最近的报错",
             Self::LockVault => "立即锁定凭据库",
             Self::Records => "会话记录与回放",
         }

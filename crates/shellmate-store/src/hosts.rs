@@ -119,6 +119,21 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX snippet_group_identity ON snippet_groups(stable_id);
     CREATE UNIQUE INDEX snippet_identity ON snippets(stable_id);",
 
+    // v8: local AI conversation history; inputs are the redacted sent snapshots.
+    "CREATE TABLE ai_conversations (
+        id TEXT PRIMARY KEY NOT NULL, host_id TEXT, session_label TEXT NOT NULL,
+        title TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX ai_conversations_updated ON ai_conversations(updated_at DESC);
+    CREATE TABLE ai_messages (
+        id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
+        context TEXT NOT NULL, commands_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+        position INTEGER NOT NULL, redactions INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX ai_messages_conversation ON ai_messages(conversation_id,position);",
+
 ];
 
 /// The host library.
@@ -661,7 +676,7 @@ mod tests {
     fn v5_to_v6_retains_ssh_and_round_trips_telnet_and_serial() {
         let mut conn=Connection::open_in_memory().unwrap();migrate(&mut conn,&MIGRATIONS[..5]).unwrap();
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES('old','ssh','example.test',22,'ssh','agent')",[]).unwrap();
-        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),7);
+        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),8);
         let old=store.host(&HostId::from_raw("old")).unwrap().unwrap();assert_eq!(old.protocol,Protocol::Ssh);assert_eq!(old.serial,shellmate_core::SerialSettings::default());
         let mut serial=Host::new("ESP32","/dev/cu.fixture");serial.protocol=Protocol::Serial;serial.port=0;
         serial.serial=shellmate_core::SerialSettings{baud:460800,data_bits:7,parity:'E',stop_bits:2,flow:"hardware".into(),newline:shellmate_core::Newline::Lf};
@@ -761,9 +776,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 8, supported: 7 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v8），当前 Shellmate 只支持到 v7，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 9, supported: 8 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v9），当前 Shellmate 只支持到 v8，请升级后再试");
     }
 }

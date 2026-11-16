@@ -242,6 +242,7 @@ impl Workspace {
             self.split.focus = Pane::Main;
         }
         self.touch_session(id);
+        self.sync_ai_context(cx);
         cx.notify();
     }
     pub(super) fn touch_session(&mut self, id: usize) {

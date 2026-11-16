@@ -31,6 +31,7 @@ prototype_icons! {
     Settings => ("settings", 16.),
     Broadcast => ("broadcast", 15.),
     Ai => ("ai", 14.),
+    History => ("history", 16.),
     Commands => ("commands", 14.),
     Moon => ("moon", 15.),
     Sun => ("sun", 16.),
