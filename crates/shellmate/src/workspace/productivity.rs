@@ -35,8 +35,8 @@ impl Workspace {
                 .map(|s| SessionItem {
                     id: s.id,
                     title: s.title.to_string(),
-                    detail: s.ssh().map_or("本机终端",|s|s.host.protocol.label()).into(),
-                    host: s.ssh().map(|s| s.host.id.clone()),
+                    detail: s.host().map_or("本机终端",|h|h.protocol.label()).into(),
+                    host: s.host().map(|h| h.id.clone()),
                 })
                 .collect(),
             active: self.active.and_then(|i| self.sessions.get(i)).map(|s| s.id),
@@ -54,7 +54,7 @@ impl Workspace {
         self.show_panel(Panel::Terminal, window, cx);
         let host = self
             .focused_session()
-            .map(|s| s.ssh().map_or_else(|| "local".into(), |s| s.host.id.to_string()));
+            .map(|s| s.host().map_or_else(|| "local".into(), |h| h.id.to_string()));
         let picker = cx.new(|cx| Picker::history(self.store.clone(), host, current, window, cx));
         self.install_picker(picker, window, cx);
     }
@@ -80,7 +80,7 @@ impl Workspace {
     }
     fn choose(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
         match choice {
-            Choice::Quick(host) => self.connect_temporary(host, window, cx),
+            Choice::Quick(host) => self.connect_temporary(*host, window, cx),
             Choice::Host(id) => self.connect_host(&id, window, cx),
             Choice::Session(id) => {
                 if let Some(ix) = self.sessions.iter().position(|s| s.id == id) {
@@ -150,6 +150,7 @@ impl Workspace {
         self.sessions.iter().find(|s| Some(s.id) == id).is_some_and(|s| {
             s.terminal.read(cx).is_attached()
                 && !s.terminal.read(cx).is_exited()
+                && s.stream_connected()
                 && s.ssh().is_none_or(|s| s.status == ssh::SshStatus::Connected)
         })
     }
@@ -229,9 +230,9 @@ impl Workspace {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        let (host, label) = session.ssh().map_or_else(
+        let (host, label) = session.host().map_or_else(
             || ("local".into(), "本机".into()),
-            |s| (s.host.id.to_string(), s.host.name.clone()),
+            |h| (h.id.to_string(), h.name.clone()),
         );
         let entry = HistoryEntry {
             id: 0,

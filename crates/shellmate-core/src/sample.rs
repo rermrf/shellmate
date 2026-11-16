@@ -78,6 +78,7 @@ pub fn sample_book() -> HostBook {
             group: Some(GroupId::from_raw(s.group)),
             tags: s.tags.iter().map(|t| t.to_string()).collect(),
             favorite: s.fav,
+            serial: Default::default(),
             protocol: s.proto,
             auth: s.auth,
             identity_file: None,

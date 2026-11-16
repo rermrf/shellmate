@@ -28,7 +28,8 @@ impl Workspace {
             .map(|s| SessionRow {
                 id: s.id,
                 title: s.title.to_string(),
-                local: s.ssh().is_none(),
+                local: s.host().is_none(),
+                protocol:s.host().map_or(shellmate_core::Protocol::Ssh,|h|h.protocol),
                 status: if self.command_available(Some(s.id), cx) {
                     Status::Connected
                 } else {
@@ -150,14 +151,13 @@ impl Workspace {
             .into_iter()
             .filter_map(|id| self.sessions.iter().find(|s| s.id == id))
             .map(|s| {
-                let production = s.ssh().is_some_and(|ssh| {
-                    let group = ssh
-                        .host
+                let production = s.host().is_some_and(|host| {
+                    let group = host
                         .group
                         .as_ref()
                         .and_then(|id| self.book.group(id))
                         .map_or("", |g| g.name.as_str());
-                    crate::productivity::model::production(group, &ssh.host.tags)
+                    crate::productivity::model::production(group, &host.tags)
                 });
                 Target {
                     id: s.id,
@@ -312,8 +312,9 @@ impl Workspace {
         else {
             return div()
                 .flex_1()
-                .min_h_0()
-                .child(main.view.clone())
+                .min_h_0().flex().flex_col()
+                .children(self.render_serial_toolbar(main,cx))
+                .child(div().flex_1().min_h_0().child(main.view.clone()))
                 .into_any_element();
         };
         let p = cx.palette().clone();
@@ -394,6 +395,7 @@ impl Workspace {
                     cx.listener(move |this, _, w, cx| this.focus_pane(which, w, cx)),
                 )
                 .child(header)
+                .children(self.render_serial_toolbar(session,cx))
                 .child(div().flex_1().min_h_0().child(session.view.clone()))
         };
         div()

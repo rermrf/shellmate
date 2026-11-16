@@ -42,6 +42,7 @@ mod proto;
 #[cfg(debug_assertions)]
 mod archive_demo;
 mod ssh;
+mod streams;
 
 actions!(
     shellmate,
@@ -118,6 +119,7 @@ impl Panel {
 /// What a session is connected to.
 enum SessionKind {
     Local,
+    Stream(Box<streams::StreamSession>),
     Ssh(Box<ssh::SshSession>),
 }
 
@@ -143,10 +145,12 @@ struct Session {
 }
 
 impl Session {
+    fn host(&self) -> Option<&shellmate_core::Host> { match &self.kind {SessionKind::Ssh(s)=>Some(&s.host),SessionKind::Stream(s)=>Some(&s.host),SessionKind::Local=>None} }
+    fn stream_connected(&self)->bool { match &self.kind {SessionKind::Stream(s)=>s.connected(),_=>true} }
     fn ssh(&self) -> Option<&ssh::SshSession> {
         match &self.kind {
             SessionKind::Ssh(ssh) => Some(ssh),
-            SessionKind::Local => None,
+            SessionKind::Local | SessionKind::Stream(_) => None,
         }
     }
 }
@@ -410,6 +414,8 @@ impl Workspace {
             match (&mut session.kind, event) {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
                 (SessionKind::Local, TerminalEvent::Restarted) => session.exited = false,
+                (SessionKind::Stream(s), TerminalEvent::Disconnected(_) | TerminalEvent::Exited(_)) => {s.connected=false;session.exited=true;},
+                (SessionKind::Stream(_), TerminalEvent::RestartRequested) => this.start_stream(id,window,cx),
                 (SessionKind::Ssh(_), TerminalEvent::Exited(_)) => this.on_tab_exited(id, cx),
                 (SessionKind::Ssh(_), TerminalEvent::Disconnected(_)) => this.on_tab_disconnected(id, window, cx),
                 (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => this.retry_tab(id, window, cx),
@@ -432,7 +438,7 @@ impl Workspace {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.get(ix) else { return };
         let new_id=session.id;
-        let selected = session.ssh().map_or_else(|| "local".to_string(), |ssh| ssh.host.id.to_string());
+        let selected = session.host().map_or_else(|| "local".to_string(), |host| host.id.to_string());
         self.split.select_tab(self.main_id(),new_id);
         self.session_menu=None;
         self.picker = None;
@@ -497,10 +503,11 @@ impl Workspace {
                 }
             }
         }
+        for session in &self.sessions {if let SessionKind::Stream(stream)=&session.kind {live.insert(stream.host.id.to_string(),if stream.connected(){LiveStatus::Ok}else{LiveStatus::Failed});}}
         let local_alive = self.sessions.iter().any(|s| matches!(s.kind, SessionKind::Local) && !s.exited);
         let active = match self.active.and_then(|ix| self.sessions.get(ix)) {
             None => Active::None,
-            Some(session) => session.ssh().map_or(Active::Local, |ssh| Active::Host(ssh.host.id.to_string())),
+            Some(session) => session.host().map_or(Active::Local, |host| Active::Host(host.id.to_string())),
         };
         self.sidebar.update(cx, |s, cx| {
             s.set_sessions(count, live, summary.into(), cx);
@@ -510,6 +517,8 @@ impl Workspace {
 
     /// A click on a host of the rail: its tab comes to the front; with no tab the host is just selected.
     fn activate_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix)=self.sessions.iter().position(|s|s.host().is_some_and(|h|&h.id==id)){self.activate(ix,window,cx);return;}
+
         let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
         match ssh::existing_session(tabs, id) {
             ssh::Existing::Switch(ix) | ssh::Existing::Reconnect(ix) => self.activate(ix, window, cx),
@@ -861,6 +870,7 @@ impl Workspace {
                     (Some(_), Panel::Terminal) => item,
                     (Some(s), Panel::Files | Panel::Forward | Panel::Monitor) if s.ssh().is_some() => item,
                     (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
+                    (Some(s), _) if s.host().is_some() => item.disabled("串口 / Telnet 会话不支持此面板"),
                     (Some(_), other) => item.disabled(other.local_hint()),
                 }
             })
@@ -900,6 +910,8 @@ impl Workspace {
 
     /// Header subtitle: the SSH target of an SSH session, the shell of a local one.
     fn session_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
+        if let SessionKind::Stream(s)=&session.kind {return if let Some(state)=&s.snapshot {format!("{} · {} {} · 串口",s.host.addr,state.settings.baud,state.settings.framing())}else{format!("{} · Telnet",s.host.address_line())};}
+
         #[cfg(debug_assertions)] if crate::proto::requested(){if session.ssh().is_none(){return "chen@MacBook-Pro · /bin/zsh -l · ~ · 本机进程，不经过网络".into();}
         if let Some(ssh)=session.ssh(){return format!("{}@{}:{} · {} · {}",ssh.host.user.as_deref().unwrap_or(""),ssh.host.addr,ssh.host.port,ssh.host.protocol.label(),ssh.host.auth.label());}}
         match session.ssh() {
@@ -944,6 +956,9 @@ impl Workspace {
         let status=if focused.ssh().is_some(){ssh::status_line(size.cols,size.rows)}else{format!("PTY {}×{}    xterm-256color    UTF-8    本机 PTY",size.cols,size.rows)};
         let status_fields=status.split("    ").map(str::to_string).collect::<Vec<_>>();
         #[cfg(debug_assertions)] let status_fields=if crate::proto::requested(){vec![format!("PTY {}×38",if self.split.other.is_some(){66}else if self.commands_open{96}else{134}),"xterm-256color".into(),"UTF-8".into(),"延迟 28ms · 保活 30s".into()]}else{status_fields};
+        let status_fields=if let SessionKind::Stream(s)=&focused.kind {
+            vec![if crate::prototype_fixture(){"PTY 134×38".into()}else{format!("PTY {}×{}",size.cols,size.rows)},"xterm-256color".into(),"UTF-8".into(),s.snapshot.as_ref().map_or_else(||"Telnet 明文".into(),|s|format!("RX {:.1} KB",s.received as f64/1024.))]
+        }else{status_fields};
         let view = focused.view.clone();
         let recording=self.running_recordings.get(&focused.id);
         let recording_label=recording.map_or_else(||"● 录制".to_string(),|r|format!("REC {} · .cast",shellmate_term::archive::mmss(r.display_seconds())));
@@ -1142,6 +1157,7 @@ impl Render for Workspace {
 /// Color of a tab's status dot: connecting yellow, ok green, failed red, ended grey.
 fn session_dot(session: &Session, p: &theme::Palette) -> gpui::Hsla {
     match &session.kind {
+        SessionKind::Stream(s) => if s.connected() {p.ok}else{p.tx3},
         SessionKind::Local if session.exited => p.tx3,
         SessionKind::Local => p.ok,
         SessionKind::Ssh(ssh) => match ssh.status {

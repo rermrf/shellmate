@@ -182,7 +182,7 @@ impl Action {
 }
 #[derive(Clone)]
 pub enum Choice {
-    Quick(Host),
+    Quick(Box<Host>),
     Host(HostId),
     Session(usize),
     Command(Snippet),
@@ -221,7 +221,7 @@ pub fn palette(
             title: format!("连接 {}", query.trim()),
             detail: "临时会话，不写入主机列表".into(),
             hint: "↵".into(),
-            choice: Choice::Quick(host),
+            choice: Choice::Quick(Box::new(host)),
         });
     }
     let mut hosts: Vec<_> = book

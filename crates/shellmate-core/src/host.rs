@@ -45,15 +45,16 @@ id_type!(
 );
 
 /// Connection protocol of a saved host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Protocol {
-    /// Secure Shell (the only connectable protocol in P2).
+    /// Secure Shell.
+    #[default]
     Ssh,
     /// Mosh (not connectable yet).
     Mosh,
-    /// Telnet (not connectable yet).
+    /// Telnet over TCP (plaintext).
     Telnet,
-    /// Serial console (not connectable yet).
+    /// Serial console.
     Serial,
 }
 
@@ -165,6 +166,8 @@ pub struct Host {
     pub protocol: Protocol,
     /// Authentication method.
     pub auth: AuthMethod,
+    /// Serial framing (retained when changing protocols).
+    pub serial: crate::SerialSettings,
     /// Private key file for [`AuthMethod::PrivateKey`]; `None` uses the default keys.
     pub identity_file: Option<PathBuf>,
     /// ProxyJump chain, first hop first. Each jump host may have jump hosts of its own.
@@ -187,6 +190,7 @@ impl Host {
             favorite: false,
             protocol: Protocol::Ssh,
             auth: AuthMethod::default(),
+            serial: Default::default(),
             identity_file: None,
             jump: Vec::new(),
             last_connected_at: None,

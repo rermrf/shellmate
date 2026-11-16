@@ -69,8 +69,14 @@ impl Workspace {
         let name = draft.host.name.clone();
         let id = draft.host.id.clone();
         let endpoint = crate::connect::Endpoint::of(&draft.host, &crate::connect::default_user());
+        let host=draft.host.clone();
         let outcome = library::save_host(&mut self.store.borrow_mut(), self.secrets.as_ref(), draft)?;
-        if let Some(credential) = credential { self.pending_forms.insert(id, (endpoint, credential)); }
+        if let Some(credential) = credential {
+            if let Err(e)=library::save_telnet_password(self.secrets.as_ref(),&host,&credential.answer.secret,credential.answer.save) {
+                window.push_notification(Notification::warning(format!("主机已保存，但密码没有存入钥匙串：{e}")),cx);
+            }
+            self.pending_forms.insert(id, (endpoint, credential));
+        }
         else { self.pending_forms.remove(&id); }
         self.reload_book(window, cx);
         window.push_notification(Notification::success(format!("已保存 {name}")), cx);

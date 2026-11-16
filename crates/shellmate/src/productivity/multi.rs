@@ -15,6 +15,7 @@ pub struct SessionRow {
     pub id: usize,
     pub title: String,
     pub local: bool,
+    pub protocol: shellmate_core::Protocol,
     pub status: Status,
 }
 impl SessionRow {
@@ -24,8 +25,7 @@ impl SessionRow {
     pub fn subtitle(&self) -> &'static str {
         match self.status {
             Status::Connected if self.local => "本机",
-            Status::Connected if crate::prototype_fixture()&&self.title=="ESP32-DevKit"=>"串口",
-            Status::Connected => "SSH",
+            Status::Connected => self.protocol.label(),
             Status::Connecting => "连接中",
             Status::Reconnecting => "重连中",
             Status::Failed => "连接失败",
@@ -245,6 +245,7 @@ mod tests {
             id,
             title: format!("tab {id}"),
             local: false,
+            protocol:shellmate_core::Protocol::Ssh,
             status,
         }
     }

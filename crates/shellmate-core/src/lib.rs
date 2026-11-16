@@ -7,6 +7,8 @@ pub mod io;
 #[cfg(any(test, feature = "test-support"))]
 pub mod sample;
 pub mod secret;
+pub mod serial;
+pub use serial::{Newline, SerialSettings};
 pub mod ssh_config;
 
 pub use filter::{HostFilter, HostSection, sections};

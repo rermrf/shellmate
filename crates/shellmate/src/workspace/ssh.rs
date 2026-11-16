@@ -222,7 +222,7 @@ impl Workspace {
     fn ssh_mut(&mut self, session_id: usize) -> Option<&mut SshSession> {
         self.sessions.iter_mut().find(|s| s.id == session_id).and_then(|s| match &mut s.kind {
             SessionKind::Ssh(ssh) => Some(&mut **ssh),
-            SessionKind::Local => None,
+            SessionKind::Local | SessionKind::Stream(_) => None,
         })
     }
 
@@ -359,6 +359,11 @@ impl Workspace {
     /// Opens a tab for the saved host and starts connecting; a host that already has a tab
     /// switches to it instead (a copy of a session is a separate action).
     pub(super) fn connect_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(host)=self.book.host(id).or_else(||self.temporary_hosts.get(id)).filter(|h|matches!(h.protocol,shellmate_core::Protocol::Telnet|shellmate_core::Protocol::Serial)).cloned() {
+            if let Some(ix)=self.sessions.iter().position(|s|s.host().is_some_and(|h|&h.id==id)) {self.activate(ix,window,cx);if !self.sessions[ix].stream_connected(){self.start_stream(self.sessions[ix].id,window,cx);}return;}
+            self.open_stream(host,window,cx);return;
+        }
+
         let tabs = self.sessions.iter().enumerate().filter_map(|(ix, s)| s.ssh().map(|ssh| (ix, ssh)));
         match existing_session(tabs, id) {
             Existing::Switch(ix) => return self.activate(ix, window, cx),
@@ -947,6 +952,10 @@ impl Workspace {
         let Some(ix) = self.active.filter(|ix| *ix < self.sessions.len()) else {
             return self.open_local(window, cx);
         };
+        if let SessionKind::Stream(s)=&self.sessions[ix].kind {
+            if s.host.protocol==shellmate_core::Protocol::Serial {window.push_notification(Notification::info("串口设备不能同时打开两次，请先关闭端口"),cx);return;}
+            let host=s.host.clone();self.open_stream(host,window,cx);return;
+        }
         let Some(ssh) = self.sessions[ix].ssh() else {
             let terminal = self.sessions[ix].terminal.clone();
             let cwd = terminal

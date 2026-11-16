@@ -95,6 +95,13 @@ const MIGRATIONS: &[&str] = &[
     // v5: recording geometry is required for standalone replay.
     "ALTER TABLE recordings ADD COLUMN cols INTEGER NOT NULL DEFAULT 80;
      ALTER TABLE recordings ADD COLUMN rows INTEGER NOT NULL DEFAULT 24;",
+    // v6: protocol and TCP port already exist; add serial framing without secrets.
+    "ALTER TABLE hosts ADD COLUMN serial_baud INTEGER NOT NULL DEFAULT 115200;
+     ALTER TABLE hosts ADD COLUMN serial_bits INTEGER NOT NULL DEFAULT 8;
+     ALTER TABLE hosts ADD COLUMN serial_parity TEXT NOT NULL DEFAULT 'N';
+     ALTER TABLE hosts ADD COLUMN serial_stop INTEGER NOT NULL DEFAULT 1;
+     ALTER TABLE hosts ADD COLUMN serial_flow TEXT NOT NULL DEFAULT 'none';
+     ALTER TABLE hosts ADD COLUMN serial_newline TEXT NOT NULL DEFAULT 'CRLF';",
 ];
 
 /// The host library.
@@ -366,10 +373,11 @@ struct RawHost {
     auth: String,
     identity_file: Option<String>,
     last_connected_at: Option<i64>,
+    serial: shellmate_core::SerialSettings,
 }
 
 const HOST_COLUMNS: &str =
-    "id, name, addr, port, username, group_id, favorite, protocol, auth, identity_file, last_connected_at";
+    "id, name, addr, port, username, group_id, favorite, protocol, auth, identity_file, last_connected_at, serial_baud, serial_bits, serial_parity, serial_stop, serial_flow, serial_newline";
 
 fn raw_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHost> {
     Ok(RawHost {
@@ -384,6 +392,14 @@ fn raw_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawHost> {
         auth: row.get(8)?,
         identity_file: row.get(9)?,
         last_connected_at: row.get(10)?,
+        serial: shellmate_core::SerialSettings {
+            baud: row.get(11)?, data_bits: row.get(12)?,
+            parity: row.get::<_, String>(13)?.chars().next().unwrap_or('N'),
+            stop_bits: row.get(14)?, flow: row.get(15)?,
+            newline: match row.get::<_, String>(16)?.as_str() {
+                "LF" => shellmate_core::Newline::Lf, "CR" => shellmate_core::Newline::Cr, _ => shellmate_core::Newline::CrLf,
+            },
+        },
     })
 }
 
@@ -415,6 +431,7 @@ fn load_hosts(conn: &Connection, only: Option<&HostId>) -> Result<Vec<Host>> {
                 auth: auth_from_str(&raw.auth)?,
                 identity_file: raw.identity_file.map(PathBuf::from),
                 last_connected_at: raw.last_connected_at,
+                serial: raw.serial,
             })
         })
         .collect()
@@ -503,6 +520,9 @@ fn write_host_row(tx: &Transaction<'_>, host: &Host) -> Result<()> {
             host.last_connected_at,
         ],
     )?;
+    host.serial.validate().map_err(|e| StoreError::Corrupt(e.into()))?;
+    tx.execute("UPDATE hosts SET serial_baud=?2, serial_bits=?3, serial_parity=?4, serial_stop=?5, serial_flow=?6, serial_newline=?7 WHERE id=?1",
+        params![host.id.as_str(), host.serial.baud, host.serial.data_bits, host.serial.parity.to_string(), host.serial.stop_bits, host.serial.flow, host.serial.newline.label()])?;
     tx.execute("DELETE FROM host_tags WHERE host_id = ?1", params![host.id.as_str()])?;
     for (position, tag) in host.tags.iter().enumerate() {
         tx.execute(
@@ -621,6 +641,20 @@ mod tests {
     }
 
     #[test]
+    fn v5_to_v6_retains_ssh_and_round_trips_telnet_and_serial() {
+        let mut conn=Connection::open_in_memory().unwrap();migrate(&mut conn,&MIGRATIONS[..5]).unwrap();
+        conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES('old','ssh','example.test',22,'ssh','agent')",[]).unwrap();
+        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),6);
+        let old=store.host(&HostId::from_raw("old")).unwrap().unwrap();assert_eq!(old.protocol,Protocol::Ssh);assert_eq!(old.serial,shellmate_core::SerialSettings::default());
+        let mut serial=Host::new("ESP32","/dev/cu.fixture");serial.protocol=Protocol::Serial;serial.port=0;
+        serial.serial=shellmate_core::SerialSettings{baud:460800,data_bits:7,parity:'E',stop_bits:2,flow:"hardware".into(),newline:shellmate_core::Newline::Lf};
+        let mut telnet=Host::new("router","192.0.2.1");telnet.protocol=Protocol::Telnet;telnet.auth=AuthMethod::Password;telnet.port=23;telnet.user=Some("admin".into());
+        store.save_hosts(&[serial.clone(),telnet.clone()]).unwrap();
+        assert_eq!(store.host(&serial.id).unwrap(),Some(serial));assert_eq!(store.host(&telnet.id).unwrap(),Some(telnet));
+        assert_eq!(store.host(&old.id).unwrap(),Some(old));
+    }
+
+    #[test]
     fn fresh_database_gets_every_migration() {
         let store = HostStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), MIGRATIONS.len() as i64);
@@ -710,9 +744,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 6, supported: 5 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v6），当前 Shellmate 只支持到 v5，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 7, supported: 6 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v7），当前 Shellmate 只支持到 v6，请升级后再试");
     }
 }

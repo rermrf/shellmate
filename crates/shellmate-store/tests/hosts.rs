@@ -332,7 +332,7 @@ fn data_survives_reopening_the_file() {
         store.touch_connected_at(&web.id, 42).unwrap();
     }
     let store = HostStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert_eq!(store.groups().unwrap(), [group]);
     web.last_connected_at = Some(42);
     assert_eq!(store.hosts().unwrap(), [web]);

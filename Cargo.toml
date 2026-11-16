@@ -11,6 +11,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 serialport = "4.7"
+shellmate-telnet = { path = "crates/shellmate-telnet" }
+shellmate-serial = { path = "crates/shellmate-serial" }
 shellmate-core = { path = "crates/shellmate-core" }
 shellmate-term = { path = "crates/shellmate-term" }
 shellmate-ssh = { path = "crates/shellmate-ssh" }

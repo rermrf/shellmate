@@ -130,6 +130,7 @@ impl Workspace {
         let dark = cx.is_dark();
 
         let mut session_sources=vec![("h1", "S1"), ("h3", "S2"), ("h10", "S3"), ("h7", "S4")];
+        if scene=="telnet" {session_sources.push(("h11","TELNET"));}
         if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
         for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
             let host = self.book.host(&HostId::from_raw(host_id)).unwrap().clone();
@@ -139,15 +140,21 @@ impl Workspace {
                 size.cols = 160;
                 size.rows = 40;
                 t.set_size(size);
-                let text = proto::ansi(&DATA[lines], dark);
-                if scene == "split" {
+                let text = if lines=="TELNET" {
+                    "\x1b[90mTrying 192.168.1.1...\x1b[0m\r\nConnected to 192.168.1.1. Escape character is ^].\r\nRT-AX86U login: admin\r\nPassword:\r\n\x1b[32;1madmin@RT-AX86U\x1b[0m:\x1b[34;1m~\x1b[0m$ ".to_string()
+                }else if host.protocol==Protocol::Serial {
+                    let mut display=shellmate_serial::transform::Display::default();display.options(scene=="serial-hex",false);
+                    let raw=if scene=="serial-hex" {DATA[lines].a().iter().map(|line|line.a().iter().map(|s|s["t"].s()).collect::<String>()).collect::<Vec<_>>().join("\r\n")}else{proto::ansi(&DATA[lines],dark)};
+                    let mut bytes=display.feed(raw.as_bytes(),"09:41:03.000");bytes.extend(display.flush("09:41:03.000"));if scene=="serial-hex" {format!("\x1b[36m{}\x1b[0m\x1b[?25l",String::from_utf8(bytes).unwrap())}else{String::from_utf8(bytes).unwrap()}
+                }else{proto::ansi(&DATA[lines], dark)};
+                if scene == "split" || scene=="serial-hex" {
                     // Let both real pane geometries settle before feeding mock output. Shrinking
                     // a populated grid reflows and scrolls it, hiding the beginning of the fixture.
                     cx.spawn(async move |terminal,cx| {
                         cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
-                        terminal.update(cx,|t,cx|t.attach(move |sink:OutputSink,_| {
+                        terminal.update(cx,|t,cx|{t.attach(move |sink:OutputSink,_| {
                             sink.output(text.as_bytes());Ok(Box::new(Inert))
-                        },cx)).ok();
+                        },cx);t.scroll_to_edge(true);}).ok();
                     }).detach();
                 } else {
                     t.attach(move |sink:OutputSink,_| {sink.output(text.as_bytes());Ok(Box::new(Inert))},cx);
@@ -164,6 +171,11 @@ impl Workspace {
             if i == 3 {
                 ssh.status = ssh::SshStatus::Reconnecting(proto::reading(scene, dark).reconnect);
             }
+            let kind=if matches!(host.protocol,Protocol::Serial|Protocol::Telnet) {
+                let mut stream=streams::StreamSession::new(host.clone());stream.connected=true;
+                if let Some(state)=&mut stream.snapshot {state.open=true;state.received=18637;state.hex=scene=="serial-hex";}
+                SessionKind::Stream(Box::new(stream))
+            }else{SessionKind::Ssh(Box::new(ssh))};
             self.sessions.push(Session {
                 id,
                 title: host.name.into(),
@@ -175,12 +187,12 @@ impl Workspace {
                 forward: None,
                 monitor: None,
                 typed: None,
-                kind: SessionKind::Ssh(Box::new(ssh)),
+                kind,
                 _subscription: subscription,
             });
         }
         self.next_id = self.sessions.len()+1;
-        self.activate(0, window, cx);
+        self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if scene=="telnet"{4}else{0}, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
         match scene {
@@ -241,7 +253,7 @@ impl Workspace {
                 panel.update(cx, |r, cx| r.proto_scene(scene == "rv-log", cx));
                 self.records_window = Some(panel.downgrade());
             }
-            "host-new" => self.new_host(window, cx),
+            "host-new" | "host-serial" | "host-telnet" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "set-cred" => self.open_settings(0, window, cx),
             "set-sync" => self.open_settings(1, window, cx),

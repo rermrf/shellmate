@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 serialport = { workspace = true }
+shellmate-core.workspace = true
+libc.workspace = true
+[dev-dependencies]
+tempfile.workspace = true

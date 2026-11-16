@@ -90,6 +90,7 @@ impl Shell {
         )));
         let capture = Arc::new(Mutex::new(Capture::default()));
         let sink = GridSink {
+            raw_grid:Arc::new(Mutex::new(None)),
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: capture.clone(),

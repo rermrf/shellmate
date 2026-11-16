@@ -66,6 +66,10 @@ pub trait TerminalBackend: Send {
 pub trait OutputHandler: Send + Sync {
     /// Raw bytes from the remote side (VT escape sequences included).
     fn output(&self, bytes: &[u8]);
+    /// A transport with a display filter (serial HEX/timestamps). Capture uses
+    /// raw bytes; a simple sink may display only the formatted bytes.
+    fn transformed_output(&self, _raw: &[u8], display: &[u8]) {self.output(display);}
+
     /// The remote program ended; `None` when the status is unknown.
     fn exited(&self, code: Option<u32>);
     /// The transport broke (or could not be established) for the given reason.
@@ -87,6 +91,9 @@ impl OutputSink {
     pub fn output(&self, bytes: &[u8]) {
         self.0.output(bytes);
     }
+
+    /// Delivers original and formatted serial bytes without confusing capture.
+    pub fn transformed_output(&self, raw: &[u8], display: &[u8]) {self.0.transformed_output(raw, display);}
 
     /// Reports that the remote program exited with `code`.
     pub fn exited(&self, code: Option<u32>) {

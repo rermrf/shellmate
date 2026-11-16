@@ -7211,9 +7211,11 @@ dependencies = [
  "shellmate-core",
  "shellmate-forward",
  "shellmate-monitor",
+ "shellmate-serial",
  "shellmate-sftp",
  "shellmate-ssh",
  "shellmate-store",
+ "shellmate-telnet",
  "shellmate-term",
  "similar",
  "tokio",
@@ -7269,7 +7271,10 @@ dependencies = [
 name = "shellmate-serial"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serialport",
+ "shellmate-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -7319,6 +7324,15 @@ dependencies = [
  "shellmate-forward",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "shellmate-telnet"
+version = "0.1.0"
+dependencies = [
+ "shellmate-core",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

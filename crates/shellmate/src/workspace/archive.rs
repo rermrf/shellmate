@@ -84,7 +84,7 @@ impl Workspace {
     }
     fn set_session_logging(&self, id: usize, on: bool, cx: &mut Context<Self>) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-            let label = s.ssh().map_or("本机", |s| s.host.name.as_str());
+            let label = s.host().map_or("本机", |h| h.name.as_str());
             s.terminal
                 .update(cx, |t, _| t.set_logging(on.then(|| self.log_root.clone()), label));
         }
@@ -94,9 +94,9 @@ impl Workspace {
             return Ok(());
         }
         let session = self.sessions.iter().find(|s| s.id == id).ok_or("会话已关闭")?;
-        let (host, label) = session.ssh().map_or_else(
+        let (host, label) = session.host().map_or_else(
             || ("local".into(), "本机".into()),
-            |s| (s.host.id.to_string(), s.host.name.clone()),
+            |h| (h.id.to_string(), h.name.clone()),
         );
         let now = archive::now();
         let size = session.terminal.read(cx).size();
@@ -107,7 +107,7 @@ impl Workspace {
         header.timestamp = Some(now);
         header.title = Some(title.clone());
         header.env.insert("TERM".into(), "xterm-256color".into());
-        if session.ssh().is_none() {
+        if session.host().is_none() {
             let shell = session
                 .terminal
                 .read(cx)
@@ -210,6 +210,7 @@ impl Workspace {
         error
     }
     fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.poll_streams(window,cx);
         let mut stopped = vec![];
         for s in &self.sessions {
             let error = s.terminal.update(cx, |t, _| t.flush_archives());

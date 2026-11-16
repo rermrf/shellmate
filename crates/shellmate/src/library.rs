@@ -51,6 +51,16 @@ pub fn save_host(store: &mut HostStore, _secrets: &dyn SecretStore, draft: HostD
     Ok(SaveOutcome::default())
 }
 
+/// Telnet has no protocol-level authentication success signal. Only explicit
+/// editor Save with opt-in persists its password; SSH keeps its authenticated
+/// event policy. Never persist a serial credential or an empty replacement.
+pub fn save_telnet_password(secrets:&dyn SecretStore,host:&Host,password:&Secret,remember:bool)->Result<(),String> {
+    if host.protocol==shellmate_core::Protocol::Telnet && remember && !password.is_empty() {
+        secrets.set(&SecretKey::HostPassword(host.id.clone()),password).map_err(|e|e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Validate and resolve an unsaved form using the exact library route rules, without mutations.
 pub fn editor_route(book: &shellmate_core::HostBook, host: &Host) -> Result<Vec<Host>, String> {
     let mut scratch = HostStore::open_in_memory().map_err(|e| e.to_string())?;
@@ -164,6 +174,8 @@ pub fn forward_rules_of(plan: &ImportPlan) -> (Vec<(HostId, ForwardRule)>, usize
 /// The raw text of the host editor's fields.
 #[derive(Clone, Debug, Default)]
 pub struct EditorFields {
+    pub protocol: shellmate_core::Protocol,
+    pub serial: shellmate_core::SerialSettings,
     pub name: String,
     pub addr: String,
     pub port: String,
@@ -188,7 +200,9 @@ pub fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
 /// Validates the form and builds the host to save on top of `original` (which keeps its id,
 /// favorite flag, protocol and last connection time) or a new host.
 pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<&Path>) -> Result<HostDraft, String> {
-    let name = fields.name.trim();
+    let serial=fields.protocol==shellmate_core::Protocol::Serial;
+    let serial_name=std::path::Path::new(fields.addr.trim()).file_name().and_then(|s|s.to_str()).unwrap_or("");
+    let name = if serial && fields.name.trim().is_empty() {serial_name} else {fields.name.trim()};
     if name.is_empty() {
         return Err("请填写名称".into());
     }
@@ -196,20 +210,23 @@ pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<
     if addr.is_empty() {
         return Err("请填写主机地址".into());
     }
-    if addr.chars().any(char::is_whitespace) {
+    if addr.contains('\0') {return Err("地址不能包含 NUL".into());}
+    if !serial && addr.chars().any(char::is_whitespace) {
         return Err("主机地址不能包含空格".into());
     }
-    let port = match fields.port.trim().parse::<u16>() {
+    if serial {fields.serial.validate().map_err(str::to_string)?; if !std::path::Path::new(addr).is_absolute(){return Err("串口设备必须是绝对路径".into());}}
+    let port = if serial {0} else {match fields.port.trim().parse::<u16>() {
         Ok(port) if port > 0 => port,
         _ => return Err("端口应为 1–65535 之间的数字".into()),
-    };
+    }};
 
     let mut host = original.cloned().unwrap_or_else(|| Host::new(name, addr));
     host.name = name.to_string();
     host.addr = addr.to_string();
     host.port = port;
+    host.protocol=fields.protocol;host.serial=fields.serial.clone();
     host.user = Some(fields.user.trim().to_string()).filter(|u| !u.is_empty());
-    host.auth = fields.auth;
+    host.auth = if fields.protocol==shellmate_core::Protocol::Telnet {AuthMethod::Password}else{fields.auth};
     host.identity_file = match fields.auth {
         AuthMethod::PrivateKey => {
             Some(fields.identity_file.trim()).filter(|p| !p.is_empty()).map(|p| expand_tilde(p, home))
@@ -223,7 +240,7 @@ pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<
         }
     }
     host.tags = tags;
-    host.jump = fields.jumps.clone();
+    host.jump = if fields.protocol==shellmate_core::Protocol::Ssh {fields.jumps.clone()}else{vec![]};
 
     let password = Some(fields.password.as_str()).filter(|p| fields.auth == AuthMethod::Password && !p.is_empty());
     Ok(HostDraft { host, group_name: fields.group.clone(), password: password.map(Secret::new) })
@@ -235,6 +252,26 @@ mod tests {
     use shellmate_store::MemoryStore;
 
     use super::*;
+
+    #[test]
+    fn telnet_keychain_requires_explicit_opt_in_and_ssh_is_unchanged() {
+        let secrets=MemoryStore::default();let mut host=Host::new("router","192.0.2.1");let key=SecretKey::HostPassword(host.id.clone());let password=Secret::new("fixture-password");
+        save_telnet_password(&secrets,&host,&password,true).unwrap();assert!(secrets.get(&key).unwrap().is_none());
+        host.protocol=Protocol::Telnet;save_telnet_password(&secrets,&host,&password,false).unwrap();assert!(secrets.get(&key).unwrap().is_none());
+        save_telnet_password(&secrets,&host,&password,true).unwrap();assert_eq!(secrets.get(&key).unwrap(),Some(password));
+    }
+
+    #[test]
+    fn telnet_and_serial_editor_validation() {
+        let mut f=fields("router","192.0.2.1");f.protocol=Protocol::Telnet;f.port="23".into();f.auth=AuthMethod::Password;
+        let h=build_draft(&f,None,None).unwrap().host;assert_eq!((h.protocol,h.port,h.auth),(Protocol::Telnet,23,AuthMethod::Password));
+        f.port="0".into();assert!(build_draft(&f,None,None).is_err());
+        f.protocol=Protocol::Serial;f.addr="/dev/cu.fixture".into();f.name.clear();
+        let h=build_draft(&f,None,None).unwrap().host;assert_eq!(h.name,"cu.fixture");assert_eq!(h.serial.framing(),"8N1");assert_eq!(h.port,0);
+        f.serial.baud=0;assert!(build_draft(&f,None,None).is_err());f.serial.baud=115200;
+        f.serial.parity='X';assert!(build_draft(&f,None,None).is_err());f.serial.parity='N';
+        f.addr="relative-device".into();assert!(build_draft(&f,None,None).is_err());
+    }
 
     fn store() -> HostStore {
         HostStore::open_in_memory().unwrap()
@@ -322,7 +359,7 @@ mod tests {
         let host = build_draft(&f, Some(&saved), None).unwrap().host;
         assert_eq!(
             (host.id.clone(), host.favorite, host.last_connected_at, host.protocol),
-            (saved.id, true, Some(42), Protocol::Mosh)
+            (saved.id, true, Some(42), Protocol::Ssh)
         );
         assert_eq!((host.name.as_str(), host.jump), ("renamed", jumps));
     }

@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+shellmate-telnet.workspace = true
+shellmate-serial.workspace = true
 shellmate-core.workspace = true
 shellmate-term.workspace = true
 shellmate-store.workspace = true

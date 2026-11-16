@@ -151,6 +151,12 @@ pub enum SessionEnd {
     Disconnected(String),
 }
 
+/// Serial display filters must not modify the stream used by history or archives.
+struct Silent;
+impl EventListener for Silent {fn send_event(&self,_:AlacEvent){}}
+struct RawGrid {term:Term<Silent>,parser:Processor}
+impl RawGrid {fn new(size:TerminalSize)->Self {Self{term:Term::new(Config::default(),&size,Silent),parser:Processor::new()}}}
+
 /// Parses backend output into the grid and forwards lifecycle notifications.
 /// Bound to the generation of the attach that created it; output from a
 /// replaced backend is dropped.
@@ -158,6 +164,7 @@ struct GridSink {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
     capture: Arc<Mutex<Capture>>,
+    raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
@@ -198,6 +205,21 @@ impl OutputHandler for GridSink {
         }
     }
 
+    fn transformed_output(&self,raw:&[u8],display:&[u8]) {
+        if self.current.load(Ordering::Acquire)!=self.generation {return;}
+        let mut source=self.raw_grid.lock();
+        let source=source.get_or_insert_with(||{
+            let term=self.term.lock();let size=TerminalSize{cols:term.columns() as u16,rows:term.screen_lines() as u16,..Default::default()};RawGrid::new(size)
+        });
+        self.output_capture.lock().output(raw);
+        for command in self.capture.lock().advance(&mut source.term,&mut source.parser,raw) {
+            let _=self.tx.try_send(Msg::Command{generation:self.generation,command,time:unix_time()});
+        }
+        self.output_capture.lock().sync_logger(&source.term);
+        let mut term=self.term.lock();self.parser.lock().advance(&mut *term,display);
+        if !self.pending.swap(true,Ordering::AcqRel){let _=self.tx.try_send(Msg::Output);}
+    }
+
     fn exited(&self, code: Option<u32>) {
         let _ = self.tx.try_send(Msg::Exited { generation: self.generation, code });
     }
@@ -213,6 +235,7 @@ pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
     capture: Arc<Mutex<Capture>>,
+    raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     backend: Option<Box<dyn TerminalBackend>>,
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
@@ -275,6 +298,7 @@ impl Terminal {
             term: Arc::new(FairMutex::new(term)),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: Arc::new(Mutex::new(Capture::default())),
+            raw_grid:Arc::new(Mutex::new(None)),
             output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             backend: None,
             local,
@@ -327,11 +351,13 @@ impl Terminal {
     ) -> bool {
         self.close_backend();
         *self.capture.lock() = Capture::default();
+        *self.raw_grid.lock()=None;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let sink = OutputSink::new(GridSink {
             term: self.term.clone(),
             parser: self.parser.clone(),
             capture: self.capture.clone(),
+            raw_grid:self.raw_grid.clone(),
             output_capture: self.output_capture.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: self.output_pending.clone(),
@@ -528,7 +554,11 @@ impl Terminal {
             let mut term = self.term.lock();
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
-            self.capture.lock().input(&term, bytes);
+        }
+        {
+            let source=self.raw_grid.lock();
+            if let Some(source)=source.as_ref(){self.capture.lock().input(&source.term,bytes);}
+            else {self.capture.lock().input(&*self.term.lock(),bytes);}
         }
         self.backend.as_mut().ok_or(std::io::ErrorKind::NotConnected)?.write(bytes)
     }
@@ -551,7 +581,7 @@ impl Terminal {
     }
 
     pub fn set_bracketed_paste(&mut self,enabled:bool){self.bracketed_paste=enabled;}
-    fn paste_mode(&self)->TermMode{crate::send::effective_mode(self.mode(),self.bracketed_paste)}
+    fn paste_mode(&self)->TermMode{let source=self.raw_grid.lock();let mode=source.as_ref().map_or_else(||self.mode(),|s|*s.term.mode());crate::send::effective_mode(mode,self.bracketed_paste)}
     pub fn start_local(&mut self,options:PtyOptions,cx:&mut Context<Self>){self.local=Some(options);self.spawn_local(cx);}
     pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{self.output_capture.lock().start(path,file,header)}
     pub fn stop_recording(&mut self)->std::io::Result<Option<crate::capture_output::RecordingResult>>{self.output_capture.lock().stop()}
@@ -561,6 +591,13 @@ impl Terminal {
     pub fn set_logging(&mut self,root:Option<std::path::PathBuf>,host:&str){
         self.output_capture.lock().stop_logging();
         if let Some(root)=root{
+            let source=self.raw_grid.lock();
+            if let Some(source)=source.as_ref() {
+                let writer=crate::session_log::LogWriter::new(root,host);
+                if source.term.mode().contains(TermMode::ALT_SCREEN){self.output_capture.lock().defer_logging(writer);}
+                else {let mut tracker=crate::session_log::LineTracker::new(self.size.cols,self.size.rows);tracker.seed(&source.term);self.output_capture.lock().logging(tracker,writer);}
+                return;
+            }
             let term=self.term.lock();
             let writer=crate::session_log::LogWriter::new(root,host);
             if term.mode().contains(TermMode::ALT_SCREEN){
@@ -601,6 +638,7 @@ impl Terminal {
         self.size = size;
         if grid_changed {
             self.output_capture.lock().resize(size.cols,size.rows);
+            if let Some(source)=self.raw_grid.lock().as_mut(){source.term.resize(size);}
             self.term.lock().resize(size);
             let dims = size.dims();
             if let Some(backend) = self.backend.as_mut()
@@ -795,6 +833,9 @@ mod sink_tests {
         current: Arc<AtomicU64>,
         pending: Arc<AtomicBool>,
         sink: OutputSink,
+        capture:Arc<Mutex<Capture>>,
+        raw_grid:Arc<Mutex<Option<RawGrid>>>,
+        output_capture:Arc<Mutex<crate::capture_output::OutputCapture>>,
     }
 
     fn fixture(generation: u64) -> Fixture {
@@ -803,18 +844,50 @@ mod sink_tests {
         let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, Listener(tx.clone()))));
         let current = Arc::new(AtomicU64::new(generation));
         let pending = Arc::new(AtomicBool::new(false));
+        let capture=Arc::new(Mutex::new(Capture::default()));
+        let raw_grid=Arc::new(Mutex::new(None));
+        let output_capture=Arc::new(Mutex::new(crate::capture_output::OutputCapture::default()));
         let sink = OutputSink::new(GridSink {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
-            capture: Arc::new(Mutex::new(Capture::default())),
-            output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
+            capture:capture.clone(),
+            raw_grid:raw_grid.clone(),
+            output_capture:output_capture.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,
             generation,
             current: current.clone(),
         });
-        Fixture { term, rx, current, pending, sink }
+        Fixture { term, rx, current, pending, sink,capture,raw_grid,output_capture }
+    }
+
+    #[test]
+    fn serial_display_transforms_preserve_raw_recording_and_command_history() {
+        let f=fixture(1);
+        let root=std::env::temp_dir().join(format!("shellmate-serial-capture-{}",shellmate_core::HostId::generate()));
+        let(path,file)=crate::archive::recording_file(&root,"fixture",1_700_000_000).unwrap();
+        f.output_capture.lock().start(path.clone(),file,&crate::cast::Header::new(80,24)).unwrap();
+        let log_root=root.join("logs");
+        f.output_capture.lock().logging(crate::session_log::LineTracker::new(80,24),crate::session_log::LogWriter::new(log_root.clone(),"fixture"));
+        f.sink.transformed_output(b"device> ",b"HEX display\r\n");
+        {let raw=f.raw_grid.lock();f.capture.lock().input(&raw.as_ref().unwrap().term,b"echo hello");}
+        f.sink.transformed_output(b"echo hello",b"65 63 68 6F\r\n");
+        {let raw=f.raw_grid.lock();f.capture.lock().input(&raw.as_ref().unwrap().term,b"\r");}
+        f.sink.transformed_output(b"\r\nhello\r\n",b"ASCII display\r\n");
+        let commands=drain(&f.rx).into_iter().filter_map(|m|if let Msg::Command{command,..}=m{Some(command)}else{None}).collect::<Vec<_>>();
+        assert_eq!(commands,["echo hello"]);assert_eq!(row(&f.term,0),"HEX display");
+        // Flushing an incomplete HEX row has display bytes but no new raw bytes.
+        f.sink.transformed_output(&[],b"last partial HEX row\r\n");
+        f.output_capture.lock().stop().unwrap();
+        let cast=crate::cast::Cast::open(&path).unwrap();
+        let recorded=cast.events.iter().filter_map(|e|if let crate::cast::Data::Output(s)=&e.data{Some(s.as_str())}else{None}).collect::<String>();
+        assert_eq!(recorded,"device> echo hello\r\nhello\r\n");
+        f.output_capture.lock().stop_logging();
+        let path=std::fs::read_dir(log_root.join("fixture")).unwrap().next().unwrap().unwrap().path();
+        let logged=std::fs::read_to_string(path).unwrap();
+        assert!(logged.contains("device> echo hello"));assert!(logged.contains("hello"));assert!(!logged.contains("HEX"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn row(term: &Arc<FairMutex<Term<Listener>>>, line: i32) -> String {

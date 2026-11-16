@@ -155,12 +155,10 @@ mod tests {
         conn.execute("INSERT INTO settings VALUES ('history_enabled', '0')", [])
             .unwrap();
         let host = Host::new("kept", "example.test");
-        let tx = conn.transaction().unwrap();
-        crate::hosts::write_hosts(&tx, std::slice::from_ref(&host)).unwrap();
-        tx.commit().unwrap();
+        conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES(?1,?2,?3,22,'ssh','private_key')",rusqlite::params![host.id.as_str(),host.name,host.addr]).unwrap();
         drop(conn);
         let store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         assert!(!store.history_enabled().unwrap());
         assert!(store.history_shortcut().unwrap());
         assert!(store.snippets().unwrap().is_empty());
