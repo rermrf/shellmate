@@ -20,6 +20,7 @@ mod stats;
 
 pub use addr::{AddrError, Endpoint, parse_listen, parse_target};
 pub use forwarder::{Forwarder, Options};
+pub use listen::pick_local_port;
 pub use retry::{GrantMemory, RetryTiming};
 pub use rule::{ForwardKind, ForwardRule, RuleId};
 pub use state::{ForwardEvent, RuleError, RuleState, RuleView};

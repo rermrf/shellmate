@@ -70,6 +70,13 @@ fn probe_bind(addr: SocketAddr) -> io::Result<()> {
     socket.bind(addr)
 }
 
+/// The local port to use for a forward that would like `port` on `host`: that very port when nobody listens
+/// there, else the free port [`suggest_port`] offers (`None` if there is none, or `host` is not an address).
+pub fn pick_local_port(host: &str, port: u16) -> Option<u16> {
+    let ip: IpAddr = host.parse().ok()?;
+    if is_free(SocketAddr::new(ip, port)) { Some(port) } else { suggest_port(ip, port) }
+}
+
 /// Whether nobody listens on `addr` or on an address that would shadow it.
 fn is_free(addr: SocketAddr) -> bool {
     !shadows_a_listener(addr, &mut probe_bind) && probe_bind(addr).is_ok()
@@ -115,6 +122,17 @@ pub(crate) fn suggest_port_with(port: u16, mut is_free: impl FnMut(u16) -> bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_port_is_kept_and_a_taken_one_gets_a_suggestion() {
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let other = pick_local_port("127.0.0.1", port).expect("a free port is offered");
+        assert_ne!(other, port);
+        drop(taken);
+        assert_eq!(pick_local_port("127.0.0.1", port), Some(port), "free again");
+        assert_eq!(pick_local_port("not-an-ip", 80), None);
+    }
 
     #[test]
     fn suggestions_start_ten_thousand_above() {
