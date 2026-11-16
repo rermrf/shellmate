@@ -1,5 +1,6 @@
 //! Deterministic prototype fixtures. Compiled only in debug builds, rendered by the real views.
 mod data;
+pub mod stress;
 pub use data::DATA;
 use std::ops::Index;
 #[derive(Clone, Copy, Debug)]
@@ -72,10 +73,24 @@ pub const SCENES: &[&str] = &[
     "editor",
     "hostkey-changed",
     "hostkey-new",
+    "stress-main", "stress-mon-ov", "stress-mon-proc", "stress-mon-svc", "stress-mon-dk", "stress-files", "stress-fwd",
 ];
 pub fn requested() -> bool {
     std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s.starts_with("proto:"))
 }
+/// Optional point-size suffix, used only by the debug fixture.
+pub fn request(value: &str) -> (&str, Option<(u32,u32)>) {
+    let (scene,dimensions)=value.split_once('@').map_or((value,None),|(s,d)|(s,Some(d)));
+    let size=dimensions.and_then(|d|d.split_once('x')).and_then(|(w,h)|Some((w.parse::<u32>().ok()?,h.parse::<u32>().ok()?)))
+        .filter(|(w,h)| (980..=4096).contains(w) && (620..=2160).contains(h));
+    (scene,size)
+}
+pub fn window_size() -> (u32,u32) {
+    let value=std::env::var("SHELLMATE_DEMO").unwrap_or_default();
+    let (scene,size)=request(value.strip_prefix("proto:").unwrap_or(&value));
+    size.unwrap_or(if scene.starts_with("stress-"){(1776,901)}else{(1440,900)})
+}
+
 /// Fake wall time: 2026-11-12 09:46 local, independent of the date the review is run.
 pub fn now() -> i64 {
     timestamp("11-12 09:46")
@@ -168,14 +183,22 @@ pub fn ansi_line(segments: &V, dark: bool) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn fixture_sizes_are_bounded_and_optional() {
+        assert_eq!(request("stress-mon-ov@1100x700"),("stress-mon-ov",Some((1100,700))));
+        assert_eq!(request("stress-files@1776x901"),("stress-files",Some((1776,901))));
+        assert_eq!(request("main"),("main",None));
+        assert_eq!(request("main@0x0"),("main",None));
+        assert_eq!(request("main@bad"),("main",None));
+    }
+    #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 30);
+        assert_eq!(SCENES.len(), 37);
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
         assert_eq!(DATA["CMDS"].a().len(), 3);
-        for scene in SCENES {
+        for scene in SCENES.iter().filter(|scene|!scene.starts_with("stress-")) {
             for dark in [false, true] {
                 assert_eq!(reading(scene, dark).scene, *scene);
                 assert_eq!(reading(scene, dark).dark, dark);

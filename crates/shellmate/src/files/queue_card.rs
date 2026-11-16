@@ -59,6 +59,9 @@ impl FilesPanel {
 
     fn render_transfer_row(&self, view: &TransferView, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let id = view.id;
+        let size_text=sizes_text(view);
+        let size_width=crate::layout::numeric_width([size_text.as_str()],7.2,150.);
+        let progress_width=crate::layout::transfer_progress_width(self.width,size_width);
         let (tile_bg, tile_fg) = match view.direction {
             Direction::Upload => (p.accs, p.acc),
             Direction::Download => (p.oks, p.ok),
@@ -107,12 +110,10 @@ impl FilesPanel {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
-                            .truncate()
+                        crate::ui::ellipsis(("transfer-name",id.0),view.name.clone())
                             .text_size(px(13.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.tx)
-                            .child(view.name.clone()),
+                            .text_color(p.tx),
                     )
                     .child(
                         div().truncate().text_size(px(11.5)).text_color(text_color(tone, p)).child(status_line(view)),
@@ -120,8 +121,7 @@ impl FilesPanel {
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w(px(progress_width)).flex_none().min_w_0()
                     .h(px(6.))
                     .rounded(px(3.))
                     .bg(p.card3)
@@ -131,16 +131,16 @@ impl FilesPanel {
             .child(
                 div()
                     .flex_none()
-                    .w(px(150.))
+                    .w(px(size_width)).whitespace_nowrap()
                     .text_right()
                     .whitespace_nowrap()
                     .text_size(px(12.))
                     .font_family(MONO_FONT)
                     .text_color(p.tx2)
-                    .child(sizes_text(view)),
+                    .child(size_text),
             )
             .child(div().flex().flex_none().w(px(56.)).children(main))
-            .child(div().flex().flex_none().w(px(44.)).justify_end().children(cancel))
+            .child(div().flex().flex_none().w(px(52.)).justify_end().children(cancel))
             .into_any_element()
     }
 
@@ -164,7 +164,7 @@ impl FilesPanel {
             clear.opacity(0.5).cursor_not_allowed()
         };
         Some(
-            div()
+            div().w_full().min_w_0()
                 .flex()
                 .flex_col()
                 .flex_none()
@@ -176,8 +176,8 @@ impl FilesPanel {
                 .pb(px(10.))
                 .pl(px(18.))
                 .child(
-                    div()
-                        .flex()
+                    div().min_w_0()
+                        .flex().flex_wrap()
                         .items_center()
                         .gap(px(10.))
                         .mb(px(6.))
@@ -193,7 +193,7 @@ impl FilesPanel {
                         .id("tq-list")
                         .flex()
                         .flex_col()
-                        .max_h(px(176.))
+                        .max_h(px(176.)).min_h_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.queue_scroll)
                         .children(rows),

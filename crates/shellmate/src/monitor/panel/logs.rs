@@ -154,17 +154,17 @@ pub(super) fn log_box(pane: Option<&LogPane>, empty: &str, max: usize, p: &Palet
     let body = match pane {
         Some(pane) if !pane.lines.is_empty() => {
             let skip = pane.lines.len().saturating_sub(max);
-            body.children(pane.lines.iter().skip(skip).map(|line| {
-                div()
+            body.children(pane.lines.iter().skip(skip).enumerate().map(|(index,line)| {
+                div().h(px(18.)).flex_none()
                     .flex()
                     .gap(px(10.))
                     .text_size(px(11.5))
                     .line_height(px(18.))
                     .font_family(MONO_FONT)
                     .when(!line.time.is_empty(), |d| {
-                        d.child(div().flex_none().text_color(p.tx3).child(line.time.clone()))
+                        d.child(div().flex_none().whitespace_nowrap().text_color(p.tx3).child(line.time.clone()))
                     })
-                    .child(div().flex_1().min_w_0().text_color(level_color(p, line.level)).child(line.text.clone()))
+                    .child(crate::ui::ellipsis(("monitor-log-line",index),line.text.clone()).flex_1().text_color(level_color(p, line.level)))
             }))
         }
         Some(LogPane { note: Some(note), .. }) => body

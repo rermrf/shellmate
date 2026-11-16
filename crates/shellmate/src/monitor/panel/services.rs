@@ -16,7 +16,7 @@ use super::{MonitorPanel, MonitorPanelEvent, tone_colors};
 use crate::monitor::model::{Banner, Page};
 use crate::monitor::services::{self, Detail, ServiceButton, ServiceFilter};
 use crate::theme::{ActivePalette, CARD_RADIUS, MONO_FONT, Palette};
-use crate::ui::{SegmentItem, card_shadow, segmented};
+use crate::ui::{ellipsis, SegmentItem, card_shadow, segmented};
 
 /// How tall a row of the list is.
 const ROW_HEIGHT: f32 = 56.0;
@@ -116,6 +116,7 @@ impl MonitorPanel {
     // ---- drawing -----------------------------------------------------------------------------
 
     fn service_row(&self, ix: usize, shown: Option<&str>, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let extra=crate::layout::Responsive::at(self.width).service_extra_columns;
         let row = self.service_rows.get(ix)?;
         let name = row.name.clone();
         let selected = shown == Some(row.name.as_str());
@@ -141,14 +142,12 @@ impl MonitorPanel {
                         .flex_col()
                         .gap(px(2.))
                         .child(
-                            div()
-                                .truncate()
+                            ellipsis(("service-name",ix),row.name.clone())
                                 .font_family(MONO_FONT)
                                 .font_weight(FontWeight::BOLD)
-                                .text_size(px(13.))
-                                .child(row.name.clone()),
+                                .text_size(px(13.)),
                         )
-                        .child(div().truncate().text_size(px(12.)).text_color(p.tx2).child(row.description.clone())),
+                        .child(ellipsis(("service-description",ix),row.description.clone()).text_size(px(12.)).text_color(p.tx2)),
                 )
                 .child(
                     div().w(px(90.)).flex_none().flex().child(
@@ -161,10 +160,10 @@ impl MonitorPanel {
                             .text_size(px(11.5))
                             .font_family(MONO_FONT)
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(row.state.clone()),
+                            .whitespace_nowrap().child(row.state.clone()),
                     ),
                 )
-                .child(
+                .when(extra,|d|d.child(
                     div()
                         .w(px(56.))
                         .flex_none()
@@ -172,17 +171,17 @@ impl MonitorPanel {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(if row.autostart_on { p.tx } else { p.tx3 })
                         .child(row.autostart),
-                )
-                .child(
+                ))
+                .when(extra,|d|d.child(
                     div()
-                        .w(px(72.))
+                        .w(px(88.))
                         .flex_none()
-                        .text_right()
+                        .text_right().whitespace_nowrap()
                         .font_family(MONO_FONT)
                         .text_size(px(12.5))
                         .text_color(if row.memory == "—" { p.tx3 } else { p.tx2 })
                         .child(row.memory.clone()),
-                )
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| this.select_service(name.clone(), cx)))
                 .into_any_element(),
         )
@@ -227,8 +226,7 @@ impl MonitorPanel {
 
     fn mini_card(&self, caption: &'static str, value: String, p: &Palette) -> AnyElement {
         div()
-            .flex_1()
-            .min_w_0()
+            .flex_1().min_w(px(crate::layout::numeric_width([value.as_str()],7.8,84.)+24.))
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -238,18 +236,19 @@ impl MonitorPanel {
             .bg(p.card2)
             .child(div().text_size(px(11.5)).line_height(px(16.)).text_color(p.tx2).child(caption))
             .child(
-                div().truncate().font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_size(px(13.)).line_height(px(17.)).child(value),
+                div().whitespace_nowrap().font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_size(px(13.)).line_height(px(17.)).child(value),
             )
             .into_any_element()
     }
 
     fn render_service_detail(&self, detail: &Detail, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let layout=crate::layout::Responsive::at(self.width);
         let (bg, fg) = tone_colors(p, detail.tone);
         let name = detail.name.clone();
         let switch = &detail.autostart;
         let toggle_action = if switch.on { ServiceAction::Disable } else { ServiceAction::Enable };
         let enabled = switch.enabled;
-        let switch_row = div()
+        let switch_row = div().flex_none()
             .flex()
             .items_center()
             .justify_between()
@@ -276,13 +275,13 @@ impl MonitorPanel {
             });
 
         let probe = self.data.probe.as_deref();
-        let log_header = div()
+        let log_header = div().flex_none().min_w_0()
             .flex()
             .items_baseline()
             .justify_between()
             .child(div().text_size(px(13.)).font_weight(FontWeight::BOLD).child("日志"))
             .child(
-                div()
+                div().flex_none().min_w_0()
                     .font_family(MONO_FONT)
                     .text_size(px(11.5))
                     .text_color(p.tx3)
@@ -291,9 +290,9 @@ impl MonitorPanel {
 
         div()
             .id("service-detail")
-            .w(px(400.))
+            .w(px(layout.service_detail_width)).when(layout.services_stacked,|d|d.w_full()).overflow_y_scroll()
             .flex_none()
-            .min_h_0()
+            .min_h_0().when(layout.services_stacked,|d|d.min_h(px(480.)))
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -302,22 +301,20 @@ impl MonitorPanel {
             .rounded(CARD_RADIUS)
             .shadow(card_shadow(p))
             .child(
-                div()
+                div().flex_none().min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(3.))
                     .child(
-                        div()
-                            .truncate()
+                        ellipsis("service-detail-name",detail.name.clone())
                             .font_family(MONO_FONT)
                             .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.)).line_height(px(21.))
-                            .child(detail.name.clone()),
+                            .text_size(px(16.)).line_height(px(21.)),
                     )
-                    .child(div().text_size(px(12.5)).line_height(px(15.)).text_color(p.tx2).child(detail.description.clone())),
+                    .child(ellipsis("service-detail-description",detail.description.clone()).text_size(px(12.5)).line_height(px(15.)).text_color(p.tx2)),
             )
             .child(
-                div()
+                div().flex_none().min_w_0()
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -336,7 +333,7 @@ impl MonitorPanel {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(detail.state.clone()),
                     )
-                    .child(div().text_size(px(12.)).text_color(p.tx2).child(detail.since.clone())),
+                    .child(ellipsis("service-since",detail.since.clone()).flex_1().text_size(px(12.)).text_color(p.tx2)),
             )
             .when_some(detail.failure.clone().filter(|why|!self.service_log.as_ref().is_some_and(|log|log.lines.iter().any(|line|line.text==*why))), |d, why| {
                 d.child(
@@ -349,21 +346,21 @@ impl MonitorPanel {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .font_family(MONO_FONT)
-                        .child(why),
+                        .child(ellipsis("service-failure",why)),
                 )
             })
             .child(
-                div()
-                    .flex()
+                div().flex_none().min_w_0()
+                    .flex().flex_wrap()
                     .gap(px(8.))
                     .child(self.mini_card("主进程", detail.main_pid.clone(), p))
                     .child(self.mini_card("内存", detail.memory.clone(), p))
                     .child(self.mini_card("CPU 时间", detail.cpu.clone(), p)),
             )
             .child(
-                div()
+                div().flex_none().min_w_0()
                     .flex()
-                    .gap(px(8.))
+                    .gap(px(6.))
                     .children(detail.buttons.iter().map(|button| self.service_button(button, &name, p, cx))),
             )
             .child(switch_row)
@@ -379,6 +376,7 @@ impl MonitorPanel {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let layout=crate::layout::Responsive::at(self.width);
         let Some(list) = self.data.services.clone() else {
             let page = crate::monitor::model::loading("服务列表");
             return self.message_card(&page.title, &page.detail, false, p, cx);
@@ -394,7 +392,7 @@ impl MonitorPanel {
             }
         };
         let toolbar = div()
-            .flex()
+            .flex().flex_wrap()
             .flex_none()
             .items_center()
             .gap(px(10.))
@@ -404,7 +402,7 @@ impl MonitorPanel {
             .pr(px(14.))
             .child(
                 div()
-                    .w(px(260.))
+                    .w(px(if layout.service_extra_columns{260.}else{160.})).min_w_0()
                     .h(px(34.))
                     .px(px(12.))
                     .flex()
@@ -422,7 +420,7 @@ impl MonitorPanel {
                     ),
             )
             .child(segmented("service-filter", filters, on_pick, cx).flex_none())
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(div().text_size(px(12.)).text_color(p.tx2).child(format!(
                 "{} / {} 个服务",
                 self.service_rows.len(),
@@ -450,8 +448,8 @@ impl MonitorPanel {
             .border_color(p.line)
             .child(heading("服务", None, false))
             .child(heading("状态", Some(90.), false))
-            .child(heading("自启", Some(56.), false))
-            .child(heading("内存", Some(72.), true));
+            .when(layout.service_extra_columns,|d|d.child(heading("自启",Some(56.),false)))
+            .when(layout.service_extra_columns,|d|d.child(heading("内存",Some(88.),true)));
 
         let shown = self.shown_service();
         let shown_for_rows = shown.clone();
@@ -472,7 +470,7 @@ impl MonitorPanel {
             shown.as_deref().and_then(|name| list.get(name)).map(|service| services::detail(service, uptime, probe));
 
         let list_card = div()
-            .flex_1()
+            .flex_1().when(layout.services_stacked,|d|d.h(px(300.)).flex_none())
             .min_w_0()
             .min_h_0()
             .flex()
@@ -497,7 +495,7 @@ impl MonitorPanel {
             }));
 
         div()
-            .id("monitor-services")
+            .id("monitor-services").min_w_0().when(layout.services_stacked,|d|d.overflow_y_scroll())
             .flex_1()
             .min_h_0()
             .flex()
@@ -508,7 +506,7 @@ impl MonitorPanel {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .flex()
+                    .flex().min_w_0().when(layout.services_stacked,|d|d.flex_col().flex_none())
                     .gap(px(10.))
                     .when(stale, |d| d.opacity(0.5))
                     .child(list_card)

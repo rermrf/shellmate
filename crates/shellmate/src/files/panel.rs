@@ -111,6 +111,8 @@ struct Demo {
 }
 
 pub struct FilesPanel {
+    pub(super) width: f32,
+    pub(super) details_open: bool,
     pub(super) model: FilesModel,
     session: Option<Arc<SftpSession>>,
     runtime: SshRuntime,
@@ -166,6 +168,7 @@ impl FilesPanel {
             }
         });
         Self {
+            width:1144., details_open:false,
             model,
             session: None,
             runtime,
@@ -712,7 +715,7 @@ impl FilesPanel {
                 cx.write_to_clipboard(ClipboardItem::new_string(menu.path.clone()));
                 window.push_notification(Notification::success(menu.path.clone()).title("已复制路径"), cx);
             }
-            MenuAction::Permissions => window.focus(&self.perm_focus, cx),
+            MenuAction::Permissions => {self.details_open=true;window.focus(&self.perm_focus,cx);cx.notify();},
             MenuAction::Delete => self.ask_delete(window, cx),
         }
         cx.notify();
@@ -788,6 +791,8 @@ impl FilesPanel {
     pub(super) fn on_escape(&mut self, _: &FilesEscape, _: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
             self.close_menu(cx);
+        } else if self.details_open {
+            self.details_open=false;cx.notify();
         } else {
             cx.propagate();
         }
@@ -924,12 +929,21 @@ impl FilesPanel {
         use crate::theme::ActivePalette;
         use shellmate_sftp::transfer::{TransferView,TransferEvent,TransferState,Direction,PauseReason,ItemId};
         let data=&crate::proto::DATA;
-        self.model.on_terminal_cwd("/var/www/app");
+        let stress=scene=="stress-files";
+        let directory=if stress{crate::proto::stress::PATH}else{"/var/www/app"};
+        self.model.on_terminal_cwd(directory);
         let request=self.model.set_link(LinkStatus::Ready).expect("first fixture listing");
-        let entries=data["FILES"].a().iter().map(|f|Entry{name:f["n"].s().into(),path:format!("/var/www/app/{}",f["n"].s()),kind:if f["t"].s()=="d"{EntryKind::Dir}else{EntryKind::File},size:if f["n"].s()=="nginx.conf"{2316}else{crate::proto::bytes(f["s"].s())},modified:Some(crate::proto::timestamp(f["m"].s())),mode:u32::from_str_radix(f["p"].s(),8).ok(),uid:Some(1000),gid:Some(33),owner:"deploy".into(),group:"www".into(),link:None}).collect();
-        self.model.apply_listed(request.id,super::model::Listed{dir:Some("/var/www/app".into()),entries:Ok(entries),stat:None});self.model.select_name("nginx.conf");
+        let mut entries:Vec<Entry>=data["FILES"].a().iter().map(|f|Entry{name:f["n"].s().into(),path:format!("/var/www/app/{}",f["n"].s()),kind:if f["t"].s()=="d"{EntryKind::Dir}else{EntryKind::File},size:if f["n"].s()=="nginx.conf"{2316}else{crate::proto::bytes(f["s"].s())},modified:Some(crate::proto::timestamp(f["m"].s())),mode:u32::from_str_radix(f["p"].s(),8).ok(),uid:Some(1000),gid:Some(33),owner:"deploy".into(),group:"www".into(),link:None}).collect();
+        if stress {
+            for (i,entry) in entries.iter_mut().enumerate(){
+                entry.name=if i==0{crate::proto::stress::FILE.into()}else{format!("production-customer-data-platform-客户数据-configuration-and-archive-{i}-20261112.tar.zst")};
+                entry.path=format!("{directory}/{}",entry.name);entry.size=1_319_413_953_331;entry.owner="production-service-account-16".into();entry.group="customer-data-platform".into();
+                entry.kind=EntryKind::File;
+            }
+        }
+        self.model.apply_listed(request.id,super::model::Listed{dir:Some(directory.into()),entries:Ok(entries),stat:None});self.model.select_name(if stress{crate::proto::stress::FILE}else{"nginx.conf"});
         let mut list=super::transfers::TransferList::new();let measured=crate::proto::reading(scene,cx.is_dark());
-        for(i,t)in data["TRANSFERS"].a().iter().enumerate(){let total=(t["size"].n()*1_048_576.)as u64;let done=if i==0{(measured.transfer*1_048_576.) as u64}else{(total as f64*t["pct"].n()/100.)as u64};list.apply(&TransferEvent::Added(TransferView{id:ItemId(i as u64),direction:if t["dir"].s()=="up"{Direction::Upload}else{Direction::Download},name:t["n"].s().into(),destination:"/var/www/app".into(),state:match t["st"].s(){"run"=>TransferState::Running,"pause"=>TransferState::Paused(PauseReason::User),"done"=>TransferState::Done,_=>TransferState::Queued},bytes_done:done,bytes_total:total,files_done:0,files_total:1,scanning:false,speed:if i==0{measured.transfer_speed*1_048_576.}else{0.},current:None,skipped:Default::default(),in_place:0,failures:vec![],failure_total:0,clash:None,result:None,temp:None}));}
+        for(i,t)in data["TRANSFERS"].a().iter().enumerate(){let total=(t["size"].n()*1_048_576.)as u64;let done=if i==0{(measured.transfer*1_048_576.) as u64}else{(total as f64*t["pct"].n()/100.)as u64};list.apply(&TransferEvent::Added(TransferView{id:ItemId(i as u64),direction:if t["dir"].s()=="up"{Direction::Upload}else{Direction::Download},name:if stress{format!("production-customer-database-full-backup-{i}-20261112-abcdef0123456789.tar.zst")}else{t["n"].s().into()},destination:directory.into(),state:match t["st"].s(){"run"=>TransferState::Running,"pause"=>TransferState::Paused(PauseReason::User),"done"=>TransferState::Done,_=>TransferState::Queued},bytes_done:done,bytes_total:total,files_done:0,files_total:1,scanning:false,speed:if i==0{measured.transfer_speed*1_048_576.}else{0.},current:None,skipped:Default::default(),in_place:0,failures:vec![],failure_total:0,clash:None,result:None,temp:None}));}
         self.transfers=Some(cx.new(|_|list));cx.notify();
     }
 }

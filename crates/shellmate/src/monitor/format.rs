@@ -4,7 +4,10 @@
 pub fn bytes(value: u64) -> String {
     const KB: f64 = 1024.0;
     let b = value as f64;
-    if b >= KB * KB * KB {
+    if b >= KB.powi(4) {
+        let (divisor,unit)=if b>=KB.powi(6){(KB.powi(6),"EB")}else if b>=KB.powi(5){(KB.powi(5),"PB")}else{(KB.powi(4),"TB")};
+        format!("{:.1} {unit}",b/divisor)
+    } else if b >= KB * KB * KB {
         format!("{:.1} GB", b / (KB * KB * KB))
     } else if b >= KB * KB {
         format!("{:.0} MB", b / (KB * KB))
@@ -18,6 +21,7 @@ pub fn bytes(value: u64) -> String {
 /// A size for the totals of a disk or the memory card, always with a decimal from a gigabyte up
 /// (`79 GB`, `1.0 GB`, `0.2 GB`): `51 / 79 GB` is how the prototype writes it.
 pub fn gigabytes(value: u64) -> String {
+    if value >= 1<<40 {return bytes(value);}
     let gb = value as f64 / (1024.0 * 1024.0 * 1024.0);
     if gb >= 10.0 {
         format!("{gb:.0} GB")
@@ -38,6 +42,11 @@ fn gb_number(value: u64, decimals_below: f64) -> String {
 /// `51 / 79 GB`, `9.6 / 15.6 GB`, `0.2 / 1 GB` (`50 / 80 MB` when the total is below a tenth of a gigabyte): used
 /// and total with the unit once. Disks are written in whole gigabytes from 10 up, memory from 100 up.
 pub fn gb_pair(used: u64, total: u64, decimals_below: f64) -> String {
+    if total >= 1<<40 {
+        let shift=if total>=1<<60{60}else if total>=1<<50{50}else{40};
+        let unit=match shift{60=>"EB",50=>"PB",_=>"TB"};
+        return format!("{:.1} / {:.1} {unit}",used as f64/(1u64<<shift) as f64,total as f64/(1u64<<shift)as f64);
+    }
     if (total as f64) < 0.1 * 1024.0 * 1024.0 * 1024.0 {
         return format!("{:.0} / {:.0} MB", used as f64 / 1_048_576.0, total as f64 / 1_048_576.0);
     }
@@ -47,7 +56,7 @@ pub fn gb_pair(used: u64, total: u64, decimals_below: f64) -> String {
 /// A size in decimal units, the way docker writes image sizes: `3.2 GB`, `29 MB`, `7.8 MB`, `812 kB`.
 pub fn decimal_size(value: u64) -> String {
     let b = value as f64;
-    if b >= 1e9 {
+    if b >= 1e12 { format!("{:.1} TB",b/1e12) } else if b >= 1e9 {
         format!("{:.1} GB", b / 1e9)
     } else if b >= 1e7 {
         format!("{:.0} MB", b / 1e6)
@@ -64,6 +73,7 @@ pub fn decimal_size(value: u64) -> String {
 pub fn bytes_short(value: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     let b = value as f64;
+    if value >= 1<<40 { return bytes(value); }
     if b >= 1024.0 * MB {
         let gb = b / (1024.0 * MB);
         if (gb - gb.round()).abs() < 0.05 { format!("{:.0} GB", gb.round()) } else { format!("{gb:.1} GB") }
@@ -133,6 +143,14 @@ pub fn load(one: f32, five: f32, fifteen: f32) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn large_server_sizes_and_rates_stay_compact_with_units() {
+        assert_eq!(bytes(1_319_413_953_331),"1.2 TB");
+        assert_eq!(bytes(u64::MAX),"16.0 EB");
+        assert_eq!(gb_pair(1<<40,2<<40,10.),"1.0 / 2.0 TB");
+        assert_eq!(rate_pair(12.5*(1u64<<30)as f64,0.),("12.5".into(),"0.0".into(),"GB/s"));
+        assert_eq!(decimal_size(1_200_000_000_000),"1.2 TB");
+    }
     #[test]
     fn sizes() {
         assert_eq!(bytes(0), "0 B");

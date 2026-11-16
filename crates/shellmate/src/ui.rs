@@ -56,6 +56,26 @@ pub fn surface_ring(radius: f32, width: f32, color: Hsla) -> impl IntoElement {
     }).absolute().inset_0()
 }
 
+/// One-line variable server text; the tooltip preserves the full value at every width.
+pub fn ellipsis(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful<gpui::Div> {
+    let text=text.into();
+    let tip=text.clone();
+    div().id(id).min_w_0().truncate().child(text)
+        .tooltip(move |window,cx|Tooltip::new(tip.clone()).max_w((window.viewport_size().width-px(48.)).min(px(680.))).whitespace_normal().build(window,cx))
+}
+
+/// Observe the allocated viewport without allowing intrinsic child widths to set breakpoints.
+/// Defer entity updates until after layout, and notify only when its pixel width changes.
+pub fn observe_width<V: 'static>(entity: gpui::WeakEntity<V>, previous: f32, set: fn(&mut V, f32)) -> impl IntoElement {
+    gpui::canvas(move |bounds, window, cx| {
+        let width=f32::from(bounds.size.width).floor();
+        if width>0. && (width-previous).abs()>=1. {
+            let entity=entity.clone();
+            window.defer(cx,move |_,cx| {entity.update(cx,|view,cx|{set(view,width);cx.notify();}).ok();});
+        }
+    },|_,_,_,_|()).absolute().inset_0()
+}
+
 pub fn dot(color: Hsla, size: f32) -> impl IntoElement {
     div().size(px(size)).flex_none().rounded_full().bg(color)
 }

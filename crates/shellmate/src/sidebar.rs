@@ -331,7 +331,7 @@ impl Sidebar {
                     .size(px(12.))
                     .text_color(p.tx3)),
             )
-            .child(div().flex_1().child(title))
+            .child(crate::ui::ellipsis(SharedString::from(format!("group-label-{key}")),title).flex_1())
             .child(div().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.tx3).child(section.hosts.len().to_string()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.collapsed.remove(&key) {
@@ -370,17 +370,15 @@ impl Sidebar {
 
         let avatar = host_avatar(host, tone, live, Avatar { size: 32., radius: 10., dot: 12. }, p);
 
-        let name_line = div()
+        let name_line = div().min_w_0()
             .flex()
             .items_center()
             .gap(px(5.))
             .child(
-                div()
+                crate::ui::ellipsis(SharedString::from(format!("host-title-{}",host.id)),host.name.clone())
                     .text_size(px(13.5)).line_height(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.tx)
-                    .truncate()
-                    .child(host.name.clone()),
+                    .text_color(p.tx),
             )
             .when(host.favorite, |d| d.child(div().flex_none().text_size(px(11.)).line_height(px(13.)).font_weight(FontWeight::NORMAL).text_color(p.warn).child("★")));
 
@@ -402,7 +400,7 @@ impl Sidebar {
                     .flex_1()
                     .min_w_0()
                     .child(name_line)
-                    .child(div().mt(px(1.)).text_size(px(11.5)).line_height(px(13.)).text_color(p.tx2).truncate().child(sub)),
+                    .child(crate::ui::ellipsis(SharedString::from(format!("host-address-{}",host.id)),sub).mt(px(1.)).text_size(px(11.5)).line_height(px(13.)).text_color(p.tx2)),
             )
             .children(host.badge().map(|b| {
                 div()

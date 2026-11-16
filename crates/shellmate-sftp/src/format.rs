@@ -10,8 +10,11 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", b / KB)
     } else if b < KB * KB * KB {
         format!("{:.1} MB", b / (KB * KB))
-    } else {
+    } else if b < KB.powi(4) {
         format!("{:.2} GB", b / (KB * KB * KB))
+    } else {
+        let (divisor,unit)=if b>=KB.powi(6){(KB.powi(6),"EB")}else if b>=KB.powi(5){(KB.powi(5),"PB")}else{(KB.powi(4),"TB")};
+        format!("{:.2} {unit}",b/divisor)
     }
 }
 
@@ -49,6 +52,12 @@ pub fn mode_octal(mode: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_sizes_keep_a_short_value_and_unit() {
+        assert_eq!(format_size(1_319_413_953_331),"1.20 TB");
+        assert_eq!(format_size(u64::MAX),"16.00 EB");
+    }
 
     #[test]
     fn sizes_use_the_prototype_format() {

@@ -16,10 +16,13 @@ impl TerminalBackend for Inert {
 }
 impl Workspace {
     pub(crate) fn proto_scene(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (scene,_) = proto::request(scene);
         if !proto::SCENES.contains(&scene) {
             log::warn!("unknown prototype scene");
             return;
         }
+        let stress=scene.starts_with("stress-");
+        let scene=scene.strip_prefix("stress-").unwrap_or(scene);
         self.sessions.clear();
         self.groups.clear();
         self.active = None;
@@ -83,6 +86,14 @@ impl Workspace {
                 host
             })
             .collect::<Vec<_>>();
+        let mut hosts=hosts;
+        if stress {
+            for (i,host) in hosts.iter_mut().enumerate() {
+                host.name=format!("{}-{i}",proto::stress::HOST);host.addr=host.name.clone();host.user=Some(proto::stress::USER.into());host.port=65535;host.protocol=Protocol::Ssh;
+            }
+            let mut group=self.store.borrow().groups().unwrap().remove(0);
+            group.name="生产环境 · 欧洲西部数据中心 · 客户数据与结算平台".into();self.store.borrow_mut().save_group(&group).unwrap();
+        }
         self.store.borrow_mut().save_hosts(&hosts).unwrap();
         self.reload_book(window, cx);
         self.store
@@ -118,10 +129,9 @@ impl Workspace {
         }
         let dark = cx.is_dark();
 
-        for (i, (host_id, lines)) in [("h1", "S1"), ("h3", "S2"), ("h10", "S3"), ("h7", "S4")]
-            .into_iter()
-            .enumerate()
-        {
+        let mut session_sources=vec![("h1", "S1"), ("h3", "S2"), ("h10", "S3"), ("h7", "S4")];
+        if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
+        for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
             let host = self.book.host(&HostId::from_raw(host_id)).unwrap().clone();
             let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette, cx));
             terminal.update(cx, |t, cx| {
@@ -169,7 +179,7 @@ impl Workspace {
                 _subscription: subscription,
             });
         }
-        self.next_id = 5;
+        self.next_id = self.sessions.len()+1;
         self.activate(0, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
@@ -202,9 +212,9 @@ impl Workspace {
             "rail" => self.set_sidebar_open(false, cx),
             "local" => self.proto_local(window, cx),
             "reconnect" => self.activate(3, window, cx),
-            "files" | "editor" => self.proto_files(scene, window, cx),
+            "files" | "editor" => self.proto_files(if stress {"stress-files"}else{scene}, window, cx),
             "fwd" | "fwd-new" => {
-                let view = crate::forward::demo::view("cards", "prod-web-01");
+                let view = if stress {proto::stress::forward()}else{crate::forward::demo::view("cards", "prod-web-01")};
                 let panel = cx.new(|cx| crate::forward::panel::ForwardPanel::new(view, cx));
                 let subscription =
                     cx.subscribe(&panel, |_, _, _: &crate::forward::panel::ForwardPanelEvent, _| {});
@@ -217,7 +227,7 @@ impl Workspace {
                 });
                 self.sessions[0].panel = Panel::Forward;
             }
-            "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" => self.proto_monitor(scene, window, cx),
+            "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" => self.proto_monitor(scene, stress, window, cx),
             "rv" | "rv-log" => {
                 let panel = crate::records::panel::RecordsWindow::open(
                     self.store.clone(),
@@ -282,10 +292,10 @@ impl Workspace {
     }
 }
 impl Workspace {
-    fn proto_monitor(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let data = crate::proto::monitor::data(scene, cx.is_dark());
+    fn proto_monitor(&mut self, scene: &str, stress: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let data = if stress{proto::stress::monitor(scene,cx.is_dark())}else{crate::proto::monitor::data(scene, cx.is_dark())};
         let panel =
-            cx.new(|cx| crate::monitor::panel::MonitorPanel::new("prod-web-01", data, None, window, cx));
+            cx.new(|cx| crate::monitor::panel::MonitorPanel::new(if stress{proto::stress::HOST}else{"prod-web-01"}, data, None, window, cx));
         let page = match scene {
             "mon-proc" => crate::monitor::model::Page::Processes,
             "mon-svc" => crate::monitor::model::Page::Services,
@@ -295,13 +305,13 @@ impl Workspace {
         panel.update(cx, |p, cx| {
             p.set_page(page, cx);
             if scene == "mon-proc" {
-                p.show_process(2207, window, cx);
+                p.show_process(if stress{4_194_304}else{2207}, window, cx);
             }
             if scene == "mon-svc" {
                 p.demo_services(
                     "",
                     crate::monitor::services::ServiceFilter::All,
-                    Some("php8.2-fpm.service"),
+                    Some(if stress{proto::stress::SERVICE}else{"php8.2-fpm.service"}),
                     window,
                     cx,
                 );
@@ -309,7 +319,7 @@ impl Workspace {
                 p.proto_order(cx);
             }
             if scene == "mon-dk" {
-                p.demo_container_log("worker", crate::monitor::demo::container_log(), cx);
+                p.demo_container_log(if stress{proto::stress::CONTAINER}else{"worker"}, crate::monitor::demo::container_log(), cx);
             }
         });
         let subscription = cx.subscribe(&panel, |_, _, _: &crate::monitor::panel::MonitorPanelEvent, _| {});

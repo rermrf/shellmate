@@ -9,6 +9,7 @@ mod editor;
 mod files;
 mod forward;
 mod library;
+mod layout;
 mod monitor;
 mod productivity;
 mod reconnect;
@@ -100,7 +101,11 @@ fn main() {
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-        #[cfg(debug_assertions)] let bounds=if proto::requested(){Bounds::new(point(px(60.),px(60.)),size(px(1440.),px(900.)))}else{bounds};
+        #[cfg(debug_assertions)]
+        let bounds = if proto::requested() {
+            let (width, height) = proto::window_size();
+            Bounds::new(point(px(60.), px(60.)), size(px(width as f32), px(height as f32)))
+        } else { bounds };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {

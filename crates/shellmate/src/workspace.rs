@@ -603,14 +603,15 @@ impl Workspace {
 
     // ---- rendering -----------------------------------------------------
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let limit=crate::productivity::multi::tab_limit(self.sidebar_open,self.commands_open);
+        let preferred=crate::productivity::multi::tab_limit(self.sidebar_open,self.commands_open);
+        let limit=crate::layout::tabs_that_fit(f32::from(window.viewport_size().width)-if self.sidebar_open {284.} else {76.}-12.,preferred);
         let visible=crate::productivity::multi::visible_tabs(self.sessions.len(),self.active,limit);
         let tabs = visible.into_iter().map(|ix| { let s=&self.sessions[ix];
             let active = Some(ix) == self.active;
             div()
-                .id(("tab", s.id))
+                .id(("tab", s.id)).max_w(px(190.)).min_w_0()
                 .flex()
                 .flex_none()
                 .items_center()
@@ -624,7 +625,7 @@ impl Workspace {
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
                 .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
                 .child(dot(session_dot(s, &p), 7.))
-                .child(s.title.clone())
+                .child(crate::ui::ellipsis(("tab-title",s.id),s.title.clone()).flex_1())
                 .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id),|d|d.child(div().px(px(5.)).rounded(px(4.)).bg(p.warns).text_color(p.warn).text_size(px(10.)).child("广播")))
                 .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
                     let failed = status == ssh::SshStatus::Failed;
@@ -650,7 +651,7 @@ impl Workspace {
                 }))
                 .child(
                     div()
-                        .id(("close-tab", s.id))
+                        .id(("close-tab", s.id)).flex_none()
                         .size(px(22.))
                         .flex()
                         .items_center()
@@ -688,7 +689,7 @@ impl Workspace {
             .gap(px(8.))
             .child(div().flex().items_center().gap(px(6.)).min_w_0().overflow_hidden().children(tabs))
             .child(new_tab)
-            .when(crate::productivity::multi::tab_overflow(self.sessions.len(),self.sidebar_open,self.commands_open),|d|d.child(
+            .when(crate::productivity::multi::tab_overflow(self.sessions.len(),self.sidebar_open,self.commands_open)||self.sessions.len()>limit,|d|d.child(
                 div().id("tab-list-button").flex_none().cursor_pointer().px(px(8.)).py(px(5.)).rounded(px(8.)).text_size(px(12.)).text_color(p.tx2)
                     .child(format!("{} 个标签 ▾",self.sessions.len()))
                     .on_click(cx.listener(|this,event: &gpui::ClickEvent,w,cx|this.open_session_menu(crate::productivity::session_menu::Kind::Tabs,event.position(),w,cx)))
@@ -746,9 +747,9 @@ impl Workspace {
                     .items_baseline()
                     .gap(px(10.))
                     .flex_1()
-                    .min_w_0()
-                    .child(div().flex_none().text_size(px(20.)).line_height(px(23.)).font_weight(FontWeight::BOLD).text_color(p.tx).child(title))
-                    .child(div().min_w_0().truncate().text_size(px(12.)).line_height(px(15.)).text_color(p.tx2).child(subtitle)),
+                    .min_w_0().overflow_hidden()
+                    .child(crate::ui::ellipsis("session-heading",title).flex_shrink(1.).max_w(px(310.)).text_size(px(20.)).line_height(px(23.)).font_weight(FontWeight::BOLD).text_color(p.tx))
+                    .child(crate::ui::ellipsis("session-subtitle",subtitle).flex_1().min_w_0().text_size(px(12.)).line_height(px(15.)).text_color(p.tx2)),
             )
             .child(
                 segmented(
@@ -923,13 +924,13 @@ impl Render for Workspace {
         let p = cx.palette().clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
             Some(Session { panel: Panel::Files, files: Some(files), .. }) => {
-                div().flex_1().min_h_0().flex().child(files.panel.clone()).into_any_element()
+                div().flex_1().min_w_0().min_h_0().flex().child(files.panel.clone()).into_any_element()
             }
             Some(Session { panel: Panel::Forward, forward: Some(forward), .. }) => {
-                div().flex_1().min_h_0().flex().child(forward.panel.clone()).into_any_element()
+                div().flex_1().min_w_0().min_h_0().flex().child(forward.panel.clone()).into_any_element()
             }
             Some(Session { panel: Panel::Monitor, monitor: Some(monitor), .. }) => {
-                div().flex_1().min_h_0().flex().child(monitor.panel.clone()).into_any_element()
+                div().flex_1().min_w_0().min_h_0().flex().child(monitor.panel.clone()).into_any_element()
             }
             Some(session) => self.render_terminal_card(session, cx).into_any_element(),
             None => self.render_empty(cx).into_any_element(),
@@ -986,7 +987,7 @@ impl Render for Workspace {
                     .pb(px(12.))
                     // Beside the sidebar there is a gap; beside the rail the tabs start right after it.
                     .pl(px(0.))
-                    .child(self.render_tab_bar(cx))
+                    .child(self.render_tab_bar(_window,cx))
                     .child(self.render_header(cx))
                     .child(
                         div().flex_1().min_h_0().flex().gap(px(12.)).child(body)

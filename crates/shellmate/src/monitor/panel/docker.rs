@@ -1,6 +1,8 @@
 //! The Docker page: the header card, the containers by compose project with their ports, numbers and buttons,
 //! and the log that opens under a container.
 
+use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, div, px};
@@ -13,7 +15,7 @@ use crate::monitor::containers::{self, ContainerRow, Group, PortChip};
 use crate::monitor::model::{Banner, Page, Tone};
 use crate::monitor::services::LogSource;
 use crate::theme::{ActivePalette as _, CARD_RADIUS, MONO_FONT, Palette};
-use crate::ui::card_shadow;
+use crate::ui::{card_shadow, ellipsis};
 
 /// The subject of the pane of a container whose page is not in front: nothing follows, nothing is kept.
 const CLOSED: &str = "closed";
@@ -114,7 +116,7 @@ impl MonitorPanel {
     fn chip_button(&self, ix: (usize, usize), chip: &PortChip, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let (bg, fg) = if chip.forwarded { (p.oks, p.ok) } else { (p.accs, p.acc) };
         let target = chip.target.clone();
-        let tooltip: SharedString = chip.tooltip.clone().into();
+        let tooltip: SharedString = format!("{}\n{}", chip.label, chip.tooltip).into();
         div()
             .id(("port-chip", ix.0 * 100 + ix.1))
             .px(px(8.))
@@ -129,6 +131,7 @@ impl MonitorPanel {
             .cursor_pointer()
             .hover(|d| d.opacity(0.85))
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .flex_none()
             .child(chip.label.clone())
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(MonitorPanelEvent::ForwardPort(target.clone()))))
             .into_any_element()
@@ -151,7 +154,7 @@ impl MonitorPanel {
         };
         let mut element = div()
             .id((spec.id, ix))
-            .w(px(if spec.label=="×"{28.}else{44.}))
+            .w(px(if spec.label == "×" { 28. } else { 44. }))
             .h(px(28.))
             .px(px(10.))
             .flex()
@@ -160,7 +163,8 @@ impl MonitorPanel {
             .rounded(px(8.))
             .bg(bg)
             .text_color(fg)
-            .text_size(px(12.)).line_height(px(15.))
+            .text_size(px(12.))
+            .line_height(px(15.))
             .font_weight(FontWeight::SEMIBOLD)
             .child(spec.label);
         element = if spec.enabled {
@@ -183,134 +187,225 @@ impl MonitorPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ix = group * 100 + index;
-        let name = row.name.clone();
+        let compact = crate::layout::Responsive::at(self.width).docker_compact;
+        let name_width = if self.width >= 1100. { 241. } else { self.width * 0.20 };
+        let status_width = if self.width >= 1100. { 199. } else { self.width * 0.16 };
+        let cpu_width = crate::layout::numeric_width([row.cpu.as_str()], 7.2, 52.);
+        let memory_width = crate::layout::numeric_width([row.memory.as_str()], 7.2, 120.);
+        let labels = row.ports.iter().map(|port| port.label.as_str()).collect::<Vec<_>>();
+        let inline_ports = crate::layout::inline_container_ports(self.width, cpu_width, memory_width, &labels);
         let log_open =
-            self.container_log.as_ref().is_some_and(|(open, pane)| open == &row.name && pane.subject != CLOSED);
+            self.container_log.as_ref().is_some_and(|(name, pane)| name == &row.name && pane.subject != CLOSED);
+        let run = if row.running { ContainerAction::Restart } else { ContainerAction::Start };
         let dot_color = match row.dot {
             Tone::Ok => p.ok,
             Tone::Warn => p.warn,
             _ => p.tx3,
         };
-        let run_action = if row.running { ContainerAction::Restart } else { ContainerAction::Start };
+        let status_color = match row.status_tone {
+            Tone::Plain => p.tx2,
+            tone => tone_text(p, tone),
+        };
+        let name = row.name.clone();
         let spec = |id, label, enabled, tone, open| RowButton { id, label, enabled, tone, open };
-        let buttons = div()
+        let mut buttons = div()
+            .flex_none()
             .flex()
             .gap(px(4.))
-            .flex_none()
             .child({
                 let name = name.clone();
-                let press = move |_: &mut Self, cx: &mut Context<Self>| {
-                    cx.emit(MonitorPanelEvent::ContainerTerminal(name.clone()))
-                };
-                self.row_button(spec("container-exec", "终端", row.can_exec, Tone::Plain, false), ix, press, p, cx)
+                self.row_button(
+                    spec("container-exec", "终端", row.can_exec, Tone::Plain, false),
+                    ix,
+                    move |_, cx| cx.emit(MonitorPanelEvent::ContainerTerminal(name.clone())),
+                    p,
+                    cx,
+                )
             })
             .child({
                 let name = name.clone();
-                let press = move |this: &mut Self, cx: &mut Context<Self>| this.toggle_container_log(&name, cx);
-                self.row_button(spec("container-logs", "日志", true, Tone::Off, log_open), ix, press, p, cx)
-            })
-            .child({
-                let name = name.clone();
-                let press = move |_: &mut Self, cx: &mut Context<Self>| {
-                    cx.emit(MonitorPanelEvent::Container(run_action, name.clone()))
-                };
-                self.row_button(spec("container-run", row.run_label, true, Tone::Off, false), ix, press, p, cx)
-            })
-            .child({
-                let name = name.clone();
-                let press = move |_: &mut Self, cx: &mut Context<Self>| {
-                    cx.emit(MonitorPanelEvent::Container(ContainerAction::Stop, name.clone()))
-                };
-                self.row_button(spec("container-stop", "停止", row.can_stop, Tone::Off, false), ix, press, p, cx)
-            })
-            .child({
-                let name = name.clone();
-                let press = move |_: &mut Self, cx: &mut Context<Self>| {
-                    cx.emit(MonitorPanelEvent::Container(ContainerAction::Remove, name.clone()))
-                };
-                self.row_button(spec("container-rm", "×", row.can_remove, Tone::Err, false), ix, press, p, cx)
+                self.row_button(
+                    spec("container-log", "日志", true, Tone::Off, log_open),
+                    ix,
+                    move |this, cx| this.toggle_container_log(&name, cx),
+                    p,
+                    cx,
+                )
             });
+        if compact {
+            let this = cx.entity().downgrade();
+            let name = name.clone();
+            let label = row.run_label;
+            let stop = row.can_stop;
+            let remove = row.can_remove;
+            buttons = buttons.child(
+                Button::new(("container-more", ix)).ghost().label("⋯").w(px(28.)).h(px(28.)).dropdown_menu(
+                    move |mut menu, _, _| {
+                        for (label, action, enabled) in [
+                            (label, run, true),
+                            ("停止", ContainerAction::Stop, stop),
+                            ("删除", ContainerAction::Remove, remove),
+                        ] {
+                            let this = this.clone();
+                            let name = name.clone();
+                            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(move |_, _, cx| {
+                                this.update(cx, |_, cx| cx.emit(MonitorPanelEvent::Container(action, name.clone())))
+                                    .ok();
+                            }));
+                        }
+                        menu
+                    },
+                ),
+            );
+        } else {
+            for (id, label, action, enabled, tone) in [
+                ("container-run", row.run_label, run, true, Tone::Off),
+                ("container-stop", "停止", ContainerAction::Stop, row.can_stop, Tone::Off),
+                ("container-remove", "×", ContainerAction::Remove, row.can_remove, Tone::Err),
+            ] {
+                let name = name.clone();
+                buttons = buttons.child(self.row_button(
+                    spec(id, label, enabled, tone, false),
+                    ix,
+                    move |_, cx| cx.emit(MonitorPanelEvent::Container(action, name.clone())),
+                    p,
+                    cx,
+                ));
+            }
+        }
+        let stats = || {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .whitespace_nowrap()
+                .font_family(MONO_FONT)
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .child(div().w(px(cpu_width)).flex_none().text_right().child(row.cpu.clone()))
+                .child(div().w(px(memory_width)).flex_none().text_color(p.tx2).child(row.memory.clone()))
+        };
         let line = div()
+            .w_full()
+            .min_w_0()
+            .h(px(58.))
+            .flex_none()
+            .px(px(20.))
             .flex()
             .items_center()
             .gap(px(10.))
-            .h(px(58.))
-            .px(px(20.))
             .child(div().size(px(8.)).flex_none().rounded_full().bg(dot_color))
             .child(
                 div()
-                    .w(px(241.))
-                    .flex_none()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(0.))
-                    .child(div().truncate().font_weight(FontWeight::BOLD).text_size(px(13.)).line_height(px(16.)).child(row.name.clone()))
+                    .when(compact, |d| d.flex_1())
+                    .when(!compact, |d| d.w(px(name_width)).flex_none())
                     .child(
-                        div()
-                            .truncate()
+                        ellipsis(("container-name", ix), name.clone())
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(13.))
+                            .line_height(px(16.)),
+                    )
+                    .child(
+                        ellipsis(("container-image", ix), row.image.clone())
                             .font_family(MONO_FONT)
-                            .text_size(px(11.5)).line_height(px(15.))
-                            .text_color(p.tx2)
-                            .child(row.image.clone()),
+                            .text_size(px(11.5))
+                            .line_height(px(15.))
+                            .text_color(p.tx2),
                     ),
             )
-            .child(
+            .when(!compact, |d| {
+                d.child(
+                    ellipsis(("container-status", ix), row.status.clone())
+                        .w(px(status_width))
+                        .flex_none()
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(status_color),
+                )
+            })
+            .when(!compact, |d| {
+                d.child(div().flex_1().min_w_0().flex().flex_wrap().gap(px(6.)).when(inline_ports, |d| {
+                    d.children(row.ports.iter().enumerate().map(|(i, port)| self.chip_button((ix, i), port, p, cx)))
+                }))
+                .child(stats())
+            })
+            .child(buttons);
+        let mut result = div().id(("container", ix)).w_full().min_w_0().flex_none().flex().flex_col().child(line);
+        if compact {
+            result = result.child(
                 div()
-                    .w(px(199.))
-                    .flex_none()
-                    .truncate()
-                    .text_size(px(12.)).line_height(px(16.))
-                    .text_color(match row.status_tone {
-                        Tone::Plain => p.tx2,
-                        other => tone_text(p, other),
-                    })
-                    .child(row.status.clone()),
-            )
-            .child(
+                    .ml(px(38.))
+                    .mr(px(20.))
+                    .pb(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        ellipsis(("container-status", ix), row.status.clone())
+                            .flex_1()
+                            .min_w(px(100.))
+                            .text_size(px(12.))
+                            .text_color(status_color),
+                    )
+                    .child(stats()),
+            );
+        }
+        if !inline_ports && !row.ports.is_empty() {
+            result = result.child(
                 div()
-                    .flex_1()
+                    .ml(px(38.))
+                    .mr(px(20.))
+                    .pb(px(10.))
                     .min_w_0()
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
-                    .children(row.ports.iter().enumerate().map(|(i, chip)| self.chip_button((ix, i), chip, p, cx))),
-            )
-            .child(
+                    .children(row.ports.iter().enumerate().map(|(i, port)| self.chip_button((ix, i), port, p, cx))),
+            );
+        }
+        if log_open {
+            let caption = self.container(&name).map_or("", containers::log_caption);
+            result = result.child(
                 div()
-                    .w(px(52.))
-                    .flex_none()
-                    .text_right()
-                    .font_family(MONO_FONT)
-                    .text_size(px(12.)).line_height(px(16.))
-                    .child(row.cpu.clone()),
-            )
-            .child(
-                div()
-                    .w(px(120.))
-                    .flex_none()
-                    .text_right()
-                    .font_family(MONO_FONT)
-                    .text_size(px(12.)).line_height(px(16.))
-                    .text_color(p.tx2)
-                    .child(row.memory.clone()),
-            )
-            .child(buttons);
-        let pane = log_open.then(|| {
-            let container = self.container(&row.name);
-            let caption = container.map_or("", containers::log_caption);
-            div()
-                .ml(px(38.)).mr(px(20.)).mb(px(6.)).mt(px(2.))
-                .rounded(px(12.)).bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
-                .px(px(12.)).py(px(10.)).flex().flex_col().gap(px(4.))
-                .child(div().text_size(px(11.5)).line_height(px(18.)).font_family(MONO_FONT).text_color(p.acc).child(caption))
-                .child(log_box(self.container_log.as_ref().map(|(_, pane)| pane), "没有日志", LOG_LINES, p)
-                    .p_0().bg(gpui::transparent_black()).h(px(LOG_LINES as f32 * 18.)))
-        });
-        div().id(("container", ix)).flex().flex_col().child(line).children(pane).into_any_element()
+                    .ml(px(38.))
+                    .mr(px(20.))
+                    .mb(px(6.))
+                    .mt(px(2.))
+                    .min_w_0()
+                    .rounded(px(12.))
+                    .bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        ellipsis(("container-log-caption", ix), caption)
+                            .text_size(px(11.5))
+                            .line_height(px(18.))
+                            .font_family(MONO_FONT)
+                            .text_color(p.acc),
+                    )
+                    .child(
+                        log_box(self.container_log.as_ref().map(|(_, pane)| pane), "没有日志", LOG_LINES, p)
+                            .p_0()
+                            .bg(gpui::transparent_black())
+                            .h(px(LOG_LINES as f32 * 18.)),
+                    ),
+            );
+        }
+        result.into_any_element()
     }
 
     fn group_card(&self, index: usize, group: &Group, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .flex_none()
@@ -325,15 +420,20 @@ impl MonitorPanel {
                     .gap(px(10.))
                     .px(px(20.))
                     .py(px(6.))
-                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).line_height(px(17.)).child(group.name.clone()))
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
+                        ellipsis(("container-group", index), group.name.clone())
+                            .max_w(px(280.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(14.))
+                            .line_height(px(17.)),
+                    )
+                    .child(
+                        ellipsis(("container-config", index), group.subtitle.clone())
+                            .flex_1()
                             .font_family(MONO_FONT)
-                            .text_size(px(11.5)).line_height(px(15.))
-                            .text_color(p.tx2)
-                            .child(group.subtitle.clone()),
+                            .text_size(px(11.5))
+                            .line_height(px(15.))
+                            .text_color(p.tx2),
                     ),
             )
             .children(group.rows.iter().enumerate().map(|(i, row)| self.container_row(index, i, row, p, cx)))
@@ -359,17 +459,28 @@ impl MonitorPanel {
                 .flex_col()
                 .items_start()
                 .gap(px(4.))
-                .child(div().font_weight(FontWeight::BOLD).text_size(px(16.)).line_height(px(18.)).child(value))
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(16.))
+                        .line_height(px(18.))
+                        .whitespace_nowrap()
+                        .child(value),
+                )
                 .child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.tx2).child(caption))
         };
         let (running, total) = containers::counts(&view);
         let prune_tip: SharedString = header.prune_tooltip.clone().into();
         let top = div()
+            .min_w_0()
+            .w_full()
             .flex()
+            .flex_wrap()
             .flex_none()
             .items_center()
             .gap(px(18.))
-            .pl(px(18.)).pr(px(14.))
+            .pl(px(18.))
+            .pr(px(14.))
             .py(px(14.))
             .bg(p.card)
             .rounded(CARD_RADIUS)
@@ -377,12 +488,24 @@ impl MonitorPanel {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(180.))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).line_height(px(17.)).child(header.title.clone()))
-                    .child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.tx2).child(header.subtitle.clone())),
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(14.))
+                            .line_height(px(17.))
+                            .child(header.title.clone())
+                            .whitespace_nowrap(),
+                    )
+                    .child(
+                        ellipsis("docker-subtitle", header.subtitle.clone())
+                            .text_size(px(12.))
+                            .line_height(px(17.))
+                            .text_color(p.tx2),
+                    ),
             )
             .child(stat(format!("{running} / {total} 个容器运行中"), "容器"))
             .child(stat(header.images.clone(), "镜像"))
@@ -396,7 +519,8 @@ impl MonitorPanel {
                     .items_center()
                     .rounded(px(10.))
                     .bg(p.card2)
-                    .text_size(px(12.)).line_height(px(16.))
+                    .text_size(px(12.))
+                    .line_height(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
                     .hover(|d| d.opacity(0.85))
@@ -414,13 +538,16 @@ impl MonitorPanel {
                 .rounded(px(14.))
                 .bg(p.warns)
                 .text_color(p.warn)
-                .text_size(px(12.)).line_height(px(16.))
+                .text_size(px(12.))
+                .line_height(px(16.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(format!("读取容器时出错（显示的是上一次的结果）：{why}"))
         });
 
         div()
             .id("monitor-docker")
+            .w_full()
+            .min_w_0()
             .flex_1()
             .min_h_0()
             .flex()

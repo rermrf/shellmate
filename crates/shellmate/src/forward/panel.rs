@@ -2,13 +2,10 @@
 //! says comes from [`super::model`]; what the user does with it goes to the workspace as
 //! [`ForwardPanelEvent`]s (which saves rules, starts and stops them).
 
-use gpui::component::input::{Input, InputEvent, InputState};
 use crate::ui::Toggle as Switch;
+use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::prelude::*;
-use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, SharedString, Subscription, Window, div,
-    px,
-};
+use gpui::{Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Subscription, Window, div, px};
 use shellmate_forward::{ForwardKind, ForwardRule, RuleId};
 
 use super::model::{
@@ -45,6 +42,7 @@ struct FormFields {
 
 /// The panel.
 pub struct ForwardPanel {
+    width: f32,
     view: ForwardView,
     form: Option<FormFields>,
     focus: FocusHandle,
@@ -58,7 +56,7 @@ impl Focusable for ForwardPanel {
 
 impl ForwardPanel {
     pub fn new(view: ForwardView, cx: &mut Context<Self>) -> Self {
-        Self { view, form: None, focus: cx.focus_handle() }
+        Self { width: 1144., view, form: None, focus: cx.focus_handle() }
     }
 
     /// What the panel shows now.
@@ -163,7 +161,8 @@ impl ForwardPanel {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(12.)).min_h(px(72.))
+            .gap(px(12.))
+            .min_h(px(72.))
             .px(px(18.))
             .py(px(16.))
             .bg(p.card)
@@ -176,8 +175,18 @@ impl ForwardPanel {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(div().text_size(px(15.)).line_height(px(21.)).font_weight(FontWeight::BOLD).child(summary.title.clone()))
-                    .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child(summary.subtitle.clone()))
+                    .child(
+                        crate::ui::ellipsis("forward-summary", summary.title.clone())
+                            .text_size(px(15.))
+                            .line_height(px(21.))
+                            .font_weight(FontWeight::BOLD),
+                    )
+                    .child(
+                        crate::ui::ellipsis("forward-subtitle", summary.subtitle.clone())
+                            .text_size(px(12.5))
+                            .line_height(px(17.))
+                            .text_color(p.tx2),
+                    )
                     .children(
                         summary
                             .notes
@@ -320,40 +329,92 @@ impl ForwardPanel {
     }
 
     fn render_card(&self, ix: usize, card: &RuleCard, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let stacked = crate::layout::Responsive::at(self.width).forward_stacked_stats;
         let (bg, fg) = match card.kind {
             ForwardKind::Local => (p.accs, p.acc),
             ForwardKind::Remote => (p.oks, p.ok),
             ForwardKind::Dynamic => (p.warns, p.warn),
         };
-        let status_color = if card.tone == Tone::Off { p.tx2 } else { Self::tone_color(p, card.tone) };
-        let (id, enabled) = (card.id.clone(), card.enabled);
-        let toggle_id = id.clone();
-        let delete_id = id.clone();
-        div()
-            .id(("fwd-rule", ix)).min_h(px(76.))
-            .flex()
+        let color = if card.tone == Tone::Off { p.tx2 } else { Self::tone_color(p, card.tone) };
+        let toggle_id = card.id.clone();
+        let delete_id = card.id.clone();
+        let status = div()
+            .min_w_0()
             .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .when(stacked, |d| d.w_full())
+            .when(!stacked, |d| d.w(px(260.)))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.5))
+                    .line_height(px(17.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child(dot(Self::tone_color(p, card.tone), 7.))
+                    .child(crate::ui::ellipsis(("forward-status", ix), card.status.clone()).flex_1()),
+            )
+            .children(card.traffic.as_ref().map(|traffic| {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_x(px(8.))
+                    .text_size(px(12.))
+                    .font_family(MONO_FONT)
+                    .text_color(p.tx2)
+                    .children(
+                        traffic
+                            .split(" · ")
+                            .map(|piece| div().flex_none().whitespace_nowrap().child(piece.to_string())),
+                    )
+            }))
+            .children(card.retry.clone().map(|retry| {
+                let id = card.id.clone();
+                let (bg, fg) = if card.tone == Tone::Failed { (p.errs, p.err) } else { (p.warns, p.warn) };
+                div()
+                    .id(("fwd-retry", ix))
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .bg(bg)
+                    .text_color(fg)
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .child(retry.label)
+                    .on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(ForwardPanelEvent::Retry(id.clone(), retry.action))),
+                    )
+            }));
+        let mut line = div()
+            .w_full()
+            .min_w_0()
+            .flex()
             .items_center()
             .gap(px(16.))
-            .px(px(18.))
-            .py(px(16.))
-            .bg(p.card)
-            .rounded(CARD_RADIUS)
-            .shadow(card_shadow(p))
             .child(
                 div()
                     .size(px(44.))
                     .flex_none()
+                    .rounded(px(14.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(14.))
                     .bg(bg)
                     .text_color(fg)
                     .font_family(MONO_FONT)
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(14.)).line_height(px(19.))
-                    .child(div().relative().top(px(1.5)).child(card.flag)),
+                    .text_size(px(14.))
+                    .line_height(px(19.))
+                    .child(card.flag),
             )
             .child(
                 div()
@@ -364,76 +425,42 @@ impl ForwardPanel {
                     .gap(px(4.))
                     .child(
                         div()
+                            .min_w_0()
                             .flex()
                             .items_baseline()
                             .gap(px(8.))
-                            .child(div().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child(card.name.clone()))
-                            .child(div().text_size(px(12.)).line_height(px(15.)).text_color(p.tx2).child(kind_name(card.kind))),
+                            .child(
+                                crate::ui::ellipsis(("forward-name", ix), card.name.clone())
+                                    .flex_1()
+                                    .text_size(px(14.))
+                                    .line_height(px(20.))
+                                    .font_weight(FontWeight::BOLD),
+                            )
+                            .child(div().flex_none().text_size(px(12.)).text_color(p.tx2).child(kind_name(card.kind))),
                     )
                     .child(
-                        div()
-                            .truncate()
+                        crate::ui::ellipsis(("forward-route", ix), card.route.clone())
                             .font_family(MONO_FONT)
-                            .text_size(px(12.5)).line_height(px(17.)).relative().top(px(2.))
-                            .text_color(p.tx2)
-                            .child(card.route.clone()),
+                            .text_size(px(12.5))
+                            .line_height(px(17.))
+                            .text_color(p.tx2),
                     )
                     .children(
                         card.warnings
                             .iter()
                             .map(|line| div().text_size(px(11.5)).text_color(p.warn).child(format!("⚠ {line}"))),
                     ),
-            )
-            .child(
-                div()
-                    .w(px(260.))
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap(px(4.)).relative().top(px(2.5))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_start()
-                            .gap(px(6.))
-                            .text_size(px(12.5)).line_height(px(17.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(status_color)
-                            .child(div().mt(px(5.)).child(dot(Self::tone_color(p, card.tone), 7.)))
-                            .child(div().flex_1().min_w_0().child(card.status.clone())),
-                    )
-                    .children(card.traffic.clone().map(|traffic| {
-                        div().text_size(px(12.)).text_color(p.tx2).font_family(MONO_FONT).child(traffic)
-                    }))
-                    .children(card.retry.clone().map(|retry| {
-                        let retry_id = id.clone();
-                        let (bg, fg) = if card.tone == Tone::Failed { (p.errs, p.err) } else { (p.warns, p.warn) };
-                        div()
-                            .id(("fwd-retry", ix))
-                            .h(px(24.))
-                            .px(px(10.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(8.))
-                            .bg(bg)
-                            .text_color(fg)
-                            .text_size(px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .hover(|d| d.opacity(0.8))
-                            .child(SharedString::from(retry.label))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(ForwardPanelEvent::Retry(retry_id.clone(), retry.action));
-                            }))
-                    })),
-            )
-            .child(Switch::new(("fwd-toggle", ix)).checked(enabled).color(p.ok).on_click(cx.listener(
-                move |_, checked: &bool, _, cx| {
-                    cx.emit(ForwardPanelEvent::Toggle(toggle_id.clone(), *checked));
-                },
-            )))
+            );
+        let mut bottom = None;
+        if stacked {
+            bottom = Some(status);
+        } else {
+            line = line.child(status);
+        }
+        line = line
+            .child(Switch::new(("fwd-toggle", ix)).checked(card.enabled).color(p.ok).on_click(
+                cx.listener(move |_, on: &bool, _, cx| cx.emit(ForwardPanelEvent::Toggle(toggle_id.clone(), *on))),
+            ))
             .child(
                 div()
                     .id(("fwd-delete", ix))
@@ -449,7 +476,23 @@ impl ForwardPanel {
                     .hover(|d| d.bg(p.card2))
                     .child("×")
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(ForwardPanelEvent::Delete(delete_id.clone())))),
-            )
+            );
+        div()
+            .id(("fwd-rule", ix))
+            .w_full()
+            .min_w_0()
+            .min_h(px(76.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .px(px(18.))
+            .py(px(16.))
+            .bg(p.card)
+            .rounded(CARD_RADIUS)
+            .shadow(card_shadow(p))
+            .child(line)
+            .children(bottom)
             .into_any_element()
     }
 
@@ -511,8 +554,10 @@ impl Render for ForwardPanel {
         let empty = self.view.cards.is_empty() && self.form.is_none();
         div()
             .id("forward-panel")
+            .relative()
             .track_focus(&self.focus)
-            .flex_1()
+            .size_full()
+            .min_w_0()
             .min_h_0()
             .flex()
             .flex_col()
@@ -522,5 +567,6 @@ impl Render for ForwardPanel {
             .children(form)
             .children(cards)
             .children(empty.then(|| self.render_empty(&p, cx)))
+            .child(crate::ui::observe_width(cx.entity().downgrade(), self.width, |this, width| this.width = width))
     }
 }

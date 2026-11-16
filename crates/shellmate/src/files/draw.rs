@@ -7,6 +7,7 @@ use gpui::assets::IconName as Lucide;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::Input;
 use gpui::component::popover::Popover;
+use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, Sizable as _};
 use gpui::prelude::*;
@@ -62,40 +63,38 @@ impl FilesPanel {
     }
 
     fn render_breadcrumbs(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let crumbs = self.model.crumbs();
-        let last = crumbs.len().saturating_sub(1);
-        let piece = |id: (&'static str, usize), label: String, dir: String, strong: bool, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .px(px(4.))
-                .py(px(2.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .font_weight(if strong { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                .text_color(if strong { p.tx } else { p.tx2 })
-                .hover(|d| d.bg(p.card2))
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.go_to(&dir, cx)))
+        let crumbs=self.model.crumbs();
+        let full=self.model.cwd().to_string();
+        let collapsed=full.chars().count()>38 || crumbs.len()>4;
+        let piece=|index:usize,label:String,dir:String,strong:bool,cx:&mut Context<Self>| {
+            let tip=dir.clone();
+            div().id(("crumb",index)).min_w_0().max_w(px(if strong{200.}else{90.})).px(px(4.)).py(px(2.)).rounded(px(6.))
+                .cursor_pointer().font_weight(if strong{FontWeight::BOLD}else{FontWeight::MEDIUM}).text_color(if strong{p.tx}else{p.tx2})
+                .tooltip(move |w,cx|Tooltip::new(tip.clone()).build(w,cx))
+                .child(div().truncate().child(label)).on_click(cx.listener(move |this,_,_,cx|this.go_to(&dir,cx)))
         };
-        div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .gap(px(4.))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .font_family(MONO_FONT)
-            .text_size(px(13.))
-            .child(piece(("crumb", 0), "/".into(), "/".into(), crumbs.is_empty(), cx))
-            .children(crumbs.into_iter().enumerate().map(|(i, (name, dir))| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(piece(("crumb", i + 1), name, dir, i == last, cx))
-                    .child(div().text_color(p.tx3).child("/"))
-            }))
+        let mut path=div().flex().flex_1().min_w_0().items_center().gap(px(4.)).whitespace_nowrap().font_family(MONO_FONT).text_size(px(13.))
+            .child(piece(0,"/".into(),"/".into(),crumbs.is_empty(),cx));
+        if collapsed && !crumbs.is_empty() {
+            let entries=crumbs.clone();let this=cx.entity().downgrade();
+            path=path.child(Button::new("hidden-path").ghost().compact().label("…").tooltip(full)
+                .dropdown_menu(move |mut menu,_,_| {
+                    for (_,dir) in &entries {
+                        let this=this.clone();let dir=dir.clone();
+                        menu=menu.item(PopupMenuItem::new(crate::layout::middle_ellipsis(&dir,64)).on_click(move |_,_,cx|{
+                            this.update(cx,|this,cx|this.go_to(&dir,cx)).ok();
+                        }));
+                    } menu
+                }));
+            let (name,dir)=crumbs.last().unwrap();
+            path=path.child(piece(crumbs.len(),crate::layout::middle_ellipsis(name,28),dir.clone(),true,cx));
+        } else {
+            let last=crumbs.len();
+            for (i,(name,dir)) in crumbs.into_iter().enumerate(){
+                path=path.child(piece(i+1,name,dir,i+1==last,cx)).child(div().flex_none().text_color(p.tx3).child("/"));
+            }
+        }
+        path
     }
 
     fn render_follow(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -194,15 +193,15 @@ impl FilesPanel {
         let offline = (!ready).then_some("连接就绪后可用");
         let no_selection = if ready { Some("先选中要下载的文件或目录") } else { offline };
         let can_download = self.model.download_path().is_some();
-        div()
-            .flex()
+        div().w_full().min_w_0()
+            .flex().flex_wrap()
             .items_center()
             .gap(px(10.))
             .pl(px(18.))
             .pr(px(14.))
             .pt(px(12.))
             .pb(px(10.))
-            .child(self.render_breadcrumbs(p, cx))
+            .child(div().min_w_0().flex().when(crate::layout::Responsive::at(self.width).files_toolbar_stacked,|d|d.w_full().flex_none()).when(!crate::layout::Responsive::at(self.width).files_toolbar_stacked,|d|d.flex_1()).child(self.render_breadcrumbs(p,cx)))
             .child(self.render_follow(p, cx))
             .child(
                 Self::tool("new-folder", "新建文件夹", false, offline, p)
@@ -216,6 +215,8 @@ impl FilesPanel {
                 Self::tool("upload", "上传", true, offline, p)
                     .when(ready, |d| d.on_click(cx.listener(|this, _, _, cx| this.pick_upload(cx)))),
             )
+            .when(!crate::layout::Responsive::at(self.width).files_inline_details,|d|d.child(Self::button("file-details-toggle","详情",false,p)
+                .on_click(cx.listener(|this,_,window,cx|{this.details_open = !this.details_open;window.focus(&this.focus,cx);cx.notify();}))))
             .child(
                 div()
                     .id("refresh")
@@ -324,9 +325,7 @@ impl FilesPanel {
                     .gap(px(10.))
                     .child(icon)
                     .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
+                        crate::ui::ellipsis(("file-name",index),name.clone()).flex_1()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(if selected {
                                 p.acc
@@ -334,8 +333,7 @@ impl FilesPanel {
                                 p.err
                             } else {
                                 p.tx
-                            })
-                            .child(name),
+                            }),
                     )
                     .children(note.map(|(text, color)| {
                         div().min_w_0().truncate().text_size(px(11.5)).text_color(color).child(text)
@@ -357,12 +355,12 @@ impl FilesPanel {
                 .when(selected, |d| d.bg(p.accs))
                 .when(!selected, |d| d.hover(|d| d.bg(p.card2)))
                 .child(name_cell)
-                .child(div().w(px(84.)).flex_none().text_right().text_size(px(12.)).text_color(p.tx2).child(size))
-                .child(div().w(px(110.)).flex_none().text_size(px(12.)).text_color(p.tx2).child(time))
+                .child(div().w(px(84.)).flex_none().whitespace_nowrap().text_right().text_size(px(12.)).text_color(p.tx2).child(size))
+                .child(div().w(px(110.)).flex_none().whitespace_nowrap().text_size(px(12.)).text_color(p.tx2).child(time))
                 .child(
                     div()
                         .w(px(104.))
-                        .flex_none()
+                        .flex_none().whitespace_nowrap()
                         .text_size(px(12.))
                         .font_family(MONO_FONT)
                         .text_color(p.tx2)
@@ -516,7 +514,7 @@ impl FilesPanel {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w_0()
+            .min_w_0().min_h_0()
             .rounded(crate::theme::CARD_RADIUS)
             .bg(p.card)
             .border_0()
@@ -549,7 +547,7 @@ impl FilesPanel {
             .flex()
             .gap(px(12.)).line_height(px(17.))
             .child(div().w(px(25.)).flex_none().text_color(p.tx2).child(label))
-            .child(div().flex_1().min_w_0().child(value))
+            .child(crate::ui::ellipsis(label,value).flex_1())
     }
 
     fn render_details(&self, window: &Window, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -594,19 +592,19 @@ impl FilesPanel {
         let can_apply = self.model.chmod_request().is_some();
         let rows = ["所有者", "用户组", "其他"];
         let columns = ["读", "写", "执行"];
-        div()
+        div().id("file-details")
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(268.))
+            .w(px(268.)).h_full().min_h_0().overflow_y_scroll()
             .gap(px(12.))
             .p(px(18.))
             .rounded(crate::theme::CARD_RADIUS)
             .bg(p.card)
             .shadow(card_shadow(p))
-            .child(div().text_size(px(17.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child(title))
+            .child(crate::ui::ellipsis("file-detail-name",title).flex_none().text_size(px(17.)).line_height(px(20.)).font_weight(FontWeight::BOLD))
             .child(
-                div()
+                div().flex_none()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
@@ -616,9 +614,9 @@ impl FilesPanel {
                     .child(Self::info_row("修改", time, p))
                     .child(Self::info_row("属主", owner, p)),
             )
-            .child(div().h(px(1.)).mt(px(4.)).bg(p.line))
+            .child(div().h(px(1.)).flex_none().mt(px(4.)).bg(p.line))
             .child(
-                div()
+                div().flex_none()
                     .flex()
                     .items_baseline()
                     .justify_between()
@@ -630,7 +628,7 @@ impl FilesPanel {
                     ),
             )
             .child(
-                div()
+                div().flex_none()
                     .id("perm-grid")
                     .track_focus(&self.perm_focus)
                     .flex()
@@ -784,33 +782,30 @@ impl FilesPanel {
 
 impl Render for FilesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_rename_input(window, cx);
-        let p = cx.palette().clone();
-        div()
-            .id("files-panel")
-            .key_context(CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(Self::on_previous))
-            .on_action(cx.listener(Self::on_next))
-            .on_action(cx.listener(Self::on_open))
-            .on_action(cx.listener(Self::on_parent))
-            .on_action(cx.listener(Self::on_delete))
-            .on_action(cx.listener(Self::on_escape))
+        self.sync_rename_input(window,cx);
+        let p=cx.palette().clone();
+        let inline=crate::layout::Responsive::at(self.width).files_inline_details;
+        div().id("files-panel").relative().key_context(CONTEXT).track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_previous)).on_action(cx.listener(Self::on_next))
+            .on_action(cx.listener(Self::on_open)).on_action(cx.listener(Self::on_parent))
+            .on_action(cx.listener(Self::on_delete)).on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_cancel_rename))
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .gap(px(10.))
-                    .child(self.render_files_card(&p, cx))
-                    .child(self.render_details(window, &p, cx)),
-            )
-            .children(self.render_queue(&p, cx))
-            .children(self.render_menu(&p, cx))
+            .size_full().min_w_0().min_h_0().flex().flex_col().gap(px(10.)).overflow_hidden()
+            .child(div().flex().flex_1().min_w_0().min_h_0().gap(px(10.))
+                .child(self.render_files_card(&p,cx))
+                .when(inline,|d|d.child(self.render_details(window,&p,cx))))
+            .children(self.render_queue(&p,cx))
+            .children(self.render_menu(&p,cx))
+            .when(!inline&&self.details_open,|d|d.child(
+                div().id("file-detail-overlay").absolute().inset_0().occlude().bg(p.scrim).flex().justify_end()
+                    .on_mouse_down(MouseButton::Left,cx.listener(|this,_,_,cx|{this.details_open=false;cx.notify();}))
+                    .child(div().id("file-detail-sheet").occlude().w(px(288.)).max_w_full().h_full().bg(p.card).rounded_l(px(18.))
+                        .on_mouse_down(MouseButton::Left,|_,_,cx|cx.stop_propagation())
+                        .flex().flex_col().p(px(10.))
+                        .child(div().flex().items_center().justify_between().h(px(36.)).flex_none()
+                            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("详情"))
+                            .child(Self::button("close-details","关闭",false,&p).on_click(cx.listener(|this,_,_,cx|{this.details_open=false;cx.notify();}))))
+                        .child(div().flex_1().min_h_0().child(self.render_details(window,&p,cx))))))
+            .child(crate::ui::observe_width(cx.entity().downgrade(),self.width,|this,width|this.width=width))
     }
 }

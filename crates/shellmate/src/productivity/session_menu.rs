@@ -76,15 +76,11 @@ impl Render for SessionMenu {
                     .hover(|d| d.bg(p.card2))
                     .child(dot(color, 7.))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
+                        crate::ui::ellipsis(("menu-session-title",id),s.title.clone()).flex_1()
                             .text_size(px(13.))
-                            .text_color(if self.active == Some(id) { p.acc } else { p.tx })
-                            .truncate()
-                            .child(s.title.clone()),
+                            .text_color(if self.active == Some(id) { p.acc } else { p.tx }),
                     )
-                    .child(div().text_size(px(11.)).text_color(p.tx2).child(s.subtitle()))
+                    .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(p.tx2).child(s.subtitle()))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(Event::Pick(id))))
             }))
     }
