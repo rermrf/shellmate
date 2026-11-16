@@ -79,8 +79,12 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     let (a, _) = answer(&client, &c)
         .await
         .unwrap_or_else(|e| panic!("follow-up failed: {e}"));
+    // Models often write `grep '[n]ginx'` so grep does not match itself; ignore bracket expressions.
+    let mentions = |command: &str, word: &str| {
+        command.replace(['[', ']'], "").to_lowercase().contains(word)
+    };
     assert!(
-        a.commands.iter().any(|card| card.command.contains("nginx")),
+        a.commands.iter().any(|card| mentions(&card.command, "nginx")),
         "follow-up command did not retain requested filter"
     );
     println!("PASS: two-turn continuity and streamed answer");

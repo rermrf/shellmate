@@ -129,7 +129,7 @@
 
 需要用户手测（写入 `docs/manual-tests.md` V1–V14）：真实指纹的 Touch ID、存储方式双向切换、闲置 / 合盖锁定、两台设备之间的配置包手动同步等。
 
-## M5 review 结论（2026-11-17，通过；真实接口测试待用户提供 Key）
+## M5 review 结论（2026-11-17，通过）
 
 - 用 rig-core 0.46.0：OpenAI 兼容走 Chat Completions（`OpenAIConfig::new(..).with_base_url(..).chat(model)`），Anthropic 走 rig 的 anthropic provider，统一成一个 `ProviderClient`。测试全部用 rig 的测试 HTTP 客户端，不开端口。rig 自带的 `Secret` 不会清零，所以配置里只放占位值，真实 Key 在发请求前经 HTTP middleware 注入，认证头标记为敏感。
 - 命令卡片：`propose_command` 只是一个"建议"工具，没有任何执行器；不支持工具的服务退回解析回答里的代码块。"插入"进入 P6 的发送确认，危险命令照样标红。
@@ -138,6 +138,6 @@
 - review 中修复：脱敏补上 `*_PWD`、`mysql -p<密码>`、`redis-cli -a`、`sshpass -p`、`--password=` 等长参数、`curl -u user:pass`，私钥块去除后不再残留字符；抽屉标题的上下文不再被截断（"历史"改为图标按钮）；错误提示条与"清除全部对话"按钮样式调整。
 - 界面还原：`ai` 3.1 % / 3.3 %（浅 / 深）；新增界面（多轮对话、历史、错误、未配置、AI 设置、解释报错）在 1440×900 与 1100×700 下截图确认。
 - 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1220 通过、0 失败。
-- 待办：用户提供 API Key 后运行真实接口测试 `cargo test -p shellmate-ai --test e2e real_two_turn_stream_commands_and_invalid_key -- --ignored`（Key 只经 `SHELLMATE_AI_KEY_FILE` 传入）。
+- 真实接口测试（2026-11-17，用户提供的 OpenAI 兼容服务，模型 gpt-5.6-luna）：`cargo test -p shellmate-ai --test e2e real_two_turn_stream_commands_and_invalid_key -- --ignored`（Key 只经 `SHELLMATE_AI_KEY_FILE` 传入）连续两次通过：流式回答、两轮对话连贯、端口命令卡片、错误 Key 的中文提示。第一次失败是测试断言过严：模型把后续命令写成 `grep '[n]ginx'`（避免匹配 grep 自身），断言改为忽略方括号。
 
 需要用户手测（写入 `docs/manual-tests.md` A1–A10）。
