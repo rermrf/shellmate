@@ -119,7 +119,7 @@ pub fn segmented(
                 .id(i)
                 .flex()
                 .flex_auto()
-                .when(editor, |d|d.flex_1().min_w_0())
+                .when(editor || host_filter, |d|d.flex_1().min_w_0())
                 .items_center()
                 .justify_center()
                 .gap(px(6.))
@@ -135,7 +135,7 @@ pub fn segmented(
                 })
                 .text_color(if item.active { p.tx } else { p.tx2 })
                 .when(item.active, |d| d.bg(p.card).shadow(item_shadow(&p)))
-                .child(item.label.clone())
+                .child(div().when(host_filter, |d|d.relative().top(px(-1.))).child(item.label.clone()))
                 .children(item.badge.clone().map(|b| {
                     div()
                         .px(px(5.))

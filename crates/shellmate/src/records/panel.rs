@@ -494,12 +494,12 @@ fn date_label(unix: i64) -> String {
 impl Render for RecordsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let mut list = div().id("archive-list").flex_1().min_h_0().overflow_y_scroll();
+        let mut list = div().id("archive-list").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(2.));
         if self.logs_tab {
             for (i, file) in self.logs.iter().enumerate() {
                 list = list.child(
                     div()
-                        .id(("log-file", i))
+                        .id(("log-file", i)).h(px(52.)).flex_none()
                         .px(px(12.)).py(px(10.))
                         .rounded(px(12.))
                         .cursor_pointer()
@@ -530,8 +530,7 @@ impl Render for RecordsWindow {
                 list = list.child(
                     div()
                         .id(("recording", row.id as usize))
-                        .h(px(58.))
-                        .mb(px(2.))
+                        .h(px(58.)).flex_none()
                         .px(px(12.))
                         .py(px(10.))
                         .rounded(px(13.))
@@ -561,7 +560,7 @@ impl Render for RecordsWindow {
                                 .child(div().flex_none().child(format!(
                                     "{} · {}",
                                     archive::mmss(row.duration),
-                                    shellmate_sftp::format_size(row.size)
+                                    shellmate_sftp::format_size(row.size).replace(".0 "," ")
                                 ))),
                         )
                         .children(error.map(|e| div().text_size(px(11.)).text_color(p.err).child(e)))
@@ -629,7 +628,7 @@ impl Render for RecordsWindow {
         let mut body = div()
             .flex_1()
             .min_w_0()
-            .pt(px(36.))
+            .pt(px(if self.logs_tab {40.} else {38.}))
             .flex()
             .flex_col()
             .gap(px(12.));
@@ -692,7 +691,7 @@ impl Render for RecordsWindow {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .rounded(px(18.)).shadow(card_shadow(&p)).py(px(10.))
+                        .rounded(px(18.)).shadow(card_shadow(&p)).pt(px(12.)).pb(px(10.))
                         .bg(p.card)
                         .overflow_hidden()
                         .child(

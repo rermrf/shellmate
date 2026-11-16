@@ -2,6 +2,7 @@
 
 pub mod dialogs;
 pub mod diff;
+mod gutter;
 pub mod lang;
 pub mod model;
 pub mod refusal;

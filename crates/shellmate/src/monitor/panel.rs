@@ -659,7 +659,7 @@ impl MonitorPanel {
                                     div()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(13.5))
+                                        .text_size(px(13.5)).line_height(px(if item.tag=="服务"{18.}else{19.}))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(item.title.clone()),
                                 ),
@@ -668,7 +668,7 @@ impl MonitorPanel {
                             div()
                                 .mt(px(4.))
                                 .truncate()
-                                .text_size(px(12.))
+                                .text_size(px(12.)).line_height(px(17.))
                                 .text_color(p.tx2)
                                 .font_family(MONO_FONT)
                                 .child(item.detail.clone()),
@@ -677,7 +677,7 @@ impl MonitorPanel {
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(12.5))
+                        .text_size(px(12.5)).line_height(px(17.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(p.acc)
                         .child(format!("{} →", item.action_label)),
@@ -694,7 +694,7 @@ impl MonitorPanel {
             .flex_1()
             .min_w_0()
             .gap(px(10.))
-            .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child("需要关注"))
+            .child(div().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child("需要关注"))
             .when(list.is_empty(), |d| {
                 d.child(
                     div()
@@ -742,7 +742,7 @@ impl MonitorPanel {
                     .flex()
                     .items_baseline()
                     .justify_between()
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child("各核占用"))
+                    .child(div().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child("各核占用"))
                     .children(temperature.map(|t| div().text_size(px(12.)).text_color(p.tx2).child(t))),
             )
             .child(div().flex().gap(px(22.)).children(model::core_columns(bars).into_iter().map(|column| {
@@ -756,7 +756,7 @@ impl MonitorPanel {
                         .flex()
                         .items_center()
                         .gap(px(10.))
-                        .text_size(px(12.5))
+                        .text_size(px(12.5)).line_height(px(17.))
                         .child(
                             div()
                                 .w(px(label_width))
@@ -774,14 +774,14 @@ impl MonitorPanel {
                         .child(div().w(px(38.)).flex_none().text_right().font_family(MONO_FONT).child(bar.text))
                 }))
             })))
-            .when(per_core.is_empty(), |d| d.child(div().text_size(px(12.5)).text_color(p.tx3).child("—")))
+            .when(per_core.is_empty(), |d| d.child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx3).child("—")))
             .child(div().h(px(1.)).bg(p.line).my(px(4.)))
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .justify_between()
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child("占用最高"))
+                    .child(div().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child("占用最高"))
                     .child(div().text_size(px(12.)).text_color(p.tx2).child("点击查看进程")),
             )
             .children(top.into_iter().map(|proc| {
@@ -795,7 +795,7 @@ impl MonitorPanel {
                     .px(px(8.))
                     .mx(px(-8.))
                     .rounded(px(10.))
-                    .text_size(px(12.5))
+                    .text_size(px(12.5)).line_height(px(17.))
                     .cursor_pointer()
                     .hover(|d| d.bg(p.card2))
                     .child(div().w(px(44.)).flex_none().font_family(MONO_FONT).text_color(p.tx2).child(pid.to_string()))

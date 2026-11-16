@@ -176,8 +176,8 @@ impl ForwardPanel {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).child(summary.title.clone()))
-                    .child(div().text_size(px(12.5)).text_color(p.tx2).child(summary.subtitle.clone()))
+                    .child(div().text_size(px(15.)).line_height(px(21.)).font_weight(FontWeight::BOLD).child(summary.title.clone()))
+                    .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child(summary.subtitle.clone()))
                     .children(
                         summary
                             .notes
@@ -352,8 +352,8 @@ impl ForwardPanel {
                     .text_color(fg)
                     .font_family(MONO_FONT)
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(14.))
-                    .child(card.flag),
+                    .text_size(px(14.)).line_height(px(19.))
+                    .child(div().relative().top(px(1.5)).child(card.flag)),
             )
             .child(
                 div()
@@ -367,14 +367,14 @@ impl ForwardPanel {
                             .flex()
                             .items_baseline()
                             .gap(px(8.))
-                            .child(div().text_size(px(14.)).font_weight(FontWeight::BOLD).child(card.name.clone()))
-                            .child(div().text_size(px(12.)).text_color(p.tx2).child(kind_name(card.kind))),
+                            .child(div().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child(card.name.clone()))
+                            .child(div().text_size(px(12.)).line_height(px(15.)).text_color(p.tx2).child(kind_name(card.kind))),
                     )
                     .child(
                         div()
                             .truncate()
                             .font_family(MONO_FONT)
-                            .text_size(px(12.5))
+                            .text_size(px(12.5)).line_height(px(17.)).relative().top(px(2.))
                             .text_color(p.tx2)
                             .child(card.route.clone()),
                     )

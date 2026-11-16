@@ -231,14 +231,14 @@ impl MonitorPanel {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(2.))
             .px(px(12.))
             .py(px(10.))
             .rounded(px(12.))
             .bg(p.card2)
-            .child(div().text_size(px(11.5)).text_color(p.tx2).child(caption))
+            .child(div().text_size(px(11.5)).line_height(px(16.)).text_color(p.tx2).child(caption))
             .child(
-                div().truncate().font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_size(px(14.)).child(value),
+                div().truncate().font_family(MONO_FONT).font_weight(FontWeight::BOLD).text_size(px(13.)).line_height(px(17.)).child(value),
             )
             .into_any_element()
     }
@@ -311,10 +311,10 @@ impl MonitorPanel {
                             .truncate()
                             .font_family(MONO_FONT)
                             .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.))
+                            .text_size(px(16.)).line_height(px(21.))
                             .child(detail.name.clone()),
                     )
-                    .child(div().text_size(px(12.5)).text_color(p.tx2).child(detail.description.clone())),
+                    .child(div().text_size(px(12.5)).line_height(px(15.)).text_color(p.tx2).child(detail.description.clone())),
             )
             .child(
                 div()
@@ -331,7 +331,7 @@ impl MonitorPanel {
                             .rounded(px(8.))
                             .bg(bg)
                             .text_color(fg)
-                            .text_size(px(12.))
+                            .text_size(px(12.)).line_height(px(15.))
                             .font_family(MONO_FONT)
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(detail.state.clone()),

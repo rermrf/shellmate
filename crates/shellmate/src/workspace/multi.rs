@@ -320,23 +320,25 @@ impl Workspace {
         let pane = |session: &Session, which: Pane, cx: &mut Context<Self>| {
             let focused = self.split.focus == which;
             let size = session.terminal.read(cx).size();
+            let term_palette=cx.terminal_style().palette;
             let mut header = div()
-                .h(px(32.))
+                .h(px(31.)).text_color(shellmate_term::colors::to_hsla(term_palette.foreground))
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .px(px(12.))
+                .px(px(14.))
                 .border_b_1()
                 .border_color(p.line)
-                .when(focused, |d| d.bg(p.accs))
+                .when(focused, |d| d.bg(gpui::rgba(0x6ca6ff24)))
                 .child(dot(session_dot(session, &p), 6.));
             if which == Pane::Other {
                 header = header.child(
                     div()
                         .id("split-session-title")
+                        .px(px(6.)).py(px(2.))
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD)
                         .child(format!("{} ▾", session.title))
                         .on_click(cx.listener(|this, event: &gpui::ClickEvent, w, cx| {
                             cx.stop_propagation();
@@ -344,19 +346,18 @@ impl Workspace {
                         })),
                 );
             } else {
-                header = header.child(div().text_size(px(12.)).child(session.title.clone()));
+                header = header.child(div().text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD).child(session.title.clone()));
             }
             header = header
                 .child(
                     div()
-                        .font_family(theme::MONO_FONT)
-                        .text_size(px(11.))
-                        .text_color(p.tx3)
+                        .text_size(px(11.5)).line_height(px(13.))
+                        .text_color(shellmate_term::colors::to_hsla(cx.terminal_style().palette.dim))
                         .child(if crate::prototype_fixture(){"66×38".to_string()}else{format!("{}×{}", size.cols, size.rows)}),
                 )
                 .child(div().flex_1())
                 .when(focused, |d| {
-                    d.child(div().text_size(px(11.5)).text_color(p.acc).child("输入焦点"))
+                    d.child(div().text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(shellmate_term::colors::to_hsla(term_palette.ansi[4])).child("输入焦点"))
                 });
             if which == Pane::Other {
                 header = header.child(
@@ -367,7 +368,7 @@ impl Workspace {
                         .bg(p.card2)
                         .px(px(7.))
                         .py(px(3.))
-                        .text_size(px(11.5))
+                        .text_size(px(11.)).line_height(px(13.))
                         .text_color(p.tx2)
                         .child(if self.split.axis == Axis::Horizontal {
                             "改为上下"

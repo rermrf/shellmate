@@ -130,13 +130,18 @@ impl Workspace {
                 size.rows = 40;
                 t.set_size(size);
                 let text = proto::ansi(&DATA[lines], dark);
-                t.attach(
-                    move |sink: OutputSink, _| {
-                        sink.output(text.as_bytes());
-                        Ok(Box::new(Inert))
-                    },
-                    cx,
-                );
+                if scene == "split" {
+                    // Let both real pane geometries settle before feeding mock output. Shrinking
+                    // a populated grid reflows and scrolls it, hiding the beginning of the fixture.
+                    cx.spawn(async move |terminal,cx| {
+                        cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                        terminal.update(cx,|t,cx|t.attach(move |sink:OutputSink,_| {
+                            sink.output(text.as_bytes());Ok(Box::new(Inert))
+                        },cx)).ok();
+                    }).detach();
+                } else {
+                    t.attach(move |sink:OutputSink,_| {sink.output(text.as_bytes());Ok(Box::new(Inert))},cx);
+                }
             });
             let view = cx.new(|cx| {
                 let mut v = TerminalView::new(terminal.clone(), cx.terminal_style(), cx);
@@ -361,9 +366,9 @@ impl Workspace {
                 for i in 0..20{let a=-std::f32::consts::FRAC_PI_2+i as f32*std::f32::consts::PI/28.;let point=gpui::point(center.x+px(a.cos()*16.),center.y+px(a.sin()*16.));if i==0{arc.move_to(point);}else{arc.line_to(point);}}
                 if let Ok(path)=arc.build(){window.paint_path(path,p.acc);}
             }).absolute().inset_0()))
-            .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child("网络已切换，正在重连"))
+            .child(div().text_size(px(17.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child("网络已切换，正在重连"))
             .child(div().text_center().text_size(px(13.)).line_height(px(21.)).text_color(p.tx2).child(format!("Wi-Fi「Office-5G」→ 有线网络 · 第 {attempt} / 5 次尝试\n恢复后自动还原标签、工作目录与端口转发")))
-            .child(div().flex().gap(px(8.)).child(Button::new("proto-retry").primary().w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("立即重连")).child(Button::new("proto-close").w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("关闭标签"))))
+            .child(div().flex().gap(px(8.)).mt(px(4.)).child(Button::new("proto-retry").primary().w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("立即重连")).child(Button::new("proto-close").w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("关闭标签"))))
         .into_any_element())
     }
     fn proto_hostkey(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {

@@ -414,7 +414,7 @@ impl Render for Picker {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(if history{14.}else{16.}))
                     .px(px(if history {14.} else {18.}))
                     .py(px(if history { 7. } else { 10. }))
                     .line_height(px(16.))
@@ -541,15 +541,15 @@ impl Render for Drawer {
                                 .child(
                                     div()
                                         .text_size(px(13.))
-                                        .line_height(px(18.))
+                                        .line_height(px(16.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(command.name.clone()),
                                 )
                                 .child(
                                     div()
-                                        .font_family(MONO_FONT)
+                                        .mt(px(2.)).font_family(MONO_FONT)
                                         .text_size(px(11.5))
-                                        .line_height(px(14.))
+                                        .line_height(px(15.))
                                         .text_color(p.tx2)
                                         .truncate()
                                         .child(command.command.clone()),

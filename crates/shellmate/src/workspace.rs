@@ -622,7 +622,7 @@ impl Workspace {
                 .cursor_pointer()
                 .text_size(px(13.)).line_height(px(16.))
                 .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
-                .when(!active, |d| d.text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
+                .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
                 .child(dot(session_dot(s, &p), 7.))
                 .child(s.title.clone())
                 .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id),|d|d.child(div().px(px(5.)).rounded(px(4.)).bg(p.warns).text_color(p.warn).text_size(px(10.)).child("广播")))
@@ -657,7 +657,7 @@ impl Workspace {
                         .justify_center()
                         .rounded(px(5.))
                         .hover(|d| d.bg(p.card3))
-                        .child(Icon::new(Lucide::X).size(px(12.)).text_color(p.tx3))
+                        .text_size(px(15.)).line_height(px(15.)).text_color(p.tx3).child("×")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close(ix, window, cx);
@@ -676,7 +676,7 @@ impl Workspace {
             .rounded(px(7.))
             .cursor_pointer()
             .hover(|d| d.bg(p.card3.opacity(0.7)))
-            .child(Icon::new(Lucide::Plus).size(px(16.)).text_color(p.tx2))
+            .child(Icon::new(Lucide::Plus).size(px(15.)).text_color(p.tx2))
             .tooltip(|window, cx| Tooltip::new("新建本机终端 ⌘T").build(window, cx))
             .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx)));
 

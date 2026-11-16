@@ -246,7 +246,7 @@ impl Sidebar {
             .bg(p.card)
             .shadow(card_shadow(&p))
             .child(Icon::new(Lucide::Search).size(px(15.)).text_color(p.tx3))
-            .child(div().flex_1().min_w_0().child(Input::new(&self.search).appearance(false).cleanable(true).p_0().h(px(18.)).text_size(px(13.)).line_height(px(18.))))
+            .child(div().flex_1().min_w_0().child(Input::new(&self.search).appearance(false).cleanable(true).p_0().h(px(18.)).text_size(px(13.)).line_height(px(18.)).relative().top(px(-1.)).left(px(2.5))))
             .child(div().id("sidebar-palette").cursor_pointer().child(kbd("⌘K",cx)).on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::SearchHosts))))
 
     }
@@ -281,7 +281,7 @@ impl Sidebar {
             .flex()
             .items_center()
             .gap(px(10.))
-            .h(px(50.)).mb(px(2.))
+            .h(px(51.)).mb(px(1.)).flex_none()
             .px(px(10.))
             .rounded(px(12.))
             .cursor_pointer()
@@ -301,8 +301,8 @@ impl Sidebar {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_size(px(13.5)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx).child("本机终端"))
-                    .child(div().text_size(px(11.5)).line_height(px(13.)).text_color(p.tx3).truncate().child(self.local_summary.clone())),
+                    .child(div().text_size(px(13.5)).line_height(px(19.)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx).child("本机终端"))
+                    .child(div().text_size(px(11.5)).line_height(px(13.)).mt(px(1.)).text_color(p.tx2).truncate().child(self.local_summary.clone())),
             )
             .child(kbd("⌘T", cx))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -320,17 +320,16 @@ impl Sidebar {
             .id(SharedString::from(format!("group-{key}")))
             .flex()
             .items_center()
-            .gap(px(6.5))
-            .h(px(31.))
-            .px(px(6.))
-            .mt(px(6.))
+            .gap(px(6.))
+            .h(px(25.)).flex_none()
+            .px(px(8.))
             .cursor_pointer()
             .text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::SEMIBOLD)
             .text_color(p.tx2)
             .child(
-                Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
-                    .size(px(12.))
-                    .text_color(p.tx3),
+                div().w(px(10.)).flex_none().child(Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
+                    .size(px(12.)).relative().left(px(-1.))
+                    .text_color(p.tx3)),
             )
             .child(div().flex_1().child(title))
             .child(div().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::MEDIUM).text_color(p.tx3).child(section.hosts.len().to_string()))
@@ -349,7 +348,7 @@ impl Sidebar {
                 .map(|h| self.render_host(h, tone, &p, cx).into_any_element())
                 .collect::<Vec<_>>()
         });
-        div().child(header).children(rows.into_iter().flatten())
+        div().flex().flex_col().flex_none().gap(px(2.)).child(header).children(rows.into_iter().flatten())
     }
 
     fn render_host(
@@ -374,7 +373,7 @@ impl Sidebar {
         let name_line = div()
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(5.))
             .child(
                 div()
                     .text_size(px(13.5)).line_height(px(16.))
@@ -383,15 +382,15 @@ impl Sidebar {
                     .truncate()
                     .child(host.name.clone()),
             )
-            .when(host.favorite, |d| d.child(div().flex_none().text_size(px(13.)).line_height(px(13.)).font_weight(FontWeight::NORMAL).text_color(p.warn).child("★")));
+            .when(host.favorite, |d| d.child(div().flex_none().text_size(px(11.)).line_height(px(13.)).font_weight(FontWeight::NORMAL).text_color(p.warn).child("★")));
 
         div()
             .id(SharedString::from(format!("host-{}", host.id)))
-            .relative().top(px(-2.))
+            .relative()
             .flex()
             .items_center()
             .gap(px(10.))
-            .h(px(52.))
+            .h(px(50.)).flex_none()
             .px(px(10.))
             .rounded(px(12.))
             .cursor_pointer()
@@ -403,16 +402,16 @@ impl Sidebar {
                     .flex_1()
                     .min_w_0()
                     .child(name_line)
-                    .child(div().text_size(px(11.5)).line_height(px(13.)).text_color(p.tx2).truncate().child(sub)),
+                    .child(div().mt(px(1.)).text_size(px(11.5)).line_height(px(13.)).text_color(p.tx2).truncate().child(sub)),
             )
             .children(host.badge().map(|b| {
                 div()
                     .flex_none()
                     .px(px(6.))
-                    .py(px(1.))
-                    .rounded(px(5.))
-                    .bg(p.card3.opacity(0.8))
-                    .text_size(px(10.5))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .bg(p.card3)
+                    .text_size(px(10.5)).line_height(px(12.))
                     .text_color(p.tx2)
                     .child(b)
             }))
@@ -657,7 +656,7 @@ impl Render for Sidebar {
                     .on_action(cx.listener(Self::connect_selected))
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll().pt(px(1.))
+                    .overflow_y_scroll().flex().flex_col().gap(px(12.)).pt(px(11.))
                     .pb(px(8.))
                     .children(list),
             )

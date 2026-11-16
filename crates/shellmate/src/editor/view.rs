@@ -1,5 +1,5 @@
 //! The editor modal: a title row with the file's name, language, place and status; the code editor
-//! of gpui-component with line numbers; and a footer. Everything it decides lives in
+//! of gpui-component with a synchronized line-number gutter; and a footer. Everything it decides lives in
 //! [`super::model`]; this feeds the model what happens and draws what it says.
 
 use std::cell::Cell;
@@ -14,9 +14,9 @@ use gpui::{
 use shellmate_sftp::{SftpError, TextFile, path};
 
 use super::dialogs::{ConflictAnswer, ConflictChoice, ConflictDialog, UnsavedAnswer, UnsavedChoice, UnsavedDialog};
-use super::diff;
 use super::lang::{self, Lang};
 use super::model::{EditModel, SaveEnd, SaveRequest, Tone};
+use super::{diff, gutter};
 use crate::files::format::{clock_hm, clock_now};
 use crate::files::panel::FilesPanel;
 use crate::theme::{ActivePalette, MONO_FONT, Palette};
@@ -89,10 +89,13 @@ impl FileEditor {
         let began = std::time::Instant::now();
         // No soft wrap, as in the prototype (`wrap=off`): long lines scroll sideways. Wrapping has to measure
         // every line of the file before the first frame, which takes seconds for a file of 5 MB.
-        let editor = cx.new(|cx| EditorState::new(window, cx).language(lang.token).soft_wrap(false));
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx).language(lang.token).soft_wrap(false).folding(false).line_number(false)
+        });
         // Not `default_value`: that is applied at the first paint, and may count as a change.
         editor.update(cx, |state, cx| state.set_value(file.text.clone(), window, cx));
         log::info!("编辑器：{} 载入缓冲区 {} 字节，用时 {} ms", name, file.text.len(), began.elapsed().as_millis());
+        let repaint_gutter = cx.observe(&editor, |_, _, cx| cx.notify());
         let subscription = cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::Change) {
                 this.on_edited(cx);
@@ -109,7 +112,7 @@ impl FileEditor {
             saving_text: None,
             save_task: None,
             dialog_open: false,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, repaint_gutter],
         }
     }
 
@@ -123,7 +126,10 @@ impl FileEditor {
             let on_cancel = editor.clone();
             dialog
                 .centered()
-                .w(px(1200.)).rounded(px(24.)).border_0().shadow(crate::dialogs::modal_shadow(None))
+                .w(px(1200.))
+                .rounded(px(24.))
+                .border_0()
+                .shadow(crate::dialogs::modal_shadow(None))
                 .p(px(0.))
                 .close_button(false)
                 .overlay_closable(false)
@@ -380,6 +386,82 @@ impl FileEditor {
     }
 }
 
+impl FileEditor {
+    /// A 52 px gutter, widened only for large line numbers. The editor publishes its scroll offset; only visible numbers are
+    /// shaped, and the code retains the component's selection, IME and horizontal scrolling.
+    fn gutter(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor = self.editor.clone();
+        let font_id = window.text_system().resolve_font(&gpui::font(MONO_FONT));
+        let digit = window.text_system().advance(font_id, px(13.), '0').map_or(7.8, |size| f32::from(size.width));
+        let width = gutter::width(editor.read(cx).text().lines_len(), digit);
+        let click_editor = editor.clone();
+        let scroll_editor = editor.clone();
+        let p = cx.palette().clone();
+        let origin = std::rc::Rc::new(Cell::new(gpui::point(px(0.), px(0.))));
+        let hit_origin = origin.clone();
+        div()
+            .id("code-line-numbers")
+            .w(px(width))
+            .h_full()
+            .flex_none()
+            .bg(p.card2)
+            .overflow_hidden()
+            .on_mouse_down(gpui::MouseButton::Left, move |event, w, cx| {
+                let offset = click_editor.read(cx).scroll_offset().y;
+                let row = gutter::row_at(
+                    f32::from(event.position.y - hit_origin.get().y),
+                    f32::from(offset),
+                    click_editor.read(cx).text().lines_len(),
+                ) as u32;
+                click_editor.update(cx, |state, cx| {
+                    state.set_cursor_position(gpui::component::input::Position::new(row, 0), w, cx)
+                });
+            })
+            .on_scroll(move |event, _, cx| {
+                let offset = scroll_editor.read(cx).scroll_offset();
+                let delta = event.delta.pixel_delta(px(21.));
+                scroll_editor
+                    .update(cx, |state, cx| state.set_scroll_offset(gpui::point(offset.x, offset.y + delta.y), cx));
+                cx.stop_propagation();
+            })
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        origin.set(bounds.origin);
+                    },
+                    move |bounds, _, window, cx| {
+                        let state = editor.read(cx);
+                        let offset = state.scroll_offset().y;
+                        let line_height = px(gutter::LINE);
+                        let top = bounds.top() + px(gutter::TOP) + offset;
+                        let visible =
+                            gutter::visible(f32::from(offset), f32::from(bounds.size.height), state.text().lines_len());
+                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            for row in visible {
+                                let text = (row + 1).to_string();
+                                let run = gpui::TextRun {
+                                    len: text.len(),
+                                    font: gpui::font(MONO_FONT),
+                                    color: p.tx3,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                };
+                                let line = window.text_system().shape_line(text.into(), px(13.), &[run], None);
+                                let at = gpui::point(
+                                    bounds.right() - px(gutter::RIGHT) - line.width,
+                                    top + line_height * row as f32,
+                                );
+                                let _ = line.paint(at, line_height, gpui::TextAlign::Left, None, window, cx);
+                            }
+                        });
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
 impl Render for FileEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
@@ -437,7 +519,8 @@ impl Render for FileEditor {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(17.)).line_height(px(20.))
+                                    .text_size(px(17.))
+                                    .line_height(px(20.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.tx)
                                     .child(self.name.clone()),
@@ -449,7 +532,8 @@ impl Render for FileEditor {
                                     .py(px(2.))
                                     .rounded(px(7.))
                                     .bg(p.card3)
-                                    .text_size(px(11.5)).line_height(px(13.))
+                                    .text_size(px(11.5))
+                                    .line_height(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.tx2)
                                     .child(self.lang.badge),
@@ -459,7 +543,8 @@ impl Render for FileEditor {
                                     .min_w_0()
                                     .truncate()
                                     .font_family(MONO_FONT)
-                                    .text_size(px(12.)).line_height(px(16.))
+                                    .text_size(px(12.))
+                                    .line_height(px(16.))
                                     .text_color(p.tx2)
                                     .child(self.place.clone()),
                             ),
@@ -469,7 +554,8 @@ impl Render for FileEditor {
                             .flex_none()
                             .max_w(px(420.))
                             .truncate()
-                            .text_size(px(12.5)).line_height(px(15.))
+                            .text_size(px(12.5))
+                            .line_height(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Self::tone_color(tone, &p))
                             .child(status),
@@ -484,7 +570,21 @@ impl Render for FileEditor {
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(Editor::new(&self.editor).appearance(false).bordered(false).h_full().font_family(MONO_FONT).text_size(px(13.)).line_height(px(21.)).pt(px(16.)).pl(px(18.))))
+            .child(
+                div().flex_1().min_h_0().flex().child(self.gutter(window, cx)).child(
+                    div().flex_1().min_w_0().child(
+                        Editor::new(&self.editor)
+                            .appearance(false)
+                            .bordered(false)
+                            .h_full()
+                            .font_family(MONO_FONT)
+                            .text_size(px(13.))
+                            .line_height(px(21.))
+                            .pt(px(8.))
+                            .pl(px(6.)),
+                    ),
+                ),
+            )
             .child(
                 div()
                     .flex()
@@ -495,7 +595,8 @@ impl Render for FileEditor {
                     .h(px(38.))
                     .border_t_1()
                     .border_color(p.line)
-                    .text_size(px(12.)).line_height(px(15.))
+                    .text_size(px(12.))
+                    .line_height(px(15.))
                     .text_color(p.tx2)
                     .child(footer)
                     .child("保存时经 SFTP 原子写回（临时文件 + rename），保留原权限与属主"),

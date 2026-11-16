@@ -159,7 +159,7 @@ impl MonitorPanel {
             .rounded(px(8.))
             .bg(bg)
             .text_color(fg)
-            .text_size(px(12.))
+            .text_size(px(12.)).line_height(px(15.))
             .font_weight(FontWeight::SEMIBOLD)
             .child(spec.label);
         element = if spec.enabled {
@@ -323,8 +323,8 @@ impl MonitorPanel {
                     .items_baseline()
                     .gap(px(10.))
                     .px(px(20.))
-                    .py(px(8.))
-                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).child(group.name.clone()))
+                    .py(px(6.))
+                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).line_height(px(17.)).child(group.name.clone()))
                     .child(
                         div()
                             .min_w_0()

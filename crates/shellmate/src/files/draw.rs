@@ -610,13 +610,13 @@ impl FilesPanel {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .text_size(px(12.5))
+                    .text_size(px(12.5)).line_height(px(17.))
                     .child(Self::info_row("类型", kind, p))
                     .child(Self::info_row("大小", size, p))
                     .child(Self::info_row("修改", time, p))
                     .child(Self::info_row("属主", owner, p)),
             )
-            .child(div().h(px(1.)).bg(p.line))
+            .child(div().h(px(1.)).mt(px(4.)).bg(p.line))
             .child(
                 div()
                     .flex()

@@ -415,6 +415,7 @@ impl HostEditor {
 
     fn input(&self, state: &Entity<InputState>, p: &Palette, mono: bool) -> Input {
         Input::new(state)
+            .flex_none()
             .bordered(false)
             .focus_bordered(false)
             .bg(p.card2)
@@ -427,7 +428,7 @@ impl HostEditor {
     }
 
     fn field(&self, label: &'static str, p: &Palette, control: impl IntoElement) -> gpui::Div {
-        div()
+        div().flex_none()
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -440,7 +441,7 @@ impl HostEditor {
             AuthMethod::Password => {
                 stack().gap(px(10.)).child(self.field("密码", p, self.input(&self.password, p, false).mask_toggle()))
             }
-            AuthMethod::PrivateKey => div()
+            AuthMethod::PrivateKey => div().flex_none()
                 .flex()
                 .flex_col()
                 .gap(px(10.))
@@ -521,7 +522,7 @@ impl HostEditor {
                 }
                 menu
             });
-        div()
+        div().flex_none()
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -757,12 +758,12 @@ impl Render for HostEditor {
                     .min_h_0()
                     .overflow_y_scroll()
                     .mx(px(24.))
-                    .pr(px(8.))
+                    .pr(px(0.))
                     .flex()
                     .flex_col()
                     .gap(px(12.))
                     .child(
-                        div()
+                        div().flex_none()
                             .flex()
                             .gap(px(14.))
                             .child(div().flex_1().min_w_0().child(self.field(
@@ -777,7 +778,7 @@ impl Render for HostEditor {
                             ))),
                     )
                     .child(
-                        div()
+                        div().flex_none()
                             .flex()
                             .gap(px(10.))
                             .child(div().flex_1().min_w_0().mr(px(4.)).child(self.field(
@@ -794,7 +795,7 @@ impl Render for HostEditor {
                     )
                     .child(self.field("标签（逗号分隔）", &p, self.input(&self.tags, &p, false)))
                     .child(
-                        div()
+                        div().flex_none()
                             .mt(px(6.))
                             .flex()
                             .flex_col()
@@ -810,7 +811,7 @@ impl Render for HostEditor {
                     )
                     .child(self.render_auth_details(&p, cx))
                     .child(
-                        div()
+                        div().flex_none()
                             .px(px(14.))
                             .py(px(12.))
                             .rounded(px(14.))

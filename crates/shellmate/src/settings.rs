@@ -145,15 +145,17 @@ impl Render for SettingsWindow {
                                 .p(px(16.))
                                 .min_h(px(100.))
                                 .rounded(px(18.))
-                                .border_1()
-                                .border_color(if selected { p.acc } else { p.line })
+                                .shadow(vec![gpui::BoxShadow {color:if selected{p.acc}else{p.line},offset:gpui::point(px(0.),px(0.)),blur_radius:px(0.),spread_radius:px(1.5),inset:false}])
                                 .bg(if selected { p.accs } else { p.card })
                                 .child(
                                     div()
                                         .text_size(px(14.))
                                         .line_height(px(17.))
                                         .font_weight(FontWeight::BOLD)
-                                        .child(format!("{}  {title}", if selected { "◉" } else { "○" })),
+                                        .flex().items_center().gap(px(8.))
+                                        .child(div().size(px(16.)).flex_none().rounded_full().border_1().border_color(if selected{p.acc}else{p.tx3})
+                                            .flex().items_center().justify_center().when(selected,|d|d.child(div().size(px(8.)).rounded_full().bg(p.acc))))
+                                        .child(title),
                                 )
                                 .child(
                                     div()
@@ -161,7 +163,7 @@ impl Render for SettingsWindow {
                                         .whitespace_normal()
                                         .mt(px(12.))
                                         .text_size(px(12.5))
-                                        .line_height(px(18.))
+                                        .line_height(px(20.))
                                         .text_color(p.tx2)
                                         .child(description),
                                 )
@@ -226,6 +228,22 @@ impl Render for SettingsWindow {
                     ),
             );
         } else {
+            if self.section==2 {
+                let style=cx.terminal_style();
+                let color=shellmate_term::colors::to_hsla;
+                let font=style.font_size;
+                let height=(font*style.line_height).round();
+                let row=|label:&'static str,value:String| div().flex().justify_between().text_size(px(13.)).line_height(px(18.))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(label)).child(div().text_color(p.tx2).child(value));
+                content=content.child(div().flex_none().px(px(18.)).py(px(16.)).rounded(px(18.)).bg(p.card).flex().flex_col().gap(px(10.))
+                    .child(row("字体",format!("{} {} · 中文回退 {} · 行高 {:.1}",style.font_family,f32::from(font),crate::theme::CJK_FALLBACK,style.line_height)))
+                    .child(div().px(px(14.)).py(px(12.)).rounded(px(12.)).bg(color(style.palette.background)).text_color(color(style.palette.foreground))
+                        .font_family(style.font_family).text_size(font).line_height(height).whitespace_nowrap().overflow_hidden().flex()
+                        .child(div().text_color(color(style.palette.ansi[2])).font_weight(FontWeight::BOLD).child("deploy@prod-web-01"))
+                        .child(":").child(div().text_color(color(style.palette.ansi[4])).font_weight(FontWeight::BOLD).child("~"))
+                        .child("$ echo \"宽字符占两格 ✓\" | wc -m"))
+                    .child(row("滚动缓冲",if self.preferences.get(P::SessionLog){"10,000 行 · 会话日志已开启"}else{"10,000 行 · 会话日志未开启"}.into())));
+            }
             let keys: &[P] = match self.section {
                 2 => &[
                     P::CopySelection,
@@ -239,14 +257,13 @@ impl Render for SettingsWindow {
                 3 => &[P::LoginShell],
                 _ => &[P::FollowDirectory],
             };
+            let mut rows=div().flex_none().rounded(px(18.)).bg(p.card).px(px(18.)).py(px(4.)).flex().flex_col();
             for key in keys {
                 let key = *key;
-                content = content.child(
+                rows = rows.child(
                     div()
-                        .px(px(18.))
+                        .min_h(px(56.)).flex_none()
                         .py(px(12.))
-                        .rounded(px(14.))
-                        .bg(p.card)
                         .flex()
                         .items_center()
                         .gap(px(12.))
@@ -299,6 +316,7 @@ impl Render for SettingsWindow {
                         ),
                 );
             }
+            content=content.child(rows);
         }
         div()
             .relative()

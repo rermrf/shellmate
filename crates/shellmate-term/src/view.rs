@@ -523,6 +523,7 @@ impl Render for TerminalView {
             .overflow_hidden()
             .rounded_tl(self.top_radius)
             .rounded_tr(self.top_radius)
+            .when(self.terminal.read(cx).is_replay(), |d| d.rounded_bl(self.top_radius).rounded_br(self.top_radius))
             .bg(to_hsla(self.style.palette.background))
             .child(div().size_full().px(px(18.)).py(px(14.)).cursor(CursorStyle::IBeam).child(element))
             .children(search)

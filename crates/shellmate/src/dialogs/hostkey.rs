@@ -117,11 +117,11 @@ impl HostKeyDialog {
                             .rounded(px(7.))
                             .bg(p.accs)
                             .text_color(p.acc)
-                            .text_size(px(12.))
+                            .text_size(px(12.)).line_height(px(15.))
                             .font_weight(FontWeight::BOLD)
                             .child("首次连接"),
                     )
-                    .child(div().text_size(px(12.5)).text_color(p.tx2).child("known_hosts 中没有此主机")),
+                    .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child("known_hosts 中没有此主机")),
             )
             .child(
                 div()
@@ -230,7 +230,7 @@ impl HostKeyDialog {
         let acknowledged = self.acknowledged;
         div().flex().flex_col()
             .child(div().pt(px(24.)).pb(px(18.)).px(px(26.)).rounded_t(px(26.)).bg(p.errs).flex().flex_col().gap(px(10.))
-                .child(div().flex().child(div().px(px(10.)).py(px(5.)).rounded(px(7.)).bg(p.err).text_color(gpui::white()).text_size(px(12.)).font_weight(FontWeight::BOLD).child("安全警告 · 连接已暂停")))
+                .child(div().flex().child(div().px(px(10.)).py(px(5.)).rounded(px(7.)).bg(p.err).text_color(gpui::white()).text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::BOLD).child("安全警告 · 连接已暂停")))
                 .child(div().text_size(px(23.)).line_height(px(32.)).font_weight(FontWeight::BOLD).text_color(p.err).child(format!("{} 的主机密钥已变更",self.request.host)))
                 .child(div().text_size(px(13.)).line_height(px(21.)).child(format!("服务器 {} 提供的密钥与 ~/.ssh/known_hosts {}记录不一致。可能是服务器重装，也可能有人正在进行中间人攻击。确认前不会发送任何凭据。",self.display_address(),if crate::prototype_fixture(){"第 14 行"}else{"中的"}))))
             .child(stack().p(px(26.)).pt(px(18.)).gap(px(14.))
