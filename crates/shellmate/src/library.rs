@@ -17,7 +17,7 @@ pub struct HostDraft {
     pub host: Host,
     /// Name of the group to put the host in; created if it does not exist yet. Empty: no group.
     pub group_name: String,
-    /// A password to store in the keychain.
+    /// A password to offer on the next authentication, kept only in memory.
     pub password: Option<Secret>,
 }
 
@@ -40,20 +40,26 @@ fn group_named(store: &mut HostStore, name: &str) -> Result<Group, String> {
     Ok(group)
 }
 
-/// Saves the host the editor produced, creating its group and storing its password.
-pub fn save_host(store: &mut HostStore, secrets: &dyn SecretStore, draft: HostDraft) -> Result<SaveOutcome, String> {
+/// Saves configuration only. Credentials require a successful authentication before persistence.
+pub fn save_host(store: &mut HostStore, _secrets: &dyn SecretStore, draft: HostDraft) -> Result<SaveOutcome, String> {
     let HostDraft { mut host, group_name, password } = draft;
+    drop(password); // The caller retains a separate in-memory authentication candidate.
     let group_name = group_name.trim();
     host.group = if group_name.is_empty() { None } else { Some(group_named(store, group_name)?.id) };
     store.save_host(&host).map_err(|e| e.to_string())?;
 
-    let mut outcome = SaveOutcome::default();
-    if let Some(password) = password
-        && let Err(err) = secrets.set(&SecretKey::HostPassword(host.id.clone()), &password)
-    {
-        outcome.keychain_warning = Some(err.to_string());
-    }
-    Ok(outcome)
+    Ok(SaveOutcome::default())
+}
+
+/// Validate and resolve an unsaved form using the exact library route rules, without mutations.
+pub fn editor_route(book: &shellmate_core::HostBook, host: &Host) -> Result<Vec<Host>, String> {
+    let mut scratch = HostStore::open_in_memory().map_err(|e| e.to_string())?;
+    for group in &book.groups { scratch.save_group(group).map_err(|e|e.to_string())?; }
+    let mut hosts = book.hosts.clone();
+    hosts.retain(|h|h.id != host.id);
+    hosts.push(host.clone());
+    scratch.save_hosts(&hosts).map_err(|e|e.to_string())?;
+    scratch.resolve_route(&host.id).map_err(|e|e.to_string())
 }
 
 /// Deletes a host and its keychain password. Refused while other hosts jump through it.
@@ -362,13 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn saving_stores_the_password_in_the_secret_store_only() {
+    fn saving_configuration_never_stores_an_unauthenticated_password() {
         let (mut store, secrets) = (store(), MemoryStore::new());
         let mut d = draft(&EditorFields { auth: AuthMethod::Password, password: "hunter2".into(), ..fields("n", "h") });
         let id = d.host.id.clone();
         d.group_name.clear();
         assert_eq!(save_host(&mut store, &secrets, d).unwrap(), SaveOutcome::default());
-        assert_eq!(secrets.get(&SecretKey::HostPassword(id)).unwrap().unwrap().expose(), "hunter2");
+        assert!(secrets.get(&SecretKey::HostPassword(id)).unwrap().is_none());
     }
 
     #[test]
@@ -388,7 +394,7 @@ mod tests {
         let mut store = store();
         let d = draft(&EditorFields { auth: AuthMethod::Password, password: "pw".into(), ..fields("n", "h") });
         let outcome = save_host(&mut store, &Failing, d).unwrap();
-        assert_eq!(outcome.keychain_warning.as_deref(), Some("钥匙串访问失败：无法访问钥匙串"));
+        assert_eq!(outcome, SaveOutcome::default());
         assert_eq!(store.hosts().unwrap().len(), 1);
         let id = store.hosts().unwrap()[0].id.clone();
         let warning = delete_host(&mut store, &Failing, &id).unwrap();
@@ -413,6 +419,26 @@ mod tests {
         assert!(store.host(&a_id).unwrap().unwrap().jump.is_empty(), "nothing was saved");
     }
 
+    #[test]
+    fn connection_test_uses_unsaved_values_and_preserves_route_validation() {
+        let first = Host::new("first","first.invalid");
+        let second = Host::new("second","second.invalid");
+        let mut target = Host::new("target","saved.invalid");
+        let book=shellmate_core::HostBook::new(vec![],vec![first.clone(),second.clone(),target.clone()]);
+        target.addr="unsaved.invalid".into();
+        target.port=2222;
+        target.jump=vec![second.id.clone(),first.id.clone()];
+        let route=editor_route(&book,&target).unwrap();
+        assert_eq!(route.iter().map(|h|h.name.as_str()).collect::<Vec<_>>(),["second","first","target"]);
+        assert_eq!(route.last().unwrap().addr,"unsaved.invalid");
+        assert_eq!(route.last().unwrap().port,2222);
+        assert_eq!(book.host(&target.id).unwrap().addr,"saved.invalid");
+        target.jump.push(target.id.clone());
+        assert!(editor_route(&book,&target).is_err());
+        target.jump=vec![Host::new("missing","missing.invalid").id];
+        assert!(editor_route(&book,&target).is_err());
+    }
+
     // ---- deleting ----
 
     #[test]
@@ -421,6 +447,7 @@ mod tests {
         let d = draft(&EditorFields { auth: AuthMethod::Password, password: "pw".into(), ..fields("n", "h") });
         let id = d.host.id.clone();
         save_host(&mut store, &secrets, d).unwrap();
+        secrets.set(&SecretKey::HostPassword(id.clone()), &Secret::new("authenticated-password")).unwrap();
         let other = SecretKey::KeyPassphrase("/keys/shared".into());
         secrets.set(&other, &Secret::new("kept")).unwrap();
 
@@ -442,6 +469,7 @@ mod tests {
         let db = draft(&EditorFields { jumps: vec![id.clone()], ..fields("db", "d.example.com") });
         save_host(&mut store, &secrets, bastion).unwrap();
         save_host(&mut store, &secrets, db).unwrap();
+        secrets.set(&SecretKey::HostPassword(id.clone()), &Secret::new("authenticated-password")).unwrap();
 
         let err = delete_host(&mut store, &secrets, &id).unwrap_err();
         assert_eq!(err, "无法删除「bastion」：主机「db」将它用作跳板机");

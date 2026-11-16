@@ -67,6 +67,7 @@ pub fn data(scene: &str, dark: bool) -> MonitorData {
             }
         })
         .collect();
+    snapshot.processes.sort_by_key(|process| process.pid); // Snapshot::process uses binary search.
     snapshot.zombies = 0; // The captured attention list has services, containers, and disk only.
     data.snapshot = Some(Arc::new(snapshot));
     let services = DATA["SERVICES"]
@@ -128,6 +129,7 @@ mod tests {
                 let model = data(scene, dark);
                 let snapshot = model.snapshot.unwrap();
                 assert_eq!(snapshot.processes.len(), 15);
+                assert!(snapshot.process(2207).is_some(), "the fixture must support binary PID lookup for selection");
                 assert_eq!(snapshot.host.cores, 4);
                 assert_eq!(model.services.unwrap().services.len(), DATA["SERVICES"].a().len());
                 assert_eq!(model.docker.unwrap().containers.len(), 6);

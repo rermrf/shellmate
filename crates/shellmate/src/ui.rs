@@ -101,7 +101,9 @@ pub fn segmented(
     let p = cx.palette().clone();
     let on_pick = std::rc::Rc::new(on_pick);
     let id = id.into();
+    let process_sort = id == ElementId::Name("process-sort".into());
     let panels = id == ElementId::Name("panels".into());
+    let editor = matches!(&id, ElementId::Name(name) if matches!(name.as_ref(),"editor-protocol"|"editor-auth"));
     let host_filter = id == ElementId::Name("host-filter".into());
     div()
         .id(id)
@@ -117,14 +119,15 @@ pub fn segmented(
                 .id(i)
                 .flex()
                 .flex_auto()
+                .when(editor, |d|d.flex_1().min_w_0())
                 .items_center()
                 .justify_center()
                 .gap(px(6.))
-                .h(px(if panels { 30. } else { 28. }))
-                .px(px(14.))
+                .h(px(if editor {32.} else if panels { 30. } else { 28. }))
+                .px(px(if process_sort {12.}else{14.}))
                 .rounded(px(if panels { 9. } else { 8. }))
-                .text_size(px(if host_filter { 12.5 } else { 13. }))
-                .line_height(px(if host_filter { 15. } else { 16. }))
+                .text_size(px(if host_filter || process_sort { 12.5 } else { 13. }))
+                .line_height(px(if host_filter || process_sort { 15. } else { 16. }))
                 .font_weight(if item.active {
                     FontWeight::SEMIBOLD
                 } else {
@@ -148,7 +151,7 @@ pub fn segmented(
                     .when(!item.active, |d| d.hover(|d| d.text_color(p.tx)))
                     .on_click(move |_, window, cx| on_pick(i, window, cx));
             } else {
-                seg = seg.opacity(0.4).cursor_not_allowed();
+                seg = seg.when(!editor, |d|d.opacity(0.4)).cursor_not_allowed();
             }
             if let Some(tip) = item.tooltip {
                 seg = seg.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));

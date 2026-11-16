@@ -116,14 +116,14 @@ impl FileEditor {
     /// Opens `editor` as a modal over the window (one at a time: the modal sees to that).
     pub fn open(editor: Entity<Self>, window: &mut Window, cx: &mut App) {
         let first_build = Cell::new(true);
-        window.open_dialog(cx, move |dialog, window, cx| {
+        crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
             if first_build.replace(false) {
                 editor.update(cx, |editor, cx| editor.focus(window, cx));
             }
             let on_cancel = editor.clone();
             dialog
                 .centered()
-                .w(px(1200.))
+                .w(px(1200.)).rounded(px(24.)).border_0().shadow(crate::dialogs::modal_shadow(None))
                 .p(px(0.))
                 .close_button(false)
                 .overlay_closable(false)
@@ -437,7 +437,7 @@ impl Render for FileEditor {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(17.))
+                                    .text_size(px(17.)).line_height(px(20.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(p.tx)
                                     .child(self.name.clone()),
@@ -449,7 +449,7 @@ impl Render for FileEditor {
                                     .py(px(2.))
                                     .rounded(px(7.))
                                     .bg(p.card3)
-                                    .text_size(px(11.5))
+                                    .text_size(px(11.5)).line_height(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.tx2)
                                     .child(self.lang.badge),
@@ -459,7 +459,7 @@ impl Render for FileEditor {
                                     .min_w_0()
                                     .truncate()
                                     .font_family(MONO_FONT)
-                                    .text_size(px(12.))
+                                    .text_size(px(12.)).line_height(px(16.))
                                     .text_color(p.tx2)
                                     .child(self.place.clone()),
                             ),
@@ -469,7 +469,7 @@ impl Render for FileEditor {
                             .flex_none()
                             .max_w(px(420.))
                             .truncate()
-                            .text_size(px(12.5))
+                            .text_size(px(12.5)).line_height(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(Self::tone_color(tone, &p))
                             .child(status),
@@ -484,7 +484,7 @@ impl Render for FileEditor {
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(Editor::new(&self.editor).appearance(false).bordered(false).h_full()))
+            .child(div().flex_1().min_h_0().child(Editor::new(&self.editor).appearance(false).bordered(false).h_full().font_family(MONO_FONT).text_size(px(13.)).line_height(px(21.)).pt(px(16.)).pl(px(18.))))
             .child(
                 div()
                     .flex()
@@ -492,10 +492,10 @@ impl Render for FileEditor {
                     .items_center()
                     .gap(px(16.))
                     .px(px(22.))
-                    .py(px(10.))
+                    .h(px(38.))
                     .border_t_1()
                     .border_color(p.line)
-                    .text_size(px(12.))
+                    .text_size(px(12.)).line_height(px(15.))
                     .text_color(p.tx2)
                     .child(footer)
                     .child("保存时经 SFTP 原子写回（临时文件 + rename），保留原权限与属主"),

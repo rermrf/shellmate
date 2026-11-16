@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use shellmate_core::{AuthMethod, FingerprintState, Host, HostId, PtyDims, Secret};
 use shellmate_ssh::{
-    ChallengeRequest, ConnectEvent, ConnectOptions, Connection, HostKeyRequest, HostKeyVerifier, HostSecrets,
-    PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError, WeakConnection,
+    ChallengeRequest, ConnectEvent, ConnectOptions, Connection, HostKeyDecision, HostKeyRequest, HostKeyVerifier,
+    HostSecrets, PassphraseRequest, PasswordRequest, PendingShell, Prompter, Route, SshError, WeakConnection,
 };
 use shellmate_store::{SecretKey, SecretStore};
 use tokio::sync::oneshot;
 
 /// A password or passphrase the user typed, and whether to remember it in the keychain.
+#[derive(Clone)]
 pub struct Answer {
     pub secret: Secret,
     pub save: bool,
@@ -35,7 +36,7 @@ pub enum UiMsg {
     /// Progress to print in the terminal.
     Event(ConnectEvent),
     /// Trust this host key?
-    HostKey { request: HostKeyRequest, reply: oneshot::Sender<bool> },
+    HostKey { request: HostKeyRequest, reply: oneshot::Sender<HostKeyDecision> },
     /// Ask for a password.
     Password { request: PasswordRequest, reply: oneshot::Sender<Option<Answer>> },
     /// Ask for a private key passphrase.
@@ -148,6 +149,15 @@ impl AuthMemory {
     }
 }
 
+/// An editor credential bound to the exact endpoint and authentication method it was entered for.
+/// Secrets are only persisted after a matching Authenticated event.
+#[derive(Clone)]
+pub struct FormCredential {
+    pub method: AuthMethod,
+    pub key: Option<PathBuf>,
+    pub answer: Answer,
+}
+
 /// The UI side of one connection attempt.
 pub struct UiBridge {
     tx: async_channel::Sender<UiMsg>,
@@ -171,6 +181,7 @@ pub struct UiBridge {
     reused: Mutex<HashSet<PathBuf>>,
     /// What authenticated earlier on this connection.
     memory: Arc<AuthMemory>,
+    form: Mutex<HashMap<Endpoint, FormCredential>>,
 }
 
 /// An answer that may be saved once it is known to have worked.
@@ -201,7 +212,36 @@ impl UiBridge {
             typed_challenge: Mutex::new(HashMap::new()),
             reused: Mutex::new(HashSet::new()),
             memory,
+            form: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn supply_form(&self, endpoint: Endpoint, credential: FormCredential) {
+        lock(&self.form).insert(endpoint, credential);
+    }
+
+    fn apply_form(&self, route: &mut Route, known: &mut HashMap<Endpoint, Secret>) {
+        for hop in route.via.iter_mut().chain(std::iter::once(&mut route.target)) {
+            let endpoint = Endpoint { host: hop.host.clone(), port: hop.port, user: hop.user.clone() };
+            let form = lock(&self.form);
+            let Some(credential) = form.get(&endpoint).filter(|c| hop.auth.first() == Some(&c.method)) else {
+                continue;
+            };
+            match credential.method {
+                AuthMethod::Password => {
+                    hop.password = Some(credential.answer.secret.clone());
+                    known.insert(endpoint.clone(), credential.answer.secret.clone());
+                    self.remember(Candidate::Password(endpoint), &credential.answer);
+                }
+                AuthMethod::PrivateKey if credential.key == hop.identity_file => {
+                    if let Some(key) = &credential.key {
+                        hop.passphrase = Some(credential.answer.secret.clone());
+                        self.remember(Candidate::Passphrase(key.clone()), &credential.answer);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Remembers the keychain passwords used for autofill.
@@ -293,11 +333,14 @@ impl UiBridge {
 #[async_trait]
 impl HostKeyVerifier for UiBridge {
     async fn verify(&self, request: HostKeyRequest) -> bool {
+        self.decide(request).await != HostKeyDecision::Reject
+    }
+    async fn decide(&self, request: HostKeyRequest) -> HostKeyDecision {
         let (reply, answer) = oneshot::channel();
         if self.tx.send(UiMsg::HostKey { request, reply }).await.is_err() {
-            return false;
+            return HostKeyDecision::Reject;
         }
-        answer.await.unwrap_or(false)
+        answer.await.unwrap_or(HostKeyDecision::Reject)
     }
 }
 
@@ -434,6 +477,7 @@ pub async fn connect_attempt(
                 .map_err(|err| SshError::Unsupported(err.to_string()))??
         };
         bridge.memory.apply(&mut route, &mut known);
+        bridge.apply_form(&mut route, &mut known);
         bridge.set_known_passwords(known);
 
         let events = bridge.clone();
@@ -452,27 +496,56 @@ pub async fn connect_attempt(
     };
     let outcome = attempt.await;
 
-    let saves = bridge.take_confirmed_saves();
-    let saves = if saves.is_empty() {
-        SaveReport::default()
-    } else {
-        tokio::task::spawn_blocking(move || {
-            let mut report = SaveReport::default();
-            for (key, secret) in saves {
-                match secrets.set(&key, &secret) {
-                    Ok(()) => report.saved.push(key),
-                    Err(err) => report.errors.push(err.to_string()),
-                }
-            }
-            report
-        })
-        .await
-        .unwrap_or_default()
-    };
+    let saves = persist_confirmed(&bridge, secrets).await;
     match outcome {
         Ok((connection, shells)) => Ok(Connected { connection, shells, saves }),
         Err(error) => Err(ConnectFailure { error, saves }),
     }
+}
+
+/// Authenticate the form's route without creating a session channel or running a command.
+pub async fn test_connection(
+    chain: Vec<Host>,
+    secrets: Arc<dyn SecretStore>,
+    bridge: Arc<UiBridge>,
+) -> Result<(Option<AuthMethod>, SaveReport), ConnectFailure> {
+    let attempt = async {
+        let source = secrets.clone();
+        let (mut route, mut known) =
+            tokio::task::spawn_blocking(move || build_route(&chain, source.as_ref(), &default_user()))
+                .await
+                .map_err(|e| SshError::Unsupported(e.to_string()))??;
+        bridge.apply_form(&mut route, &mut known);
+        bridge.set_known_passwords(known);
+        let events = bridge.clone();
+        let options = ConnectOptions::new(bridge.clone(), bridge.clone()).with_event_handler(move |e| events.event(e));
+        Connection::test(route, options).await
+    }
+    .await;
+    let saves = persist_confirmed(&bridge, secrets).await;
+    match attempt {
+        Ok(method) => Ok((method, saves)),
+        Err(error) => Err(ConnectFailure { error, saves }),
+    }
+}
+
+async fn persist_confirmed(bridge: &UiBridge, secrets: Arc<dyn SecretStore>) -> SaveReport {
+    let saves = bridge.take_confirmed_saves();
+    if saves.is_empty() {
+        return SaveReport::default();
+    }
+    tokio::task::spawn_blocking(move || {
+        let mut report = SaveReport::default();
+        for (key, secret) in saves {
+            match secrets.set(&key, &secret) {
+                Ok(()) => report.saved.push(key),
+                Err(err) => report.errors.push(err.to_string()),
+            }
+        }
+        report
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // ---- wording ---------------------------------------------------------------------------
@@ -499,10 +572,16 @@ pub fn format_event(event: &ConnectEvent, names: &HashMap<String, String>) -> St
         ConnectEvent::HostKeyVerified { key, state, saved, .. } => {
             let kind = key.short_algorithm();
             match (state, saved) {
-                (FingerprintState::Known, _) => format!("{GREEN}✓ 主机指纹已校验 {kind} · known_hosts"),
-                (FingerprintState::New, true) => format!("{GREEN}✓ 已信任新主机指纹 {kind} · 已写入 known_hosts"),
-                (FingerprintState::Changed, true) => format!("{GREEN}✓ 已更新 known_hosts 中的主机指纹 {kind}"),
-                (_, false) => format!("{YELLOW}! 已信任主机指纹 {kind}，但无法写入 known_hosts（下次仍会询问）"),
+                (FingerprintState::Known, _) => {
+                    format!("{GREEN}✓ 主机指纹已校验 {kind} · known_hosts")
+                }
+                (FingerprintState::New, true) => {
+                    format!("{GREEN}✓ 已信任新主机指纹 {kind} · 已写入 known_hosts")
+                }
+                (FingerprintState::Changed, true) => {
+                    format!("{GREEN}✓ 已更新 known_hosts 中的主机指纹 {kind}")
+                }
+                (_, false) => format!("{YELLOW}! 本次连接已信任主机指纹 {kind} · 未写入 known_hosts（下次仍会询问）"),
             }
         }
         ConnectEvent::Authenticated { method, .. } => match method {
@@ -575,6 +654,64 @@ mod tests {
     }
 
     #[test]
+    fn form_credentials_require_matching_authentication_and_keychain_opt_in() {
+        for method in [AuthMethod::Password, AuthMethod::PrivateKey] {
+            for save in [false, true] {
+                let mut host = host("edited", "example.invalid", 22, Some("alice"));
+                host.auth = method;
+                host.identity_file = Some("/temporary/selected-key".into());
+                let (bridge, _rx) = bridge_for(&[host.clone()]);
+                let endpoint = Endpoint::of(&host, "me");
+                bridge.supply_form(
+                    endpoint,
+                    FormCredential {
+                        method,
+                        key: host.identity_file.clone(),
+                        answer: Answer { secret: Secret::new("temporary-secret"), save },
+                    },
+                );
+                let (mut route, mut known) = build_route(&[host.clone()], &MemoryStore::new(), "me").unwrap();
+                bridge.apply_form(&mut route, &mut known);
+                let applied = if method == AuthMethod::Password {
+                    route.target.password.as_ref()
+                } else {
+                    route.target.passphrase.as_ref()
+                };
+                assert_eq!(applied.map(Secret::expose), Some("temporary-secret"));
+                assert!(bridge.take_confirmed_saves().is_empty(), "form submission is not authentication");
+                bridge.event(ConnectEvent::Authenticated {
+                    host: host.addr.clone(),
+                    port: host.port,
+                    user: "alice".into(),
+                    method: Some(method),
+                    key_file: host.identity_file.clone(),
+                });
+                assert_eq!(bridge.take_confirmed_saves().len(), usize::from(save));
+                assert!(bridge.take_confirmed_saves().is_empty(), "persist exactly once");
+            }
+        }
+    }
+
+    #[test]
+    fn edited_endpoint_or_key_does_not_receive_stale_form_credentials() {
+        let mut host = host("edited", "example.invalid", 22, Some("alice"));
+        host.identity_file = Some("/temporary/new-key".into());
+        let (bridge, _rx) = bridge_for(&[host.clone()]);
+        bridge.supply_form(
+            Endpoint::of(&host, "me"),
+            FormCredential {
+                method: AuthMethod::PrivateKey,
+                key: Some("/temporary/old-key".into()),
+                answer: Answer { secret: Secret::new("temporary-secret"), save: true },
+            },
+        );
+        let (mut route, mut known) = build_route(&[host], &MemoryStore::new(), "me").unwrap();
+        bridge.apply_form(&mut route, &mut known);
+        assert!(route.target.passphrase.is_none());
+        assert!(bridge.take_confirmed_saves().is_empty());
+    }
+
+    #[test]
     fn event_lines_follow_the_prototype_wording() {
         let chain = [host("bastion", "bastion.example.com", 22, None), host("db", "10.0.2.8", 22, None)];
         let names = names_by_address(&chain);
@@ -598,7 +735,7 @@ mod tests {
         assert_eq!(line(verified(FingerprintState::Known, true)), "\x1b[32m✓ 主机指纹已校验 ED25519 · known_hosts");
         assert!(line(verified(FingerprintState::New, true)).contains("已写入 known_hosts"));
         assert!(line(verified(FingerprintState::Changed, true)).contains("已更新 known_hosts"));
-        assert!(line(verified(FingerprintState::New, false)).contains("无法写入 known_hosts"));
+        assert!(line(verified(FingerprintState::New, false)).contains("未写入 known_hosts"));
         let authed = |method| ConnectEvent::Authenticated {
             host: "h".into(),
             port: 22,
@@ -657,7 +794,7 @@ mod tests {
             panic!("expected a host key question")
         };
         assert_eq!(seen, request);
-        reply.send(true).unwrap();
+        reply.send(HostKeyDecision::Save).unwrap();
         assert!(asking.await.unwrap());
 
         // The dialog goes away without answering: that is a refusal.
@@ -1035,18 +1172,19 @@ mod tests {
         let memory = AuthMemory::new();
         let (bridge, rx) = bridge_with(std::slice::from_ref(&web), memory.clone());
 
-        let answer = |bridge: &Arc<UiBridge>, rx: &async_channel::Receiver<UiMsg>, round, prompt: &'static str, typed| {
-            let (bridge, rx, web) = (bridge.clone(), rx.clone(), web.clone());
-            async move {
-                let asking = tokio::spawn({
-                    let bridge = bridge.clone();
-                    async move { bridge.challenge(challenge(&web, round, &[(prompt, false)])).await }
-                });
-                let Ok(UiMsg::Challenge { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
-                reply.send(Some(vec![Secret::new(typed)])).ok().unwrap();
-                asking.await.unwrap().unwrap();
-            }
-        };
+        let answer =
+            |bridge: &Arc<UiBridge>, rx: &async_channel::Receiver<UiMsg>, round, prompt: &'static str, typed| {
+                let (bridge, rx, web) = (bridge.clone(), rx.clone(), web.clone());
+                async move {
+                    let asking = tokio::spawn({
+                        let bridge = bridge.clone();
+                        async move { bridge.challenge(challenge(&web, round, &[(prompt, false)])).await }
+                    });
+                    let Ok(UiMsg::Challenge { reply, .. }) = rx.recv().await else { panic!("expected a dialog") };
+                    reply.send(Some(vec![Secret::new(typed)])).ok().unwrap();
+                    asking.await.unwrap().unwrap();
+                }
+            };
         answer(&bridge, &rx, 1, "Password: ", "kbd-pw").await;
         answer(&bridge, &rx, 2, "Verification code: ", "123456").await;
         authenticated(&bridge, &web, Some(AuthMethod::KeyboardInteractive), None);
@@ -1128,7 +1266,10 @@ mod tests {
         asking.abort();
         assert!(asking.await.unwrap_err().is_cancelled());
         assert!(reply.is_closed(), "the dialog's reply channel reports the question as cancelled");
-        assert!(reply.send(Some(Answer { secret: Secret::new("late"), save: false })).is_err(), "a late answer goes nowhere");
+        assert!(
+            reply.send(Some(Answer { secret: Secret::new("late"), save: false })).is_err(),
+            "a late answer goes nowhere"
+        );
         assert!(saved(&bridge).is_empty());
     }
 }

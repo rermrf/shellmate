@@ -80,7 +80,7 @@ impl RecordsWindow {
                 view.top_radius = px(18.);
                 view
             });
-            let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索日志"));
+            let query = cx.new(|cx| InputState::new(window, cx).placeholder("过滤日志"));
             let subscription = cx.subscribe(&query, |this: &mut Self, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.filter(cx);
@@ -500,26 +500,23 @@ impl Render for RecordsWindow {
                 list = list.child(
                     div()
                         .id(("log-file", i))
-                        .p(px(12.))
-                        .rounded(px(13.))
+                        .px(px(12.)).py(px(10.))
+                        .rounded(px(12.))
                         .cursor_pointer()
                         .when(self.selected == i, |d| d.bg(p.card).shadow(card_shadow(&p)))
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(px(13.5)).line_height(px(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(file.host.clone()),
                         )
                         .child(
                             div()
-                                .mt(px(4.))
-                                .text_size(px(11.5))
+                                .mt(px(3.)).flex().items_center().justify_between()
+                                .text_size(px(11.5)).line_height(px(13.))
                                 .text_color(p.tx2)
-                                .child(format!(
-                                    "{} · {}",
-                                    file.date,
-                                    shellmate_sftp::format_size(file.size)
-                                )),
+                                .child(file.date.clone())
+                                .child(shellmate_sftp::format_size(file.size).replace(".0 ", " ")),
                         )
                         .on_click(cx.listener(move |s, _, _, cx| s.select(i, cx))),
                 );
@@ -644,7 +641,7 @@ impl Render for RecordsWindow {
             body = body
                 .child(
                     div()
-                        .h(px(38.))
+                        .h(px(34.))
                         .flex_none()
                         .flex()
                         .items_center()
@@ -654,15 +651,16 @@ impl Render for RecordsWindow {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(17.))
-                                .line_height(px(20.))
+                                .font_family(MONO_FONT).text_size(px(17.))
+                                .line_height(px(22.))
                                 .font_weight(FontWeight::BOLD)
                                 .child(heading),
                         )
                         .child(
-                            div().w(px(218.)).child(
+                            div().w(px(264.)).child(
                                 Input::new(&self.query)
-                                    .appearance(false)
+                                    .bordered(false).bg(p.card).rounded(px(11.))
+                                    .prefix(gpui::component::Icon::new(gpui::assets::IconName::Search).size(px(14.)).text_color(p.tx3))
                                     .h(px(34.))
                                     .text_size(px(13.)),
                             ),
@@ -672,7 +670,7 @@ impl Render for RecordsWindow {
                                 .h(px(34.))
                                 .px(px(12.))
                                 .text_size(px(12.5))
-                                .rounded(px(10.))
+                                .rounded(px(11.)).bg(p.card)
                                 .label("在 Finder 中显示")
                                 .disabled(path.is_none())
                                 .on_click(move |_, _, cx| {
@@ -694,7 +692,7 @@ impl Render for RecordsWindow {
                     div()
                         .flex_1()
                         .min_h_0()
-                        .rounded(px(16.))
+                        .rounded(px(18.)).shadow(card_shadow(&p)).py(px(10.))
                         .bg(p.card)
                         .overflow_hidden()
                         .child(
@@ -706,13 +704,17 @@ impl Render for RecordsWindow {
                                     range
                                         .map(|i| {
                                             div()
-                                                .h(px(22.))
-                                                .px(px(12.))
+                                                .h(px(20.)).line_height(px(20.))
+                                                .px(px(16.))
                                                 .font_family(MONO_FONT)
-                                                .text_size(px(12.))
+                                                .text_size(px(12.5))
                                                 .text_color(p.tx)
                                                 .overflow_hidden()
-                                                .child(s.log_lines[s.filtered[i]].clone())
+                                                .flex().gap(px(14.)).children({
+                                                    let line=&s.log_lines[s.filtered[i]];
+                                                    let (time,text)=line.split_once("  ").unwrap_or(("",line));
+                                                    [div().flex_none().text_color(p.tx3).child(time.to_string()), div().min_w_0().whitespace_nowrap().child(text.to_string())]
+                                                })
                                         })
                                         .collect::<Vec<_>>()
                                 }),
@@ -1038,7 +1040,7 @@ impl RecordsWindow {
             .map(|(i, line)| {
                 format!(
                     "09:{:02}:{:02}  {}",
-                    30 + (i * 7 + 60) / 60,
+                    30 + i / 6,
                     (i * 7) % 60,
                     line.a().iter().map(|s| s["t"].s()).collect::<String>()
                 )

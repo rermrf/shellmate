@@ -441,6 +441,11 @@ impl Workspace {
         };
         let (tx, rx) = async_channel::unbounded();
         let bridge = UiBridge::new(tx, &chain, &connect::default_user(), memory);
+        for host in &chain {
+            if let Some((endpoint, credential)) = self.pending_forms.remove(&host.id)
+                && endpoint == connect::Endpoint::of(host, &connect::default_user())
+            { bridge.supply_form(endpoint, credential); }
+        }
         let names = Rc::new(connect::names_by_address(&chain));
         let join = runtime.spawn(connect::connect_attempt(chain.clone(), self.secrets.clone(), bridge, tabs));
         let abort = join.abort_handle();

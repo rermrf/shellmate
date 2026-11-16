@@ -45,6 +45,13 @@ impl KnownHosts {
         std::env::home_dir().unwrap_or_default().join(".ssh").join("known_hosts")
     }
 
+    /// Apply a trust decision. Connection-only trust performs no filesystem operation.
+    pub fn accept(&self, decision: crate::HostKeyDecision, changed: bool, host: &str, port: u16, key: &PublicKey) -> io::Result<bool> {
+        if decision != crate::HostKeyDecision::Save { return Ok(false); }
+        if changed { self.replace(host, port, key)?; } else { self.add(host, port, key)?; }
+        Ok(true)
+    }
+
     /// Path of the file.
     pub fn path(&self) -> &Path {
         &self.path
@@ -463,5 +470,26 @@ mod tests {
         hosts.replace("h", 22, &new).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(KnownHosts::new(&real).lookup("h", 22, &new).unwrap(), Lookup::Known);
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use russh::keys::{PrivateKey, key::safe_rng};
+    #[test]
+    fn connection_only_trust_never_writes_and_next_lookup_still_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = KnownHosts::new(dir.path().join("known_hosts"));
+        let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        assert!(!known.accept(crate::HostKeyDecision::Once, false, "example", 22, key.public_key()).unwrap());
+        assert!(!known.path().exists());
+        assert!(matches!(known.lookup("example",22,key.public_key()).unwrap(),Lookup::New{..}));
+        known.add("example",22,key.public_key()).unwrap();
+        let before=std::fs::read(known.path()).unwrap();
+        let changed=PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        known.accept(crate::HostKeyDecision::Once,true,"example",22,changed.public_key()).unwrap();
+        assert_eq!(std::fs::read(known.path()).unwrap(),before);
+        assert!(matches!(known.lookup("example",22,changed.public_key()).unwrap(),Lookup::Changed{..}));
     }
 }

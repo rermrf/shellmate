@@ -46,12 +46,28 @@ pub struct HostKeyRequest {
     pub recorded: Vec<HostKeyInfo>,
 }
 
+/// The scope of trust granted by the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKeyDecision {
+    /// Abort before sending credentials.
+    Reject,
+    /// Trust only this connection. Never update known_hosts.
+    Once,
+    /// Trust and persist the key in known_hosts.
+    Save,
+}
+
 /// Decides whether to trust a host key. Accepting a `New` key appends it to
 /// `known_hosts`; accepting a `Changed` key replaces the recorded one.
 #[async_trait]
 pub trait HostKeyVerifier: Send + Sync {
     /// Returns `true` to trust the key and continue connecting.
     async fn verify(&self, request: HostKeyRequest) -> bool;
+
+    /// Defaults to the original persistent trust contract for existing verifiers.
+    async fn decide(&self, request: HostKeyRequest) -> HostKeyDecision {
+        if self.verify(request).await { HostKeyDecision::Save } else { HostKeyDecision::Reject }
+    }
 }
 
 /// Ask for the password of `user@host`.

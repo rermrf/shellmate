@@ -74,6 +74,15 @@ impl Connection {
         watchdog.guard(Self::connect_hops(route, &options, &watchdog)).await
     }
 
+    /// Verify and authenticate the route, then disconnect without opening any session channel.
+    /// Used by the host editor's connection test; host-key decisions use the normal verifier.
+    pub async fn test(route: Route, options: ConnectOptions) -> Result<Option<shellmate_core::AuthMethod>, SshError> {
+        let connection = Self::connect(route, options).await?;
+        let method = connection.target().auth;
+        connection.disconnect().await;
+        Ok(method)
+    }
+
     /// Like [`connect`](Self::connect), and also opens a shell channel with a PTY of size `dims`,
     /// all within one watchdog budget.
     pub async fn connect_with_shell(

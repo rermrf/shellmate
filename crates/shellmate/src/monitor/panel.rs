@@ -879,7 +879,7 @@ impl MonitorPanel {
                 .h(px(34.))
                 .px(px(20.))
                 .rounded(px(10.))
-                .text_size(px(12.5))
+                .text_size(px(12.5)).line_height(px(17.))
                 .whitespace_nowrap()
                 .when(selected, |d| d.bg(p.accs))
                 .when(!selected, |d| d.hover(|d| d.bg(p.card2)))
@@ -888,7 +888,7 @@ impl MonitorPanel {
                 .child(div().w(px(96.)).flex_none().truncate().child(row.user.clone()))
                 .child(
                     div()
-                        .w(px(140.))
+                        .w(px(130.))
                         .flex_none()
                         .flex()
                         .items_center()
@@ -921,7 +921,7 @@ impl MonitorPanel {
                         .font_family(MONO_FONT)
                         .font_weight(FontWeight::BOLD)
                         .text_color(match row.state_tone {
-                            Tone::Plain => p.tx,
+                            Tone::Plain => p.tx2,
                             other => tone_text(p, other),
                         })
                         .child(row.state.to_string()),
@@ -999,7 +999,7 @@ impl MonitorPanel {
             .pr(px(14.))
             .child(
                 div()
-                    .w(px(260.))
+                    .w(px(284.))
                     .h(px(34.))
                     .px(px(12.))
                     .flex()
@@ -1021,7 +1021,7 @@ impl MonitorPanel {
                     .items_center()
                     .rounded(px(11.))
                     .bg(if tree { p.accs } else { p.card2 })
-                    .text_color(if tree { p.acc } else { p.tx })
+                    .text_color(if tree { p.acc } else { p.tx2 })
                     .text_size(px(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
@@ -1046,13 +1046,13 @@ impl MonitorPanel {
             .gap(px(12.))
             .px(px(28.))
             .py(px(6.))
-            .text_size(px(11.5))
+            .text_size(px(11.5)).line_height(px(16.))
             .text_color(p.tx2)
             .border_b_1()
             .border_color(p.line)
             .child(heading("PID", Some(72.)))
             .child(heading("用户", Some(96.)))
-            .child(heading("CPU %", Some(140.)))
+            .child(heading("CPU %", Some(130.)))
             .child(heading("MEM %", Some(56.)))
             .child(heading("RSS", Some(72.)))
             .child(heading("状态", Some(40.)))

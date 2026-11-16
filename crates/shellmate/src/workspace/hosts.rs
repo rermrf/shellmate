@@ -3,7 +3,7 @@
 use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
 use gpui::{Context, Window};
-use shellmate_core::{HostId, ImportCandidate, candidates, parse_ssh_config};
+use shellmate_core::{Host, HostId, ImportCandidate, candidates, parse_ssh_config};
 
 use super::Workspace;
 use crate::dialogs::confirm::ConfirmDialog;
@@ -62,17 +62,31 @@ impl Workspace {
     pub(crate) fn save_host_draft(
         &mut self,
         draft: HostDraft,
+        credential: Option<crate::connect::FormCredential>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let name = draft.host.name.clone();
+        let id = draft.host.id.clone();
+        let endpoint = crate::connect::Endpoint::of(&draft.host, &crate::connect::default_user());
         let outcome = library::save_host(&mut self.store.borrow_mut(), self.secrets.as_ref(), draft)?;
+        if let Some(credential) = credential { self.pending_forms.insert(id, (endpoint, credential)); }
+        else { self.pending_forms.remove(&id); }
         self.reload_book(window, cx);
         window.push_notification(Notification::success(format!("已保存 {name}")), cx);
         if let Some(warning) = outcome.keychain_warning {
             window.push_notification(Notification::warning(format!("主机已保存，但密码没有存入钥匙串：{warning}")), cx);
         }
         Ok(())
+    }
+
+    /// Resolve an unsaved form through a scratch library. The saved library is untouched.
+    pub(crate) fn editor_route(&self, host: &Host) -> Result<Vec<Host>, String> {
+        library::editor_route(&self.book,host)
+    }
+
+    pub(crate) fn editor_secrets(&self) -> std::sync::Arc<dyn shellmate_store::SecretStore> {
+        self.secrets.clone()
     }
 
     /// Opens the importer with the hosts of `~/.ssh/config`.

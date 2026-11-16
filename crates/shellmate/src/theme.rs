@@ -175,6 +175,7 @@ fn sync_component_colors(c: &mut ThemeColor, p: &Palette, dark: bool) {
     c.muted_foreground = p.tx3;
     c.popover = p.card;
     c.popover_foreground = p.tx;
+    // Nested modal backdrops use the same scrim as the workspace-level first modal.
     c.overlay = p.scrim;
 
     c.primary = p.acc;
@@ -306,6 +307,25 @@ pub fn apply(dark: bool, cx: &mut App) {
         theme.font_family=UI_FONT.into();
         theme.font_size = px(13.);
         theme.mono_font_family = MONO_FONT.into();
+        theme.mono_font_size = px(13.);
+        let highlight = std::sync::Arc::make_mut(&mut theme.highlight_theme);
+        highlight.style.editor_background=Some(p.card);
+        highlight.style.editor_foreground=Some(p.tx);
+        highlight.style.editor_gutter_background=Some(p.card2);
+        highlight.style.editor_line_number=Some(p.tx3);
+        highlight.style.editor_active_line_number=Some(p.tx3);
+        highlight.style.editor_active_line=Some(gpui::transparent_black());
+        // ThemeStyle has private fields; use its documented theme-file representation.
+        let token = |color: Hsla| serde_json::from_value::<gpui::component::highlighter::ThemeStyle>(serde_json::json!({"color":color})).expect("a serialized theme color round-trips");
+        let keyword = token(hex(if dark {0x7AA2FF}else{0x2F6BF5}));
+        let string = token(hex(if dark {0x5FD18B}else{0x1F8A55}));
+        let variable = token(hex(if dark {0xC792EA}else{0x9C4DCC}));
+        let comment = token(hex(if dark {0x7F858F}else{0x8A919C}));
+        let syntax=&mut highlight.style.syntax;
+        syntax.keyword=Some(keyword); syntax.function=Some(keyword); syntax.property=Some(keyword);
+        syntax.string=Some(string); syntax.number=Some(string); syntax.constant=Some(string);
+        syntax.variable=Some(variable); syntax.comment=Some(comment); syntax.comment_doc=Some(comment);
+
         theme.radius = px(11.);
         theme.radius_lg = px(22.);
         theme.shadow = true;
@@ -319,4 +339,16 @@ pub fn apply(dark: bool, cx: &mut App) {
 
     cx.set_global(AppTheme { dark, palette, terminal });
     cx.refresh_windows();
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    #[test]
+    fn prototype_syntax_colors_round_trip_through_component_theme_style() {
+        for p in [super::Palette::light(), super::Palette::dark()] {
+            let style:gpui::component::highlighter::ThemeStyle=serde_json::from_value(serde_json::json!({"color":p.acc})).unwrap();
+            let highlight:gpui::HighlightStyle=style.into();
+            assert_eq!(highlight.color,Some(p.acc));
+        }
+    }
 }

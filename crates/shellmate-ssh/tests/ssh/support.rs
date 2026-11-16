@@ -174,6 +174,8 @@ pub struct ServerState {
     pub connections: Mutex<usize>,
     /// Connections whose SSH session has not ended yet.
     pub open_connections: Mutex<usize>,
+    /// Number of session channels requested.
+    pub session_channels: Mutex<usize>,
     /// Number of shell requests (one per shell channel).
     pub shells: Mutex<usize>,
     /// Names of the subsystems requested (`sftp`).
@@ -418,6 +420,7 @@ impl server::Handler for FixtureHandler {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        *lock(&self.state.session_channels) += 1;
         if !self.options.subsystems.is_empty() {
             self.channels.insert(channel.id(), channel);
         }

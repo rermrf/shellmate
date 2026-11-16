@@ -136,13 +136,20 @@ impl Handler for ClientHandler {
                 let trusted = {
                     // Waiting for the user does not count against the watchdog.
                     let _pause = self.watchdog.pause();
-                    self.verifier.verify(request).await
+                    self.verifier.decide(request).await
                 };
-                if !trusted {
+                if trusted == crate::HostKeyDecision::Reject {
                     return Err(HandlerError::Ssh(SshError::HostKeyRejected));
                 }
-                let saved = self.known_hosts.add(&self.host, self.port, key);
-                HostKeyRecord { key: info, state: FingerprintState::New, saved: self.log_save(saved) }
+                let saved = self.known_hosts.accept(trusted, false, &self.host, self.port, key);
+                HostKeyRecord {
+                    key: info,
+                    state: FingerprintState::New,
+                    saved: match saved {
+                        Ok(saved) => saved,
+                        Err(err) => self.log_save(Err(err)),
+                    },
+                }
             }
             Lookup::Changed { recorded } => {
                 let request = HostKeyRequest {
@@ -154,13 +161,20 @@ impl Handler for ClientHandler {
                 };
                 let trusted = {
                     let _pause = self.watchdog.pause();
-                    self.verifier.verify(request).await
+                    self.verifier.decide(request).await
                 };
-                if !trusted {
+                if trusted == crate::HostKeyDecision::Reject {
                     return Err(HandlerError::Ssh(SshError::HostKeyChanged));
                 }
-                let saved = self.known_hosts.replace(&self.host, self.port, key);
-                HostKeyRecord { key: info, state: FingerprintState::Changed, saved: self.log_save(saved) }
+                let saved = self.known_hosts.accept(trusted, true, &self.host, self.port, key);
+                HostKeyRecord {
+                    key: info,
+                    state: FingerprintState::Changed,
+                    saved: match saved {
+                        Ok(saved) => saved,
+                        Err(err) => self.log_save(Err(err)),
+                    },
+                }
             }
         };
 
@@ -197,7 +211,9 @@ impl Handler for ClientHandler {
             DisconnectReason::ReceivedDisconnect(info) if info.message.trim().is_empty() => {
                 "服务器主动断开了连接".to_string()
             }
-            DisconnectReason::ReceivedDisconnect(info) => format!("服务器主动断开了连接：{}", info.message.trim()),
+            DisconnectReason::ReceivedDisconnect(info) => {
+                format!("服务器主动断开了连接：{}", info.message.trim())
+            }
             DisconnectReason::Error(HandlerError::Russh(err)) => describe_russh_error(err),
             DisconnectReason::Error(HandlerError::Ssh(err)) => err.to_string(),
         };

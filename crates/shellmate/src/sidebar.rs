@@ -301,8 +301,8 @@ impl Sidebar {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx).child("本机终端"))
-                    .child(div().text_size(px(11.5)).text_color(p.tx3).truncate().child(self.local_summary.clone())),
+                    .child(div().text_size(px(13.5)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx).child("本机终端"))
+                    .child(div().text_size(px(11.5)).line_height(px(13.)).text_color(p.tx3).truncate().child(self.local_summary.clone())),
             )
             .child(kbd("⌘T", cx))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -325,7 +325,7 @@ impl Sidebar {
             .px(px(6.))
             .mt(px(6.))
             .cursor_pointer()
-            .text_size(px(12.)).font_weight(FontWeight::SEMIBOLD)
+            .text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::SEMIBOLD)
             .text_color(p.tx2)
             .child(
                 Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
@@ -377,7 +377,7 @@ impl Sidebar {
             .gap(px(4.))
             .child(
                 div()
-                    .text_size(px(13.5))
+                    .text_size(px(13.5)).line_height(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.tx)
                     .truncate()
@@ -403,7 +403,7 @@ impl Sidebar {
                     .flex_1()
                     .min_w_0()
                     .child(name_line)
-                    .child(div().text_size(px(11.5)).text_color(p.tx2).truncate().child(sub)),
+                    .child(div().text_size(px(11.5)).line_height(px(13.)).text_color(p.tx2).truncate().child(sub)),
             )
             .children(host.badge().map(|b| {
                 div()

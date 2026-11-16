@@ -7138,6 +7138,7 @@ dependencies = [
  "gpui-kit",
  "libc",
  "log",
+ "serde_json",
  "shellmate-core",
  "shellmate-forward",
  "shellmate-monitor",

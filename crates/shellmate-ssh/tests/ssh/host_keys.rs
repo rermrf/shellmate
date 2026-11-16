@@ -194,3 +194,39 @@ fn defaults_match_the_documented_keepalive() {
     assert_eq!(options.keepalive_interval, std::time::Duration::from_secs(30));
     assert_eq!(options.keepalive_max, 3);
 }
+
+#[tokio::test]
+async fn connection_test_authenticates_without_opening_a_session_and_once_trust_asks_again() {
+    use shellmate_ssh::{HostKeyDecision, HostKeyRequest, HostKeyVerifier};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Once(AtomicUsize);
+    #[async_trait::async_trait]
+    impl HostKeyVerifier for Once {
+        async fn verify(&self, _: HostKeyRequest) -> bool {
+            panic!("decide handles trust scope")
+        }
+        async fn decide(&self, _: HostKeyRequest) -> HostKeyDecision {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            HostKeyDecision::Once
+        }
+    }
+    let server = TestServer::start(ServerOptions::default()).await;
+    let env = Env::new();
+    let verifier = Arc::new(Once(AtomicUsize::new(0)));
+    for _ in 0..2 {
+        let options = ConnectOptions::new(verifier.clone(), Script::new())
+            .with_known_hosts(&env.known_hosts)
+            .with_ssh_dir(&env.ssh_dir)
+            .with_agent_socket(env.dir.path().join("no-agent.sock"));
+        let method = Connection::test(Route::direct(host(&server)), options).await.unwrap();
+        assert_eq!(method, Some(AuthMethod::Password));
+        assert_eq!(env.known_hosts_text(), "");
+    }
+    assert_eq!(verifier.0.load(Ordering::SeqCst), 2);
+    assert_eq!(server.attempts("password"), 2);
+    assert_eq!(*lock(&server.state.session_channels), 0);
+    assert_eq!(*lock(&server.state.shells), 0);
+    assert!(lock(&server.state.ptys).is_empty());
+    assert!(lock(&server.state.execs).is_empty());
+    assert!(lock(&server.state.subsystem_requests).is_empty());
+}

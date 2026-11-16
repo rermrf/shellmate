@@ -150,7 +150,7 @@ fn level_color(p: &Palette, level: LogLevel) -> Hsla {
 /// The lines of a pane, newest at the bottom: a box that keeps the end of the log in view and clips the rest.
 /// `max` is how many lines are drawn at the most.
 pub(super) fn log_box(pane: Option<&LogPane>, empty: &str, max: usize, p: &Palette) -> gpui::Div {
-    let body = div().flex_1().min_h_0().overflow_hidden().flex().flex_col().justify_start().when(pane.is_some_and(|p|p._follow.is_some()),|d|d.justify_end()).gap(px(3.));
+    let body = div().flex_1().min_h_0().overflow_hidden().flex().flex_col().justify_start().when(pane.is_some_and(|p|p._follow.is_some()),|d|d.justify_end()).gap(px(0.));
     let body = match pane {
         Some(pane) if !pane.lines.is_empty() => {
             let skip = pane.lines.len().saturating_sub(max);
@@ -158,7 +158,7 @@ pub(super) fn log_box(pane: Option<&LogPane>, empty: &str, max: usize, p: &Palet
                 div()
                     .flex()
                     .gap(px(10.))
-                    .text_size(px(12.))
+                    .text_size(px(11.5))
                     .line_height(px(18.))
                     .font_family(MONO_FONT)
                     .when(!line.time.is_empty(), |d| {

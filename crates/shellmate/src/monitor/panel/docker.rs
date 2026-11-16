@@ -12,14 +12,14 @@ use super::{MonitorPanel, MonitorPanelEvent, tone_text};
 use crate::monitor::containers::{self, ContainerRow, Group, PortChip};
 use crate::monitor::model::{Banner, Page, Tone};
 use crate::monitor::services::LogSource;
-use crate::theme::{CARD_RADIUS, MONO_FONT, Palette};
+use crate::theme::{ActivePalette as _, CARD_RADIUS, MONO_FONT, Palette};
 use crate::ui::card_shadow;
 
 /// The subject of the pane of a container whose page is not in front: nothing follows, nothing is kept.
 const CLOSED: &str = "closed";
 
 /// How many lines of a log are drawn under a container.
-const LOG_LINES: usize = 8;
+const LOG_LINES: usize = 5;
 
 fn log_key(container: &Container) -> String {
     format!("container:{}:{}", container.name, container.state.is_running())
@@ -232,33 +232,33 @@ impl MonitorPanel {
         let line = div()
             .flex()
             .items_center()
-            .gap(px(14.))
-            .h(px(56.))
+            .gap(px(10.))
+            .h(px(58.))
             .px(px(20.))
-            .child(div().size(px(9.)).flex_none().rounded_full().bg(dot_color))
+            .child(div().size(px(8.)).flex_none().rounded_full().bg(dot_color))
             .child(
                 div()
-                    .w(px(220.))
+                    .w(px(241.))
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .child(div().truncate().font_weight(FontWeight::BOLD).text_size(px(13.5)).child(row.name.clone()))
+                    .gap(px(0.))
+                    .child(div().truncate().font_weight(FontWeight::BOLD).text_size(px(13.)).line_height(px(16.)).child(row.name.clone()))
                     .child(
                         div()
                             .truncate()
                             .font_family(MONO_FONT)
-                            .text_size(px(11.5))
+                            .text_size(px(11.5)).line_height(px(15.))
                             .text_color(p.tx2)
                             .child(row.image.clone()),
                     ),
             )
             .child(
                 div()
-                    .w(px(180.))
+                    .w(px(199.))
                     .flex_none()
                     .truncate()
-                    .text_size(px(12.5))
+                    .text_size(px(12.)).line_height(px(16.))
                     .text_color(match row.status_tone {
                         Tone::Plain => p.tx2,
                         other => tone_text(p, other),
@@ -280,7 +280,7 @@ impl MonitorPanel {
                     .flex_none()
                     .text_right()
                     .font_family(MONO_FONT)
-                    .text_size(px(12.5))
+                    .text_size(px(12.)).line_height(px(16.))
                     .child(row.cpu.clone()),
             )
             .child(
@@ -289,7 +289,7 @@ impl MonitorPanel {
                     .flex_none()
                     .text_right()
                     .font_family(MONO_FONT)
-                    .text_size(px(12.5))
+                    .text_size(px(12.)).line_height(px(16.))
                     .text_color(p.tx2)
                     .child(row.memory.clone()),
             )
@@ -298,16 +298,12 @@ impl MonitorPanel {
             let container = self.container(&row.name);
             let caption = container.map_or("", containers::log_caption);
             div()
-                .mx(px(20.))
-                .mb(px(12.))
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(div().text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(p.acc).child(caption))
-                .child(
-                    log_box(self.container_log.as_ref().map(|(_, pane)| pane), "没有日志", LOG_LINES, p)
-                        .h(px(24. + LOG_LINES as f32 * 21.)),
-                )
+                .ml(px(38.)).mr(px(20.)).mb(px(12.)).mt(px(2.))
+                .rounded(px(12.)).bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
+                .px(px(12.)).py(px(10.)).flex().flex_col().gap(px(4.))
+                .child(div().text_size(px(11.5)).line_height(px(18.)).font_family(MONO_FONT).text_color(p.acc).child(caption))
+                .child(log_box(self.container_log.as_ref().map(|(_, pane)| pane), "没有日志", LOG_LINES, p)
+                    .p_0().bg(gpui::transparent_black()).h(px(LOG_LINES as f32 * 18.)))
         });
         div().id(("container", ix)).flex().flex_col().child(line).children(pane).into_any_element()
     }
@@ -334,7 +330,7 @@ impl MonitorPanel {
                             .min_w_0()
                             .truncate()
                             .font_family(MONO_FONT)
-                            .text_size(px(11.5))
+                            .text_size(px(11.5)).line_height(px(15.))
                             .text_color(p.tx2)
                             .child(group.subtitle.clone()),
                     ),
@@ -360,10 +356,10 @@ impl MonitorPanel {
             div()
                 .flex()
                 .flex_col()
-                .items_end()
-                .gap(px(1.))
-                .child(div().font_weight(FontWeight::BOLD).text_size(px(15.)).child(value))
-                .child(div().text_size(px(11.5)).text_color(p.tx2).child(caption))
+                .items_start()
+                .gap(px(4.))
+                .child(div().font_weight(FontWeight::BOLD).text_size(px(16.)).line_height(px(18.)).child(value))
+                .child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.tx2).child(caption))
         };
         let (running, total) = containers::counts(&view);
         let prune_tip: SharedString = header.prune_tooltip.clone().into();
@@ -371,8 +367,8 @@ impl MonitorPanel {
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(28.))
-            .px(px(20.))
+            .gap(px(18.))
+            .pl(px(18.)).pr(px(14.))
             .py(px(14.))
             .bg(p.card)
             .rounded(CARD_RADIUS)
@@ -383,9 +379,9 @@ impl MonitorPanel {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(3.))
-                    .child(div().font_weight(FontWeight::BOLD).text_size(px(15.)).child(header.title.clone()))
-                    .child(div().text_size(px(12.)).text_color(p.tx2).child(header.subtitle.clone())),
+                    .gap(px(2.))
+                    .child(div().font_weight(FontWeight::BOLD).text_size(px(14.)).line_height(px(17.)).child(header.title.clone()))
+                    .child(div().text_size(px(12.)).line_height(px(17.)).text_color(p.tx2).child(header.subtitle.clone())),
             )
             .child(stat(format!("{running} / {total} 个容器运行中"), "容器"))
             .child(stat(header.images.clone(), "镜像"))
@@ -399,7 +395,7 @@ impl MonitorPanel {
                     .items_center()
                     .rounded(px(10.))
                     .bg(p.card2)
-                    .text_size(px(12.5))
+                    .text_size(px(12.)).line_height(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .cursor_pointer()
                     .hover(|d| d.opacity(0.85))
@@ -417,7 +413,7 @@ impl MonitorPanel {
                 .rounded(px(14.))
                 .bg(p.warns)
                 .text_color(p.warn)
-                .text_size(px(12.5))
+                .text_size(px(12.)).line_height(px(16.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(format!("读取容器时出错（显示的是上一次的结果）：{why}"))
         });

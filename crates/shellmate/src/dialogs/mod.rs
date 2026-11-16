@@ -36,6 +36,7 @@ pub trait DialogBody: Render + Sized + 'static {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.confirm(window, cx) {
             window.close_dialog(cx);
+            window.refresh();
         }
     }
 
@@ -43,7 +44,23 @@ pub trait DialogBody: Render + Sized + 'static {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel(window, cx);
         window.close_dialog(cx);
+        window.refresh();
     }
+}
+
+/// Open a modal using the workspace's full-window backdrop for the first layer.
+/// Nested dialogs retain their component backdrop so the underlying dialog is dimmed too.
+/// All Shellmate modals are non-dismissable by clicking outside; the dialog host occludes input.
+pub fn open_modal(
+    window: &mut Window,
+    cx: &mut App,
+    build: impl Fn(gpui::component::dialog::Dialog, &mut Window, &mut App) -> gpui::component::dialog::Dialog + 'static,
+) {
+    window.refresh();
+    let nested = window.has_active_dialog(cx);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        build(dialog.overlay(nested), window, cx).on_close(|_, window, _| window.refresh())
+    });
 }
 
 /// Opens `body` as a modal dialog `width` pixels wide.
@@ -56,7 +73,7 @@ pub fn open<V: DialogBody>(
 ) {
     let title: SharedString = title.into();
     let first_build = Cell::new(true);
-    window.open_dialog(cx, move |dialog, window, cx| {
+    open_modal(window, cx, move |dialog, window, cx| {
         if first_build.replace(false) {
             body.update(cx, |body, cx| body.focus(window, cx));
         }
@@ -80,21 +97,16 @@ pub fn open<V: DialogBody>(
         };
         dialog
             .margin_top(margin_top.max(px(20.)))
+            .shadow(modal_shadow(None))
             .rounded(px(if records || settings || host_key { 26. } else { 22. }))
             .p(px(if records || settings { 0. } else { 24. }))
             .when(records, |d| d.h(px(740.)).bg(cx.palette().win).border_0())
             .when(settings, |d| d.h(px(640.)).bg(cx.palette().win).border_0())
-            .when(host_editor, |d| {
-                d.h((window.viewport_size().height - px(60.)).min(px(840.)))
-            })
+            .when(host_editor, |d| d.h((window.viewport_size().height - px(60.)).min(px(840.))))
             .when(!records && !settings, |d| {
                 d.title(
                     div()
-                        .text_size(px(if records || settings || host_editor || host_key {
-                            22.
-                        } else {
-                            18.
-                        }))
+                        .text_size(px(if records || settings || host_editor || host_key { 22. } else { 18. }))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title.clone()),
                 )
@@ -121,12 +133,7 @@ pub enum Tone {
 
 /// A dialog button.
 pub fn button(id: &'static str, label: impl Into<SharedString>, tone: Tone, enabled: bool) -> Button {
-    let button = Button::new(id)
-        .label(label)
-        .disabled(!enabled)
-        .h(px(34.))
-        .rounded(px(11.))
-        .text_size(px(13.));
+    let button = Button::new(id).label(label).disabled(!enabled).h(px(34.)).rounded(px(11.)).text_size(px(13.));
     match tone {
         Tone::Primary => button.primary(),
         Tone::Danger => button.danger(),
@@ -136,13 +143,7 @@ pub fn button(id: &'static str, label: impl Into<SharedString>, tone: Tone, enab
 
 /// The row of buttons at the bottom of a dialog, right aligned.
 pub fn actions(buttons: Vec<Button>) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_end()
-        .gap(px(8.))
-        .pt(px(6.))
-        .children(buttons)
+    div().flex().items_center().justify_end().gap(px(8.)).pt(px(6.)).children(buttons)
 }
 
 /// A caption above a control.
@@ -151,13 +152,7 @@ pub fn field(label: impl Into<SharedString>, p: &Palette, control: impl IntoElem
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(
-            div()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.tx2)
-                .child(label.into()),
-        )
+        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.tx2).child(label.into()))
         .child(control)
 }
 
@@ -189,11 +184,7 @@ pub fn notice(kind: Notice, text: impl Into<SharedString>, p: &Palette) -> impl 
 
 /// Small muted text.
 pub fn hint(text: impl Into<SharedString>, p: &Palette) -> impl IntoElement {
-    div()
-        .text_size(px(12.5))
-        .line_height(px(19.))
-        .text_color(p.tx2)
-        .child(text.into())
+    div().text_size(px(12.5)).line_height(px(19.)).text_color(p.tx2).child(text.into())
 }
 
 /// A dialog's vertical stack.
@@ -204,4 +195,25 @@ pub fn stack() -> gpui::Div {
 /// The palette for dialog bodies.
 pub fn palette(cx: &App) -> Palette {
     cx.palette().clone()
+}
+
+/// The prototype's modal shadow, optionally with the changed-key warning ring.
+pub fn modal_shadow(ring: Option<(Hsla, f32)>) -> Vec<gpui::BoxShadow> {
+    let mut shadows = vec![gpui::BoxShadow {
+        color: gpui::rgba(0x0000004d).into(),
+        offset: gpui::point(px(0.), px(30.)),
+        blur_radius: px(80.),
+        spread_radius: px(0.),
+        inset: false,
+    }];
+    if let Some((color, width)) = ring {
+        shadows.push(gpui::BoxShadow {
+            color,
+            offset: gpui::point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(width),
+            inset: false,
+        });
+    }
+    shadows
 }

@@ -202,7 +202,7 @@ impl Render for Picker {
             .items_center()
             .gap(px(10.))
             .px(px(if history { 14. } else { 18. }))
-            .h(px(if history { 49. } else { 50. }))
+            .h(px(49.))
             .flex_none()
             .border_b_1()
             .border_color(p.line);
@@ -224,7 +224,7 @@ impl Render for Picker {
                     .appearance(false)
                     .p_0()
                     .h(px(22.))
-                    .text_size(px(if history { 13. } else { 15. })),
+                    .text_size(px(if history { 13. } else { 15. })).when(history,|i|i.font_family(MONO_FONT)),
             ),
         );
         if let Source::History { current, .. } = &self.source {
@@ -244,7 +244,7 @@ impl Render for Picker {
                                     .px(px(9.))
                                     .py(px(5.))
                                     .rounded(px(7.))
-                                    .text_size(px(11.5))
+                                    .text_size(px(11.5)).line_height(px(13.)).h(px(24.)).font_weight(if selected==value{FontWeight::SEMIBOLD}else{FontWeight::MEDIUM})
                                     .text_color(if selected == value { p.tx } else { p.tx2 })
                                     .when(selected == value, |d| d.bg(p.card))
                                     .cursor_pointer()
@@ -277,7 +277,8 @@ impl Render for Picker {
             .id("picker-rows")
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
-            .max_h(px(if history { 260. } else { 510. }))
+            .max_h(px(if history { 270. } else { 514. }))
+            .when(history,|d|d.h(px(270.)).flex_none())
             .px(px(if history { 6. } else { 8. }))
             .pt(px(4.))
             .pb(px(if history { 6. } else { 8. }));
@@ -293,7 +294,7 @@ impl Render for Picker {
                         div()
                             .px(px(10.))
                             .pt(px(10.))
-                            .pb(px(4.))
+                            .pb(px(7.))
                             .text_size(px(11.5))
                             .line_height(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -307,7 +308,7 @@ impl Render for Picker {
             rows = rows.child(
                 div()
                     .id(("picker-row", index))
-                    .h(px(if history { 34. } else { 40. }))
+                    .h(px(if history { 34. } else { 40. })).flex_none()
                     .px(px(if history { 10. } else { 12. }))
                     .flex()
                     .items_center()
@@ -317,7 +318,7 @@ impl Render for Picker {
                     .when(index == self.selected, |d| d.bg(p.accs))
                     .text_color(if index == self.selected { p.acc } else { p.tx })
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        if *hovered {
+                        if *hovered && !crate::prototype_fixture() {
                             this.selected = index;
                             cx.notify();
                         }
@@ -389,34 +390,7 @@ impl Render for Picker {
             .w_full()
             .rounded(px(if history { 16. } else { 22. }))
             .bg(p.card)
-            .when(!history, |d| d.border_1().border_color(p.line))
-            .shadow(if history {
-                vec![gpui::BoxShadow {
-                    color: gpui::rgba(0x0000004d).into(),
-                    offset: gpui::point(px(0.), px(if history { 16. } else { 30. })),
-                    blur_radius: px(if history { 44. } else { 80. }),
-                    spread_radius: px(0.),
-                    inset: false,
-                }]
-            } else {
-                // Match the component dialog surface; a real border stays visible in dark mode.
-                vec![
-                    gpui::BoxShadow {
-                        color: gpui::hsla(0., 0., 0., 0.1),
-                        offset: gpui::point(px(0.), px(20.)),
-                        blur_radius: px(25.),
-                        spread_radius: px(-5.),
-                        inset: false,
-                    },
-                    gpui::BoxShadow {
-                        color: gpui::hsla(0., 0., 0., 0.1),
-                        offset: gpui::point(px(0.), px(8.)),
-                        blur_radius: px(10.),
-                        spread_radius: px(-6.),
-                        inset: false,
-                    },
-                ]
-            })
+            .shadow(if history { vec![gpui::BoxShadow { color:gpui::rgba(0x0000004d).into(), offset:gpui::point(px(0.),px(16.)), blur_radius:px(44.), spread_radius:px(0.), inset:false }] } else { dialogs::modal_shadow(Some((p.line,1.))) })
             .overflow_hidden()
             .on_action(cx.listener(|this, _: &PickUp, _, cx| {
                 this.selected = this.selected.saturating_sub(1);
@@ -441,12 +415,12 @@ impl Render for Picker {
                     .flex()
                     .items_center()
                     .gap(px(16.))
-                    .px(px(18.))
+                    .px(px(if history {14.} else {18.}))
                     .py(px(if history { 7. } else { 10. }))
                     .line_height(px(16.))
                     .border_t_1()
                     .border_color(p.line)
-                    .text_size(px(11.))
+                    .text_size(px(if history {11.}else{11.5}))
                     .text_color(p.tx2)
                     .child(if history {
                         "↑↓ 或 ⌃R 切换"
@@ -759,8 +733,7 @@ impl Confirmation {
         });
         let opened = body.clone();
         let first = std::cell::Cell::new(true);
-        use gpui::component::WindowExt as _;
-        window.open_dialog(cx, move |dialog, window, cx| {
+        crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
             if first.replace(false) {
                 body.update(cx, |b, cx| b.focus(window, cx));
             }
@@ -770,6 +743,7 @@ impl Confirmation {
                 .w(px(540.))
                 .border_0()
                 .rounded(px(24.))
+                .shadow(dialogs::modal_shadow(None))
                 .centered()
                 .p(px(24.))
                 .close_button(false)
@@ -895,7 +869,7 @@ impl Render for Confirmation {
                             .h(px(28.))
                             .rounded(px(9.))
                             .bg(p.card2)
-                            .text_size(px(12.5))
+                            .text_size(px(12.5)).line_height(px(15.)).font_weight(FontWeight::MEDIUM)
                             .when(!connected, |d| d.opacity(0.5))
                             .child(target.title.clone())
                             .when(target.production, |d| {

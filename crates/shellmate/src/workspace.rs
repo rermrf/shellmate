@@ -154,6 +154,7 @@ pub struct Workspace {
     store: Rc<RefCell<HostStore>>,
     /// Saved passwords and key passphrases (the macOS keychain).
     secrets: Arc<dyn SecretStore>,
+    pending_forms: HashMap<HostId, (connect::Endpoint, connect::FormCredential)>,
     book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
@@ -236,6 +237,7 @@ impl Workspace {
             running_recordings:HashMap::new(),archive_task:None,records_window:None,
             store: Rc::new(RefCell::new(store)),
             secrets: Arc::new(KeychainStore::new()),
+            pending_forms: HashMap::new(),
             book,
             sidebar,
             sessions: Vec::new(),
@@ -940,7 +942,7 @@ impl Render for Workspace {
             }));
         let palette = self.picker.as_ref().filter(|picker| !picker.read(cx).is_history()).map(|picker| {
             div().id("palette-overlay").occlude().absolute().inset_0()
-                .bg(if cx.is_dark() { p.scrim } else { gpui::rgba(0x0a0c1029).into() })
+                .bg(gpui::rgba(0x0a0c1029))
                 .flex().justify_center().items_start().pt(px(110.))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.picker = None;
@@ -995,6 +997,13 @@ impl Render for Workspace {
                 gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(menu.view.clone())
             ).with_priority(3)))
             .children(palette)
+            .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
+                // Paint at the window layer, independent of a dialog content box or sidebar clipping.
+                // The component dialog host retains focus trapping and input occlusion above this.
+                if window.has_active_dialog(cx) {
+                    window.paint_quad(gpui::fill(bounds, p.scrim));
+                }
+            }).absolute().inset_0())
     }
 }
 
