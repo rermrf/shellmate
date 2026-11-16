@@ -264,7 +264,8 @@ impl Render for Picker {
             div()
                 .id("picker-close")
                 .cursor_pointer()
-                .text_size(px(11.))
+                .text_size(px(if history {14.}else{11.}))
+                .when(history,|d|d.w(px(24.)).h(px(24.)).flex().items_center().justify_center())
                 .text_color(p.tx2)
                 .bg(p.card2)
                 .rounded(px(6.))
@@ -516,7 +517,7 @@ impl Render for Drawer {
             let mut section = div().flex_none().flex().flex_col().gap(px(4.)).child(
                 div()
                     .px(px(4.))
-                    .pb(px(2.))
+                    .pb(px(4.))
                     .text_size(px(12.))
                     .line_height(px(15.))
                     .text_color(p.tx2)
@@ -526,7 +527,7 @@ impl Render for Drawer {
             for (index, command) in group.items.iter().enumerate() {
                 let send = command.clone();
                 section = section.child(
-                    div()
+                    div().h(px(49.)).flex_none()
                         .flex()
                         .items_center()
                         .gap(px(10.))

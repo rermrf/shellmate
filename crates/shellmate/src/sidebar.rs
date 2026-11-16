@@ -223,10 +223,10 @@ impl Sidebar {
                     .px(px(6.))
                     .pt(px(2.))
                     .pb(px(13.))
-                    .child(div().line_height(px(37.)).text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(p.tx).child("主机"))
+                    .child(div().relative().left(px(1.5)).top(px(-0.5)).line_height(px(37.)).text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(p.tx).child("主机"))
                     .child(
                         div()
-                            .mt(px(3.)).line_height(px(15.))
+                            .mt(px(3.)).relative().left(px(-2.)).line_height(px(15.))
                             .text_size(px(12.))
                             .text_color(p.tx2)
                             .child(format!("{host_count} 台 · {} 个会话", self.session_count)),
@@ -327,8 +327,8 @@ impl Sidebar {
             .text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::SEMIBOLD)
             .text_color(p.tx2)
             .child(
-                div().w(px(10.)).flex_none().child(Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
-                    .size(px(12.)).relative().left(px(-1.))
+                div().w(px(10.)).h(px(10.)).flex_none().flex().items_center().justify_center().relative().top(px(-2.)).left(px(-1.)).child(Icon::new(if open { Lucide::ChevronDown } else { Lucide::ChevronRight })
+                    .size(px(12.))
                     .text_color(p.tx3)),
             )
             .child(div().flex_1().child(title))
@@ -542,8 +542,8 @@ impl Sidebar {
             .rounded(px(12.))
             .bg(p.card)
             .shadow(card_shadow(&p))
-            .child(dot(if crate::prototype_fixture(){p.ok}else{p.tx3}, 7.))
-            .child(div().flex_1().text_size(px(12.)).text_color(p.tx2).child(if crate::prototype_fixture(){"已同步 · WebDAV · 2 分钟前"}else{SYNC_STATUS}))
+            .child(dot(if crate::prototype_fixture(){p.ok}else{p.tx3}, 8.))
+            .child(div().flex_1().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::NORMAL).text_color(p.tx2).child(if crate::prototype_fixture(){"已同步 · WebDAV · 2 分钟前"}else{SYNC_STATUS}))
             .child(
                 div()
                     .id("settings")
@@ -644,6 +644,7 @@ impl Render for Sidebar {
             .pl(px(12.))
             .pr(px(12.))
             .pb(px(12.))
+            .child(div().flex_1().min_h_0().flex().flex_col().relative().top(px(-1.))
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(self.render_filter(cx))
@@ -656,10 +657,10 @@ impl Render for Sidebar {
                     .on_action(cx.listener(Self::connect_selected))
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll().flex().flex_col().gap(px(12.)).pt(px(11.))
+                    .overflow_y_scroll().flex().flex_col().gap(px(11.5)).pt(px(11.))
                     .pb(px(8.))
                     .children(list),
-            )
+            ))
             .child(self.render_footer(cx))
             .into_any_element()
     }

@@ -447,7 +447,7 @@ impl MonitorPanel {
             .flex()
             .items_baseline()
             .child(div().text_size(px(30.)).font_weight(FontWeight::BOLD).child(text))
-            .child(div().text_size(px(15.)).text_color(p.tx2).font_weight(FontWeight::SEMIBOLD).child(" %"))
+            .child(div().text_size(px(15.)).line_height(px(18.)).relative().top(px(-4.)).left(px(-2.)).text_color(p.tx2).font_weight(FontWeight::SEMIBOLD).child(" %"))
     }
 
     fn render_cards(&self, cards: &Cards, p: &Palette) -> AnyElement {
@@ -514,7 +514,7 @@ impl MonitorPanel {
             .flex_1()
             .min_w_0()
             .gap(px(10.))
-            .child(div().text_size(px(12.5)).text_color(p.tx2).child("磁盘"))
+            .child(div().text_size(px(12.5)).line_height(px(19.)).text_color(p.tx2).child("磁盘"))
             .children(cards.disks.iter().map(|disk| {
                 let color = match disk.tone {
                     Tone::Err => p.err,
@@ -1009,7 +1009,7 @@ impl MonitorPanel {
                     .bg(p.card2)
                     .text_size(px(13.))
                     .child(Icon::new(Lucide::Search).size(px(14.)).text_color(p.tx3))
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.)))),
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.)).relative().left(px(2.5)))),
             )
             .child(segmented("process-sort", sorts, on_pick, cx).flex_none())
             .child(
@@ -1098,7 +1098,7 @@ impl MonitorPanel {
                         .text_size(px(12.5))
                         .font_family(MONO_FONT)
                         .child(div().flex_none().font_weight(FontWeight::BOLD).child(pid))
-                        .child(div().min_w_0().truncate().text_color(p.tx2).child(what)),
+                        .child(div().min_w_0().truncate().text_color(p.tx2).child(what.strip_prefix(' ').unwrap_or(&what).to_string())),
                 )
                 .children(buttons.iter().map(|button| self.action_button(button, key, p, cx)))
         });

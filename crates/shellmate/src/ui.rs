@@ -47,6 +47,15 @@ pub fn terminal_shadow(p: &Palette) -> Vec<BoxShadow> {
     shadow
 }
 
+/// A border-only ring that does not paint under a translucent surface.
+/// A zero-blur box shadow fills its interior in gpui, so it cannot serve as this outline.
+/// Keep the stroke inside the surface bounds so a surrounding scroll viewport cannot clip it.
+pub fn surface_ring(radius: f32, width: f32, color: Hsla) -> impl IntoElement {
+    gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
+        window.paint_quad(gpui::quad(bounds, px(radius), gpui::transparent_black(), px(width), color, gpui::BorderStyle::Solid));
+    }).absolute().inset_0()
+}
+
 pub fn dot(color: Hsla, size: f32) -> impl IntoElement {
     div().size(px(size)).flex_none().rounded_full().bg(color)
 }
@@ -101,7 +110,7 @@ pub fn segmented(
     let p = cx.palette().clone();
     let on_pick = std::rc::Rc::new(on_pick);
     let id = id.into();
-    let process_sort = id == ElementId::Name("process-sort".into());
+    let compact = matches!(&id, ElementId::Name(name) if matches!(name.as_ref(),"process-sort"|"service-filter"|"fwd-kind"));
     let panels = id == ElementId::Name("panels".into());
     let editor = matches!(&id, ElementId::Name(name) if matches!(name.as_ref(),"editor-protocol"|"editor-auth"));
     let host_filter = id == ElementId::Name("host-filter".into());
@@ -124,10 +133,10 @@ pub fn segmented(
                 .justify_center()
                 .gap(px(6.))
                 .h(px(if editor {32.} else if panels { 30. } else { 28. }))
-                .px(px(if process_sort {12.}else{14.}))
+                .px(px(if compact {12.}else{14.}))
                 .rounded(px(if panels { 9. } else { 8. }))
-                .text_size(px(if host_filter || process_sort { 12.5 } else { 13. }))
-                .line_height(px(if host_filter || process_sort { 15. } else { 16. }))
+                .text_size(px(if host_filter || compact { 12.5 } else { 13. }))
+                .line_height(px(if host_filter || compact { 15. } else { 16. }))
                 .font_weight(if item.active {
                     FontWeight::SEMIBOLD
                 } else {

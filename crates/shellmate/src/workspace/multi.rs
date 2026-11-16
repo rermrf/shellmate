@@ -327,7 +327,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .px(px(14.))
+                .pl(px(14.)).pr(px(if which==Pane::Other{8.}else{14.}))
                 .border_b_1()
                 .border_color(p.line)
                 .when(focused, |d| d.bg(gpui::rgba(0x6ca6ff24)))

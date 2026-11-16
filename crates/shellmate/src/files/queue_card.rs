@@ -71,7 +71,7 @@ impl FilesPanel {
                 .on_click(cx.listener(move |this, _, _, cx| this.row_action(id, action, cx)))
         });
         let cancel = can_cancel(view).then(|| {
-            Self::card_button(("tq-cancel", id.0), "取消", None, p).text_color(p.tx2).on_click(cx.listener(
+            Self::card_button(("tq-cancel", id.0), "取消", Some(52.), p).text_color(p.tx2).on_click(cx.listener(
                 move |this, _, _, cx| {
                     this.cancel_item(id);
                     cx.notify();

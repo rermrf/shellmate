@@ -545,7 +545,7 @@ impl FilesPanel {
     }
 
     fn info_row(label: &'static str, value: String, p: &Palette) -> impl IntoElement {
-        div()
+        div().h(px(17.)).flex_none()
             .flex()
             .gap(px(12.)).line_height(px(17.))
             .child(div().w(px(25.)).flex_none().text_color(p.tx2).child(label))

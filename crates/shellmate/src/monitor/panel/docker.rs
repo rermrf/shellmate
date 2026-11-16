@@ -151,6 +151,7 @@ impl MonitorPanel {
         };
         let mut element = div()
             .id((spec.id, ix))
+            .w(px(if spec.label=="×"{28.}else{44.}))
             .h(px(28.))
             .px(px(10.))
             .flex()
@@ -194,7 +195,7 @@ impl MonitorPanel {
         let spec = |id, label, enabled, tone, open| RowButton { id, label, enabled, tone, open };
         let buttons = div()
             .flex()
-            .gap(px(6.))
+            .gap(px(4.))
             .flex_none()
             .child({
                 let name = name.clone();
@@ -298,7 +299,7 @@ impl MonitorPanel {
             let container = self.container(&row.name);
             let caption = container.map_or("", containers::log_caption);
             div()
-                .ml(px(38.)).mr(px(20.)).mb(px(12.)).mt(px(2.))
+                .ml(px(38.)).mr(px(20.)).mb(px(6.)).mt(px(2.))
                 .rounded(px(12.)).bg(shellmate_term::colors::to_hsla(cx.terminal_style().palette.background))
                 .px(px(12.)).py(px(10.)).flex().flex_col().gap(px(4.))
                 .child(div().text_size(px(11.5)).line_height(px(18.)).font_family(MONO_FONT).text_color(p.acc).child(caption))
@@ -320,7 +321,7 @@ impl MonitorPanel {
             .child(
                 div()
                     .flex()
-                    .items_baseline()
+                    .items_center()
                     .gap(px(10.))
                     .px(px(20.))
                     .py(px(6.))

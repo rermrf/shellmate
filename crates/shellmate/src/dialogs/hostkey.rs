@@ -1,6 +1,6 @@
 //! Host key confirmation: first connection to a host, and a key that changed.
 
-use gpui::component::WindowExt as _;
+use gpui::component::{Sizable as _, WindowExt as _};
 use gpui::component::checkbox::Checkbox;
 use gpui::prelude::*;
 use gpui::{App, Context, FontWeight, IntoElement, Render, Window, div, px};
@@ -31,13 +31,12 @@ impl HostKeyDialog {
             }
             let confirm = body.clone();
             let cancel = body.clone();
-            let p = palette(cx);
             dialog
                 .w(px(if changed { 580. } else { 540. }))
                 .p(px(0.))
                 .rounded(px(26.))
                 .border_0()
-                .shadow(crate::dialogs::modal_shadow(changed.then_some((p.err, 2.))))
+                .shadow(crate::dialogs::modal_shadow(None))
                 .margin_top(((window.viewport_size().height - px(402.)) / 2.).max(px(20.)))
                 .close_button(false)
                 .overlay_closable(false)
@@ -117,11 +116,18 @@ impl HostKeyDialog {
                             .rounded(px(7.))
                             .bg(p.accs)
                             .text_color(p.acc)
-                            .text_size(px(12.)).line_height(px(15.))
+                            .text_size(px(12.))
+                            .line_height(px(15.))
                             .font_weight(FontWeight::BOLD)
                             .child("首次连接"),
                     )
-                    .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child("known_hosts 中没有此主机")),
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .line_height(px(17.))
+                            .text_color(p.tx2)
+                            .child("known_hosts 中没有此主机"),
+                    ),
             )
             .child(
                 div()
@@ -151,7 +157,7 @@ impl HostKeyDialog {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(8.))
+                            .gap(px(9.5))
                             .child(row("地址", self.display_address()))
                             .child(row(
                                 "密钥类型",
@@ -228,18 +234,57 @@ impl HostKeyDialog {
     fn render_changed(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = palette(cx);
         let acknowledged = self.acknowledged;
-        div().flex().flex_col()
+        let recorded = self.request.recorded.iter().map(|key| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(div().h(px(17.)).text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child(format!(
+                    "已记录 · {}{}",
+                    key.algorithm,
+                    if crate::prototype_fixture() { " · 2025-03-02" } else { "" }
+                )))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(px(17.))
+                        .font_family(crate::theme::MONO_FONT)
+                        .text_color(p.tx2)
+                        .line_through()
+                        .child(key.fingerprint.clone()),
+                )
+        });
+        div().relative().flex().flex_col()
             .child(div().pt(px(24.)).pb(px(18.)).px(px(26.)).rounded_t(px(26.)).bg(p.errs).flex().flex_col().gap(px(10.))
-                .child(div().flex().child(div().px(px(10.)).py(px(5.)).rounded(px(7.)).bg(p.err).text_color(gpui::white()).text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::BOLD).child("安全警告 · 连接已暂停")))
-                .child(div().text_size(px(23.)).line_height(px(32.)).font_weight(FontWeight::BOLD).text_color(p.err).child(format!("{} 的主机密钥已变更",self.request.host)))
-                .child(div().text_size(px(13.)).line_height(px(21.)).child(format!("服务器 {} 提供的密钥与 ~/.ssh/known_hosts {}记录不一致。可能是服务器重装，也可能有人正在进行中间人攻击。确认前不会发送任何凭据。",self.display_address(),if crate::prototype_fixture(){"第 14 行"}else{"中的"}))))
-            .child(stack().p(px(26.)).pt(px(18.)).gap(px(14.))
-                .child(div().px(px(16.)).py(px(14.)).rounded(px(16.)).bg(p.card2).flex().flex_col().gap(px(10.))
-                    .children(self.request.recorded.iter().map(|key|div().text_size(px(12.5)).line_height(px(17.)).text_color(p.tx2).child(format!("已记录 · {}{}",key.algorithm,if crate::prototype_fixture(){" · 2025-03-02"}else{""})).child(div().font_family(crate::theme::MONO_FONT).text_size(px(12.5)).mt(px(3.)).line_height(px(17.)).line_through().child(key.fingerprint.clone()))))
-                    .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(p.err).font_weight(FontWeight::SEMIBOLD).child(format!("本次提供 · {}",self.request.key.algorithm)).child(div().font_family(crate::theme::MONO_FONT).text_size(px(12.5)).mt(px(3.)).line_height(px(17.)).font_weight(FontWeight::BOLD).child(self.request.key.fingerprint.clone()))))
-                .child(Checkbox::new("hostkey-ack").label("我已与服务器管理员确认这次密钥变更").checked(acknowledged).on_click(cx.listener(|this,on:&bool,_,cx|{this.acknowledged = *on;cx.notify();})))
-                .child(div().flex().gap(px(10.)).child(button("hostkey-replace","更新 known_hosts 并连接",if acknowledged {Tone::Danger}else{Tone::Plain},acknowledged).when(!acknowledged,|b|b.bg(p.card3).text_color(p.tx3)).h(px(42.)).rounded(px(13.)).on_click(cx.listener(|this,_,w,cx|this.submit(w,cx))))
-                    .child(div().flex_1()).child(button("hostkey-cancel","断开连接",Tone::Primary,true).h(px(42.)).rounded(px(13.)).on_click(cx.listener(|this,_,w,cx|this.dismiss(w,cx))))))
+                .child(div().flex().child(div().px(px(10.)).h(px(25.)).flex().items_center().rounded(px(8.)).bg(p.err)
+                    .text_color(gpui::white()).text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::BOLD).child("安全警告 · 连接已暂停")))
+                .child(div().text_size(px(23.)).line_height(px(32.)).font_weight(FontWeight::BOLD).text_color(p.err)
+                    .child(format!("{} 的主机密钥已变更",self.request.host)))
+                .child(div().text_size(px(13.)).line_height(px(21.5)).child(format!(
+                    "服务器 {} 提供的密钥与 ~/.ssh/known_hosts {}记录不一致。可能是服务器重装，也可能有人正在进行中间人攻击。确认前不会发送任何凭据。",
+                    self.display_address(),if crate::prototype_fixture(){"第 14 行"}else{"中的"}))))
+            .child(div().flex().flex_col().px(px(26.)).pt(px(18.)).pb(px(22.)).gap(px(14.))
+                .child(div().px(px(16.)).py(px(14.)).min_h(px(112.)).rounded(px(16.)).bg(p.card2).flex().flex_col().gap(px(10.))
+                    .children(recorded)
+                    .child(div().flex().flex_col().gap(px(3.)).text_color(p.err)
+                        .child(div().h(px(17.)).text_size(px(12.5)).line_height(px(17.)).font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("本次提供 · {}",self.request.key.algorithm)))
+                        .child(div().text_size(px(12.5)).line_height(px(17.)).font_family(crate::theme::MONO_FONT)
+                            .font_weight(FontWeight::BOLD).child(self.request.key.fingerprint.clone()))))
+                .child(div().h(px(18.)).flex_none().flex().items_center().child(
+                    Checkbox::new("hostkey-ack").large().label("我已与服务器管理员确认这次密钥变更")
+                        .text_size(px(13.)).line_height(px(18.)).checked(acknowledged)
+                        .on_click(cx.listener(|this,on:&bool,_,cx|{this.acknowledged = *on;cx.notify();}))))
+                .child(div().h(px(42.)).flex_none().flex().gap(px(10.))
+                    .child(button("hostkey-replace","更新 known_hosts 并连接",if acknowledged{Tone::Danger}else{Tone::Plain},acknowledged)
+                        .when(!acknowledged,|b|b.bg(p.card3).text_color(p.tx3)).w(px(192.)).h(px(42.)).rounded(px(13.))
+                        .text_size(px(13.)).font_weight(FontWeight::SEMIBOLD)
+                        .on_click(cx.listener(|this,_,w,cx|this.submit(w,cx))))
+                    .child(div().flex_1())
+                    .child(button("hostkey-cancel","断开连接",Tone::Primary,true).w(px(100.)).h(px(42.)).rounded(px(13.))
+                        .text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(gpui::white()).bg(p.acc)
+                        .on_click(cx.listener(|this,_,w,cx|this.dismiss(w,cx))))))
+            .child(crate::ui::surface_ring(26.,2.,p.err))
     }
 }
 

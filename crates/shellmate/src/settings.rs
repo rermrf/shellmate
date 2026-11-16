@@ -139,75 +139,48 @@ impl Render for SettingsWindow {
                         .into_iter()
                         .map(|(selected, title, description)| {
                             div()
-                                .flex_1()
-                                .min_w_0()
+                                .id(if selected {"credential-keychain"} else {"credential-future"})
+                                .relative().flex_1().min_w_0()
                                 .whitespace_normal()
                                 .p(px(16.))
                                 .min_h(px(100.))
                                 .rounded(px(18.))
-                                .shadow(vec![gpui::BoxShadow {color:if selected{p.acc}else{p.line},offset:gpui::point(px(0.),px(0.)),blur_radius:px(0.),spread_radius:px(1.5),inset:false}])
                                 .bg(if selected { p.accs } else { p.card })
                                 .child(
                                     div()
+                                        .h(px(18.)).text_color(p.tx)
                                         .text_size(px(14.))
                                         .line_height(px(17.))
                                         .font_weight(FontWeight::BOLD)
                                         .flex().items_center().gap(px(8.))
                                         .child(div().size(px(16.)).flex_none().rounded_full().border_1().border_color(if selected{p.acc}else{p.tx3})
                                             .flex().items_center().justify_center().when(selected,|d|d.child(div().size(px(8.)).rounded_full().bg(p.acc))))
-                                        .child(title),
+                                        .child(title)
+                                        .when(!selected, |d|d.child(div().ml_auto().text_size(px(11.)).font_weight(FontWeight::NORMAL).text_color(p.tx3).child("后续版本提供"))),
                                 )
                                 .child(
                                     div()
                                         .w_full()
                                         .whitespace_normal()
-                                        .mt(px(12.))
+                                        .mt(px(10.))
                                         .text_size(px(12.5))
                                         .line_height(px(20.))
                                         .text_color(p.tx2)
                                         .child(description),
                                 )
-                                .when(!selected, |d| {
-                                    d.child(
-                                        div()
-                                            .mt(px(8.))
-                                            .text_size(px(11.))
-                                            .text_color(p.tx3)
-                                            .child("后续版本提供"),
-                                    )
-                                })
+                                .child(crate::ui::surface_ring(18., 1.5, if selected { p.acc } else { p.line }))
                         }),
                     ),
                 );
-            for (i, label) in ["用 Touch ID 解锁凭据", "闲置 15 分钟后锁定"]
-                .into_iter()
-                .enumerate()
-            {
-                content = content.child(
-                    div()
-                        .p(px(16.))
-                        .rounded(px(14.))
-                        .bg(p.card)
-                        .flex()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .whitespace_normal()
-                                .text_size(px(13.5))
-                                .child(label)
-                                .child(
-                                    div()
-                                        .mt(px(4.))
-                                        .text_size(px(12.))
-                                        .text_color(p.tx3)
-                                        .child("后续版本提供"),
-                                ),
-                        )
-                        .child(Switch::new(("future-pref", i)).checked(false).disabled(true)),
-                );
-            }
+            content = content.child(
+                div().flex_none().rounded(px(18.)).bg(p.card).px(px(18.)).py(px(4.)).flex().flex_col()
+                    .children(["用 Touch ID 解锁凭据", "闲置 15 分钟后锁定"].into_iter().enumerate().map(|(i,label)| {
+                        div().h(px(56.)).flex_none().flex().items_center().gap(px(12.))
+                            .child(div().flex_1().min_w_0().text_size(px(13.5)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx)
+                                .child(label).child(div().mt(px(4.)).text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::NORMAL).text_color(p.tx3).child("后续版本提供")))
+                            .child(Switch::new(("future-pref",i)).checked(false).disabled(true))
+                    }))
+            );
         } else if self.section == 1 {
             content = content.child(
                 div()

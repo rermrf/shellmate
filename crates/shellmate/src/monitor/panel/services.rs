@@ -418,7 +418,7 @@ impl MonitorPanel {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&self.service_query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.))),
+                            .child(Input::new(&self.service_query).appearance(false).bordered(false).p_0().h(px(18.)).text_size(px(13.)).relative().left(px(2.5))),
                     ),
             )
             .child(segmented("service-filter", filters, on_pick, cx).flex_none())

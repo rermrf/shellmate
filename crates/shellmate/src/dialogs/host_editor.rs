@@ -419,7 +419,8 @@ impl HostEditor {
             .bordered(false)
             .focus_bordered(false)
             .bg(p.card2)
-            .h(px(38.))
+            // Input::h is a multiline option; constrain the single-line control's actual box.
+            .min_h(px(38.)).max_h(px(38.))
             .rounded(px(11.))
             .px(px(12.))
             .text_size(px(13.))
