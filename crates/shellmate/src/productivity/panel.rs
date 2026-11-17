@@ -1028,9 +1028,6 @@ impl Render for Manager {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let mut list = div()
-            .id("manage-list")
-            .max_h(px(430.))
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(16.));
@@ -1179,7 +1176,8 @@ impl Render for Manager {
         }
         stack()
             .child(hint("编辑名称与命令，使用 ↑↓ 调整顺序。", &p))
-            .child(list)
+            .child(dialogs::scroll_body("manage-list", list)
+                .flex_none().max_h(px(430.)).surface(p.card))
             .child(
                 Button::new("group-add")
                     .label("添加分组")

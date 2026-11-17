@@ -74,6 +74,7 @@ pub const SCENES: &[&str] = &[
     "bundle-preview",
     "set-sync",
     "set-term",
+    "set-term-scrolled",
     "set-local",
     "set-conn",
     "host-new",
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 66);
+        assert_eq!(SCENES.len(), 67);
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));

@@ -26,6 +26,7 @@ pub struct SettingsWindow {
     preferences: Preferences,
     ai: Entity<crate::ai::settings::AiSettings>,
     section: usize,
+    scroll: gpui::ScrollHandle,
     error: Option<String>,
     credentials: std::sync::Arc<shellmate_store::CredentialStore>,
     selected_master: bool,
@@ -60,6 +61,7 @@ impl SettingsWindow {
                 ai, workspace,
                 preferences,
                 section,
+                scroll: gpui::ScrollHandle::new(),
                 error: None,
                 selected_master: credentials.backend() == Backend::Master,
                 credentials,
@@ -189,6 +191,11 @@ impl SettingsWindow {
             .update(cx, |i, cx| i.set("meadow river stone !", cx));
         cx.notify();
     }
+    #[cfg(debug_assertions)]
+    pub fn fixture_scroll(&mut self, offset: f32, cx: &mut Context<Self>) {
+        self.scroll.set_offset(gpui::point(px(0.), px(-offset)));
+        cx.notify();
+    }
     fn toggle(&mut self, key: P, value: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self
             .workspace
@@ -258,16 +265,12 @@ impl Render for SettingsWindow {
                     .child(name)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section = index;
+                        this.scroll.set_offset(gpui::point(px(0.), px(0.)));
                         cx.notify();
                     }))
             }));
         let mut content = div()
-            .id("settings-content")
-            .pt(px(42.))
-            .pr(px(0.))
-            .flex_1()
             .min_w_0()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(12.));
@@ -723,30 +726,26 @@ impl Render for SettingsWindow {
             .gap(px(20.))
             .child(nav)
             .child(
-                content.children(
-                    self.error
-                        .clone()
-                        .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
-                ),
-            )
-            .child(
                 div()
-                    .id("settings-close")
-                    .absolute()
-                    .right(px(24.))
-                    .top(px(24.))
-                    .size(px(30.))
-                    .rounded(px(10.))
-                    .bg(p.card)
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .text_size(px(16.))
-                    .line_height(px(16.))
-                    .text_color(p.tx2)
-                    .child("×")
-                    .on_click(cx.listener(|s, _, w, cx| s.dismiss(w, cx))),
+                    .flex_col()
+                    // 30 + 12 replaces the old 42 px scrolling top inset.
+                    .gap(px(12.))
+                    .child(dialogs::header(
+                        "settings-close",
+                        div(),
+                        &p,
+                        cx.listener(|s, _, w, cx| s.dismiss(w, cx)),
+                    ))
+                    .child(dialogs::scroll_body(
+                        "settings-content",
+                        content.children(self.error.clone().map(|e| {
+                            dialogs::notice(dialogs::Notice::Error, e, &p)
+                        })),
+                    ).track_scroll(&self.scroll)),
             )
     }
 }

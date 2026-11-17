@@ -966,15 +966,8 @@ impl Render for HostEditor {
                 cx,
             )))
             .child(
+                super::scroll_body("editor-fields",
                 div()
-                    .id("editor-fields")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.form_scroll)
-                    .mx(px(24.))
-                    .pr(px(0.))
-                    .pb(px(20.))
                     .flex()
                     .flex_col()
                     .gap(px(12.))
@@ -1074,6 +1067,10 @@ impl Render for HostEditor {
                             .as_ref()
                             .map(|(ok, text)| notice(if *ok { Notice::Info } else { Notice::Error }, text.clone(), &p)),
                     ),
+                )
+                .track_scroll(&self.form_scroll)
+                .surface(p.card)
+                .mx(px(24.)),
             )
             .child(
                 div()

@@ -11,6 +11,9 @@ pub mod confirm;
 pub mod host_editor;
 pub mod hostkey;
 pub mod import;
+mod scroll;
+
+pub use scroll::scroll_body;
 
 use std::cell::Cell;
 
@@ -88,6 +91,40 @@ pub fn fixed_shell<V: Render + 'static>(
             .overflow_hidden()
             .child(body.clone())
     })
+}
+
+/// A fixed title/action row. Put this beside the scroll body, never inside it.
+pub fn header(
+    close_id: impl Into<gpui::ElementId>,
+    content: impl IntoElement,
+    p: &Palette,
+    on_close: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .flex_none()
+        .min_h(px(30.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .bg(p.win)
+        .child(div().flex_1().min_w_0().child(content))
+        .child(
+            div()
+                .id(close_id)
+                .flex_none()
+                .size(px(30.))
+                .rounded(px(10.))
+                .bg(p.card)
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_size(px(16.))
+                .line_height(px(16.))
+                .text_color(p.tx2)
+                .child("×")
+                .on_click(on_close),
+        )
 }
 
 /// Opens `body` as a modal dialog `width` pixels wide.

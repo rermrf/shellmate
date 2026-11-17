@@ -289,7 +289,8 @@ impl Render for ImportDialog {
                     .border_1()
                     .border_color(p.line)
                     .child(header)
-                    .child(div().id("import-rows").max_h(px(300.)).overflow_y_scroll().children(rows)),
+                    .child(super::scroll_body("import-rows", div().children(rows))
+                        .flex_none().max_h(px(300.)).surface(p.card)),
             )
             .child(field(
                 "导入到分组",

@@ -639,14 +639,7 @@ impl Render for PasswordDialog {
             .child(div().ml_auto().child(actions(buttons)));
         secure_shell(
             self.purpose.title(),
-            div()
-                .id("security-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .px(px(24.))
-                .pb(px(16.))
-                .child(body),
+            dialogs::scroll_body("security-scroll", body).mx(px(24.)),
             footer,
             &p,
         )
@@ -852,11 +845,6 @@ impl Render for PreviewDialog {
             .flex_col()
             .gap(px(12.));
         let mut list = div()
-            .id("bundle-preview-rows")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px(px(24.))
             .flex()
             .flex_col();
         if let Some(preview) = &self.preview {
@@ -1019,7 +1007,7 @@ impl Render for PreviewDialog {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(list);
+            .child(dialogs::scroll_body("bundle-preview-rows", list).mx(px(24.)));
         secure_shell(
             "导入配置包预览",
             body,

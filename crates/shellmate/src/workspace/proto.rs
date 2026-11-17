@@ -289,6 +289,13 @@ impl Workspace {
                 if let Some(mut host)=incoming.items.iter().find(|i|i.kind==shellmate_store::bundle::Kind::Host).cloned(){host.id="fixture-import-new".into();host.fields.insert("name".into(),serde_json::json!("新设备"));incoming.items.push(host);}let preview=self.secrets.preview_bundle(incoming).expect("fixture preview");crate::security::PreviewDialog::open_with_manager(preview,self.secrets.clone(),None,window,cx);},
             "set-sync" => self.open_settings(1, window, cx),
             "set-term" => self.open_settings(2, window, cx),
+            "set-term-scrolled" => {
+                let settings = crate::settings::SettingsWindow::open(
+                    cx.entity().downgrade(), self.preferences.clone(), self.secrets.clone(),
+                    2, self.store.clone(), window, cx,
+                );
+                settings.update(cx, |s, cx| s.fixture_scroll(120., cx));
+            }
             "set-local" => self.open_settings(3, window, cx),
             "set-conn" => self.open_settings(4, window, cx),
             _ => {}

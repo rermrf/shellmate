@@ -605,10 +605,6 @@ impl Render for RecordsWindow {
             view.replay_time_color = p.tx3;
         });
         let mut list = div()
-            .id("archive-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(2.));
@@ -844,7 +840,7 @@ impl Render for RecordsWindow {
                             )
                     }),
             )
-            .child(list);
+            .child(dialogs::scroll_body("archive-list", list));
         let mut body = div()
             .flex_1()
             .min_w_0()
