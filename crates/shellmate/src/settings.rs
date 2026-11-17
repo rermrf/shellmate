@@ -283,16 +283,25 @@ impl Render for SettingsWindow {
                 .child(
                     div().w_full().min_w_0().flex().gap(px(10.)).children(
                         [
-                            (!self.selected_master, "系统钥匙串"),
-                            (self.selected_master, "主密码加密本地库"),
+                            (
+                                !self.selected_master,
+                                "系统钥匙串",
+                                "密码与私钥口令交给 macOS 钥匙串（keyring crate），随系统登录解锁",
+                            ),
+                            (
+                                self.selected_master,
+                                "主密码加密本地库",
+                                "Argon2id 派生密钥 + XChaCha20-Poly1305 加密 SQLite，跨平台同步更方便",
+                            ),
                         ]
                         .into_iter()
-                        .enumerate().map(|(index,(selected, title))| {
+                        .enumerate().map(|(index,(selected, title, description))| {
                             div()
                                 .id(("credential-backend",index)).cursor_pointer().on_click(cx.listener(move|s,_,w,cx|{if index==1{s.selected_master=true;cx.notify();}else if s.credentials.backend()==Backend::Master{s.operation(Purpose::SwitchKeychain,true,w,cx);}else{s.selected_master=false;cx.notify();}}))
                                 .relative().flex_1().min_w_0()
                                 .whitespace_normal()
                                 .p(px(16.))
+                                .min_h(px(100.))
                                 .rounded(px(18.))
                                 .bg(if selected { p.accs } else { p.card })
                                 .child(
@@ -306,6 +315,16 @@ impl Render for SettingsWindow {
                                             .flex().items_center().justify_center().when(selected,|d|d.child(div().size(px(8.)).rounded_full().bg(p.acc))))
                                         .child(title)
 ,
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .whitespace_normal()
+                                        .mt(px(10.))
+                                        .text_size(px(12.5))
+                                        .line_height(px(20.))
+                                        .text_color(p.tx2)
+                                        .child(description),
                                 )
                                 .child(crate::ui::surface_ring(18., 1.5, if selected { p.acc } else { p.line }))
                         }),
