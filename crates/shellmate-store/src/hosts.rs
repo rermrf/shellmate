@@ -134,6 +134,9 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX ai_messages_conversation ON ai_messages(conversation_id,position);",
 
+    // v9: ordered answer items; data conversion runs in this same transaction.
+    "ALTER TABLE ai_messages ADD COLUMN items_json TEXT NOT NULL DEFAULT '[]';",
+
 ];
 
 /// The host library.
@@ -366,6 +369,7 @@ fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     for (index, sql) in migrations.iter().enumerate().skip(found as usize) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        if index == 8 { crate::ai::migrate_v9(&tx)?; }
         tx.pragma_update(None, "user_version", index as i64 + 1)?;
         tx.commit()?;
     }
@@ -676,7 +680,7 @@ mod tests {
     fn v5_to_v6_retains_ssh_and_round_trips_telnet_and_serial() {
         let mut conn=Connection::open_in_memory().unwrap();migrate(&mut conn,&MIGRATIONS[..5]).unwrap();
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES('old','ssh','example.test',22,'ssh','agent')",[]).unwrap();
-        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),8);
+        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),9);
         let old=store.host(&HostId::from_raw("old")).unwrap().unwrap();assert_eq!(old.protocol,Protocol::Ssh);assert_eq!(old.serial,shellmate_core::SerialSettings::default());
         let mut serial=Host::new("ESP32","/dev/cu.fixture");serial.protocol=Protocol::Serial;serial.port=0;
         serial.serial=shellmate_core::SerialSettings{baud:460800,data_bits:7,parity:'E',stop_bits:2,flow:"hardware".into(),newline:shellmate_core::Newline::Lf};
@@ -776,9 +780,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 9).unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 9, supported: 8 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v9），当前 Shellmate 只支持到 v8，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 10, supported: 9 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v10），当前 Shellmate 只支持到 v9，请升级后再试");
     }
 }

@@ -368,7 +368,7 @@ mod tests {
             assert_eq!(version, 2);
         }
         let mut store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         assert_eq!(store.hosts().unwrap().len(), 1, "the host is still there");
         assert_eq!(store.setting("sidebar_collapsed").unwrap().as_deref(), Some("1"));
         let host = store.hosts().unwrap().remove(0);
@@ -378,7 +378,7 @@ mod tests {
         drop(store);
         // Opening it again changes nothing.
         let store = HostStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         assert_eq!(store.forward_rules(&host.id).unwrap(), [r]);
     }
 

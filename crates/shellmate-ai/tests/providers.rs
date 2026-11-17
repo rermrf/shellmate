@@ -189,12 +189,14 @@ async fn fallback_code_blocks_and_multiturn_roles() {
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let mut c = conversation();
         c.turns[0].answer = Some(Answer {
-            text: "先查看服务".into(),
-            commands: vec![CommandCard {
-                command: "ps aux".into(),
-                explanation: "进程".into(),
-                risk: Risk::Low,
-            }],
+            items: vec![
+                AnswerItem::Text("先查看服务".into()),
+                AnswerItem::Command(CommandCard {
+                    command: "ps aux".into(),
+                    explanation: "进程".into(),
+                    risk: Risk::Low,
+                }),
+            ],
         });
         c.turns.push(Turn {
             user: UserTurn::redacted("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
@@ -639,14 +641,14 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
         let mut answer = Answer::default();
         for event in events {
             match event {
-                Event::TextDelta(text) => answer.text.push_str(&text),
-                Event::Command(card) => answer.commands.push(card),
+                Event::TextDelta(text) => answer.push_text(&text),
+                Event::Command(card) => answer.items.push(AnswerItem::Command(card)),
                 Event::Error(e) => panic!("safe error: {e}"),
                 _ => {}
             }
         }
-        assert_eq!(answer.text, "公开回答");
-        assert!(answer.commands.is_empty());
+        assert_eq!(answer.text(), "公开回答");
+        assert!(answer.commands().next().is_none());
         c.turns[0].answer = Some(answer);
         c.turns.push(Turn {
             user: UserTurn::redacted("继续", ContextSnapshot::default()),

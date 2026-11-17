@@ -2,8 +2,8 @@
 use crate::{HostStore, Result, StoreError};
 use rusqlite::{OptionalExtension, params};
 use shellmate_ai::{
-    Answer, CommandCard, ContextSnapshot, Conversation, Provider, ReasoningLevel, Turn, UserTurn,
-    redact::redact,
+    Answer, AnswerItem, CommandCard, ContextSnapshot, Conversation, PermissionMode, Provider,
+    ReasoningLevel, Turn, UserTurn, redact::redact,
 };
 pub const SAVE_CONVERSATIONS: &str = "ai_save_conversations";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +50,47 @@ pub struct ConversationSummary {
     pub title: String,
     pub updated_at: i64,
 }
+pub(crate) fn migrate_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let rows = tx
+        .prepare("SELECT id,content,commands_json FROM ai_messages WHERE role='assistant'")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, text, commands) in rows {
+        let cards: Vec<CommandCard> = serde_json::from_str(&commands)
+            .map_err(|_| StoreError::Corrupt("AI 命令卡片损坏".into()))?;
+        let mut answer = Answer::default();
+        answer.push_text(&text);
+        answer
+            .items
+            .extend(cards.into_iter().map(AnswerItem::Command));
+        answer.sanitize();
+        let items = serde_json::to_string(&answer.items)
+            .map_err(|_| StoreError::Corrupt("无法编码 AI 回答".into()))?;
+        tx.execute(
+            "UPDATE ai_messages SET items_json=?1,content='',commands_json='[]' WHERE id=?2",
+            params![items, id],
+        )?;
+    }
+    Ok(())
+}
 impl HostStore {
+    pub fn ai_permission(&self, host_key: &str) -> Result<PermissionMode> {
+        Ok(PermissionMode::from_id(
+            &self
+                .setting(&format!("ai_permission:{host_key}"))?
+                .unwrap_or_default(),
+        ))
+    }
+    pub fn set_ai_permission(&mut self, host_key: &str, mode: PermissionMode) -> Result<()> {
+        self.set_setting(&format!("ai_permission:{host_key}"), mode.id())
+    }
+
     pub fn ai_settings(&self) -> Result<Settings> {
         self.ai_settings_for_provider(self.setting("ai_provider")?.as_deref() == Some("anthropic"))
     }
@@ -150,7 +190,7 @@ impl HostStore {
         for (index, t) in c.conversation.turns.iter().enumerate() {
             let context=serde_json::json!({"label":t.user.context.label,"protocol":t.user.context.protocol,"text":t.user.context.text}).to_string();
             tx.execute(
-                "INSERT INTO ai_messages VALUES(?1,?2,'user',?3,?4,'[]',?5,?6,?7) ON CONFLICT(id) DO UPDATE SET content=excluded.content,context=excluded.context,redactions=excluded.redactions",
+                "INSERT INTO ai_messages VALUES(?1,?2,'user',?3,?4,'[]',?5,?6,?7,'[]') ON CONFLICT(id) DO UPDATE SET content=excluded.content,context=excluded.context,redactions=excluded.redactions",
                 params![
                     format!("{}:{index}:user", c.id),
                     c.id,
@@ -162,18 +202,13 @@ impl HostStore {
                 ],
             )?;
             if let Some(a) = &t.answer {
-                let commands = serde_json::to_string(&a.commands)
-                    .map_err(|_| StoreError::Corrupt("无法编码命令卡片".into()))?;
+                let mut answer = a.clone();
+                answer.sanitize();
+                let items = serde_json::to_string(&answer.items)
+                    .map_err(|_| StoreError::Corrupt("无法编码 AI 回答".into()))?;
                 tx.execute(
-                    "INSERT INTO ai_messages VALUES(?1,?2,'assistant',?3,'',?4,?5,?6,0) ON CONFLICT(id) DO UPDATE SET content=excluded.content,commands_json=excluded.commands_json",
-                    params![
-                        format!("{}:{index}:assistant", c.id),
-                        c.id,
-                        a.text,
-                        commands,
-                        c.updated_at,
-                        (index * 2 + 1) as i64
-                    ],
+                    "INSERT INTO ai_messages VALUES(?1,?2,'assistant','','','[]',?3,?4,0,?5) ON CONFLICT(id) DO UPDATE SET content='',commands_json='[]',items_json=excluded.items_json",
+                    params![format!("{}:{index}:assistant", c.id), c.id, c.updated_at, (index*2+1) as i64, items],
                 )?;
             } else {
                 tx.execute(
@@ -190,8 +225,8 @@ impl HostStore {
     }
     pub fn ai_conversation(&self, id: &str) -> Result<Option<SavedConversation>> {
         let Some(mut c)=self.conn.query_row("SELECT id,host_id,session_label,title,provider,model,created_at,updated_at FROM ai_conversations WHERE id=?1",[id],|r|Ok(SavedConversation{id:r.get(0)?,host_id:r.get(1)?,label:r.get(2)?,title:r.get(3)?,provider:r.get(4)?,model:r.get(5)?,created_at:r.get(6)?,updated_at:r.get(7)?,conversation:Conversation::default()})).optional()?else{return Ok(None)};
-        let rows=self.conn.prepare("SELECT role,content,context,commands_json,redactions FROM ai_messages WHERE conversation_id=?1 ORDER BY position")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?.max(0) as usize)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for (role, content, context, commands, count) in rows {
+        let rows=self.conn.prepare("SELECT role,content,context,items_json,redactions FROM ai_messages WHERE conversation_id=?1 ORDER BY position")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?.max(0) as usize)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (role, content, context, items, count) in rows {
             if role == "user" {
                 let value: serde_json::Value = serde_json::from_str(&context)
                     .map_err(|_| StoreError::Corrupt("AI 上下文损坏".into()))?;
@@ -209,13 +244,12 @@ impl HostStore {
                     answer: None,
                 });
             } else {
-                let cards: Vec<CommandCard> = serde_json::from_str(&commands)
-                    .map_err(|_| StoreError::Corrupt("AI 命令卡片损坏".into()))?;
+                let items: Vec<AnswerItem> = serde_json::from_str(&items)
+                    .map_err(|_| StoreError::Corrupt("AI 回答损坏".into()))?;
                 if let Some(t) = c.conversation.turns.last_mut() {
-                    t.answer = Some(Answer {
-                        text: content,
-                        commands: cards,
-                    });
+                    let mut answer = Answer { items };
+                    answer.sanitize();
+                    t.answer = Some(answer);
                 }
             }
         }
@@ -234,6 +268,124 @@ impl HostStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_v8_to_v9_preserves_order_and_clears_legacy_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        crate::hosts::migrate_for_tests(&mut conn, 8);
+        conn.execute(
+            "INSERT INTO ai_conversations VALUES('c1',NULL,'host','问题','openai','model',1,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_messages VALUES('u','c1','user','问题','{}','[]',1,0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO ai_messages VALUES('a','c1','assistant','回答','','[{\"command\":\"ls\",\"explanation\":\"列表\",\"risk\":\"low\"}]',2,1,0)", []).unwrap();
+        drop(conn);
+        let db = HostStore::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 9);
+        let c = db.ai_conversation("c1").unwrap().unwrap();
+        assert!(
+            matches!(&c.conversation.turns[0].answer.as_ref().unwrap().items[..], [AnswerItem::Text(text),AnswerItem::Command(card)] if text=="回答" && card.command=="ls")
+        );
+        let legacy: (String, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT content,commands_json,created_at FROM ai_messages WHERE id='a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (String::new(), "[]".into(), 2));
+        drop(db);
+        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 9);
+    }
+    #[test]
+    fn ordered_steps_round_trip_and_only_sanitized_shaped_output_is_stored() {
+        use shellmate_ai::{StepStatus, Target, output::STORED_LIMIT, policy::Class};
+        let mut db = HostStore::open_in_memory().unwrap();
+        let mut c = saved();
+        let items = vec![
+            AnswerItem::Text("检查".into()),
+            AnswerItem::Command(CommandCard {
+                command: "ls".into(),
+                explanation: "列表".into(),
+                risk: shellmate_ai::Risk::Low,
+            }),
+            AnswerItem::Step {
+                command: "docker ps".into(),
+                target: Target::Background,
+                purpose: "检查容器".into(),
+                class: Class::ReadOnly,
+                status: StepStatus::Completed,
+                exit_code: Some(0),
+                duration_ms: 15,
+                output: format!(
+                    "\x1b[31mPASSWORD=private-value\x1b[0m\n{}",
+                    "中".repeat(6000)
+                ),
+            },
+            AnswerItem::Text("完成".into()),
+            AnswerItem::Step {
+                command: "rm x".into(),
+                target: Target::Terminal,
+                purpose: "删除".into(),
+                class: Class::Other,
+                status: StepStatus::Denied {
+                    reason: Some("保留 PASSWORD=denied-secret".into()),
+                },
+                exit_code: None,
+                duration_ms: 0,
+                output: String::new(),
+            },
+        ];
+        c.conversation.turns[0].answer = Some(Answer { items });
+        db.save_ai_conversation(&c).unwrap();
+        let raw: String = db
+            .conn
+            .query_row(
+                "SELECT items_json FROM ai_messages WHERE role='assistant'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("private-value"));
+        assert!(!raw.contains("denied-secret"));
+        assert!(!raw.contains("\\u001b"));
+        let loaded = db.ai_conversation("c1").unwrap().unwrap();
+        c.conversation.turns[0].answer.as_mut().unwrap().sanitize();
+        assert!(loaded.conversation == c.conversation);
+        let answer = loaded.conversation.turns[0].answer.as_ref().unwrap();
+        assert!(matches!(answer.items[0], AnswerItem::Text(_)));
+        assert!(matches!(answer.items[1], AnswerItem::Command(_)));
+        for item in &answer.items {
+            if let AnswerItem::Step { output, .. } = item {
+                assert!(output.len() <= STORED_LIMIT);
+                assert_eq!(redact(output).text, *output);
+            }
+        }
+    }
+    #[test]
+    fn permissions_are_per_host_default_ask_and_unknown_ids_are_ask() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        assert_eq!(db.ai_permission("local").unwrap(), PermissionMode::Ask);
+        db.set_ai_permission("local", PermissionMode::Full).unwrap();
+        db.set_ai_permission("host1", PermissionMode::Auto).unwrap();
+        assert_eq!(db.ai_permission("local").unwrap(), PermissionMode::Full);
+        assert_eq!(db.ai_permission("host1").unwrap(), PermissionMode::Auto);
+        assert_eq!(db.ai_permission("host2").unwrap(), PermissionMode::Ask);
+        db.set_setting("ai_permission:host1", "future").unwrap();
+        assert_eq!(db.ai_permission("host1").unwrap(), PermissionMode::Ask);
+        db.set_ai_permission("local", PermissionMode::Ask).unwrap();
+        assert_eq!(
+            db.setting("ai_permission:local").unwrap().as_deref(),
+            Some("ask")
+        );
+    }
     #[test]
     fn provider_urls_and_reasoning_round_trip_independently() {
         let mut db = HostStore::open_in_memory().unwrap();
@@ -344,8 +496,7 @@ mod tests {
                         },
                     ),
                     answer: Some(Answer {
-                        text: "回答".into(),
-                        commands: vec![],
+                        items: vec![AnswerItem::Text("回答".into())],
                     }),
                 }],
             },
@@ -379,7 +530,7 @@ mod tests {
         assert!(db.ai_conversations().unwrap().is_empty());
     }
     #[test]
-    fn migration_v7_to_v8() {
+    fn migration_v7_to_v9() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let mut conn = rusqlite::Connection::open(&path).unwrap();
@@ -388,7 +539,7 @@ mod tests {
             .unwrap();
         drop(conn);
         let db = HostStore::open(path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
         assert_eq!(db.setting("fixture").unwrap().as_deref(), Some("kept"));
         assert!(db.ai_conversations().unwrap().is_empty());
     }

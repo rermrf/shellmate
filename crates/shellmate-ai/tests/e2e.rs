@@ -45,9 +45,9 @@ async fn answer(client: &dyn ProviderClient, c: &Conversation) -> Result<(Answer
             Event::Thinking => {}
             Event::TextDelta(text) => {
                 deltas += 1;
-                a.text.push_str(&text)
+                a.push_text(&text)
             }
-            Event::Command(card) => a.commands.push(card),
+            Event::Command(card) => a.items.push(AnswerItem::Command(card)),
             Event::Done(_) => return Ok((a, deltas)),
             Event::Error(e) => return Err(e),
         }
@@ -76,7 +76,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         .unwrap_or_else(|e| panic!("first turn failed: {e}"));
     assert!(n > 0, "first turn did not stream text");
     assert!(
-        !a.commands.is_empty(),
+        a.commands().next().is_some(),
         "first turn did not propose a command"
     );
     c.turns[0].answer = Some(a);
@@ -95,9 +95,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
             .contains(word)
     };
     assert!(
-        a.commands
-            .iter()
-            .any(|card| mentions(&card.command, "nginx")),
+        a.commands().any(|card| mentions(&card.command, "nginx")),
         "follow-up command did not retain requested filter"
     );
     println!("PASS: two-turn continuity and streamed answer");
@@ -110,7 +108,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         .await
         .unwrap_or_else(|e| panic!("port question failed: {e}"));
     assert!(
-        a.commands.iter().any(|card| card.command.contains("3000")),
+        a.commands().any(|card| card.command.contains("3000")),
         "no port command card"
     );
     println!("PASS: port command card");
@@ -123,4 +121,93 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         "invalid key did not yield Key 无效或无权限"
     );
     println!("PASS: invalid-key Chinese error");
+}
+
+/// The only host in this test returns literals; it has no process or SSH access.
+#[tokio::test]
+#[ignore = "requires real API; fake host only; never run in sandbox"]
+async fn real_agent_uses_canned_docker_output_without_execution() {
+    use futures::future::BoxFuture;
+    use std::{sync::Mutex, time::Duration};
+    struct FakeHost(Mutex<Vec<ToolCall>>);
+    impl ToolHost for FakeHost {
+        fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(call);
+                ToolOutcome::Completed(shape(
+                    "CONTAINER ID   IMAGE       STATUS       NAMES\na1b2c3         nginx:1.27  Up 2 hours   shellmate-web-fixture\n",
+                    [],
+                    Some(0),
+                    Duration::from_millis(5),
+                    false,
+                    false,
+                ))
+            })
+        }
+    }
+    let cfg = config().unwrap_or_else(|e| panic!("configuration: {e}"));
+    let client = RigClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}"));
+    let host = FakeHost(Mutex::new(Vec::new()));
+    let mut c = Conversation {
+        turns: vec![Turn {
+            user: UserTurn::redacted(
+                "这台机器上运行了哪些 docker 容器？",
+                ContextSnapshot {
+                    label: "fake-host-only".into(),
+                    protocol: "SSH".into(),
+                    text: String::new(),
+                },
+            ),
+            answer: None,
+        }],
+    };
+    let mut stream = agent::run(
+        &client,
+        &mut c,
+        Capabilities {
+            background: true,
+            ..Default::default()
+        },
+        &host,
+        Limits::default(),
+    )
+    .unwrap();
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            AgentEvent::Done(_) => done = true,
+            AgentEvent::Error(e) => panic!("agent: {e}"),
+            AgentEvent::StepLimit { .. } => panic!("agent did not finish within 15 steps"),
+            _ => {}
+        }
+    }
+    drop(stream);
+    assert!(done);
+    assert!(
+        host.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.command.contains("docker"))
+    );
+    assert!(
+        c.turns[0]
+            .answer
+            .as_ref()
+            .unwrap()
+            .text()
+            .contains("shellmate-web-fixture")
+    );
+    // This fake host's sole implementation returns the literal above and records calls.
+    assert!(
+        c.turns[0]
+            .answer
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|i| matches!(i, AnswerItem::Step { .. }))
+            .count()
+            == host.0.lock().unwrap().len()
+    );
 }

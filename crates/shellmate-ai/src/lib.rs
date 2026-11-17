@@ -1,13 +1,17 @@
 //! Pure AI boundary: redacted conversations in, text and proposed commands out.
 //! There is no command execution facility in this crate.
+pub mod agent;
 mod client;
 mod config;
 mod conversation;
+pub mod output;
+pub mod policy;
 pub mod redact;
 pub use client::{Event, ProviderClient, ResponseStream, RigClient, Usage};
 pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts};
 pub use conversation::{
-    Answer, ContextSnapshot, Conversation, DEFAULT_BUDGET, Prepared, Turn, UserTurn,
+    Answer, AnswerItem, ContextSnapshot, Conversation, DEFAULT_BUDGET, Prepared, StepStatus, Turn,
+    UserTurn,
 };
 use rig_core::serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +30,7 @@ impl Risk {
         }
     }
 }
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct CommandCard {
     pub command: String,
@@ -59,6 +63,16 @@ pub enum AiError {
     Unavailable,
     #[error("服务返回了无法识别的回答，请重试")]
     InvalidResponse,
+    #[error("本轮工具输出已达到 64 K 字符上限，请开始新的对话轮次")]
+    ToolOutputLimit,
+    #[error("会话已断开")]
+    Disconnected,
     #[error("已停止生成")]
     Cancelled,
 }
+
+pub use agent::{
+    AgentEvent, AgentStream, Capabilities, Limits, Resume, Target, ToolCall, ToolHost, ToolOutcome,
+};
+pub use output::{ToolOutput, shape};
+pub use policy::PermissionMode;

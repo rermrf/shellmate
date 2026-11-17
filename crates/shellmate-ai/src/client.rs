@@ -80,6 +80,19 @@ impl RigClient {
             character_budget: DEFAULT_BUDGET,
         })
     }
+    pub(crate) fn agent_open(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionStream, Box<rig_core::ProviderError>> {
+        let mut request = request.max_tokens(self.max_tokens);
+        if let Some(reasoning) = self.reasoning {
+            request.options.reasoning = Some(reasoning);
+        }
+        self.model.stream(request).map_err(Box::new)
+    }
+    pub(crate) fn timeouts(&self) -> Timeouts {
+        self.timeouts.clone()
+    }
     pub fn test_connection(&self) -> Result<ResponseStream, AiError> {
         let request = CompletionRequest::new("请仅回答：连接成功");
         self.open(request, 0)
@@ -344,7 +357,7 @@ pub fn fenced_commands(text: &str) -> Vec<CommandCard> {
     }
     cards
 }
-fn map_error(error: rig_core::ProviderError) -> AiError {
+pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
     // Never format or forward the provider's diagnostic: it may echo the key or prompt.
     if matches!(error, rig_core::ProviderError::UnsupportedOption(_)) {
         return AiError::UnsupportedReasoning;

@@ -448,8 +448,9 @@ impl Drawer {
                                 },
                             ),
                             answer: Some(shellmate_ai::Answer {
-                                text: "已为你整理建议，请先预览后执行。".into(),
-                                commands: vec![],
+                                items: vec![shellmate_ai::AnswerItem::Text(
+                                    "已为你整理建议，请先预览后执行。".into(),
+                                )],
                             }),
                         }],
                     },
@@ -698,14 +699,21 @@ impl Render for Drawer {
                         }),
                 );
                 if let Some(answer) = turn.answer {
-                    let mut reply = div().flex_none().flex().flex_col().gap(px(8.)).child(
-                        div()
-                            .text_size(px(13.))
-                            .line_height(px(21.45))
-                            .whitespace_normal()
-                            .child(answer.text),
-                    );
-                    for (n, card) in answer.commands.into_iter().enumerate() {
+                    let mut reply = div().flex_none().flex().flex_col().gap(px(8.));
+                    for (n, item) in answer.items.into_iter().enumerate() {
+                        let card = match item {
+                            shellmate_ai::AnswerItem::Command(card) => card,
+                            item => {
+                                reply = reply.child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .line_height(px(21.45))
+                                        .whitespace_normal()
+                                        .child(item.wire_text()),
+                                );
+                                continue;
+                            }
+                        };
                         let copy = card.command.clone();
                         let insert = card.clone();
                         let risk = card.risk;
@@ -764,7 +772,7 @@ impl Render for Drawer {
                                                 .child(risk.label()),
                                         )
                                         .child(
-                                            Button::new(("ai-copy", index * 20 + n))
+                                            Button::new(("ai-copy", index * 1000 + n))
                                                 .label("复制")
                                                 .h(px(24.))
                                                 .text_size(px(11.5))
@@ -775,7 +783,7 @@ impl Render for Drawer {
                                                 }),
                                         )
                                         .child(
-                                            Button::new(("ai-insert", index * 20 + n))
+                                            Button::new(("ai-insert", index * 1000 + n))
                                                 .label("插入")
                                                 .h(px(24.))
                                                 .text_size(px(11.5))
@@ -797,7 +805,7 @@ impl Render for Drawer {
                         .turns
                         .last()
                         .and_then(|t| t.answer.as_ref())
-                        .is_none_or(|a| a.text.is_empty()))
+                        .is_none_or(|a| a.text().is_empty()))
             {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(
                     if self.pending {

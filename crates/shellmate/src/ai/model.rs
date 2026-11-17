@@ -1,5 +1,7 @@
 //! gpui-free policies for the drawer, disclosure, retries and settings.
-use shellmate_ai::{AiError, Answer, ContextSnapshot, Conversation, Event, Turn, UserTurn};
+use shellmate_ai::{
+    AiError, Answer, AnswerItem, ContextSnapshot, Conversation, Event, Turn, UserTurn,
+};
 use shellmate_store::{SecretKey, SecretStore, ai::Settings};
 pub const SUGGESTIONS: [&str; 4] = [
     "解释最近的报错",
@@ -101,7 +103,7 @@ impl DrawerModel {
         };
         match event {
             Event::Thinking => {
-                self.thinking = turn.answer.as_ref().is_none_or(|a| a.text.is_empty());
+                self.thinking = turn.answer.as_ref().is_none_or(|a| a.text().is_empty());
             }
             Event::TextDelta(text) => {
                 if !text.is_empty() {
@@ -109,14 +111,13 @@ impl DrawerModel {
                 }
                 turn.answer
                     .get_or_insert_with(Answer::default)
-                    .text
-                    .push_str(&text);
+                    .push_text(&text);
             }
             Event::Command(card) => turn
                 .answer
                 .get_or_insert_with(Answer::default)
-                .commands
-                .push(card),
+                .items
+                .push(AnswerItem::Command(card)),
             Event::Done(_) => {
                 self.busy = false;
                 self.thinking = false;
