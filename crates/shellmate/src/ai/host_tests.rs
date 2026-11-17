@@ -1,0 +1,230 @@
+use super::*;
+use shellmate_ai::{output::shape, policy::Class};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
+struct Fake {
+    calls: Arc<Mutex<Vec<ToolCall>>>,
+    running: Arc<AtomicUsize>,
+    wait: bool,
+}
+struct Guard(Arc<AtomicUsize>);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl Executor for Fake {
+    fn execute(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(call);
+            self.running.fetch_add(1, Ordering::SeqCst);
+            let _guard = Guard(self.running.clone());
+            if self.wait {
+                std::future::pending::<()>().await;
+            }
+            ToolOutcome::Completed(shape("ok", [], Some(0), Duration::ZERO, false, false))
+        })
+    }
+}
+struct Fixture {
+    host: Host,
+    ui: async_channel::Receiver<Ui>,
+    calls: Arc<Mutex<Vec<ToolCall>>>,
+    running: Arc<AtomicUsize>,
+}
+fn fixture(mode: PermissionMode, wait: bool) -> Fixture {
+    let (tx, ui) = async_channel::unbounded();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let running = Arc::new(AtomicUsize::new(0));
+    let host = Host {
+        mode: Arc::new(Mutex::new(mode)),
+        ui: tx,
+        executor: Box::new(Fake {
+            calls: calls.clone(),
+            running: running.clone(),
+            wait,
+        }),
+        alive: Arc::new(AtomicBool::new(true)),
+        resolved: Mutex::new(None),
+    };
+    Fixture {
+        host,
+        ui,
+        calls,
+        running,
+    }
+}
+fn call(class: Class) -> ToolCall {
+    let command = match class {
+        Class::ReadOnly => "uname -s",
+        Class::Other => "touch /tmp/example",
+        Class::RedLine => "systemctl reboot",
+    };
+    ToolCall {
+        id: "call-1".into(),
+        command: command.into(),
+        purpose: "测试".into(),
+        target: Target::Background,
+        timeout: Duration::from_secs(30),
+        class,
+    }
+}
+#[tokio::test]
+async fn approval_all_permission_class_combinations() {
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Auto,
+        PermissionMode::Full,
+    ] {
+        for class in [Class::ReadOnly, Class::Other, Class::RedLine] {
+            let f = fixture(mode, false);
+            let c = call(class);
+            let command = c.command.clone();
+            let policy = decide(mode, class);
+            let ui = async {
+                if policy != Decision::Run {
+                    match f.ui.recv().await.unwrap() {
+                        Ui::Approval { redline, reply, .. } => {
+                            assert_eq!(redline, class == Class::RedLine);
+                            reply
+                                .send(Approval::Approve {
+                                    command,
+                                    target: Target::Background,
+                                })
+                                .ok()
+                                .unwrap();
+                        }
+                        _ => panic!("expected approval"),
+                    }
+                }
+                match f.ui.recv().await.unwrap() {
+                    Ui::Running {
+                        automatic, ready, ..
+                    } => {
+                        assert_eq!(automatic, policy == Decision::Run);
+                        ready.send(()).unwrap();
+                    }
+                    _ => panic!("expected running"),
+                }
+            };
+            let (out, ()) = tokio::join!(f.host.run(c), ui);
+            assert!(matches!(out, ToolOutcome::Completed(_)));
+            assert_eq!(f.calls.lock().unwrap().len(), 1);
+        }
+    }
+}
+#[tokio::test]
+async fn approval_edit_reclassifies_retargets_and_records_actual_call() {
+    let f = fixture(PermissionMode::Ask, false);
+    let c = call(Class::ReadOnly);
+    let ui = async {
+        match f.ui.recv().await.unwrap() {
+            Ui::Approval { reply, .. } => {
+                reply
+                    .send(Approval::Approve {
+                        command: "systemctl reboot".into(),
+                        target: Target::Terminal,
+                    })
+                    .ok()
+                    .unwrap();
+            }
+            _ => panic!("approval"),
+        }
+        if let Ui::Running { ready, .. } = f.ui.recv().await.unwrap() {
+            ready.send(()).unwrap();
+        } else {
+            panic!("running");
+        }
+    };
+    let (out, ()) = tokio::join!(f.host.run(c.clone()), ui);
+    assert!(matches!(out, ToolOutcome::Completed(_)));
+    let resolved = f.host.resolved_call(&c);
+    assert_eq!(resolved.command, "systemctl reboot");
+    assert_eq!(resolved.target, Target::Terminal);
+    assert_eq!(resolved.class, Class::RedLine);
+    assert_eq!(*f.calls.lock().unwrap(), [resolved]);
+}
+#[tokio::test]
+async fn approval_deny_reason_reaches_outcome_without_execution() {
+    let f = fixture(PermissionMode::Ask, false);
+    let ui = async {
+        if let Ui::Approval { reply, .. } = f.ui.recv().await.unwrap() {
+            reply
+                .send(Approval::Deny {
+                    reason: Some("先等维护窗口".into()),
+                })
+                .ok()
+                .unwrap();
+        } else {
+            panic!("approval")
+        }
+    };
+    let (out, ()) = tokio::join!(f.host.run(call(Class::Other)), ui);
+    assert_eq!(
+        out,
+        ToolOutcome::Denied {
+            reason: Some("先等维护窗口".into())
+        }
+    );
+    assert!(f.calls.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn approval_cancel_while_awaiting_closes_reply_and_card() {
+    let f = fixture(PermissionMode::Ask, false);
+    let mut run = f.host.run(call(Class::Other));
+    let request = tokio::select! {event=f.ui.recv()=>event.unwrap(),_=&mut run=>panic!("ran")};
+    let Ui::Approval { reply, .. } = request else {
+        panic!("approval")
+    };
+    drop(run);
+    assert!(reply.is_closed());
+    assert!(matches!(f.ui.recv().await.unwrap(), Ui::CancelApproval(_)));
+    assert!(f.calls.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn approval_cancel_while_running_drops_executor() {
+    let f = fixture(PermissionMode::Full, true);
+    let mut run = f.host.run(call(Class::Other));
+    let request = tokio::select! {event=f.ui.recv()=>event.unwrap(),_=&mut run=>panic!("finished")};
+    if let Ui::Running { ready, .. } = request {
+        ready.send(()).unwrap();
+    } else {
+        panic!("running")
+    }
+    tokio::select! {_=&mut run=>panic!("finished"),()=tokio::time::sleep(Duration::from_millis(10))=>{}}
+    assert_eq!(f.running.load(Ordering::SeqCst), 1);
+    drop(run);
+    assert_eq!(f.running.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn approval_disconnect_cancels_pending_and_mode_change_applies_next_step() {
+    let f = fixture(PermissionMode::Ask, false);
+    let ui = async {
+        let Ui::Approval { reply, .. } = f.ui.recv().await.unwrap() else {
+            panic!("approval")
+        };
+        f.host.alive.store(false, Ordering::Release);
+        reply
+    };
+    let (out, reply) = tokio::join!(f.host.run(call(Class::ReadOnly)), ui);
+    assert_eq!(out, ToolOutcome::Disconnected);
+    assert!(reply.is_closed());
+    f.host.alive.store(true, Ordering::Release);
+    *f.host.mode.lock().unwrap() = PermissionMode::Full;
+    let _ = f.ui.recv().await.unwrap(); // card cleanup
+    let ui = async {
+        if let Ui::Running {
+            ready, automatic, ..
+        } = f.ui.recv().await.unwrap()
+        {
+            assert!(automatic);
+            ready.send(()).unwrap();
+        } else {
+            panic!("mode change not applied")
+        }
+    };
+    let (out, ()) = tokio::join!(f.host.run(call(Class::Other)), ui);
+    assert!(matches!(out, ToolOutcome::Completed(_)));
+}

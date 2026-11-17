@@ -317,6 +317,7 @@ mod tests {
                 risk: shellmate_ai::Risk::Low,
             }),
             AnswerItem::Step {
+                automatic: true,
                 command: "docker ps".into(),
                 target: Target::Background,
                 purpose: "检查容器".into(),
@@ -331,6 +332,7 @@ mod tests {
             },
             AnswerItem::Text("完成".into()),
             AnswerItem::Step {
+                automatic: false,
                 command: "rm x".into(),
                 target: Target::Terminal,
                 purpose: "删除".into(),

@@ -90,6 +90,8 @@ impl Shell {
         )));
         let capture = Arc::new(Mutex::new(Capture::default()));
         let sink = GridSink {
+            agent: Arc::new(Mutex::new(crate::agent::AgentState::default())),
+            alive: Arc::new(AtomicBool::new(true)),
             raw_grid:Arc::new(Mutex::new(None)),
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
@@ -370,4 +372,42 @@ fn bash_real_pty_history() {
 #[test]
 fn zsh_real_pty_history() {
     exercise("zsh");
+}
+
+fn agent_shell_history(name: &str, setting: &str) {
+    let Some(program) = executable(name) else {
+        eprintln!("skipping {name}: shell is not installed");
+        return;
+    };
+    let mut shell = Shell::new(&program);
+    shell.run(setting);
+    shell.run("echo user-before");
+    shell.type_text("echo discarded-input");
+    shell.wait("partially typed command", |s| s.row() == "SM> echo discarded-input");
+    let line = crate::agent::command_line("printf 'AI-DONE\\n'", "aB3dE6gH9jK2");
+    assert!(line.starts_with(b"\x15 printf"));
+    shell.input(&line);
+    shell.wait("AI command completed", |s| s.has_line("AI-DONE") && s.prompt());
+    // zsh removes an ignored command once the next command is entered.
+    shell.run("echo user-after");
+    shell.run("fc -ln 1 > shell-history.txt");
+    let history = std::fs::read_to_string(shell._home.0.join("shell-history.txt")).unwrap();
+    assert!(history.contains("echo user-before"), "{history}");
+    assert!(history.contains("echo user-after"), "{history}");
+    assert!(!history.contains("AI-DONE"), "{history}");
+    assert!(!history.contains("6973"), "{history}");
+    assert!(!history.contains("aB3dE6gH9jK2"), "{history}");
+    assert!(!history.contains("discarded-input"), "{history}");
+}
+
+#[test]
+fn bash_agent_wrapper_is_excluded_from_shell_history() {
+    for mode in ["HISTCONTROL=ignorespace", "HISTCONTROL=ignoreboth"] {
+        agent_shell_history("bash", mode);
+    }
+}
+
+#[test]
+fn zsh_agent_wrapper_is_excluded_from_shell_history() {
+    agent_shell_history("zsh", "setopt HIST_IGNORE_SPACE");
 }

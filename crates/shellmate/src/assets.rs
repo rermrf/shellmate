@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn prototype_icons_resolve_without_modifying_the_original_markup() {
-        assert_eq!(crate::icons::AppIcon::ALL.len(), 16);
+        assert_eq!(crate::icons::AppIcon::ALL.len(), 17);
         for icon in crate::icons::AppIcon::ALL {
             let path = icon.path();
             let original =

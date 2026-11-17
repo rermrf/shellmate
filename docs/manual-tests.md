@@ -65,6 +65,23 @@
 | A11 | 思考等级 | 设置里依次选「默认」「关闭」「高」各问一次同一个问题；再选一个模型不支持的等级（如给不推理的模型选「高」） | 「默认」与之前行为一致；「高」等待更久，抽屉先显示"正在思考…"再出正文；不支持时提示"当前模型不支持所选思考等级" | |
 | A12 | Anthropic 自定义地址 | 选 Anthropic，Base URL 填代理地址（带或不带 `/v1` 都试），保存后提问；再切回 OpenAI 兼容再切回来 | 请求发到代理地址；首次向新地址发送会重新弹出说明；切换服务商后各自的地址和思考等级保留 | |
 
+## AI agent execution (P8 M6)
+
+| # | Item | Steps | Expected | Result |
+|---|---|---|---|---|
+| G1 | 每步审批 | On an SSH host, ask "帮我看一下这台机器的 docker 运行了哪些服务". | A pending card for a 后台 command appears. After 运行, the output appears in the card and the AI analyses it. | |
+| G2 | 自动审批 | Switch to 自动审批, then ask to see disk and memory usage, then ask to restart a service. | Read-only commands run automatically with the 自动执行 tag. `systemctl restart` still waits for approval. | |
+| G3 | 完全访问 + red line | Switch to 完全访问, then ask it to reboot the server (deny it). | Switching opens a confirmation dialog. Ordinary commands run automatically. `reboot` shows a red card that says 高危命令，需要确认. | |
+| G4 | Remembered per host | Choose different levels on two hosts, then restart the app. | Each host keeps its own level. The local terminal has its own separate level. | |
+| G5 | Running in the terminal | Say "在终端里执行 ls -la". | The command appears and runs in the terminal you have open, and the result comes back to the drawer. On Ubuntu bash, the command is not in history. | |
+| G6 | sudo password | Have it run a command in the terminal that needs a sudo password, and type the password in the terminal. | The AI reads the result after the command finishes. The password does not appear in the drawer or in what is sent. | |
+| G7 | Edit / deny / switch target | On a pending card: edit the command, switch between 终端 and 后台, and deny with a reason. | The edited command runs and the conversation shows it. After a denial, the AI does not retry the command in another form. | |
+| G8 | Stop | Ask it to run `sleep 60` (both terminal and 后台), then click 停止. | The terminal gets Ctrl-C and returns to the prompt. The local background process is ended. | |
+| G9 | Step limit | Give a task that needs many steps. | It pauses at 15 steps with a 继续 button. Clicking it continues. | |
+| G10 | Local terminal | Repeat G1 and G5 in the local terminal. | Both background and terminal execution work. Background commands run in the terminal's current directory. | |
+| G11 | Mosh / serial | Open the AI drawer on a Mosh or serial session. | The drawer shows 此会话不支持 AI 执行命令，仅提供建议. Behaviour is the same as before. | |
+| G12 | Disconnect | Disconnect the network while a command is running. | The step shows 会话已断开 and the run stops. | |
+
 ## 其他
 
 | # | 项目 | 来源 | 说明 | 结果 |

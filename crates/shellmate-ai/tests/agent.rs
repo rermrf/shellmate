@@ -514,6 +514,7 @@ async fn old_steps_are_plain_text_and_count_toward_history_budget() {
         c.turns[0].answer = Some(Answer {
             items: vec![
                 AnswerItem::Step {
+                    automatic: false,
                     command: "docker ps".into(),
                     target: Target::Background,
                     purpose: "检查".into(),
@@ -524,6 +525,7 @@ async fn old_steps_are_plain_text_and_count_toward_history_budget() {
                     output: "web".into(),
                 },
                 AnswerItem::Step {
+                    automatic: false,
                     command: "rm x".into(),
                     target: Target::Terminal,
                     purpose: "删除".into(),
@@ -1177,4 +1179,78 @@ async fn empty_model_responses_still_fail_on_both_wires() {
         assert!(host.calls.lock().unwrap().is_empty());
         assert_eq!(http.requests().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn approved_edit_and_target_reach_both_wires_events_and_history() {
+    struct Edited;
+    impl ToolHost for Edited {
+        fn run(&self, _: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+            Box::pin(async { completed("edited result") })
+        }
+        fn resolved_call(&self, call: &ToolCall) -> ToolCall {
+            ToolCall {
+                command: "pwd".into(),
+                target: Target::Terminal,
+                class: Class::ReadOnly,
+                ..call.clone()
+            }
+        }
+    }
+    for anthropic in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                anthropic,
+                &[("edit-1", "run_command", args("uname -s"))],
+                "",
+                false,
+            ),
+            response(anthropic, &[], "完成", false),
+        ]);
+        let client = RigClient::with_http(&config(anthropic), http.clone()).unwrap();
+        let mut conversation = conversation();
+        let mut stream = agent::run(
+            &client,
+            &mut conversation,
+            capabilities(),
+            &Edited,
+            Limits::default(),
+        )
+        .unwrap();
+        let mut finished = false;
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::StepFinished { call, .. } = event {
+                assert_eq!(call.command, "pwd");
+                assert_eq!(call.target, Target::Terminal);
+                finished = true;
+            }
+        }
+        drop(stream);
+        assert!(finished);
+        let result = tool_result(&bodies(&http)[1], anthropic, "edit-1");
+        assert!(result.contains("用户批准的实际命令：pwd"));
+        assert!(result.contains("执行目标：终端"));
+        assert!(
+            matches!(&conversation.turns[0].answer.as_ref().unwrap().items[0], AnswerItem::Step {command, target: Target::Terminal, ..} if command == "pwd")
+        );
+    }
+}
+
+#[test]
+fn early_v9_steps_default_to_manual_and_automatic_tag_roundtrips() {
+    let old = json!({"Step": {"command":"pwd","target":"background","purpose":"查看目录","class":"ReadOnly","status":"Completed","exit_code":0,"duration_ms":10,"output":"/tmp"}});
+    let mut item: AnswerItem = serde_json::from_value(old).unwrap();
+    assert!(matches!(
+        item,
+        AnswerItem::Step {
+            automatic: false,
+            ..
+        }
+    ));
+    if let AnswerItem::Step { automatic, .. } = &mut item {
+        *automatic = true;
+    }
+    let restored: AnswerItem =
+        serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+    assert_eq!(restored, item);
 }

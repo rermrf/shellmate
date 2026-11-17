@@ -166,6 +166,8 @@ struct GridSink {
     capture: Arc<Mutex<Capture>>,
     raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
+    agent: Arc<Mutex<crate::agent::AgentState>>,
+    alive: Arc<AtomicBool>,
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
     osc7: Mutex<Osc7Scanner>,
@@ -180,6 +182,8 @@ impl OutputHandler for GridSink {
         if self.current.load(Ordering::Acquire) != self.generation {
             return;
         }
+        let filtered = self.agent.lock().output(bytes);
+        let bytes = filtered.as_slice();
         self.output_capture.lock().output(bytes);
         let reported = self.osc7.lock().feed_with_offsets(bytes);
         {
@@ -221,10 +225,12 @@ impl OutputHandler for GridSink {
     }
 
     fn exited(&self, code: Option<u32>) {
+        self.alive.store(false, Ordering::Release);
         let _ = self.tx.try_send(Msg::Exited { generation: self.generation, code });
     }
 
     fn disconnected(&self, reason: String) {
+        self.alive.store(false, Ordering::Release);
         let _ = self.tx.try_send(Msg::Disconnected { generation: self.generation, reason });
     }
 }
@@ -237,6 +243,8 @@ pub struct Terminal {
     capture: Arc<Mutex<Capture>>,
     raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
+    agent: Arc<Mutex<crate::agent::AgentState>>,
+    alive: Arc<AtomicBool>,
     backend: Option<Box<dyn TerminalBackend>>,
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
     local: Option<PtyOptions>,
@@ -300,6 +308,8 @@ impl Terminal {
             capture: Arc::new(Mutex::new(Capture::default())),
             raw_grid:Arc::new(Mutex::new(None)),
             output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
+            agent: Arc::new(Mutex::new(crate::agent::AgentState::default())),
+            alive: Arc::new(AtomicBool::new(false)),
             backend: None,
             local,
             size,
@@ -353,12 +363,16 @@ impl Terminal {
         *self.capture.lock() = Capture::default();
         *self.raw_grid.lock()=None;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.alive = Arc::new(AtomicBool::new(true));
+        *self.agent.lock() = crate::agent::AgentState::default();
         let sink = OutputSink::new(GridSink {
             term: self.term.clone(),
             parser: self.parser.clone(),
             capture: self.capture.clone(),
             raw_grid:self.raw_grid.clone(),
             output_capture: self.output_capture.clone(),
+            agent: self.agent.clone(),
+            alive: self.alive.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: self.output_pending.clone(),
             tx: self.tx.clone(),
@@ -422,6 +436,7 @@ impl Terminal {
     }
 
     fn close_backend(&mut self) {
+        self.alive.store(false, Ordering::Release);
         if let Some(mut backend) = self.backend.take() {
             backend.close();
         }
@@ -536,6 +551,41 @@ impl Terminal {
         {
             log::warn!("backend write failed: {err}");
         }
+    }
+
+    /// A generation-specific connection lease: reconnect never revives an old run.
+    pub fn agent_liveness(&self) -> Arc<AtomicBool> { self.alive.clone() }
+    pub fn agent_connected(&self) -> bool { self.alive.load(Ordering::Acquire) && self.backend.is_some() && !self.replay }
+    pub fn agent_busy(&self) -> bool { self.agent.lock().busy(self.mode().contains(TermMode::ALT_SCREEN)) || self.capture.lock().running() }
+    pub fn agent_start(&mut self, command: &str, nonce: &str) -> Result<crate::agent::CaptureHandle, &'static str> {
+        if !self.agent_connected() { return Err("disconnected"); }
+        if self.capture.lock().running() { return Err("busy"); }
+        let (scanner, handle) = crate::agent::MarkerScanner::new(nonce);
+        {
+            let mut agent = self.agent.lock();
+            if agent.busy(self.mode().contains(TermMode::ALT_SCREEN)) { return Err("busy"); }
+            agent.active = Some((nonce.to_owned(), scanner));
+        }
+        if self.try_input(&crate::agent::command_line(command, nonce)).is_err() {
+            self.agent_finish(nonce, false);
+            return Err("disconnected");
+        }
+        Ok(handle)
+    }
+    pub fn agent_interrupt(&mut self, nonce: &str) {
+        let running = self.agent.lock().active.as_ref().is_some_and(|(id, scanner)| id == nonce && scanner.running());
+        if running { self.input(b"\x03"); }
+    }
+    pub fn agent_finish(&mut self, nonce: &str, interrupt: bool) {
+        if interrupt { self.agent_interrupt(nonce); }
+        let remaining = {
+            let mut agent = self.agent.lock();
+            if agent.active.as_ref().is_none_or(|(id, _)| id != nonce) { return; }
+            agent.active.take().unwrap().1.flush()
+        };
+        // Match the output parser's lock order: grid before parser.
+        let mut term = self.term.lock();
+        self.parser.lock().advance(&mut *term, &remaining);
     }
 
     /// Sends user input to the process, snapping the view back to the prompt.
@@ -838,6 +888,7 @@ mod sink_tests {
         capture:Arc<Mutex<Capture>>,
         raw_grid:Arc<Mutex<Option<RawGrid>>>,
         output_capture:Arc<Mutex<crate::capture_output::OutputCapture>>,
+        agent: Arc<Mutex<crate::agent::AgentState>>,
     }
 
     fn fixture(generation: u64) -> Fixture {
@@ -849,19 +900,48 @@ mod sink_tests {
         let capture=Arc::new(Mutex::new(Capture::default()));
         let raw_grid=Arc::new(Mutex::new(None));
         let output_capture=Arc::new(Mutex::new(crate::capture_output::OutputCapture::default()));
+        let agent = Arc::new(Mutex::new(crate::agent::AgentState::default()));
         let sink = OutputSink::new(GridSink {
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture:capture.clone(),
             raw_grid:raw_grid.clone(),
             output_capture:output_capture.clone(),
+            agent: agent.clone(),
+            alive: Arc::new(AtomicBool::new(true)),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,
             generation,
             current: current.clone(),
         });
-        Fixture { term, rx, current, pending, sink,capture,raw_grid,output_capture }
+        Fixture { term, rx, current, pending, sink,capture,raw_grid,output_capture,agent }
+    }
+
+    #[test]
+    fn agent_real_pty_alt_screen_is_busy_and_marker_never_renders() {
+        use shellmate_core::{Program, Secret};
+        let f = fixture(1);
+        let root = tempfile::tempdir().unwrap();
+        let program = Program { executable: "/bin/sh".into(), args: vec!["-i".into()],
+            env: [("HOME".into(),Secret::new(root.path().to_str().unwrap())), ("ENV".into(),Secret::new("/dev/null")), ("PS1".into(),Secret::new("agent-test$ "))].into(), cwd: Some(root.path().into()) };
+        let sink=f.sink.clone();
+        let mut pty=LocalPty::spawn_program(&program,TerminalSize::default().dims(),move|b|sink.output(b), |_|{}).unwrap();
+        let started=Instant::now();
+        while f.agent.lock().last_output.is_none() {assert!(started.elapsed()<Duration::from_secs(3));std::thread::sleep(Duration::from_millis(10));}
+        pty.write(b"printf '\\033[?1049h'\r").unwrap();
+        while !f.term.lock().mode().contains(TermMode::ALT_SCREEN) {assert!(started.elapsed()<Duration::from_secs(3));std::thread::sleep(Duration::from_millis(10));}
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(f.agent.lock().busy(f.term.lock().mode().contains(TermMode::ALT_SCREEN)));
+        pty.write(b"printf '\\033[?1049l'\r").unwrap();
+        while f.term.lock().mode().contains(TermMode::ALT_SCREEN) {assert!(started.elapsed()<Duration::from_secs(3));std::thread::sleep(Duration::from_millis(10));}
+        let (scanner,handle)=crate::agent::MarkerScanner::new("aB3dE6gH9jK2");
+        f.agent.lock().active=Some(("aB3dE6gH9jK2".into(),scanner));
+        pty.write(&crate::agent::command_line("printf 'captured\\n'", "aB3dE6gH9jK2")).unwrap();
+        while handle.snapshot().exit_code.is_none() {assert!(started.elapsed()<Duration::from_secs(3));std::thread::sleep(Duration::from_millis(10));}
+        assert_eq!(handle.snapshot().exit_code,Some(0));
+        assert!(String::from_utf8_lossy(&handle.snapshot().bytes).contains("captured"));
+        pty.close();
     }
 
     #[test]
@@ -993,3 +1073,5 @@ mod sink_tests {
 #[cfg(all(test, unix))]
 #[path = "capture_pty_tests.rs"]
 mod capture_pty_tests;
+
+impl Drop for Terminal { fn drop(&mut self) { self.alive.store(false, Ordering::Release); } }

@@ -16,6 +16,7 @@ pub(crate) struct Capture {
     start: Option<Start>,
     pending: Option<Pending>,
     semantic: bool,
+    running: bool,
     input_phase: bool,
     last: Option<String>,
     osc: Osc133,
@@ -33,6 +34,7 @@ struct Start {
 }
 
 impl Capture {
+    pub fn running(&self) -> bool { self.running }
     pub fn advance<T: EventListener>(
         &mut self,
         term: &mut Term<T>,
@@ -63,15 +65,18 @@ impl Capture {
             self.semantic = true;
             match mark {
                 b'A' | b'D' => {
+                    self.running = false;
                     self.cancel();
                     self.input_phase = false;
                 }
                 b'B' => {
+                    self.running = false;
                     self.cancel();
                     self.input_phase = true;
                     self.start = Some(start(term));
                 }
                 b'C' => {
+                    self.running = true;
                     let line = self
                         .pending
                         .as_mut()

@@ -11,7 +11,6 @@ use tokio::sync::mpsc;
 
 use crate::connection::Connection;
 use crate::error::SshError;
-use crate::shell::expect_reply;
 use crate::watchdog::Watchdog;
 
 /// How much of each of stdout and stderr [`Connection::exec`] keeps by default (1 MiB).
@@ -228,13 +227,23 @@ impl Connection {
     /// it when dropped, and what arrived before the server answered the request.
     async fn open_exec(&self, command: &str) -> Result<(ChannelReadHalf, CloseOnDrop, Vec<ChannelMsg>), SshError> {
         let open = async {
-            let mut channel =
+            let channel =
                 self.inner.handle.channel_open_session().await.map_err(|err| SshError::Channel(err.to_string()))?;
-            channel.exec(true, command.as_bytes().to_vec()).await.map_err(|err| SshError::Channel(err.to_string()))?;
+            let (mut read, write) = channel.split();
+            // Install before sending exec or awaiting its acknowledgement: cancellation at
+            // either await must close the channel too.
+            let closing = CloseOnDrop { write: Some(write), runtime: self.inner.runtime.clone() };
+            closing.write.as_ref().unwrap().exec(true, command.as_bytes().to_vec()).await.map_err(|err| SshError::Channel(err.to_string()))?;
             let mut backlog = Vec::new();
-            expect_reply(&mut channel, &mut backlog, "执行命令").await?;
-            let (read, write) = channel.split();
-            Ok((read, CloseOnDrop { write: Some(write), runtime: self.inner.runtime.clone() }, backlog))
+            loop {
+                match read.wait().await {
+                    Some(ChannelMsg::Success) => break,
+                    Some(ChannelMsg::Failure) => return Err(SshError::Channel("服务器拒绝了执行命令请求".into())),
+                    Some(ChannelMsg::Close) | None => return Err(SshError::Channel("服务器关闭了会话通道".into())),
+                    Some(msg) => backlog.push(msg),
+                }
+            }
+            Ok((read, closing, backlog))
         };
         Watchdog::new(self.inner.watchdog_limit).guard(open).await
     }

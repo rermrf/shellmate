@@ -72,6 +72,9 @@ pub enum AnswerItem {
         status: StepStatus,
         exit_code: Option<i32>,
         duration_ms: u64,
+        /// Whether the host executed without an approval card; absent in early v9 rows.
+        #[serde(default)]
+        automatic: bool,
         output: String,
     },
 }

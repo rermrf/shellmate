@@ -24,3 +24,5 @@ mod capture_output;
 pub mod replay;
 pub use capture_output::RecordingResult;
 mod behavior;
+
+pub mod agent;

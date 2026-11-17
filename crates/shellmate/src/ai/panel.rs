@@ -1,8 +1,11 @@
+#[path = "agent_ui.rs"]
+pub(super) mod agent_ui;
 use super::model::{DrawerModel, SUGGESTIONS};
 use crate::{
     theme::{ActivePalette, MONO_FONT},
     workspace::Workspace,
 };
+use agent_ui::ActiveStep;
 use futures::StreamExt;
 use gpui::{
     component::{
@@ -12,6 +15,8 @@ use gpui::{
     prelude::*,
     *,
 };
+use shellmate_ai::agent::{self, AgentEvent, Capabilities};
+use shellmate_ai::policy::PermissionMode;
 use shellmate_ai::{
     AiError, CommandCard, ContextSnapshot, Event, ProviderClient, RigClient, Risk, Turn, UserTurn,
 };
@@ -20,6 +25,14 @@ use shellmate_store::{
     ai::{ConversationSummary, SavedConversation},
 };
 use std::sync::Arc;
+use std::{collections::HashSet, sync::Mutex};
+pub struct SessionContext {
+    pub session: Option<usize>,
+    pub host: Option<String>,
+    pub label: String,
+    pub protocol: String,
+    pub binding: Option<super::exec::Binding>,
+}
 pub struct Drawer {
     pub model: DrawerModel,
     workspace: WeakEntity<Workspace>,
@@ -45,6 +58,19 @@ pub struct Drawer {
     pub configured: bool,
     pub fixture: bool,
     scroll: ScrollHandle,
+    follow_bottom: bool,
+    capabilities: Capabilities,
+    mode: Arc<Mutex<PermissionMode>>,
+    permission_menu: bool,
+    binding: Option<super::exec::Binding>,
+    active_step: Option<ActiveStep>,
+    expanded: HashSet<(usize, usize)>,
+    overflowing_output: HashSet<(usize, usize)>,
+    readonly: bool,
+    continuation: Option<Box<agent::Resume>>,
+    resume_steps: usize,
+    run_config: Option<shellmate_ai::Config>,
+    next_context: Option<SessionContext>,
 }
 impl Drawer {
     pub fn new(
@@ -92,20 +118,44 @@ impl Drawer {
             configured,
             fixture: false,
             scroll: ScrollHandle::new(),
+            follow_bottom: true,
+            capabilities: Capabilities::default(),
+            mode: Arc::new(Mutex::new(PermissionMode::Ask)),
+            permission_menu: false,
+            binding: None,
+            active_step: None,
+            expanded: HashSet::new(),
+            overflowing_output: HashSet::new(),
+            readonly: false,
+            continuation: None,
+            resume_steps: 0,
+            run_config: None,
+            next_context: None,
         }
     }
-    pub fn sync_context(
-        &mut self,
-        session: Option<usize>,
-        host: Option<String>,
-        label: String,
-        protocol: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.session = session;
-        self.host = host;
-        self.label = label;
-        self.protocol = protocol;
+    pub fn sync_context(&mut self, context: SessionContext, cx: &mut Context<Self>) {
+        if self.fixture {
+            return;
+        }
+        if self.model.busy || self.pending || self.continuation.is_some() {
+            self.next_context = Some(context);
+            return;
+        }
+        self.session = context.session;
+        self.host = context.host;
+        self.label = context.label;
+        self.protocol = context.protocol;
+        self.binding = context.binding;
+        self.capabilities = self
+            .binding
+            .as_ref()
+            .map(|b| b.capabilities.clone())
+            .unwrap_or_default();
+        *self.mode.lock().unwrap() = self
+            .db
+            .borrow()
+            .ai_permission(self.permission_key())
+            .unwrap_or_default();
         if !self.fixture {
             self.configured = self.db.borrow().ai_settings().is_ok_and(|s| s.configured());
         }
@@ -118,16 +168,31 @@ impl Drawer {
         }
     }
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
-        if self.pending || self.model.busy {
+        if self.pending || self.model.busy || question.trim().is_empty() {
             return;
         }
+        self.continuation = None;
+        self.run_config = None;
+        self.release_context(cx);
         let context = self
             .workspace
-            .update(cx, |s, cx| s.ai_context(cx))
+            .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
         let user = UserTurn::redacted(&question, context);
         if user.question.trim().is_empty() {
             return;
+        }
+        if !self.fixture {
+            self.binding = self
+                .workspace
+                .update(cx, |s, cx| s.ai_binding(self.session, cx))
+                .ok()
+                .flatten();
+            self.capabilities = self
+                .binding
+                .as_ref()
+                .map(|b| b.capabilities.clone())
+                .unwrap_or_default();
         }
         self.input.update(cx, |i, cx| i.set_value("", w, cx));
         self.begin(Some(user), w, cx);
@@ -138,7 +203,11 @@ impl Drawer {
         }
         if let Some(user) = user {
             self.queued = Some(user);
+            self.follow_bottom = true;
         }
+        self.readonly = false;
+        self.continuation = None;
+        self.active_step = None;
         self.pending = true;
         self.history = false;
         self.model.error = None;
@@ -198,27 +267,93 @@ impl Drawer {
         );
     }
     fn start(&mut self, config: shellmate_ai::Config, w: &mut Window, cx: &mut Context<Self>) {
+        self.epoch += 1;
+        if self.continuation.is_none() && !self.fixture {
+            self.binding = self
+                .workspace
+                .update(cx, |s, cx| s.ai_binding(self.session, cx))
+                .ok()
+                .flatten();
+            *self.mode.lock().unwrap() = self
+                .db
+                .borrow()
+                .ai_permission(self.permission_key())
+                .unwrap_or_default();
+        }
         let Some(runtime) = crate::runtime::get(cx) else {
             self.model.event(Event::Error(AiError::Unavailable));
             cx.notify();
             return;
         };
-        let conversation = self.model.conversation.clone();
+        let mut conversation = self.model.conversation.clone();
         let (tx, rx) = async_channel::bounded(64);
         let epoch = self.epoch;
+        let (ui, messages) = async_channel::unbounded();
+        let binding = self.binding.clone();
+        let capabilities = binding
+            .as_ref()
+            .map(|b| b.capabilities.clone())
+            .unwrap_or_default();
+        self.capabilities = capabilities.clone();
+        let alive = binding
+            .as_ref()
+            .map(|b| b.alive.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let executor = super::exec::AppExecutor {
+            binding: binding.unwrap_or(super::exec::Binding {
+                session: usize::MAX,
+                capabilities: Capabilities::default(),
+                connection: None,
+                local: false,
+                alive: alive.clone(),
+            }),
+            ui: ui.clone(),
+        };
+        let host = super::host::Host {
+            mode: self.mode.clone(),
+            ui,
+            executor: Box::new(executor),
+            alive,
+            resolved: Mutex::new(None),
+        };
+        self.bridge(messages, epoch, w, cx);
+        let continuation = self.continuation.take();
+        self.run_config = Some(config.clone());
         let join = runtime.spawn(async move {
-            let result = RigClient::new(&config).and_then(|client| client.start(&conversation));
+            let client = match RigClient::new(&config) {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = worker_event(&tx, AgentEvent::Error(e)).await;
+                    return;
+                }
+            };
+            let result = match continuation {
+                Some(resume) => agent::resume(
+                    &client,
+                    &mut conversation,
+                    &host,
+                    *resume,
+                    agent::Limits::default(),
+                ),
+                None => agent::run(
+                    &client,
+                    &mut conversation,
+                    capabilities,
+                    &host,
+                    agent::Limits::default(),
+                ),
+            };
             match result {
                 Ok(mut stream) => {
                     let _ = tx.send(Worker::Started(stream.dropped_turns)).await;
                     while let Some(event) = stream.next().await {
-                        if tx.send(Worker::Event(event)).await.is_err() {
+                        if worker_event(&tx, event).await.is_err() {
                             break;
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Worker::Event(Event::Error(e))).await;
+                    let _ = worker_event(&tx, AgentEvent::Error(e)).await;
                 }
             }
         });
@@ -235,15 +370,19 @@ impl Drawer {
                                 s.model.dropped = n;
                                 s.persist();
                             }
-                            Worker::Event(event) => {
-                                s.model.event(event);
+                            Worker::Event(event, ready) => {
+                                s.agent_event(event);
+                                let _ = ready.send(());
                                 if !s.model.busy {
                                     s.abort = None;
                                     s.persist();
+                                    if s.continuation.is_none() {
+                                        s.binding = None;
+                                        s.release_context(cx);
+                                    }
                                 }
                             }
                         }
-                        s.scroll.scroll_to_bottom();
                         cx.notify();
                     })
                     .is_err()
@@ -292,11 +431,23 @@ impl Drawer {
             abort.abort();
         }
         self.epoch += 1;
+        self.continuation = None;
+        self.run_config = None;
+        if let Some(step) = self.active_step.take()
+            && let Some(turn) = self.model.conversation.turns.last_mut()
+        {
+            turn.answer
+                .get_or_insert_with(Default::default)
+                .items
+                .push(shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call));
+        }
         self.pending = false;
+        self.binding = None;
         if self.model.busy {
             self.model.event(Event::Error(AiError::Cancelled));
             self.persist();
         }
+        self.release_context(cx);
         cx.notify();
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -308,6 +459,10 @@ impl Drawer {
         self.history_rows.clear();
         self.history = false;
         self.save_error = None;
+        self.expanded.clear();
+        self.overflowing_output.clear();
+        self.follow_bottom = true;
+        self.release_context(cx);
         cx.notify();
     }
     fn history(&mut self, cx: &mut Context<Self>) {
@@ -330,6 +485,10 @@ impl Drawer {
                 self.model.conversation = c.conversation;
                 self.model.error = None;
                 self.history = false;
+                self.readonly = true;
+                self.expanded.clear();
+                self.overflowing_output.clear();
+                self.follow_bottom = true;
                 cx.notify();
             }
             _ => {
@@ -386,8 +545,12 @@ impl Drawer {
     }
     #[cfg(debug_assertions)]
     pub fn scene(&mut self, scene: &str, cx: &mut Context<Self>) {
+        self.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
+        if scene.starts_with("ai-agent") {
+            self.agent_scene(scene);
+        }
         if matches!(scene, "ai-chat" | "ai-error") {
             self.model.start(
                 "找出占用 3000 端口的进程\nTOKEN=fixture-sensitive",
@@ -466,7 +629,7 @@ impl Drawer {
 }
 enum Worker {
     Started(usize),
-    Event(Event),
+    Event(AgentEvent, tokio::sync::oneshot::Sender<()>),
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
@@ -589,12 +752,31 @@ impl Render for Drawer {
                     ),
             )
             .child(context);
+        // GPUI applies this request during layout, using the new content height.
+        if self.follow_bottom && !self.history {
+            self.scroll.scroll_to_bottom();
+        }
         let mut body = div()
             .id("ai-messages")
             .track_scroll(&self.scroll)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
+            .on_scroll(cx.listener(|_, _, _, cx| {
+                // Read the offset after GPUI has applied the user's scroll delta.
+                // Nested output scrolling leaves the message offset unchanged.
+                let drawer = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    drawer
+                        .update(cx, |s, cx| {
+                            s.follow_bottom =
+                                s.scroll.offset().y + s.scroll.max_offset().y <= px(4.);
+                            cx.notify();
+                        })
+                        .ok();
+                });
+            }))
             .px(px(14.))
             .pt(px(4.))
             .pb(px(10.))
@@ -654,7 +836,7 @@ impl Render for Drawer {
                         .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
                 );
         } else if self.model.conversation.turns.is_empty() {
-            body=body.child(div().flex_none().pt(px(6.)).flex().flex_col().gap(px(8.)).child(div().text_size(px(13.)).line_height(px(20.8)).text_color(p.tx2).child("用自然语言描述想做的事，或让我解释终端里的报错。生成的命令都要先预览，不会自动执行。"))
+            body=body.child(div().flex_none().pt(px(6.)).flex().flex_col().gap(px(8.)).child(div().text_size(px(13.)).line_height(px(20.8)).text_color(p.tx2).child("用自然语言描述想做的事，或让我解释终端里的报错。执行命令遵循这台主机的审批设置。"))
         .children(SUGGESTIONS.into_iter().enumerate().map(|(i,label)|div().id(("ai-suggestion",i)).py(px(10.)).px(px(12.)).rounded(px(12.)).bg(p.card2).cursor_pointer().hover(|d|d.bg(p.card3)).text_size(px(13.)).line_height(px(17.)).child(label).on_click(cx.listener(move|s,_,w,cx|s.ask(label.into(),w,cx))))));
         }
         if !self.history {
@@ -702,6 +884,10 @@ impl Render for Drawer {
                     let mut reply = div().flex_none().flex().flex_col().gap(px(8.));
                     for (n, item) in answer.items.into_iter().enumerate() {
                         let card = match item {
+                            item @ shellmate_ai::AnswerItem::Step { .. } => {
+                                reply = reply.child(self.step_card(&item, (index, n), cx));
+                                continue;
+                            }
                             shellmate_ai::AnswerItem::Command(card) => card,
                             item => {
                                 reply = reply.child(
@@ -797,8 +983,20 @@ impl Render for Drawer {
                     body = body.child(reply);
                 }
             }
+            if self.continuation.is_some() {
+                body = body.child(
+                    crate::dialogs::button(
+                        "ai-continue",
+                        format!("已执行 {} 步 · 继续", self.resume_steps),
+                        crate::dialogs::Tone::Primary,
+                        true,
+                    )
+                    .on_click(cx.listener(|s, _, w, cx| s.resume(w, cx))),
+                );
+            }
             if self.pending
                 || (self.model.busy
+                    && self.active_step.is_none()
                     && self
                         .model
                         .conversation
@@ -860,6 +1058,10 @@ impl Render for Drawer {
         if let Some(e) = &self.save_error {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e.clone()));
         }
+        // Keep the blocking card last so following the bottom reveals all its actions.
+        if !self.history && self.active_step.is_some() {
+            body = body.child(self.active_card(cx));
+        }
         let footer = div()
             .flex_none()
             .pt(px(10.))
@@ -870,6 +1072,7 @@ impl Render for Drawer {
             .flex()
             .flex_col()
             .gap(px(6.))
+            .child(self.permission_chip(cx))
             .child(
                 div()
                     .flex()
@@ -893,7 +1096,7 @@ impl Render for Drawer {
                         crate::dialogs::button(
                             "ai-send",
                             if self.model.busy || self.pending {
-                                "停止生成"
+                                "停止"
                             } else {
                                 "发送"
                             },
@@ -932,4 +1135,10 @@ impl Render for Drawer {
             .child(body)
             .child(footer)
     }
+}
+
+async fn worker_event(tx: &async_channel::Sender<Worker>, event: AgentEvent) -> Result<(), ()> {
+    let (ready, receive) = tokio::sync::oneshot::channel();
+    tx.send(Worker::Event(event, ready)).await.map_err(|_| ())?;
+    receive.await.map_err(|_| ())
 }

@@ -324,6 +324,7 @@ impl Workspace {
         self.next_id += 1;
         let subscription = self.watch_terminal(session_id, &terminal, window, cx);
         self.sessions.push(Session {
+            ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id: session_id,
             title: title.into(),
             view,

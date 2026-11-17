@@ -43,6 +43,7 @@ impl Index<usize> for V {
     }
 }
 pub const SCENES: &[&str] = &[
+    "ai-agent", "ai-agent-run", "ai-agent-redline", "ai-agent-full",
     "ai", "ai-chat", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
     "main", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
     "files",
@@ -198,7 +199,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 56);
+        assert_eq!(SCENES.len(), 60);
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));

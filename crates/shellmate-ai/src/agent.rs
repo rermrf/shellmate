@@ -115,7 +115,7 @@ impl ToolOutcome {
             Self::Failed(reason) => format!("执行失败：{reason}"),
         }
     }
-    fn item(&self, call: &ToolCall) -> AnswerItem {
+    pub fn item(&self, call: &ToolCall) -> AnswerItem {
         let (status, exit_code, duration_ms, output) = match self {
             Self::Completed(out) => (
                 if out.timed_out {
@@ -147,6 +147,7 @@ impl ToolOutcome {
             status,
             exit_code,
             duration_ms,
+            automatic: false,
             output,
         };
         item.sanitize();
@@ -157,6 +158,10 @@ pub trait ToolHost: Send + Sync {
     /// Approval and execution belong to the host. Do not detach work: cancellation
     /// of this future must cancel the operation. The core never spawns host tasks.
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
+    /// The approved command may have been edited or retargeted by the user.
+    fn resolved_call(&self, call: &ToolCall) -> ToolCall {
+        call.clone()
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -389,7 +394,18 @@ fn stream<'a>(
             }
             if let Some((raw, call)) = s.active.take() {
                 let outcome = s.host.run(call.clone()).await.sanitize();
-                let wire = outcome.wire_text();
+                let resolved = s.host.resolved_call(&call);
+                let wire = if resolved != call {
+                    format!(
+                        "用户批准的实际命令：{}\n执行目标：{}\n{}",
+                        crate::output::stored_text(&resolved.command),
+                        resolved.target.label(),
+                        outcome.wire_text()
+                    )
+                } else {
+                    outcome.wire_text()
+                };
+                let call = resolved;
                 let turn = s.turn.as_mut().unwrap();
                 turn.output_chars = turn.output_chars.saturating_add(wire.chars().count());
                 turn.steps += 1;

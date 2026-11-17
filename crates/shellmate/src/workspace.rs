@@ -125,6 +125,7 @@ enum SessionKind {
 }
 
 struct Session {
+    ai_alive: Arc<std::sync::atomic::AtomicBool>,
     id: usize,
     title: SharedString,
     view: Entity<TerminalView>,
@@ -143,6 +144,10 @@ struct Session {
     typed: Option<ssh::TypedLine>,
     kind: SessionKind,
     _subscription: Subscription,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) { self.ai_alive.store(false, std::sync::atomic::Ordering::Release); }
 }
 
 impl Session {
@@ -381,6 +386,7 @@ impl Workspace {
         let open_locals = self.sessions.len();
         let title = if open_locals == 0 { "本机".to_string() } else { format!("本机 · {}", open_locals + 1) };
         self.sessions.push(Session {
+            ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
             title: title.into(),
             view,
@@ -432,6 +438,7 @@ impl Workspace {
                 _ => {}
             }
             this.sync_sidebar(cx);
+            this.sync_ai_context(cx);
             cx.notify();
         })
     }
@@ -481,6 +488,7 @@ impl Workspace {
         self.broadcast.checked.remove(&closed);
         self.recent_sessions.retain(|id|*id!=closed);
         self.session_menu=None;
+        self.sessions[ix].terminal.read(cx).agent_liveness().store(false, std::sync::atomic::Ordering::Release);
         self.sessions.remove(ix);
         self.update_pane_radii(cx);
         if let Some(group) = group {

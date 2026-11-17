@@ -1,18 +1,111 @@
 use super::*;
 impl Workspace {
-    pub(crate) fn ai_context(&self, cx: &App) -> shellmate_ai::ContextSnapshot {
-        self.focused_session()
-            .map_or_else(shellmate_ai::ContextSnapshot::default, |s| {
-                shellmate_ai::ContextSnapshot {
-                    label: s.title.to_string(),
-                    protocol: s.host().map_or("本机终端", |h| h.protocol.label()).into(),
-                    text: shellmate_ai::redact::recent_context(
-                        &s.terminal.read(cx).recent_displayed_text(usize::MAX),
-                        40,
-                    )
-                    .text,
+    pub(crate) fn ai_binding(
+        &self,
+        id: Option<usize>,
+        cx: &App,
+    ) -> Option<crate::ai::exec::Binding> {
+        let session = self.sessions.iter().find(|s| Some(s.id) == id)?;
+        let terminal = session.terminal.read(cx);
+        let connection = session
+            .ssh()
+            .and_then(|s| self.group(s.group))
+            .and_then(|g| g.live_connection());
+        let connected = terminal.agent_connected()
+            && match &session.kind {
+                SessionKind::Local => !session.exited,
+                SessionKind::Ssh(s) => s.status == ssh::SshStatus::Connected,
+                SessionKind::Stream(s) => s.connected(),
+            };
+        let (background, can_terminal) = crate::ai::model::execution_targets(
+            session.host().map(|h| h.protocol),
+            connected,
+            connection.is_some(),
+        );
+        let alive = if background && !terminal.agent_connected() {
+            session.ai_alive.clone()
+        } else {
+            terminal.agent_liveness()
+        };
+        Some(crate::ai::exec::Binding {
+            session: session.id,
+            connection,
+            local: matches!(session.kind, SessionKind::Local),
+            alive,
+            capabilities: shellmate_ai::agent::Capabilities {
+                background,
+                terminal: can_terminal,
+                terminal_busy: terminal.agent_busy(),
+                cwd: terminal.cwd().map(str::to_owned),
+            },
+        })
+    }
+    pub(crate) fn ai_terminal_start(
+        &mut self,
+        id: usize,
+        command: &str,
+        nonce: &str,
+        lease: &Arc<std::sync::atomic::AtomicBool>,
+        cx: &mut Context<Self>,
+    ) -> Result<shellmate_term::agent::CaptureHandle, shellmate_ai::agent::ToolOutcome> {
+        use shellmate_ai::agent::ToolOutcome;
+        if !self
+            .ai_binding(Some(id), cx)
+            .is_some_and(|b| b.capabilities.terminal)
+        {
+            return Err(ToolOutcome::Disconnected);
+        }
+        let session = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or(ToolOutcome::Disconnected)?;
+        if !Arc::ptr_eq(lease, &session.terminal.read(cx).agent_liveness())
+            || !lease.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ToolOutcome::Disconnected);
+        }
+        session
+            .terminal
+            .update(cx, |t, _| t.agent_start(command, nonce))
+            .map_err(|e| {
+                if e == "busy" {
+                    ToolOutcome::Busy
+                } else {
+                    ToolOutcome::Disconnected
                 }
             })
+    }
+    pub(crate) fn ai_terminal_finish(
+        &mut self,
+        id: usize,
+        nonce: &str,
+        finish: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.sessions.iter().find(|s| s.id == id) {
+            session.terminal.update(cx, |t, _| {
+                if finish {
+                    t.agent_finish(nonce, true)
+                } else {
+                    t.agent_interrupt(nonce)
+                }
+            });
+        }
+    }
+    pub(crate) fn ai_context(&self, id: Option<usize>, cx: &App) -> shellmate_ai::ContextSnapshot {
+        self.sessions.iter().find(|s| Some(s.id) == id).map_or_else(
+            shellmate_ai::ContextSnapshot::default,
+            |s| shellmate_ai::ContextSnapshot {
+                label: s.title.to_string(),
+                protocol: s.host().map_or("本机终端", |h| h.protocol.label()).into(),
+                text: shellmate_ai::redact::recent_context(
+                    &s.terminal.read(cx).recent_displayed_text(usize::MAX),
+                    40,
+                )
+                .text,
+            },
+        )
     }
     pub(crate) fn sync_ai_context(&mut self, cx: &mut Context<Self>) {
         let Some(drawer) = self.ai_drawer.clone() else {
@@ -25,7 +118,14 @@ impl Workspace {
         let protocol = session.map_or_else(String::new, |s| {
             s.host().map_or("本机终端", |h| h.protocol.label()).into()
         });
-        drawer.update(cx, |d, cx| d.sync_context(id, host, label, protocol, cx));
+        let context = crate::ai::panel::SessionContext {
+            session: id,
+            host,
+            label,
+            protocol,
+            binding: self.ai_binding(id, cx),
+        };
+        drawer.update(cx, |d, cx| d.sync_context(context, cx));
     }
     pub(super) fn open_ai(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.ai_drawer.is_none() {

@@ -1,3 +1,5 @@
+pub mod exec;
+pub mod host;
 pub mod model;
 pub mod panel;
 pub mod settings;
@@ -121,7 +123,7 @@ impl DialogBody for Disclosure {
 impl Render for Disclosure {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = dialogs::palette(cx);
-        dialogs::stack().child(dialogs::hint(format!("将把最近 40 行已脱敏的终端显示文本、你的问题及本次对话的历史发送到 {}。不会发送登录凭据。首次同意后，会记住此地址；测试连接也会向该地址发送一句测试问题。",self.destination),&p)).children(self.error.clone().map(|e|dialogs::notice(dialogs::Notice::Error,e,&p))).child(dialogs::actions(vec![dialogs::button("ai-disclosure-cancel","取消",Tone::Plain,true).on_click(cx.listener(|s,_,w,cx|s.dismiss(w,cx))),dialogs::button("ai-disclosure-ok","同意并继续",Tone::Primary,true).on_click(cx.listener(|s,_,w,cx|s.submit(w,cx)))]))
+        dialogs::stack().child(dialogs::hint(format!("将把最近 40 行已脱敏的终端显示文本、你的问题及本次对话的历史发送到 {}。不会发送登录凭据。AI 执行命令后，命令及其脱敏后的输出也会发送到该地址。首次同意后，会记住此地址；测试连接也会向该地址发送一句测试问题。",self.destination),&p)).children(self.error.clone().map(|e|dialogs::notice(dialogs::Notice::Error,e,&p))).child(dialogs::actions(vec![dialogs::button("ai-disclosure-cancel","取消",Tone::Plain,true).on_click(cx.listener(|s,_,w,cx|s.dismiss(w,cx))),dialogs::button("ai-disclosure-ok","同意并继续",Tone::Primary,true).on_click(cx.listener(|s,_,w,cx|s.submit(w,cx)))]))
     }
 }
 impl Drop for Disclosure {

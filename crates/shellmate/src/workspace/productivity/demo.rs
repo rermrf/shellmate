@@ -81,6 +81,7 @@ impl Workspace {
             let subscription = self.watch_terminal(id, &terminal, window, cx);
             let ssh = ssh::SshSession::demo(host.clone());
             self.sessions.push(Session {
+                ai_alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 id,
                 title: host.name.into(),
                 view,

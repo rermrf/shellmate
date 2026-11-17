@@ -282,3 +282,53 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod permission_tests {
+    #[test]
+    fn chip_permissions_persist_per_host_and_local_key() {
+        use shellmate_ai::policy::PermissionMode;
+        use shellmate_store::HostStore;
+        let root = std::env::temp_dir().join(format!("shellmate-agent-store-{}",shellmate_core::HostId::generate()));
+        std::fs::create_dir(&root).unwrap();
+        let path=root.join("hosts.db");
+        {
+            let mut db=HostStore::open(&path).unwrap();
+            db.set_ai_permission("local",PermissionMode::Full).unwrap();
+            db.set_ai_permission("prod-web-01",PermissionMode::Auto).unwrap();
+        }
+        {
+            let db=HostStore::open(&path).unwrap();
+            assert_eq!(db.ai_permission("local").unwrap(),PermissionMode::Full);
+            assert_eq!(db.ai_permission("prod-web-01").unwrap(),PermissionMode::Auto);
+            assert_eq!(db.ai_permission("other-host").unwrap(),PermissionMode::Ask);
+            assert_eq!(db.setting("ai_permission:local").unwrap().as_deref(),Some("full"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Protocol, not transport implementation, determines the offered tools (Mosh also owns SSH).
+pub fn execution_targets(protocol: Option<shellmate_core::Protocol>, connected: bool, ssh_exec: bool) -> (bool, bool) {
+    match protocol {
+        None => (true, connected),
+        Some(shellmate_core::Protocol::Ssh) => (ssh_exec, connected),
+        Some(shellmate_core::Protocol::Telnet) => (false, connected),
+        Some(shellmate_core::Protocol::Mosh | shellmate_core::Protocol::Serial) => (false, false),
+    }
+}
+#[cfg(test)]
+mod capability_tests {
+    use super::execution_targets;
+    use shellmate_core::Protocol;
+    #[test]
+    fn session_capability_matrix_including_mosh_auxiliary_ssh() {
+        for connected in [false,true] {for ssh in [false,true] {
+            assert_eq!(execution_targets(None,connected,ssh),(true,connected));
+            assert_eq!(execution_targets(Some(Protocol::Ssh),connected,ssh),(ssh,connected));
+            assert_eq!(execution_targets(Some(Protocol::Telnet),connected,ssh),(false,connected));
+            assert_eq!(execution_targets(Some(Protocol::Mosh),connected,ssh),(false,false));
+            assert_eq!(execution_targets(Some(Protocol::Serial),connected,ssh),(false,false));
+        }}
+    }
+}

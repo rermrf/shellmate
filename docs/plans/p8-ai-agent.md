@@ -216,3 +216,37 @@ When the approval card is shown, the user can switch the target before running.
   - the real model with a fake `ToolHost` returning canned output: checks that the model calls `run_command`, uses the result, and finishes;
   - the terminal executor against a real local PTY;
   - the background executor against the `shellmate-e2e` container.
+
+## M6 review conclusions (2026-11-17)
+
+### M6a: core
+- **Policy test table:** close to 1,300 command checks.
+- **Unseen-command spot check:** 43 commands written by the reviewer were all classified correctly.
+- **Problem found with the real model:** with reasoning set to 高, the model often omits the single-valued `target` parameter, which aborted the whole turn. Fixed with defaults and leniency:
+  - a missing target or purpose gets a default;
+  - unknown fields are ignored;
+  - an invalid call returns an error to the model instead of failing; 3 invalid calls in a row end the turn.
+- **Policy gaps found and fixed:**
+  - red line was missed behind wrappers such as `timeout`, `nice`, `doas` and `ssh host`, and inside interpreter code such as `awk system()` and `python -c`;
+  - common read-only forms were asked about unnecessarily: `ps --sort`, `top -bn1`, `ip a`, `$VAR`, safe `awk`/`sed`;
+  - reading sensitive files (private keys, shadow, `.env`, credentials, history) now always asks.
+- **Real API** (OpenAI-compatible gateway, gpt-5.6-luna, fake executor): passed 3 times each at 默认 and 高.
+
+### M6b: executors and UI
+- **SSH background channel:** verified against the `shellmate-e2e` container (`ai::exec::tests::ssh_background_docker_uname_nonzero_timeout_stderr`):
+  - normal output, a non-zero exit code with stderr, and a timeout.
+- **Local background process and real-PTY terminal execution:** automated tests cover:
+  - the exit code and echo removal;
+  - the shell staying usable after a timeout's Ctrl-C;
+  - stopping kills the whole process group;
+  - the hidden marker never renders.
+- **Fixed in review:**
+  - output blocks no longer wrap and scroll horizontally, so tables line up; collapse is by height;
+  - the drawer follows new content like a chat, and an approval request always scrolls into view;
+  - the permission chip is compact, and 完全访问 uses a light red background;
+  - 自动执行 moved into the card header;
+  - terminal commands get a leading space so they stay out of shell history, and the nonce is 12 characters.
+- **Known limitation:** after cancelling a background SSH command, closing the channel does not guarantee the remote process exits; the SSH API cannot kill the remote process group.
+- **Final re-run** (outside the sandbox): clippy has zero warnings; `cargo test --workspace` has 1289 passed, 0 failed.
+
+Manual tests are in `docs/manual-tests.md` G1–G12.
