@@ -146,7 +146,13 @@ impl Item {
             .to_owned()
     }
     fn same(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.fields == other.fields && self.secret == other.secret
+        self.kind == other.kind
+            && self.preview_fields().eq(other.preview_fields())
+            && self.secret == other.secret
+    }
+    /// Hidden compatibility data still travels in the payload and exact snapshots.
+    fn preview_fields(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.fields.iter().filter(|(key, _)| self.kind != Kind::Host || key.as_str() != "tags")
     }
     fn natural(&self) -> Vec<Value> {
         let cols: &[&str] = match self.kind {
@@ -660,8 +666,7 @@ impl PreviewRow {
             return vec!["凭据内容不同（不显示明文）".into()];
         }
         self.incoming
-            .fields
-            .iter()
+            .preview_fields()
             .filter(|(k, v)| old.fields.get(*k) != Some(*v))
             .map(|(k, v)| {
                 format!(
@@ -691,7 +696,6 @@ fn field_label(field: &str) -> &str {
         "serial_stop" => "停止位",
         "serial_flow" => "流控",
         "serial_newline" => "换行",
-        "tags" => "标签",
         "jumps" => "跳板",
         "tone" => "颜色",
         "sort" => "顺序",
@@ -1063,6 +1067,7 @@ mod tests {
         assert_eq!(p.counts(), [6, 0, 0]);
         assert_eq!(b.apply_bundle(&p).unwrap(), 6);
         assert_eq!(db.borrow().hosts().unwrap().len(), 1);
+        assert_eq!(db.borrow().hosts().unwrap()[0].tags, ["prod"]);
         assert_eq!(
             db.borrow().snippets().unwrap()[0].items[0].id,
             "command-stable"
@@ -1071,6 +1076,47 @@ mod tests {
             &bundle,
             &b.export_bundle(Contents::default()).unwrap()
         ));
+    }
+    #[test]
+    fn tags_only_difference_is_identical_and_keeps_payloads() {
+        let (db, manager) = populated();
+        let local = manager.export_bundle(Contents::default()).unwrap();
+        let mut incoming = local.clone();
+        incoming.items.iter_mut().find(|i| i.kind == Kind::Host).unwrap()
+            .fields.insert("tags".into(), json!(["legacy,tag", "主库"]));
+        // Preview equality must not weaken exact snapshots used to detect concurrent edits.
+        assert!(!same_snapshot(&local, &incoming));
+        let preview = manager.preview_bundle(incoming).unwrap();
+        assert_eq!(preview.counts(), [0, 6, 0]);
+        let host = preview.rows.iter().find(|r| r.incoming.kind == Kind::Host).unwrap();
+        assert_eq!(host.classification, Classification::Identical);
+        assert_eq!(host.classification.label(), "相同");
+        assert!(host.diff().is_empty());
+        assert_eq!(host.incoming.fields["tags"], json!(["legacy,tag", "主库"]));
+        assert_eq!(manager.apply_bundle(&preview).unwrap(), 0);
+        assert_eq!(db.borrow().hosts().unwrap()[0].tags, ["prod"]);
+    }
+    #[test]
+    fn host_conflict_hides_tags_but_imports_them() {
+        let (db, manager) = populated();
+        let mut incoming = manager.export_bundle(Contents::default()).unwrap();
+        let host = incoming.items.iter_mut().find(|i| i.kind == Kind::Host).unwrap();
+        host.fields.insert("addr".into(), json!("changed.test"));
+        host.fields.insert("tags".into(), json!(["legacy,tag", "主库"]));
+        let mut preview = manager.preview_bundle(incoming).unwrap();
+        assert_eq!(preview.counts(), [0, 5, 1]);
+        let host = preview.rows.iter().find(|r| r.incoming.kind == Kind::Host).unwrap();
+        assert_eq!(host.diff(), ["地址：web.example.test → changed.test"]);
+        preview.choose_all(Choice::Overwrite);
+        assert_eq!(manager.apply_bundle(&preview).unwrap(), 1);
+        let hosts = db.borrow().hosts().unwrap();
+        assert_eq!(hosts[0].addr, "changed.test");
+        assert_eq!(hosts[0].tags, ["legacy,tag", "主库"]);
+        let exported = manager.export_bundle(Contents::default()).unwrap();
+        assert_eq!(
+            exported.items.iter().find(|i| i.kind == Kind::Host).unwrap().fields["tags"],
+            json!(["legacy,tag", "主库"])
+        );
     }
     #[test]
     fn manual_sync_edit_on_b_updates_a_without_duplicates() {

@@ -504,7 +504,7 @@ pub async fn connect_attempt(
         }
         let mut tabs = tabs.into_iter();
         let Some((first, dims)) = tabs.next() else {
-            return Err(SshError::Unsupported("没有需要连接的标签".into()));
+            return Err(SshError::Unsupported("没有需要连接的会话".into()));
         };
         let (connection, shell) = Connection::connect_with_shell(route, options, dims).await?;
         let mut shells = vec![(first, shell)];

@@ -101,7 +101,7 @@ fn main() {
                 MenuItem::action("新建本机终端", NewLocalTerminal),
                 MenuItem::action("复制当前会话", DuplicateSession),
                 MenuItem::separator(),
-                MenuItem::action("关闭标签", CloseTab),
+                MenuItem::action("关闭会话", CloseTab),
             ]),
         ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();

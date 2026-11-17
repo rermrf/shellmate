@@ -358,7 +358,7 @@ impl Workspace {
         let host = chain.last().cloned()?;
         // Existing SSH tabs can outlive an edit that changes the saved host's protocol.
         if !matches!(host.protocol,shellmate_core::Protocol::Ssh|shellmate_core::Protocol::Mosh) {
-            let note = format!("主机配置已改为{}，请关闭该主机的旧标签后重新连接。", host.protocol.label());
+            let note = format!("主机配置已改为{}，请关闭该主机的旧会话后重新连接。", host.protocol.label());
             window.push_notification(Notification::info(note).title(format!("{} 的协议已更改", host.name)), cx);
             return None;
         }
@@ -1049,6 +1049,33 @@ mod tests {
     use shellmate_core::AuthMethod;
 
     use super::*;
+
+    #[test]
+    fn local_terminal_summary_counts_only_local_sessions() {
+        use super::super::{local_terminal_summary, streams::StreamSession};
+        use shellmate_core::Protocol;
+
+        let mut kinds = vec![
+            SessionKind::Local,
+            SessionKind::Ssh(Box::new(SshSession::new(host("remote", None), vec![], 1))),
+        ];
+        assert_eq!(local_terminal_summary("zsh", &kinds), "zsh · 1 个会话");
+        for protocol in [Protocol::Telnet, Protocol::Serial, Protocol::Mosh] {
+            let mut remote = host("remote", None);
+            remote.protocol = protocol;
+            kinds.push(if protocol == Protocol::Mosh {
+                SessionKind::Ssh(Box::new(SshSession::new(remote, vec![], 2)))
+            } else {
+                SessionKind::Stream(Box::new(StreamSession::new(remote)))
+            });
+        }
+        assert_eq!(local_terminal_summary("zsh", &kinds), "zsh · 1 个会话");
+        kinds.push(SessionKind::Local);
+        assert_eq!(local_terminal_summary("bash", &kinds), "bash · 2 个会话");
+        kinds.retain(|kind| !matches!(kind, SessionKind::Local));
+        assert_eq!(local_terminal_summary("zsh", &kinds), "zsh · ~");
+        assert_eq!(local_terminal_summary("zsh", &[]), "zsh · ~");
+    }
 
     #[test]
     fn mosh_terminal_survives_panel_transport_loss_and_reconnect(){

@@ -50,10 +50,8 @@ pub fn risky(command: &str) -> bool {
         || sequence(&s, "drop", &["table", "database"])
 }
 
-pub fn production(group: &str, tags: &[String]) -> bool {
-    std::iter::once(group)
-        .chain(tags.iter().map(String::as_str))
-        .any(|s| s.contains("生产") || s.to_lowercase().contains("prod"))
+pub fn production(group: &str) -> bool {
+    group.contains("生产") || group.to_lowercase().contains("prod")
 }
 
 pub fn quick_connect(query: &str) -> Option<Host> {
@@ -409,15 +407,17 @@ mod tests {
         }
     }
     #[test]
-    fn production_table() {
-        for (g, tags, expected) in [
-            ("生产环境", vec![], true),
-            ("prePROD", vec![], true),
-            ("开发", vec!["production".into()], true),
-            ("", vec!["生产-db".into()], true),
-            ("开发", vec!["test".into()], false),
+    fn production_uses_only_group_name() {
+        for (group, expected) in [
+            ("生产环境", true),
+            ("prePROD", true),
+            ("production", true),
+            ("生产-db", true),
+            ("开发", false),
+            ("", false),
+            ("test", false),
         ] {
-            assert_eq!(production(g, &tags), expected);
+            assert_eq!(production(group), expected, "{group}");
         }
     }
     #[test]

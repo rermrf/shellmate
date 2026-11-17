@@ -181,7 +181,6 @@ pub struct EditorFields {
     pub addr: String,
     pub port: String,
     pub user: String,
-    pub tags: String,
     pub group: String,
     pub identity_file: String,
     pub password: String,
@@ -199,7 +198,7 @@ pub fn expand_tilde(text: &str, home: Option<&Path>) -> PathBuf {
 }
 
 /// Validates the form and builds the host to save on top of `original` (which keeps its id,
-/// favorite flag, protocol and last connection time) or a new host.
+/// favorite flag, stored tags and last connection time) or a new host.
 pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<&Path>) -> Result<HostDraft, String> {
     let serial=fields.protocol==shellmate_core::Protocol::Serial;
     let serial_name=std::path::Path::new(fields.addr.trim()).file_name().and_then(|s|s.to_str()).unwrap_or("");
@@ -234,13 +233,6 @@ pub fn build_draft(fields: &EditorFields, original: Option<&Host>, home: Option<
         }
         _ => None,
     };
-    let mut tags: Vec<String> = Vec::new();
-    for tag in fields.tags.split([',', '，']).map(str::trim).filter(|t| !t.is_empty()) {
-        if !tags.iter().any(|t| t == tag) {
-            tags.push(tag.to_string());
-        }
-    }
-    host.tags = tags;
     if fields.protocol==shellmate_core::Protocol::Mosh {shellmate_ssh::mosh::validate_direct(!fields.jumps.is_empty())?;}
     host.jump = if matches!(fields.protocol,shellmate_core::Protocol::Ssh|shellmate_core::Protocol::Mosh) {fields.jumps.clone()}else{vec![]};
 
@@ -320,19 +312,17 @@ mod tests {
     }
 
     #[test]
-    fn fields_are_trimmed_and_tags_split_on_both_commas() {
+    fn fields_are_trimmed() {
         let f = EditorFields {
             name: "  web  ".into(),
             addr: " w.example.com ".into(),
             port: " 2222 ".into(),
             user: "  deploy ".into(),
-            tags: "nginx, k8s，nginx ,, 主库 ".into(),
             ..fields("", "")
         };
         let host = draft(&f).host;
         assert_eq!((host.name.as_str(), host.addr.as_str(), host.port), ("web", "w.example.com", 2222));
         assert_eq!(host.user.as_deref(), Some("deploy"));
-        assert_eq!(host.tags, ["nginx", "k8s", "主库"], "duplicates and empty tags are dropped");
         assert_eq!(draft(&EditorFields { user: "   ".into(), ..fields("n", "h") }).host.user, None);
     }
 
@@ -363,9 +353,11 @@ mod tests {
         saved.favorite = true;
         saved.last_connected_at = Some(42);
         saved.protocol = Protocol::Mosh;
+        saved.tags = vec!["nginx".into(), "legacy,tag".into(), "主库".into()];
         let jumps = vec![HostId::generate(), HostId::generate()];
         let f = EditorFields { jumps: jumps.clone(), ..fields("renamed", "new.example.com") };
         let host = build_draft(&f, Some(&saved), None).unwrap().host;
+        assert_eq!(host.tags, saved.tags);
         assert_eq!(
             (host.id.clone(), host.favorite, host.last_connected_at, host.protocol),
             (saved.id, true, Some(42), Protocol::Ssh)
@@ -374,6 +366,21 @@ mod tests {
     }
 
     // ---- saving ----
+
+    #[test]
+    fn saving_an_edited_host_preserves_stored_tags() {
+        let (mut store, secrets) = (store(), MemoryStore::new());
+        let mut saved = Host::new("old", "old.example.test");
+        saved.tags = vec!["prod".into(), "legacy,tag".into(), "主库".into()];
+        store.save_host(&saved).unwrap();
+        let draft = build_draft(&fields("renamed", "new.example.test"), Some(&saved), None).unwrap();
+        save_host(&mut store, &secrets, draft).unwrap();
+        let hosts = store.hosts().unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, saved.id);
+        assert_eq!(hosts[0].name, "renamed");
+        assert_eq!(hosts[0].tags, saved.tags);
+    }
 
     #[test]
     fn saving_creates_a_missing_group_and_reuses_an_existing_one() {

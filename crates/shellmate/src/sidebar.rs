@@ -116,7 +116,7 @@ fn unix_now() -> i64 {
 
 impl Sidebar {
     pub fn new(book: Rc<HostBook>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称、地址、标签"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称、地址"));
         let subscriptions = vec![cx.observe(&search, |_, _, cx| cx.notify())];
         Self {
             book,

@@ -421,8 +421,8 @@ impl Workspace {
                 if let Ok(path)=arc.build(){window.paint_path(path,p.acc);}
             }).absolute().inset_0()))
             .child(div().text_size(px(17.)).line_height(px(24.)).font_weight(FontWeight::SEMIBOLD).child("网络已切换，正在重连"))
-            .child(div().text_center().text_size(px(13.)).line_height(px(21.)).text_color(p.tx2).child(format!("Wi-Fi「Office-5G」→ 有线网络 · 第 {attempt} / 5 次尝试\n恢复后自动还原标签、工作目录与端口转发")))
-            .child(div().flex().gap(px(8.)).mt(px(4.)).child(Button::new("proto-retry").primary().w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("立即重连")).child(Button::new("proto-close").w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("关闭标签"))))
+            .child(div().text_center().text_size(px(13.)).line_height(px(21.)).text_color(p.tx2).child(format!("Wi-Fi「Office-5G」→ 有线网络 · 第 {attempt} / 5 次尝试\n恢复后自动还原会话、工作目录与端口转发")))
+            .child(div().flex().gap(px(8.)).mt(px(4.)).child(Button::new("proto-retry").primary().w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("立即重连")).child(Button::new("proto-close").w(px(88.)).h(px(36.)).rounded(px(11.)).text_size(px(13.)).label("关闭会话"))))
         .into_any_element())
     }
     fn proto_hostkey(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {

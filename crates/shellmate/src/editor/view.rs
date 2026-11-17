@@ -187,7 +187,7 @@ impl FileEditor {
             None => {
                 // The tab went away while the editor was open: there is no session to send it on.
                 let (answer, receiver) = async_channel::bounded(1);
-                let _ = answer.try_send(Err(SftpError::Disconnected("该标签页已关闭".into())));
+                let _ = answer.try_send(Err(SftpError::Disconnected("该会话已关闭".into())));
                 receiver
             }
         };

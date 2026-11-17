@@ -465,7 +465,7 @@ pub fn prune_plan(view: &DockerView, runtime: &ContainerRuntime, probe: &Probe) 
         confirm: Some(Confirm {
             title: "清理悬空镜像？".into(),
             text: format!(
-                "将删除 {} 个悬空镜像（没有标签、也没有被容器使用的镜像），可回收约 {}。\n不影响容器、数据卷和有标签的镜像。",
+                "将删除 {} 个悬空镜像（没有名称、也没有被容器使用的镜像），可回收约 {}。\n不影响容器、数据卷和有名称的镜像。",
                 view.dangling.count,
                 format::decimal_size(view.dangling.bytes)
             ),

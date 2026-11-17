@@ -178,8 +178,8 @@ impl Workspace {
                 .sessions
                 .iter()
                 .find(|s| s.ssh().is_some_and(|ssh| ssh.group == owner_id))
-                .map_or_else(|| "另一个标签".to_string(), |s| format!("「{}」", s.title));
-            notes.push(format!("这些规则在到此主机的另一条连接（标签{tab}）上运行，这里显示的是同一份。"));
+                .map_or_else(|| "另一个会话".to_string(), |s| format!("「{}」", s.title));
+            notes.push(format!("这些规则在到此主机的另一条连接（会话{tab}）上运行，这里显示的是同一份。"));
         }
         let Some(forward) = self.group(owner_id).and_then(|group| group.forward.as_ref()) else {
             return ForwardView::empty(&host.name);

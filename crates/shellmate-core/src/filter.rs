@@ -143,11 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn query_filters_by_tag() {
+    fn query_filters_by_name_but_not_tags() {
         let book = sample_book();
         let s = sections(&book, HostFilter::All, "redis");
         assert_eq!(s.len(), 1);
         assert_eq!(names(&s[0]), ["staging-redis"]);
+        for filter in HostFilter::ALL {
+            assert!(sections(&book, filter, "nginx").is_empty());
+        }
     }
 
     #[test]

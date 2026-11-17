@@ -77,7 +77,6 @@ pub struct HostEditor {
     addr: Entity<InputState>,
     port: Entity<InputState>,
     user: Entity<InputState>,
-    tags: Entity<InputState>,
     group: Entity<InputState>,
     identity: Entity<InputState>,
     password: Entity<InputState>,
@@ -166,11 +165,6 @@ impl HostEditor {
                 "留空使用本机用户名",
                 cx,
             );
-            let tags = text(
-                source.map(|h| h.tags.join(", ")).unwrap_or_default(),
-                "nginx, k8s",
-                cx,
-            );
             let group = text(group_name, "不分组", cx);
             let identity = text(
                 source
@@ -206,7 +200,7 @@ impl HostEditor {
                 passphrase.update(cx, |s, cx| s.set_value("fixture-only", window, cx));
             }
             let mut subscriptions = Vec::new();
-            for input in [&name, &addr, &port, &user, &tags, &group, &identity, &password, &passphrase, &baud] {
+            for input in [&name, &addr, &port, &user, &group, &identity, &password, &passphrase, &baud] {
                 let input = input.clone();
                 let focus = input.focus_handle(cx);
                 subscriptions.push(cx.on_focus(&focus, window, move |_: &mut Self, window, cx| {
@@ -235,7 +229,6 @@ impl HostEditor {
                 &addr,
                 &port,
                 &user,
-                &tags,
                 &group,
                 &password,
                 &passphrase,
@@ -268,7 +261,14 @@ impl HostEditor {
                 },
             ));
             Self {
-                base: original.clone().unwrap_or_else(|| Host::new("", "")),
+                base: original.clone().unwrap_or_else(|| {
+                    let mut host = Host::new("", "");
+                    // Copies retain compatibility data that the form no longer exposes.
+                    if let Some(source) = source {
+                        host.tags.clone_from(&source.tags);
+                    }
+                    host
+                }),
                 passphrase,
                 key_info: None,
                 key_task: None,
@@ -288,7 +288,6 @@ impl HostEditor {
                 addr,
                 port,
                 user,
-                tags,
                 group,
                 identity,
                 password,
@@ -358,7 +357,6 @@ impl HostEditor {
             addr: value(&self.addr),
             port: value(&self.port),
             user: value(&self.user),
-            tags: value(&self.tags),
             group: value(&self.group),
             identity_file: value(&self.identity),
             password: value(&self.password),
@@ -1012,7 +1010,6 @@ impl Render for HostEditor {
                             )))
                             .child(div().w(px(90.)).child(self.field("端口", &p, self.input(&self.port, &p, true)))),
                     )
-                    .child(self.field("标签（逗号分隔）", &p, self.input(&self.tags, &p, false)))
                     )
                     .children((self.protocol==Protocol::Serial).then(||self.render_serial_fields(&p,cx)))
                     .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))

@@ -747,7 +747,7 @@ impl Workspace {
                             .map(|p| format!("{}:{:?}", p.pid, p.cpu_percent.map(|v| v.round())))
                             .collect();
                         log::info!(
-                            "监控 [{arg}] {phase:?} 核{} CPU{cpu:?} 内存{:?} 进程{} 僵尸{} 磁盘{} 网络{:?} 前三{top:?} 标签{}",
+                            "监控 [{arg}] {phase:?} 核{} CPU{cpu:?} 内存{:?} 进程{} 僵尸{} 磁盘{} 网络{:?} 前三{top:?} 会话{}",
                             s.host.cores,
                             s.memory.map(|m| m.used_percent().round()),
                             s.processes.len(),
@@ -757,7 +757,7 @@ impl Workspace {
                             self.sessions.len(),
                         );
                     }
-                    None => log::info!("监控 [{arg}] {phase:?} 还没有数据，标签{}", self.sessions.len()),
+                    None => log::info!("监控 [{arg}] {phase:?} 还没有数据，会话{}", self.sessions.len()),
                 }
             }
             other => log::warn!("unknown monitor step {other:?}"),

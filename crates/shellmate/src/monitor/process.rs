@@ -315,7 +315,7 @@ pub struct ActionButton {
 }
 
 const ZOMBIE_NOTE: &str = "僵尸进程已经结束，只是还没被父进程回收：对它发信号没有用，需要处理它的父进程";
-const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新终端标签里打好命令，由你回车并输入密码";
+const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新会话里打好命令，由你回车并输入密码";
 
 /// Why `action` cannot be done to `process`, if it cannot.
 pub fn unavailable(process: &Process) -> Option<&'static str> {
@@ -385,7 +385,7 @@ pub fn buttons(process: &Process, probe: Option<&Probe>) -> Vec<ActionButton> {
                 Err(_) => off("这个进程号不能用于操作"),
                 Ok((via, line, _)) => {
                     let tooltip = match (action, via) {
-                        (ProcessAction::Strace, _) => Some(format!("在新终端标签里运行：{line}")),
+                        (ProcessAction::Strace, _) => Some(format!("在新会话里运行：{line}")),
                         (_, Via::Sudo) => Some(format!("以 sudo -n 执行：{line}")),
                         (_, Via::Terminal) => Some(format!("{TERMINAL_NOTE}：{line}")),
                         (_, Via::Direct) => None,
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(button(&password, ProcessAction::Strace).label, "strace 跟踪", "strace is in a terminal anyway");
         assert_eq!(
             button(&password, ProcessAction::Strace).tooltip.as_deref(),
-            Some("在新终端标签里运行：sudo strace -f -p 1")
+            Some("在新会话里运行：sudo strace -f -p 1")
         );
         let none = buttons(&root_process, Some(&probe(Sudo::Unavailable)));
         assert_eq!(button(&none, ProcessAction::Term).via, Via::Terminal);

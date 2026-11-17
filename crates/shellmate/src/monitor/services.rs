@@ -231,7 +231,7 @@ pub fn failure_text(service: &Service) -> Option<String> {
     })
 }
 
-const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新终端标签里打好命令，由你回车并输入密码";
+const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新会话里打好命令，由你回车并输入密码";
 
 fn command_of(action: ServiceAction, service: &Service) -> Result<Command, BuildError> {
     commands::systemctl(action, &service.name)

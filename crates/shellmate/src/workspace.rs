@@ -521,7 +521,11 @@ impl Workspace {
         self.sync_productivity(cx);
         let count = self.sessions.len();
         let shell = shell_name(&PtyOptions::default().shell_path());
-        let summary = if crate::prototype_fixture(){"zsh · ~".to_string()} else if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个标签") };
+        let summary = if crate::prototype_fixture() {
+            "zsh · ~".to_string()
+        } else {
+            local_terminal_summary(&shell, self.sessions.iter().map(|s| &s.kind))
+        };
         let mut live: HashMap<String, LiveStatus> = HashMap::new();
         for ssh in self.sessions.iter().filter_map(Session::ssh) {
             if let Some(status) = ssh.live() {
@@ -688,7 +692,7 @@ impl Workspace {
         let content_width =
             f32::from(window.viewport_size().width) - if self.sidebar_open { SIDEBAR_WIDTH } else { RAIL_WIDTH } - 12.;
         let available = (content_width - toolbar_width - 4. * 8.).max(0.);
-        let overflow_label = format!("{} 个标签 ▾", self.sessions.len());
+        let overflow_label = format!("{} 个会话 ▾", self.sessions.len());
         let overflow_width = measure(&overflow_label, 12., FontWeight::NORMAL, window) + 16.;
         let cap = None;
         #[cfg(debug_assertions)]
@@ -1249,6 +1253,11 @@ fn user_at_host() -> String {
 
 fn shell_name(path: &str) -> String {
     Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
+}
+
+fn local_terminal_summary<'a>(shell: &str, kinds: impl IntoIterator<Item = &'a SessionKind>) -> String {
+    let count = kinds.into_iter().filter(|kind| matches!(kind, SessionKind::Local)).count();
+    if count == 0 { format!("{shell} · ~") } else { format!("{shell} · {count} 个会话") }
 }
 
 /// Abbreviates `$HOME` to `~`.

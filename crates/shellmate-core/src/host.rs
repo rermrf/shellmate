@@ -158,7 +158,7 @@ pub struct Host {
     pub user: Option<String>,
     /// The group the host belongs to, if any.
     pub group: Option<GroupId>,
-    /// Free-form tags, searchable.
+    /// Legacy free-form tags retained for storage and bundle compatibility.
     pub tags: Vec<String>,
     /// Shown in the favorites tab.
     pub favorite: bool,
@@ -234,13 +234,13 @@ impl Host {
         }
     }
 
-    /// Whether the host matches a search query (name, address or tags, case-insensitive).
+    /// Whether the host matches a search query (name or address, case-insensitive).
     pub fn matches(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
             return true;
         }
-        let haystack = format!("{} {} {}", self.name, self.addr, self.tags.join(" ")).to_lowercase();
+        let haystack = format!("{} {}", self.name, self.addr).to_lowercase();
         haystack.contains(&query)
     }
 }
@@ -362,12 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn matches_name_addr_and_tags_case_insensitively() {
+    fn matches_name_and_addr_case_insensitively_but_not_tags() {
         let h = host("Prod-Web");
         assert!(h.matches(""));
         assert!(h.matches("  prod "));
         assert!(h.matches("10.0.0"));
-        assert!(h.matches("NGINX"));
+        assert!(!h.matches("NGINX"));
         assert!(!h.matches("mysql"));
     }
 

@@ -422,7 +422,7 @@ pub fn close_confirmation(host: &str, running: usize, connections: u32) -> (Stri
     if connections > 0 {
         text.push_str(&format!("（当前 {connections} 个连接会断开）"));
     }
-    (format!("关闭 {host} 的最后一个标签？"), text)
+    (format!("关闭 {host} 的最后一个会话？"), text)
 }
 
 /// The question before a rule is deleted: the title and the text (what the rule is, and that open
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn closing_the_last_tab_warns_with_both_counts() {
         let (title, text) = close_confirmation("prod-web-01", 3, 5);
-        assert_eq!(title, "关闭 prod-web-01 的最后一个标签？");
+        assert_eq!(title, "关闭 prod-web-01 的最后一个会话？");
         assert_eq!(text, "关闭后 3 条端口转发会停止（当前 5 个连接会断开）");
         assert_eq!(
             close_confirmation("h", 1, 0).1,

@@ -157,7 +157,7 @@ impl Workspace {
                         .as_ref()
                         .and_then(|id| self.book.group(id))
                         .map_or("", |g| g.name.as_str());
-                    crate::productivity::model::production(group, &host.tags)
+                    crate::productivity::model::production(group)
                 });
                 Target {
                     id: s.id,
