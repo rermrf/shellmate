@@ -1,6 +1,7 @@
 use super::*;
 use crate::ai::host::{Approval, Ui};
 use crate::dialogs::{self, DialogBody, Tone};
+use gpui::component::input::{Textarea, TextareaState};
 use shellmate_ai::{
     Answer, AnswerItem, StepStatus,
     agent::{Target, ToolCall, ToolOutcome},
@@ -15,7 +16,7 @@ pub(super) struct ActiveStep {
     pub redline: bool,
     pub started: Option<Instant>,
     pub automatic: bool,
-    pub edit: Option<Entity<InputState>>,
+    pub edit: Option<Entity<TextareaState>>,
     _edit_subscription: Option<Subscription>,
     pub reason: Option<Entity<InputState>>,
 }
@@ -390,7 +391,11 @@ impl Drawer {
             cx,
         ));
         card = if let Some(edit) = &step.edit {
-            card.child(Input::new(edit).text_size(px(12.)).font_family(MONO_FONT))
+            card.child(
+                Textarea::new(edit)
+                    .text_size(px(12.5))
+                    .font_family(MONO_FONT),
+            )
         } else {
             card.child(command_block(&step.call.command, cx))
         };
@@ -456,7 +461,9 @@ impl Drawer {
                                     if let Some(step) = &mut s.active_step {
                                         let command = step.call.command.clone();
                                         let edit = cx.new(|cx| {
-                                            let mut i = InputState::new(w, cx);
+                                            // Approval must expose the entire edited command too.
+                                            let mut i =
+                                                TextareaState::new(w, cx).auto_grow(1, usize::MAX);
                                             i.set_value(command, w, cx);
                                             i
                                         });
@@ -532,7 +539,7 @@ impl Drawer {
             .flex_col()
             .gap(px(8.))
             .child(step_header(purpose, *target, *automatic, &state, color, cx))
-            .child(command_block(command, cx));
+            .child(self.ended_command(command, key, cx));
         match status {
             StepStatus::Denied {
                 reason: Some(reason),
@@ -585,7 +592,7 @@ impl Drawer {
                     .on_children_prepainted(move |bounds, _, cx| {
                         measured_scroll
                             .set(bounds.first().is_some_and(|b| b.size.height > px(320.)));
-                        let over = bounds.first().is_some_and(|b| b.size.height > px(8. * 17.));
+                        let over = bounds.first().is_some_and(|b| b.size.height > px(8. * 18.));
                         if over != overflowing {
                             let drawer = drawer.clone();
                             cx.defer(move |cx| {
@@ -617,7 +624,7 @@ impl Drawer {
                     .flex_none()
                     .min_w_0()
                     .max_w_full()
-                    .max_h(px(if expanded { 320. } else { 8. * 17. }))
+                    .max_h(px(if expanded { 320. } else { 8. * 18. }))
                     .overflow_x_scroll()
                     .overflow_y_hidden()
                     .when(expanded, |d| d.overflow_y_scroll())
@@ -627,7 +634,7 @@ impl Drawer {
                         // output's vertical gesture from also moving the message list.
                         if expanded
                             && scrolls_vertically.get()
-                            && event.delta.pixel_delta(px(17.)).y != px(0.)
+                            && event.delta.pixel_delta(px(18.)).y != px(0.)
                         {
                             cx.stop_propagation();
                         }
@@ -635,8 +642,8 @@ impl Drawer {
                     .flex()
                     .flex_col()
                     .items_start()
-                    .text_size(px(11.))
-                    .line_height(px(17.))
+                    .text_size(px(12.5))
+                    .line_height(px(18.))
                     .font_family(MONO_FONT)
                     .whitespace_nowrap()
                     .text_color(p.tx2)
@@ -673,6 +680,73 @@ impl Drawer {
         }
         card.into_any_element()
     }
+
+    /// Only persisted/ended steps use this cap. Active approval always uses command_block.
+    fn ended_command(&self, command: &str, key: (usize, usize), cx: &mut Context<Self>) -> Div {
+        let expanded = self.expanded_commands.contains(&key);
+        let overflowing = self.overflowing_commands.contains(&key);
+        let drawer = cx.entity().downgrade();
+        let epoch = self.epoch;
+        let conversation = self.id.clone();
+        // Measure the full, wrapped text at the available width even when clipped.
+        // This also updates on resize and handles one very long physical line.
+        let measured = div()
+            .flex_none()
+            .w_full()
+            .child(div().w_full().child(command.to_owned()))
+            .on_children_prepainted(move |bounds, _, cx| {
+                let over = bounds
+                    .first()
+                    .is_some_and(|b| b.size.height > px(3. * 18. + 0.5));
+                if over != overflowing {
+                    let drawer = drawer.clone();
+                    let conversation = conversation.clone();
+                    cx.defer(move |cx| {
+                        drawer
+                            .update(cx, |s, cx| {
+                                if s.epoch != epoch || s.id != conversation {
+                                    return;
+                                }
+                                let changed = if over {
+                                    s.overflowing_commands.insert(key)
+                                } else {
+                                    s.overflowing_commands.remove(&key)
+                                };
+                                if changed {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    });
+                }
+            });
+        let mut block = command_surface(cx).child(
+            div()
+                .w_full()
+                .when(!expanded, |d| d.max_h(px(3. * 18.)).overflow_hidden())
+                .child(measured),
+        );
+        if overflowing {
+            block = block.child(
+                Button::new(markdown::element_id(
+                    &format!("{}:command-toggle", self.id),
+                    key.0,
+                    key.1,
+                ))
+                .label(if expanded { "收起" } else { "展开" })
+                .mt(px(6.))
+                .h(px(24.))
+                .text_size(px(11.))
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    if !s.expanded_commands.remove(&key) {
+                        s.expanded_commands.insert(key);
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        block
+    }
 }
 // Keep the persisted v9 output representation compatible; labels are presentation only.
 fn output_sections(output: &str) -> (&str, &str) {
@@ -692,40 +766,65 @@ fn step_header(
     let p = cx.palette();
     div()
         .flex()
-        .flex_wrap()
-        .items_center()
-        .gap(px(5.))
-        .text_size(px(11.))
+        .flex_col()
+        .min_w_0()
+        .gap(px(6.))
         .child(
             div()
-                .flex_none()
-                .font_weight(FontWeight::MEDIUM)
-                .px(px(5.))
-                .py(px(2.))
-                .rounded(px(5.))
-                .bg(color.opacity(0.1))
-                .child(target.label()),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(5.))
+                .text_size(px(11.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::MEDIUM)
+                                .px(px(5.))
+                                .py(px(2.))
+                                .rounded(px(5.))
+                                .bg(color.opacity(0.1))
+                                .child(target.label()),
+                        )
+                        .when(automatic, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .py(px(2.))
+                                    .rounded(px(5.))
+                                    .bg(p.card3)
+                                    .text_size(px(10.5))
+                                    .text_color(p.tx2)
+                                    .child("自动执行"),
+                            )
+                        }),
+                )
+                .child(div().flex_none().text_color(color).child(state.to_owned())),
         )
-        .when(automatic, |d| {
-            d.child(
-                div()
-                    .flex_none()
-                    .px(px(5.))
-                    .py(px(2.))
-                    .rounded(px(5.))
-                    .bg(p.card3)
-                    .text_size(px(10.5))
-                    .text_color(p.tx2)
-                    .child("自动执行"),
-            )
-        })
-        .child(div().flex_1().min_w_0().child(purpose.to_owned()))
-        .child(div().flex_none().text_color(color).child(state.to_owned()))
+        .child(
+            div()
+                .w_full()
+                .text_color(p.tx)
+                .text_size(px(13.))
+                .line_height(px(20.8))
+                .whitespace_normal()
+                .child(purpose.to_owned()),
+        )
 }
 fn command_block(command: &str, cx: &App) -> Div {
+    command_surface(cx).child(command.to_owned())
+}
+fn command_surface(cx: &App) -> Div {
     div()
-        .p(px(9.))
-        .rounded(px(8.))
+        .min_w_0()
+        .p(px(11.))
+        .rounded(px(10.))
         .bg(shellmate_term::colors::to_hsla(
             cx.terminal_style().palette.background,
         ))
@@ -733,10 +832,9 @@ fn command_block(command: &str, cx: &App) -> Div {
             cx.terminal_style().palette.foreground,
         ))
         .font_family(MONO_FONT)
-        .text_size(px(12.))
+        .text_size(px(12.5))
         .line_height(px(18.))
         .whitespace_normal()
-        .child(command.to_owned())
 }
 struct FullAccess {
     drawer: WeakEntity<Drawer>,
@@ -790,6 +888,8 @@ impl Drawer {
         self.active_step = None;
         self.expanded.clear();
         self.overflowing_output.clear();
+        self.expanded_commands.clear();
+        self.overflowing_commands.clear();
         let redline = scene == "ai-agent-redline";
         *self.mode.lock().unwrap() = if redline {
             PermissionMode::Full
@@ -822,12 +922,12 @@ impl Drawer {
             .answer
             .get_or_insert_with(Answer::default);
         if !redline {
-            answer.items.push(AnswerItem::Step {automatic:true,command:"docker ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'".into(),target:Target::Background,purpose:"查看正在运行的容器".into(),class:Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1300,output:"标准输出：\nNAMES      IMAGE                STATUS       PORTS\nnginx      nginx:1.27-alpine     Up 12 days   0.0.0.0:443->443/tcp\napi        shellmate/api:2.8.1   Up 3 days    8080/tcp\nworker     shellmate/jobs:2.8.1  Up 3 days    —\npostgres   postgres:16-alpine    Up 12 days   5432/tcp\nredis      redis:7-alpine        Up 12 days   6379/tcp\n标准错误：\n".into()});
+            answer.items.push(AnswerItem::Step {automatic:true,command:"docker ps \\\n  --no-trunc \\\n  --filter status=running \\\n  --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'".into(),target:Target::Background,purpose:"检查生产环境所有容器的运行状态并确认镜像版本和对外端口映射".into(),class:Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1300,output:"标准输出：\nNAMES      IMAGE                STATUS       PORTS\nnginx      nginx:1.27-alpine     Up 12 days   0.0.0.0:443->443/tcp\napi        shellmate/api:2.8.1   Up 3 days    8080/tcp\nworker     shellmate/jobs:2.8.1  Up 3 days    —\npostgres   postgres:16-alpine    Up 12 days   5432/tcp\nredis      redis:7-alpine        Up 12 days   6379/tcp\n标准错误：\n".into()});
             answer.push_text("5 个容器均在运行。接下来检查 nginx 最近日志。\n");
         }
         if scene == "ai-agent-run" {
             answer.items.push(AnswerItem::Step {automatic:false,command:command.into(),target:Target::Terminal,purpose:"检查入口服务日志".into(),class:Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:800,output:"标准输出：\n10.0.1.12 GET /health 200 0.002s\n10.0.1.15 GET /api/v1/status 200 0.015s\n10.0.1.12 GET /health 200 0.001s\n标准错误：\n".into()});
-            answer.push_text("检查完成：\n• 5 个容器均在运行。\n• nginx 最近请求正常，没有发现 5xx。\n• API、数据库和缓存通过内部网络提供服务。");
+            answer.push_text(crate::proto::ai::AGENT_ANALYSIS);
             self.model.busy = false;
         } else {
             self.active_step = Some(ActiveStep::new(ToolCall {

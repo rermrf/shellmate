@@ -1,5 +1,6 @@
 pub mod exec;
 pub mod host;
+mod markdown;
 pub mod model;
 pub mod panel;
 pub mod settings;
@@ -132,6 +133,10 @@ impl Drop for Disclosure {
     }
 }
 pub fn now() -> i64 {
+    #[cfg(debug_assertions)]
+    if crate::proto::requested() {
+        return crate::proto::now();
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)

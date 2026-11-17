@@ -7590,6 +7590,7 @@ dependencies = [
  "gpui-kit",
  "libc",
  "log",
+ "markdown",
  "serde_json",
  "shellmate-ai",
  "shellmate-core",

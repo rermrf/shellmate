@@ -1,5 +1,6 @@
 #[path = "agent_ui.rs"]
 pub(super) mod agent_ui;
+use super::markdown::{self, MarkdownCache};
 use super::model::{DrawerModel, SUGGESTIONS};
 use crate::{
     theme::{ActivePalette, MONO_FONT},
@@ -66,6 +67,9 @@ pub struct Drawer {
     active_step: Option<ActiveStep>,
     expanded: HashSet<(usize, usize)>,
     overflowing_output: HashSet<(usize, usize)>,
+    expanded_commands: HashSet<(usize, usize)>,
+    overflowing_commands: HashSet<(usize, usize)>,
+    markdown: MarkdownCache,
     readonly: bool,
     continuation: Option<Box<agent::Resume>>,
     resume_steps: usize,
@@ -126,6 +130,9 @@ impl Drawer {
             active_step: None,
             expanded: HashSet::new(),
             overflowing_output: HashSet::new(),
+            expanded_commands: HashSet::new(),
+            overflowing_commands: HashSet::new(),
+            markdown: MarkdownCache::default(),
             readonly: false,
             continuation: None,
             resume_steps: 0,
@@ -461,6 +468,9 @@ impl Drawer {
         self.save_error = None;
         self.expanded.clear();
         self.overflowing_output.clear();
+        self.expanded_commands.clear();
+        self.overflowing_commands.clear();
+        self.markdown = MarkdownCache::default();
         self.follow_bottom = true;
         self.release_context(cx);
         cx.notify();
@@ -488,6 +498,9 @@ impl Drawer {
                 self.readonly = true;
                 self.expanded.clear();
                 self.overflowing_output.clear();
+                self.expanded_commands.clear();
+                self.overflowing_commands.clear();
+                self.markdown = MarkdownCache::default();
                 self.follow_bottom = true;
                 cx.notify();
             }
@@ -545,6 +558,8 @@ impl Drawer {
     }
     #[cfg(debug_assertions)]
     pub fn scene(&mut self, scene: &str, cx: &mut Context<Self>) {
+        self.id = format!("fixture-{scene}");
+        self.markdown = MarkdownCache::default();
         self.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
@@ -568,11 +583,20 @@ impl Drawer {
                 }
                 self.model
                     .start("这个命令会修改系统吗？", ContextSnapshot::default());
-                self.model.event(Event::TextDelta(
-                    "不会。它只查询监听 3000 端口的进程；请先预览命令并确认目标会话。".into(),
-                ));
+                self.model
+                    .event(Event::TextDelta(crate::proto::ai::CHAT_ANALYSIS.into()));
                 self.model.event(Event::Done(None));
             }
+        }
+        if scene == "ai-markdown" {
+            self.model.start(
+                "帮我整理服务检查结果和后续检查步骤",
+                ContextSnapshot::default(),
+            );
+            self.model
+                .event(Event::TextDelta(crate::proto::ai::MARKDOWN.into()));
+            self.model.event(Event::Done(None));
+            self.follow_bottom = false;
         }
         if scene == "ai-history" {
             self.history = true;
@@ -671,7 +695,7 @@ fn ago(time: i64) -> String {
     }
 }
 impl Render for Drawer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         // Only the session label may shrink; the context prefix and line count
         // keep their intrinsic widths below the title/actions row.
@@ -840,14 +864,7 @@ impl Render for Drawer {
         .children(SUGGESTIONS.into_iter().enumerate().map(|(i,label)|div().id(("ai-suggestion",i)).py(px(10.)).px(px(12.)).rounded(px(12.)).bg(p.card2).cursor_pointer().hover(|d|d.bg(p.card3)).text_size(px(13.)).line_height(px(17.)).child(label).on_click(cx.listener(move|s,_,w,cx|s.ask(label.into(),w,cx))))));
         }
         if !self.history {
-            for (index, turn) in self
-                .model
-                .conversation
-                .turns
-                .clone()
-                .into_iter()
-                .enumerate()
-            {
+            for (index, turn) in self.model.conversation.turns.iter().enumerate() {
                 body = body.child(
                     div()
                         .flex_none()
@@ -865,7 +882,7 @@ impl Render for Drawer {
                                 .text_size(px(13.))
                                 .line_height(px(20.8))
                                 .whitespace_normal()
-                                .child(turn.user.question),
+                                .child(turn.user.question.clone()),
                         )
                         .when(turn.user.redactions > 0, |d| {
                             d.child(
@@ -880,23 +897,41 @@ impl Render for Drawer {
                             )
                         }),
                 );
-                if let Some(answer) = turn.answer {
-                    let mut reply = div().flex_none().flex().flex_col().gap(px(8.));
-                    for (n, item) in answer.items.into_iter().enumerate() {
+                if let Some(answer) = &turn.answer {
+                    let commands: Vec<String> = answer
+                        .items
+                        .iter()
+                        .filter_map(|item| {
+                            if let shellmate_ai::AnswerItem::Command(card) = item {
+                                Some(card.command.trim().to_owned())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let mut reply = div()
+                        .flex_none()
+                        .min_w_0()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.));
+                    for (n, item) in answer.items.iter().enumerate() {
                         let card = match item {
                             item @ shellmate_ai::AnswerItem::Step { .. } => {
-                                reply = reply.child(self.step_card(&item, (index, n), cx));
+                                reply = reply.child(self.step_card(item, (index, n), cx));
                                 continue;
                             }
-                            shellmate_ai::AnswerItem::Command(card) => card,
-                            item => {
-                                reply = reply.child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .line_height(px(21.45))
-                                        .whitespace_normal()
-                                        .child(item.wire_text()),
-                                );
+                            shellmate_ai::AnswerItem::Command(card) => card.clone(),
+                            shellmate_ai::AnswerItem::Text(text) => {
+                                let text =
+                                    self.markdown.text(&self.id, (index, n), text, &commands);
+                                reply = reply.child(markdown::view(
+                                    markdown::element_id(&self.id, index, n),
+                                    text,
+                                    window,
+                                    cx,
+                                ));
                                 continue;
                             }
                         };
