@@ -2,6 +2,7 @@
 
 mod security;
 mod ai;
+mod app_icon;
 mod assets;
 mod icons;
 #[cfg(debug_assertions)]
@@ -85,6 +86,7 @@ fn main() {
         editor::view::init(cx);
 
         let dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+        app_icon::apply(dark);
         #[cfg(debug_assertions)]
         let dark = match std::env::var("SHELLMATE_THEME").as_deref() {
             Ok("dark") => true,
@@ -123,6 +125,12 @@ fn main() {
         };
         let (store, store_notice) = open_store();
         let (_window, _workspace) = gpui::open_window(options, cx, move |window, cx| {
+            // The Dock icon follows the system appearance, like macOS's own dark icons.
+            window
+                .observe_window_appearance(|window, _| {
+                    app_icon::apply(app_icon::is_dark(window.appearance()))
+                })
+                .detach();
             cx.new(|cx| Workspace::new(store, store_notice, window, cx))
         })
         .expect("failed to open the main window");

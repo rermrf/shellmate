@@ -27,6 +27,9 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
 similar.workspace = true
 # Already used by gpui-component; reuse the locked parser for safe Markdown preprocessing.
 markdown = "=1.0.0"

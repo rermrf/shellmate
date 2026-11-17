@@ -16,6 +16,7 @@ chacha20poly1305 = "0.10"
 getrandom = "0.3"
 objc2 = "0.6"
 objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }
 objc2-local-authentication = "0.3"
 block2 = "0.6"
 shellmate-telnet = { path = "crates/shellmate-telnet" }
