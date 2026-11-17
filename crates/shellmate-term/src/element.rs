@@ -217,8 +217,8 @@ impl Element for TerminalElement {
             self.style = self.style.clone().for_replay();
             let (cell_width, _) = self.cell_metrics(window);
             let terminal = self.terminal.read(cx);
-            let history = terminal.term().lock().history_size();
-            let extent = crate::replay::scrollback_content_size(crate::replay::grid_size(terminal.size(), cell_width), history);
+            let term = terminal.term().lock();
+            let extent = crate::replay::content_size(&*term, crate::replay::grid_size(terminal.size(), cell_width));
             style.size.width = extent.width.into();
             style.size.height = extent.height.into();
             style.flex_shrink = 0.;

@@ -3,8 +3,12 @@ pub mod timestamps;
 use crate::cast::{Cast, Data};
 use alacritty_terminal::{
     grid::Dimensions,
-    index::{Column, Line},
-    term::{Term, cell::Flags},
+    index::{Column, Line, Point},
+    term::{
+        Term, TermMode,
+        cell::{Cell, Flags},
+    },
+    vte::ansi::{Color, CursorShape, NamedColor},
 };
 use std::ops::Range;
 pub struct Timeline {
@@ -105,15 +109,6 @@ pub fn row_y(line: i32, history: usize, scroll_y: f32) -> f32 {
     (line as f32 + history as f32) * LINE_HEIGHT + scroll_y
 }
 
-pub fn scrollback_content_size(
-    grid: crate::TerminalSize,
-    history: usize,
-) -> gpui::Size<gpui::Pixels> {
-    let mut extent = content_size(grid);
-    extent.height += grid.line_height * history as f32;
-    extent
-}
-
 /// Replay metrics never depend on the available viewport or live font size.
 pub fn grid_size(recorded: crate::TerminalSize, cell_width: gpui::Pixels) -> crate::TerminalSize {
     crate::TerminalSize {
@@ -123,11 +118,44 @@ pub fn grid_size(recorded: crate::TerminalSize, cell_width: gpui::Pixels) -> cra
     }
 }
 
-pub fn content_size(grid: crate::TerminalSize) -> gpui::Size<gpui::Pixels> {
+/// Occupied cells across scrollback and the screen, without resizing the grid.
+/// The player reserves padding and the time gutter outside its clipped viewport,
+/// so these extents exclude that already-reserved space.
+pub fn content_size<T>(term: &Term<T>, metrics: crate::TerminalSize) -> gpui::Size<gpui::Pixels> {
+    let history = term.history_size() as i32;
+    let mut cols = 0;
+    let mut rows = 0;
+    for line in -history..term.screen_lines() as i32 {
+        if let Some(column) = term.grid()[Line(line)][..]
+            .iter()
+            .rposition(cell_has_content)
+        {
+            cols = cols.max(column + 1);
+            rows = (line + history + 1) as usize;
+        }
+    }
+    if let Some(cursor) = visible_cursor(term) {
+        cols = cols.max(cursor.column.0 + 1);
+        rows = rows.max((cursor.line.0 + history + 1) as usize);
+    }
     gpui::size(
-        grid.cell_width * grid.cols as f32,
-        grid.line_height * grid.rows as f32,
+        metrics.cell_width * cols as f32,
+        metrics.line_height * rows as f32,
     )
+}
+
+fn cell_has_content(cell: &Cell) -> bool {
+    !matches!(cell.c, ' ' | '\t' | '\0')
+        || cell.zerowidth().is_some_and(|chars| !chars.is_empty())
+        || cell.bg != Color::Named(NamedColor::Background)
+        || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+        || (cell.flags.contains(Flags::INVERSE) && cell.fg != Color::Named(NamedColor::Background))
+}
+
+pub(crate) fn visible_cursor<T>(term: &Term<T>) -> Option<Point> {
+    (term.mode().contains(TermMode::SHOW_CURSOR)
+        && term.cursor_style().shape != CursorShape::Hidden)
+        .then_some(term.grid().cursor.point)
 }
 
 pub(crate) fn wheel_delta(
@@ -170,12 +198,12 @@ impl FollowCursor {
         current: [f32; 2],
         viewport: [f32; 2],
         content: [f32; 2],
-        cursor: [f32; 2],
+        cursor: Option<[f32; 2]>,
         cell: [f32; 2],
     ) -> [f32; 2] {
         let mut result = current;
         for axis in 0..2 {
-            if self.following && viewport[axis] > 0. {
+            if let Some(cursor) = cursor.filter(|_| self.following && viewport[axis] > 0.) {
                 if cursor[axis] < result[axis] {
                     result[axis] = cursor[axis];
                 } else if cursor[axis] + cell[axis] > result[axis] + viewport[axis] {
@@ -222,11 +250,6 @@ mod tests {
         }
         assert_eq!(TIME_FONT_SIZE, 12.5);
         assert_eq!(TIME_GUTTER - TIME_WIDTH, 14.);
-        let grid = grid_size(crate::TerminalSize::default(), gpui::px(7.8));
-        assert_eq!(
-            scrollback_content_size(grid, 10).height - content_size(grid).height,
-            gpui::px(200.)
-        );
     }
     #[test]
     fn ai_context_uses_displayed_cells_and_scrollback_only() {
@@ -285,7 +308,7 @@ mod tests {
         }
     }
     #[test]
-    fn replay_keeps_font_grid_and_scroll_extents() {
+    fn replay_keeps_font_and_recorded_grid_independent_of_content() {
         for live_font in [8., 14., 32.] {
             let style = crate::TerminalStyle {
                 font_family: "terminal-family".into(),
@@ -312,7 +335,15 @@ mod tests {
             assert_eq!((grid.cols, grid.rows), (cols, rows));
             assert_eq!(FONT_SIZE, 13.);
             assert_eq!(grid.line_height, gpui::px(20.));
-            let extent = content_size(grid);
+            let mut term = Term::new(Config::default(), &grid, Silent);
+            let mut parser: Processor = Processor::new();
+            // An empty recorded grid only needs space for the visible cursor.
+            assert_eq!(
+                content_size(&term, grid),
+                gpui::size(gpui::px(7.8), gpui::px(20.))
+            );
+            parser.advance(&mut term, format!("\x1b[{rows};{cols}H").as_bytes());
+            let extent = content_size(&term, grid);
             assert_eq!(
                 extent,
                 gpui::size(gpui::px(7.8 * cols as f32), gpui::px(20. * rows as f32))
@@ -321,7 +352,7 @@ mod tests {
                 [0.; 2],
                 [800., 480.],
                 [extent.width.into(), extent.height.into()],
-                [7.8 * (cols - 1) as f32, 20. * (rows - 1) as f32],
+                Some([7.8 * (cols - 1) as f32, 20. * (rows - 1) as f32]),
                 [7.8, 20.],
             );
             assert!((end[0] - (7.8 * cols as f32 - 800.).max(0.)).abs() < 0.001);
@@ -333,7 +364,7 @@ mod tests {
     fn follow_cursor_pauses_on_manual_scroll_and_seek_restarts_it() {
         let mut follow = FollowCursor::default();
         let position = |f: &FollowCursor, current, cursor| {
-            f.position(current, [80., 40.], [160., 100.], cursor, [8., 20.])
+            f.position(current, [80., 40.], [160., 100.], Some(cursor), [8., 20.])
         };
         assert_eq!(position(&follow, [0., 0.], [120., 80.]), [48., 60.]);
         assert_eq!(position(&follow, [48., 60.], [16., 20.]), [16., 20.]);
@@ -341,6 +372,89 @@ mod tests {
         assert_eq!(position(&follow, [0., 0.], [120., 80.]), [0., 0.]);
         follow.restart();
         assert_eq!(position(&follow, [0., 0.], [120., 80.]), [48., 60.]);
+    }
+
+    #[test]
+    fn blank_background_cells_count_but_foreground_only_spaces_do_not() {
+        let grid = grid_size(crate::TerminalSize::default(), gpui::px(8.));
+        let mut term = Term::new(Config::default(), &grid, Silent);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b[?25l\x1b[10;50H\x1b[31m ");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(0.), gpui::px(0.))
+        );
+        parser.advance(&mut term, b"\x1b[10;50H\x1b[41m \x1b[0m");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(400.), gpui::px(200.))
+        );
+        // Erasing that cell makes the content shrink again.
+        parser.advance(&mut term, b"\x1b[2K");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(0.), gpui::px(0.))
+        );
+        parser.advance(&mut term, b"\x1b[10;50H\x1b[7m ");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(400.), gpui::px(200.))
+        );
+    }
+
+    #[test]
+    fn visible_cursor_beyond_text_counts_and_hidden_cursor_does_not() {
+        let grid = grid_size(crate::TerminalSize::default(), gpui::px(8.));
+        let mut term = Term::new(Config::default(), &grid, Silent);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"text\x1b[20;70H");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(560.), gpui::px(400.))
+        );
+        parser.advance(&mut term, b"\x1b[?25l");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(32.), gpui::px(20.))
+        );
+        assert_eq!(visible_cursor(&term), None);
+        assert_eq!(
+            FollowCursor::default().position([10., 20.], [80., 40.], [160., 100.], None, [8., 20.]),
+            [10., 20.]
+        );
+        parser.advance(&mut term, b"\x1b[?25h");
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(560.), gpui::px(400.))
+        );
+    }
+
+    #[test]
+    fn content_in_scrollback_and_wide_character_spacers_count() {
+        let grid = grid_size(
+            crate::TerminalSize {
+                cols: 142,
+                rows: 36,
+                ..Default::default()
+            },
+            gpui::px(8.),
+        );
+        let mut term = Term::new(Config::default(), &grid, Silent);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            format!("\x1b[?25l{}界", "x".repeat(120)).as_bytes(),
+        );
+        parser.advance(&mut term, "\r\n".repeat(40).as_bytes());
+        assert_eq!(term.history_size(), 5);
+        // The only content is now the top history row, despite 40 blank rows below it.
+        assert_eq!(
+            content_size(&term, grid),
+            gpui::size(gpui::px(122. * 8.), gpui::px(20.))
+        );
+        parser.advance(&mut term, b"\x1b[?25h");
+        assert_eq!(content_size(&term, grid).height, gpui::px(41. * 20.));
+        assert_eq!((term.columns(), term.screen_lines()), (142, 36));
     }
 
     #[test]

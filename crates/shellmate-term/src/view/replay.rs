@@ -175,17 +175,22 @@ impl TerminalView {
                                 let grid = terminal.size();
                                 let term = terminal.term().lock();
                                 let history = term.history_size();
-                                let content = crate::replay::scrollback_content_size(grid, history);
-                                let cursor = term.grid().cursor.point;
+                                // Layout measured occupied cells and already clamped
+                                // offsets after any shrink. Follow the same scroll range.
+                                let max = paint_handle.max_offset();
+                                let content = b.size + size(max.x, max.y);
+                                let cursor = crate::replay::visible_cursor(&*term);
                                 let offset = paint_handle.offset();
                                 let next = follow.borrow().position(
                                     [-f32::from(offset.x), -f32::from(offset.y)],
                                     [b.size.width.into(), b.size.height.into()],
                                     [content.width.into(), content.height.into()],
-                                    [
-                                        f32::from(grid.cell_width) * cursor.column.0 as f32,
-                                        crate::replay::row_y(cursor.line.0, history, 0.),
-                                    ],
+                                    cursor.map(|cursor| {
+                                        [
+                                            f32::from(grid.cell_width) * cursor.column.0 as f32,
+                                            crate::replay::row_y(cursor.line.0, history, 0.),
+                                        ]
+                                    }),
                                     [grid.cell_width.into(), grid.line_height.into()],
                                 );
                                 let next = point(px(-next[0]), px(-next[1]));
@@ -198,9 +203,7 @@ impl TerminalView {
                                 // when the interactive scrollbar's hover animation ends.
                                 // Read geometry after layout and follow/scroll updates.
                                 let offset = paint_handle.offset();
-                                let max = paint_handle.max_offset();
-                                let hint =
-                                    OverflowHint::new(b.size, b.size + size(max.x, max.y), offset);
+                                let hint = OverflowHint::new(b.size, content, offset);
                                 if hint.right {
                                     let width = px(24.).min(b.size.width);
                                     window.paint_quad(fill(
@@ -393,27 +396,181 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        replay::{FollowCursor, Timeline, content_size, visible_cursor},
+        session_log::Silent,
+    };
+    use alacritty_terminal::{
+        grid::Dimensions,
+        term::{Config, Term},
+        vte::ansi::Processor,
+    };
 
-    #[test]
-    fn wide_grid_overflows_both_player_axes_and_fade_tracks_right_edge() {
-        // The 1140 x 740 recording dialog: list, padding, header and controls
-        // leave an 844 x 552 player. Gutters reuse its terminal padding.
-        let viewport = size(px(844. - 2. * PADDING_X), px(552. - 2. * PADDING_Y));
-        let grid = crate::replay::grid_size(
+    fn recorded_grid() -> crate::TerminalSize {
+        crate::replay::grid_size(
             crate::TerminalSize {
                 cols: 142,
                 rows: 36,
                 ..Default::default()
             },
             px(7.8),
+        )
+    }
+
+    fn player_viewport() -> gpui::Size<Pixels> {
+        // Player padding and the stationary time gutter are outside the viewport.
+        size(
+            px(844. - 2. * PADDING_X - crate::replay::TIME_GUTTER),
+            px(552. - 2. * PADDING_Y),
+        )
+    }
+
+    #[test]
+    fn recorded_grid_overflows_only_where_occupied_content_exceeds_viewport() {
+        let short = [
+            "pwd",
+            "/root",
+            "root@host:~# cd wen",
+            "ls",
+            "file",
+            "root@host:~/wen# ",
+        ]
+        .join("\r\n");
+        let tall = (0..40)
+            .map(|row| format!("line-{row:02}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        for (text, columns, rows, horizontal, vertical) in [
+            (short, 19, 6, false, false),
+            ("x".repeat(130), 131, 1, true, false),
+            (tall, 8, 40, false, true),
+        ] {
+            let grid = recorded_grid();
+            let mut term = Term::new(Config::default(), &grid, Silent);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, text.as_bytes());
+            let content = content_size(&term, grid);
+            assert_eq!(
+                content,
+                size(
+                    grid.cell_width * columns as f32,
+                    grid.line_height * rows as f32
+                )
+            );
+            assert_eq!(
+                OverflowHint::new(player_viewport(), content, point(px(0.), px(0.))),
+                OverflowHint {
+                    horizontal,
+                    vertical,
+                    right: horizontal,
+                }
+            );
+            assert_eq!((term.columns(), term.screen_lines()), (142, 36));
+        }
+    }
+
+    #[test]
+    fn playback_grows_extents_and_seek_back_resets_both_offsets_and_hints() {
+        use crate::cast::{Cast, Data, Event, Header};
+        let grid = recorded_grid();
+        let mut term = Term::new(Config::default(), &grid, Silent);
+        let mut parser: Processor = Processor::new();
+        let mut timeline = Timeline::new(Cast {
+            header: Header::new(grid.cols, grid.rows),
+            events: vec![
+                Event {
+                    at: 0.,
+                    recorded_at: 0.,
+                    data: Data::Output("pwd\r\n/root\r\nroot@host:~# ".into()),
+                },
+                Event {
+                    at: 1.,
+                    recorded_at: 1.,
+                    data: Data::Output(format!("{}{}", "x".repeat(120), "\r\nline".repeat(40))),
+                },
+            ],
+            duration: 1.,
+        });
+        let viewport = player_viewport();
+        let mut follow = FollowCursor::default();
+        let mut position = [0.; 2];
+        for (time, seek, overflows) in [(0., false, false), (1., false, true), (0., true, false)] {
+            let (reset, range) = timeline.advance(time, seek);
+            if reset {
+                term = Term::new(Config::default(), &grid, Silent);
+                parser = Processor::new();
+                follow.restart();
+            }
+            for event in &timeline.cast.events[range] {
+                crate::replay::apply_data(&mut term, &mut parser, &event.data);
+            }
+            let content = content_size(&term, grid);
+            if overflows {
+                // A manual scroll to the far edge must also clamp to content.
+                follow.manual_scroll();
+                position = [10_000.; 2];
+            }
+            position = follow.position(
+                position,
+                [viewport.width.into(), viewport.height.into()],
+                [content.width.into(), content.height.into()],
+                visible_cursor(&term).map(|cursor| {
+                    [
+                        f32::from(grid.cell_width) * cursor.column.0 as f32,
+                        crate::replay::row_y(cursor.line.0, term.history_size(), 0.),
+                    ]
+                }),
+                [grid.cell_width.into(), grid.line_height.into()],
+            );
+            let hint =
+                OverflowHint::new(viewport, content, point(px(-position[0]), px(-position[1])));
+            assert_eq!(
+                hint,
+                OverflowHint {
+                    horizontal: overflows,
+                    vertical: overflows,
+                    right: false
+                }
+            );
+            if overflows {
+                assert_eq!(
+                    position,
+                    [
+                        f32::from(content.width - viewport.width),
+                        f32::from(content.height - viewport.height)
+                    ]
+                );
+                assert!(position.iter().all(|offset| *offset > 0.));
+                // Shrinking content clamps even while manual scrolling pauses follow.
+                assert_eq!(
+                    follow.position(position, [730., 520.], [100., 60.], None, [7.8, 20.]),
+                    [0.; 2]
+                );
+            } else {
+                assert_eq!(position, [0.; 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_content_overflows_both_player_axes_and_fade_tracks_right_edge() {
+        // The 1140 x 740 recording dialog: list, padding, header and controls
+        // leave an 844 x 552 player. Gutters reuse its terminal padding.
+        let viewport = player_viewport();
+        let grid = recorded_grid();
+        let mut term = Term::new(Config::default(), &grid, Silent);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            format!("{}\x1b[35;15H", "x".repeat(130)).as_bytes(),
         );
         assert_eq!(crate::replay::FONT_SIZE, 13.);
-        let content = crate::replay::content_size(grid);
+        let content = content_size(&term, grid);
         let followed = crate::replay::FollowCursor::default().position(
             [0.; 2],
             [viewport.width.into(), viewport.height.into()],
             [content.width.into(), content.height.into()],
-            [14. * 7.8, 34. * crate::replay::LINE_HEIGHT],
+            Some([14. * 7.8, 34. * crate::replay::LINE_HEIGHT]),
             [7.8, crate::replay::LINE_HEIGHT],
         );
         assert_eq!(followed, [0., 180.]);
