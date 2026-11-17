@@ -557,6 +557,18 @@ impl Drawer {
         cx.notify();
     }
     #[cfg(debug_assertions)]
+    pub fn fixture_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for i in 0..8 {
+            self.model.start(&format!("第 {} 轮：检查服务状态", i + 1), ContextSnapshot::default());
+            self.model.event(Event::TextDelta(crate::proto::ai::CHAT_ANALYSIS.into()));
+            self.model.event(Event::Done(None));
+        }
+        self.follow_bottom = false;
+        crate::proto::scroll_after_layout(self.scroll.clone(), |handle| f32::from(handle.max_offset().y) / 2., window);
+        cx.notify();
+    }
+
+    #[cfg(debug_assertions)]
     pub fn scene(&mut self, scene: &str, cx: &mut Context<Self>) {
         self.id = format!("fixture-{scene}");
         self.markdown = MarkdownCache::default();
@@ -1160,7 +1172,9 @@ impl Render for Drawer {
             .flex()
             .flex_col()
             .child(header)
-            .child(body)
+            .child(div().relative().flex_1().min_h_0().flex().flex_col()
+                .child(body)
+                .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)))
             .child(footer)
     }
 }

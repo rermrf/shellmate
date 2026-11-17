@@ -49,14 +49,14 @@ impl Render for SessionMenu {
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .w(px(260.))
             .max_h(px(420.))
-            .overflow_y_scroll()
+            .flex().flex_col()
             .p(px(6.))
             .rounded(px(14.))
             .bg(p.card)
             .border_1()
             .border_color(p.line)
             .shadow(card_shadow(&p))
-            .children(self.rows.iter().map(|s| {
+            .child(crate::ui::scroll::scroll_body("session-menu-rows", div().children(self.rows.iter().map(|s| {
                 let id = s.id;
                 let color = match s.status {
                     Status::Connected => p.ok,
@@ -82,6 +82,6 @@ impl Render for SessionMenu {
                     )
                     .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(p.tx2).child(s.subtitle()))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(Event::Pick(id))))
-            }))
+            }))).flex_none().max_h(px(406.)).surface(p.card).bottom_padding(px(0.)))
     }
 }

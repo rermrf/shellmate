@@ -189,14 +189,15 @@ impl FilesPanel {
                         .child(clear),
                 )
                 .child(
-                    div()
+                    div().relative().min_h_0().child(div()
                         .id("tq-list")
                         .flex()
                         .flex_col()
                         .max_h(px(176.)).min_h_0()
                         .overflow_y_scroll()
                         .track_scroll(&self.queue_scroll)
-                        .children(rows),
+                        .children(rows))
+                        .child(crate::ui::scroll::scroll_fades(self.queue_scroll.clone(), p.card)),
                 )
                 .into_any_element(),
         )

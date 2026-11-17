@@ -45,7 +45,21 @@ impl Index<usize> for V {
         self.a().get(i).unwrap_or(&V::Null)
     }
 }
+pub const PAGE_SCROLL_SCENES: &[(&str, (u32, u32))] = &[
+    ("mon-ov-scrolled", (1000, 640)),
+    ("mon-dk-scrolled", (1000, 640)),
+    ("mon-svc-scrolled", (980, 640)),
+    ("fwd-scrolled", (1000, 640)),
+    ("side-scrolled", (1000, 640)),
+    ("cmds-scrolled", (1000, 640)),
+    ("ai-scrolled", (1000, 640)),
+    ("mon-proc-scrolled", (1100, 640)),
+    ("files-scrolled", (1440, 640)),
+];
+
 pub const SCENES: &[&str] = &[
+    "mon-ov-scrolled", "mon-dk-scrolled", "mon-svc-scrolled", "fwd-scrolled",
+    "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
     "ai-agent", "ai-agent-run", "ai-agent-redline", "ai-agent-full",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
     "main", "prompt-plain", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
@@ -101,7 +115,32 @@ pub fn request(value: &str) -> (&str, Option<(u32,u32)>) {
 pub fn window_size() -> (u32,u32) {
     let value=std::env::var("SHELLMATE_DEMO").unwrap_or_default();
     let (scene,size)=request(value.strip_prefix("proto:").unwrap_or(&value));
-    size.unwrap_or(if scene.starts_with("stress-"){(1776,901)}else{(1440,900)})
+    size.unwrap_or_else(|| default_window_size(scene))
+}
+
+pub fn default_window_size(scene: &str) -> (u32, u32) {
+    PAGE_SCROLL_SCENES.iter().find(|(name, _)| *name == scene).map(|(_, size)| *size)
+        .unwrap_or(if scene.starts_with("stress-") { (1776, 901) } else { (1440, 900) })
+}
+
+/// Wait for layout, the responsive-width update, and conditional page padding.
+/// No wall-clock sleeps: offsets derive from the laid-out handle on the third frame.
+pub fn scroll_after_layout(
+    handle: gpui::ScrollHandle,
+    offset: impl FnOnce(&gpui::ScrollHandle) -> f32 + 'static,
+    window: &mut gpui::Window,
+) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |window, _| {
+                let y = offset(&handle).clamp(0., f32::from(handle.max_offset().y));
+                handle.set_offset(gpui::point(gpui::px(0.), gpui::px(-y)));
+                window.refresh();
+            });
+            window.refresh();
+        });
+        window.refresh();
+    });
 }
 
 /// Fake wall time: 2026-11-12 09:46 local, independent of the date the review is run.
@@ -168,6 +207,12 @@ pub fn ansi(lines: &V, dark: bool) -> String {
 }
 mod readings;
 pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
+    let scene = if PAGE_SCROLL_SCENES.iter().any(|(name, _)| *name == scene) {
+        match scene.strip_suffix("-scrolled").unwrap_or(scene) {
+            "side" => "main",
+            base => base,
+        }
+    } else { scene };
     readings::READINGS
         .iter()
         .find(|r| r.scene == scene && r.dark == dark)
@@ -199,6 +244,18 @@ pub fn ansi_line(segments: &V, dark: bool) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_scroll_scenes_are_registered_and_have_bounded_sizes() {
+        for &(scene, size) in super::PAGE_SCROLL_SCENES {
+            assert!(super::SCENES.contains(&scene));
+            assert_eq!(super::default_window_size(scene), size);
+            assert_eq!(super::request(&format!("{scene}@1440x900")), (scene, Some((1440, 900))));
+            assert!(size.0 >= 980 && size.1 >= 620);
+        }
+        assert_eq!(super::default_window_size("main"), (1440, 900));
+        assert_eq!(super::default_window_size("set-term-scrolled"), (1440, 900));
+        assert_eq!(super::default_window_size("stress-mon-ov"), (1776, 901));
+    }
     use super::*;
     #[test]
     fn fixture_sizes_are_bounded_and_optional() {
@@ -211,14 +268,17 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 67);
+        assert_eq!(SCENES.len(), 67 + PAGE_SCROLL_SCENES.len());
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
         assert_eq!(DATA["CMDS"].a().len(), 3);
         for scene in SCENES.iter().filter(|scene|!scene.starts_with("stress-")) {
             for dark in [false, true] {
-                assert_eq!(reading(scene, dark).scene, *scene);
+                let expected = if PAGE_SCROLL_SCENES.iter().any(|(name, _)| name == scene) {
+                    if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
+                } else { scene };
+                assert_eq!(reading(scene, dark).scene, expected);
                 assert_eq!(reading(scene, dark).dark, dark);
             }
         }

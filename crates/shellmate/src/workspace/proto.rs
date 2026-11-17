@@ -21,6 +21,8 @@ impl Workspace {
             log::warn!("unknown prototype scene");
             return;
         }
+        let scrolled = proto::PAGE_SCROLL_SCENES.iter().any(|(name, _)| *name == scene);
+        let scene = if scrolled { scene.strip_suffix("-scrolled").unwrap_or(scene) } else { scene };
         let stress=scene.starts_with("stress-");
         let scene=scene.strip_prefix("stress-").unwrap_or(scene);
         self.ai_drawer=None;self.ai_open=false;
@@ -90,6 +92,23 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
         let mut hosts=hosts;
+        if scrolled && scene == "side" {
+            // One deterministic section: selected row 4, 50px rows with 2px gaps.
+            hosts = (0..20).map(|i| {
+                let mut host = hosts[0].clone();
+                host.id = HostId::from_raw(match i {
+                    0 => "h1".to_string(), 1 => "h3".to_string(),
+                    2 => "h10".to_string(), 3 => "h7".to_string(),
+                    _ => format!("scroll-host-{i:02}"),
+                });
+                host.name = format!("prod-web-{i:02}");
+                host.addr = format!("10.0.0.{}", i + 1);
+                host.group = Some(GroupId::from_raw("生产环境"));
+                host.favorite = false;
+                host.last_connected_at = None;
+                host
+            }).collect();
+        }
         if stress {
             for (i,host) in hosts.iter_mut().enumerate() {
                 host.name=format!("{}-{i}",proto::stress::HOST);host.addr=host.name.clone();host.user=Some(proto::stress::USER.into());host.port=65535;host.protocol=Protocol::Ssh;
@@ -246,9 +265,18 @@ impl Workspace {
             "rail" => self.set_sidebar_open(false, cx),
             "local" => self.proto_local(window, cx),
             "reconnect" => self.activate(3, window, cx),
-            "files" | "editor" => self.proto_files(if stress {"stress-files"}else{scene}, window, cx),
+            "files" | "editor" => self.proto_files(if stress {"stress-files"}else if scrolled {"files-scrolled"}else{scene}, window, cx),
             "fwd" | "fwd-new" => {
-                let view = if stress {proto::stress::forward()}else{crate::forward::demo::view("cards", "prod-web-01")};
+                let mut view = if stress {proto::stress::forward()}else{crate::forward::demo::view("cards", "prod-web-01")};
+                if scrolled {
+                    let samples = view.cards.clone();
+                    view.cards = (0..12).map(|i| {
+                        let mut card = samples[i % samples.len()].clone();
+                        card.id = shellmate_forward::RuleId::from_raw(format!("scroll-rule-{i}"));
+                        card.name = format!("滚动示例规则 {}", i + 1);
+                        card
+                    }).collect();
+                }
                 let panel = cx.new(|cx| crate::forward::panel::ForwardPanel::new(view, cx));
                 let subscription =
                     cx.subscribe(&panel, |_, _, _: &crate::forward::panel::ForwardPanelEvent, _| {});
@@ -301,6 +329,44 @@ impl Workspace {
             _ => {}
         }
         self.sync_sidebar(cx);
+        if scrolled {
+            match scene {
+                "mon-ov" | "mon-dk" | "mon-svc" | "mon-proc" => {
+                    if scene == "mon-ov" { self.commands_open = true; }
+                    if let Some(tab) = &self.sessions[0].monitor {
+                        tab.panel.update(cx, |p, cx| p.fixture_scroll(window, cx));
+                    }
+                }
+                "fwd" => {
+                    let handle = self.sessions[0].forward.as_ref().unwrap().panel.read(cx).scroll.clone();
+                    proto::scroll_after_layout(handle, |_| 120., window);
+                }
+                "side" => {
+                    self.sidebar.update(cx, |s, cx| s.select(Some("scroll-host-04".into()), cx));
+                    let handle = self.sidebar.read(cx).scroll.clone();
+                    // Existing top inset 11 + section header 25 + gap 2 + 4 rows + half row.
+                    proto::scroll_after_layout(handle, |_| 11. + 25. + 2. + 4. * 52. + 25., window);
+                }
+                "cmds" => {
+                    self.commands.update(cx, |drawer, cx| {
+                        let samples = drawer.groups.clone();
+                        drawer.groups = (0..6).flat_map(|i| samples.iter().cloned().map(move |mut group| {
+                            group.name = format!("{} · {}", group.name, i + 1);
+                            for command in &mut group.items { command.id = format!("scroll-{i}-{}", command.id); }
+                            group
+                        })).collect();
+                        cx.notify();
+                    });
+                    proto::scroll_after_layout(self.commands.read(cx).scroll.clone(), |_| 120., window);
+                }
+                "ai" => {
+                    if let Some(drawer) = &self.ai_drawer {
+                        drawer.update(cx, |d, cx| d.fixture_scroll(window, cx));
+                    }
+                }
+                _ => {}
+            }
+        }
         cx.notify();
     }
     fn proto_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -387,7 +453,10 @@ impl Workspace {
             return;
         };
         let panel = cx.new(|cx| crate::files::panel::FilesPanel::new(&terminal, runtime, window, cx));
-        panel.update(cx, |p, cx| p.proto_fixture(scene, cx));
+        panel.update(cx, |p, cx| {
+            p.proto_fixture(scene, cx);
+            if scene == "files-scrolled" { p.fixture_scroll(window); }
+        });
         let subscription = cx.subscribe(&panel, |_, _, _: &crate::files::panel::FilesEvent, _| {});
         self.sessions[0].files = Some(files::FilesTab {
             panel: panel.clone(),

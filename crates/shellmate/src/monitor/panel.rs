@@ -70,6 +70,8 @@ pub struct MonitorPanel {
     table: Table,
     scroll: UniformListScrollHandle,
     overview_scroll: ScrollHandle,
+    services_scroll: ScrollHandle,
+    service_detail_scroll: ScrollHandle,
     // the 服务 page
     service_query: Entity<InputState>,
     service_filter: ServiceFilter,
@@ -150,6 +152,8 @@ impl MonitorPanel {
             table: Table { rows: Vec::new(), matches: 0, total: 0 },
             scroll: UniformListScrollHandle::new(),
             overview_scroll: ScrollHandle::new(),
+            services_scroll: ScrollHandle::new(),
+            service_detail_scroll: ScrollHandle::new(),
             service_query,
             service_filter: ServiceFilter::All,
             service_selected: None,
@@ -178,6 +182,24 @@ impl MonitorPanel {
     #[cfg(debug_assertions)]
     pub fn proto_order(&mut self,cx:&mut Context<Self>){
         self.service_rows.sort_by_key(|r|crate::proto::DATA["SERVICES"].a().iter().position(|s|s["n"].s()==r.name).unwrap_or(usize::MAX));cx.notify();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn fixture_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (handle, offset) = match self.page {
+            Page::Overview => (self.overview_scroll.clone(), 120.),
+            Page::Docker => (self.docker_scroll.clone(), 120.),
+            Page::Services => (self.services_scroll.clone(), 120.),
+            Page::Processes => {
+                let index = 3;
+                self.selected = self.table.rows.get(index).map(|row| row.key);
+                // Cancel any pending reveal from show_process before setting a pixel offset.
+                self.scroll.scroll_to_item(index, ScrollStrategy::Top);
+                (self.scroll.0.borrow().base_handle.clone(), (index as f32 + 0.5) * 34.)
+            }
+        };
+        crate::proto::scroll_after_layout(handle, move |_| offset, window);
+        cx.notify();
     }
 
     /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
@@ -800,7 +822,7 @@ impl MonitorPanel {
         let stacked=crate::layout::Responsive::at(self.width).overview_stacked;
         div().id("monitor-overview").flex_1().min_h_0().min_w_0().flex().flex_col().gap(px(10.))
             .children(banner.map(|b|self.banner(&b,p,cx)))
-            .child(div().id("monitor-overview-scroll").w_full().flex_1().min_h_0().min_w_0()
+            .child(crate::ui::scroll::page_scroll("overview-fades", div().id("monitor-overview-scroll").w_full().flex_1().min_h_0().min_w_0()
                 .overflow_y_scroll().track_scroll(&self.overview_scroll).flex().flex_col().gap(px(10.))
                 .when(stale,|d|d.opacity(0.5))
                 .child(self.render_cards(&cards,p))
@@ -808,7 +830,7 @@ impl MonitorPanel {
                     .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.35).flex_basis(px(0.)))
                         .child(self.render_attention(p,cx)))
                     .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.).flex_basis(px(0.)))
-                        .child(self.render_cores_and_top(p,cx)))))
+                        .child(self.render_cores_and_top(p,cx)))), &self.overview_scroll, p.win, 0.))
             .into_any_element()
     }
 
@@ -1073,7 +1095,9 @@ impl MonitorPanel {
                 .child(text)
                 .into_any_element()
         } else {
-            div().flex_1().min_h_0().px(px(8.)).py(px(4.)).child(list).into_any_element()
+            div().relative().flex_1().min_h_0().px(px(8.)).py(px(4.))
+                .child(div().size_full().when(stale, |d| d.opacity(0.5)).child(list))
+                .child(crate::ui::scroll::scroll_fades(self.scroll.0.borrow().base_handle.clone(), p.card)).into_any_element()
         };
 
         div()
@@ -1096,7 +1120,7 @@ impl MonitorPanel {
                     .overflow_hidden()
                     .child(toolbar)
                     .child(columns)
-                    .child(div().flex_1().min_h_0().flex().flex_col().when(stale, |d| d.opacity(0.5)).child(rows_area))
+                    .child(div().flex_1().min_h_0().flex().flex_col().child(rows_area))
                     .children(bar),
             )
             .into_any_element()

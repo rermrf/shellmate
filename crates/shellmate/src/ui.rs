@@ -1,5 +1,7 @@
 //! Small presentational helpers shared by the sidebar and workspace.
 
+pub mod scroll;
+
 use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;
 use gpui::{

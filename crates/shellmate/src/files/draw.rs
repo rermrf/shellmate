@@ -1,5 +1,7 @@
 //! Drawing the panel: top bar, list, details.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -408,7 +410,7 @@ impl FilesPanel {
             .into_any_element()
     }
 
-    fn render_list_area(&self, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_list_area(&self, p: &Palette, fade_surface: Rc<Cell<Hsla>>, cx: &mut Context<Self>) -> gpui::AnyElement {
         match (self.model.link(), self.model.view()) {
             (LinkStatus::Disconnected, _) => {
                 self.message("连接已断开，重连后自动刷新", p.warn, None, Some(Lucide::TriangleAlert))
@@ -460,7 +462,13 @@ impl FilesPanel {
                 )
                 .track_scroll(&self.scroll)
                 .size_full();
-                div().flex_1().min_h_0().px(px(8.)).py(px(4.)).child(list).into_any_element()
+                let resting_surface = fade_surface.get();
+                div().relative().flex_1().min_h_0().px(px(8.)).py(px(4.)).child(list)
+                    .child(crate::ui::scroll::scroll_fades_with_surface(
+                        self.scroll.0.borrow().base_handle.clone(),
+                        // Reset after each paint so leaving the drop target cannot retain its tint.
+                        move || fade_surface.replace(resting_surface),
+                    )).into_any_element()
             }
         }
     }
@@ -481,6 +489,10 @@ impl FilesPanel {
         // Something dragged in from Finder over the card: it lights up, and a drop uploads here.
         let (hot_bg, hot_border) = (p.accs, p.acc);
         let dragging = self.demo_dragging();
+        // The drag background is translucent accs over win, not card.
+        let hot_surface = p.win.blend(hot_bg);
+        let fade_surface = Rc::new(Cell::new(if dragging { hot_surface } else { p.card }));
+        let drag_surface = fade_surface.clone();
         let (accent, card_bg, cwd) = (p.acc, p.card, self.model.cwd().to_string());
         let label = div()
             .absolute()
@@ -518,7 +530,10 @@ impl FilesPanel {
             .border_0()
             .border_color(transparent_black())
             .when(dragging, |d| d.bg(hot_bg).border_color(hot_border))
-            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(hot_bg).border_color(hot_border))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                drag_surface.set(hot_surface);
+                style.bg(hot_bg).border_color(hot_border)
+            })
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.upload(paths.paths().to_vec(), cx)))
             .shadow(card_shadow(p))
             .overflow_hidden()
@@ -526,7 +541,7 @@ impl FilesPanel {
             .child(label)
             .children(banner)
             .child(self.render_header(p))
-            .child(self.render_list_area(p, cx))
+            .child(self.render_list_area(p, fade_surface, cx))
             .child(
                 div()
                     .px(px(18.))
@@ -590,16 +605,11 @@ impl FilesPanel {
         let can_apply = self.model.chmod_request().is_some();
         let rows = ["所有者", "用户组", "其他"];
         let columns = ["读", "写", "执行"];
-        div().id("file-details")
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(268.)).h_full().min_h_0().overflow_y_scroll()
-            .gap(px(12.))
-            .p(px(18.))
-            .rounded(crate::theme::CARD_RADIUS)
-            .bg(p.card)
-            .shadow(card_shadow(p))
+        // Keep the existing -3px permission focus-ring margin inside the viewport.
+        let content = div().id("file-details-viewport")
+            .flex_1().min_h_0().m(px(-3.)).p(px(3.))
+            .overflow_y_scroll().track_scroll(&self.detail_scroll)
+            .flex().flex_col().gap(px(12.))
             .child(crate::ui::ellipsis("file-detail-name",title).flex_none().text_size(px(17.)).line_height(px(20.)).font_weight(FontWeight::BOLD))
             .child(
                 div().flex_none()
@@ -699,7 +709,15 @@ impl FilesPanel {
                         .cursor_not_allowed()
                         .tooltip(|window, cx| Tooltip::new("连接就绪后可用").build(window, cx))
                 }
-            }))
+            }));
+        div().id("file-details")
+            .flex().flex_col().flex_none()
+            .w(px(268.)).h_full().min_h_0()
+            .p(px(18.)).rounded(crate::theme::CARD_RADIUS)
+            .bg(p.card).shadow(card_shadow(p))
+            .child(div().relative().flex_1().min_h_0().flex().flex_col()
+                .child(content)
+                .child(crate::ui::scroll::scroll_fades(self.detail_scroll.clone(), p.card)))
     }
 }
 

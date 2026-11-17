@@ -240,6 +240,7 @@ impl Workspace {
         sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(collapsed, cx));
         let commands = cx.new(|_| crate::productivity::panel::Drawer {
             groups: store.snippets().unwrap_or_default(),
+            scroll: gpui::ScrollHandle::new(),
             broadcast: Default::default(),
         });
         let broadcast_bar=cx.new(|cx|crate::productivity::broadcast::BroadcastBar::new(window,cx));

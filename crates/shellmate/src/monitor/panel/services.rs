@@ -240,7 +240,7 @@ impl MonitorPanel {
             .into_any_element()
     }
 
-    fn render_service_detail(&self, detail: &Detail, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_service_detail(&self, detail: &Detail, stale: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let layout=crate::layout::Responsive::at(self.width);
         let (bg, fg) = tone_colors(p, detail.tone);
         let name = detail.name.clone();
@@ -287,18 +287,11 @@ impl MonitorPanel {
                     .child(probe.map_or("journalctl -u -f", services::log_hint)),
             );
 
-        div()
-            .id("service-detail")
-            .w(px(layout.service_detail_width)).when(layout.services_stacked,|d|d.w_full()).overflow_y_scroll()
-            .flex_none()
-            .min_h_0().when(layout.services_stacked,|d|d.min_h(px(480.)))
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .p(px(18.))
-            .bg(p.card)
-            .rounded(CARD_RADIUS)
-            .shadow(card_shadow(p))
+        let content = div().id("service-detail-viewport")
+            .flex_1().min_h_0().when(layout.services_stacked, |d| d.flex_auto())
+            .overflow_y_scroll().track_scroll(&self.service_detail_scroll)
+            .when(stale, |d| d.opacity(0.5))
+            .flex().flex_col().gap(px(12.))
             .child(
                 div().flex_none().min_w_0()
                     .flex()
@@ -364,7 +357,16 @@ impl MonitorPanel {
             )
             .child(switch_row)
             .child(log_header)
-            .child(log_box(self.service_log.as_ref(), "选中服务后在这里跟随它的日志", 40, p).flex_1().min_h(px(120.)))
+            .child(log_box(self.service_log.as_ref(), "选中服务后在这里跟随它的日志", 40, p).flex_1().min_h(px(120.)));
+        div().id("service-detail")
+            .w(px(layout.service_detail_width)).when(layout.services_stacked, |d| d.w_full())
+            .flex_none().min_h_0().when(layout.services_stacked, |d| d.min_h(px(480.)))
+            .flex().flex_col().p(px(18.))
+            .bg(p.card).rounded(CARD_RADIUS).shadow(card_shadow(p))
+            .child(div().relative().flex_1().min_h_0().flex().flex_col()
+                .when(layout.services_stacked, |d| d.flex_auto())
+                .child(content)
+                .child(crate::ui::scroll::scroll_fades(self.service_detail_scroll.clone(), p.card)))
             .into_any_element()
     }
 
@@ -477,9 +479,9 @@ impl MonitorPanel {
             .bg(p.card)
             .rounded(CARD_RADIUS)
             .shadow(card_shadow(p))
-            .child(toolbar)
-            .child(columns)
-            .child(div().flex_1().min_h_0().px(px(8.)).py(px(6.)).child(if self.service_rows.is_empty() {
+            .child(toolbar.when(stale, |d| d.opacity(0.5)))
+            .child(columns.when(stale, |d| d.opacity(0.5)))
+            .child(div().relative().flex_1().min_h_0().px(px(8.)).py(px(6.)).child(div().size_full().when(stale, |d| d.opacity(0.5)).child(if self.service_rows.is_empty() {
                 div()
                     .size_full()
                     .flex()
@@ -491,9 +493,9 @@ impl MonitorPanel {
                     .into_any_element()
             } else {
                 rows.into_any_element()
-            }));
+            })).when(!self.service_rows.is_empty(), |d| d.child(crate::ui::scroll::scroll_fades(self.service_scroll.0.borrow().base_handle.clone(), p.card))));
 
-        div()
+        let page = div()
             .id("monitor-services").min_w_0().when(layout.services_stacked,|d|d.overflow_y_scroll())
             .flex_1()
             .min_h_0()
@@ -507,10 +509,13 @@ impl MonitorPanel {
                     .min_h_0()
                     .flex().min_w_0().when(layout.services_stacked,|d|d.flex_col().flex_none())
                     .gap(px(10.))
-                    .when(stale, |d| d.opacity(0.5))
                     .child(list_card)
-                    .children(detail.map(|detail| self.render_service_detail(&detail, p, cx))),
-            )
-            .into_any_element()
+                    .children(detail.map(|detail| self.render_service_detail(&detail, stale, p, cx))),
+            );
+        if layout.services_stacked {
+            crate::ui::scroll::page_scroll("services-fades", page, &self.services_scroll, p.win, 0.).into_any_element()
+        } else {
+            page.into_any_element()
+        }
     }
 }

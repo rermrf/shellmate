@@ -557,7 +557,7 @@ impl MonitorPanel {
             .children(error)
             .child(top)
             .child(
-                div()
+                crate::ui::scroll::page_scroll("docker-fades", div()
                     .id("docker-groups")
                     .flex_1()
                     .min_h_0()
@@ -579,7 +579,7 @@ impl MonitorPanel {
                                 .text_color(p.tx3)
                                 .child("这台主机上还没有容器"),
                         )
-                    }),
+                    }), &self.docker_scroll, p.win, 10.),
             )
             .into_any_element()
     }

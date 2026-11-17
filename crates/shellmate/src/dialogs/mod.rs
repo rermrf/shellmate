@@ -11,9 +11,7 @@ pub mod confirm;
 pub mod host_editor;
 pub mod hostkey;
 pub mod import;
-mod scroll;
-
-pub use scroll::scroll_body;
+pub use crate::ui::scroll::scroll_body;
 
 use std::cell::Cell;
 

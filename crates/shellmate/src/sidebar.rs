@@ -96,6 +96,8 @@ pub struct Sidebar {
     selected: Option<String>,
     /// Focus of the host list, so Enter reaches it after a click on a row.
     list_focus: FocusHandle,
+    pub(crate) scroll: gpui::ScrollHandle,
+    rail_scroll: gpui::ScrollHandle,
     live: HashMap<String, LiveStatus>,
     session_count: usize,
     local_summary: SharedString,
@@ -125,6 +127,8 @@ impl Sidebar {
             collapsed: HashSet::new(),
             selected: None,
             list_focus: cx.focus_handle(),
+            scroll: gpui::ScrollHandle::new(),
+            rail_scroll: gpui::ScrollHandle::new(),
             live: HashMap::new(),
             session_count: 0,
             local_summary: "zsh · ~".into(),
@@ -649,7 +653,7 @@ impl Render for Sidebar {
             .child(self.render_filter(cx))
             .child(self.render_local(cx))
             .child(
-                div()
+                crate::ui::scroll::page_scroll("host-list-fades", div()
                     .id("host-list")
                     .key_context(LIST_CONTEXT)
                     .track_focus(&self.list_focus)
@@ -658,7 +662,7 @@ impl Render for Sidebar {
                     .min_h_0()
                     .overflow_y_scroll().flex().flex_col().gap(px(11.5)).pt(px(11.))
                     .pb(px(8.))
-                    .children(list),
+                    .children(list), &self.scroll, cx.palette().win, 8.),
             ))
             .child(self.render_footer(cx))
             .into_any_element()

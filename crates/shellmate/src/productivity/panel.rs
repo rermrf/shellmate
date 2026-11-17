@@ -409,7 +409,8 @@ impl Render for Picker {
             .on_action(cx.listener(|this, _: &PickConfirm, _, cx| this.pick(cx)))
             .on_action(cx.listener(|_, _: &PickClose, _, cx| cx.emit(Event::Close)))
             .child(header)
-            .child(rows)
+            .child(div().relative().child(rows)
+                .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)))
             .child(
                 div()
                     .flex()
@@ -453,17 +454,17 @@ fn time_label(time: i64) -> String {
 
 pub struct Drawer {
     pub groups: Vec<SnippetGroup>,
+    pub scroll: gpui::ScrollHandle,
     pub broadcast: BroadcastView,
 }
 impl EventEmitter<Event> for Drawer {}
 impl Render for Drawer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let mut body = div()
+        let frame = div()
             .id("commands-drawer")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .p(px(16.))
             .flex()
             .flex_col()
@@ -472,7 +473,7 @@ impl Render for Drawer {
             .bg(p.card)
             .shadow(card_shadow(&p))
             .child(
-                div()
+                div().flex_none()
                     .flex()
                     .items_center()
                     .child(
@@ -492,6 +493,7 @@ impl Render for Drawer {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Manage))),
                     ),
             );
+        let mut body = div().flex().flex_col().gap(px(14.));
         if self.groups.is_empty() {
             body = body.child(
                 div()
@@ -616,10 +618,7 @@ impl Render for Drawer {
                             ),
                     ),
             );
-        let mut sessions = div()
-            .id("broadcast-session-list")
-            .max_h(px(240.))
-            .overflow_y_scroll();
+        let mut sessions = div();
         for row in &self.broadcast.sessions {
             let id = row.id;
             let checked = self.broadcast.state.checked.contains(&id);
@@ -661,7 +660,10 @@ impl Render for Drawer {
                     .child(div().text_size(px(11.5)).text_color(p.tx2).child(row.subtitle())),
             );
         }
-        broadcast = broadcast.child(sessions);
+        broadcast = broadcast.child(crate::ui::scroll::scroll_body("broadcast-session-list", sessions)
+            .flex_none().max_h(px(240.)).surface(p.card).bottom_padding(px(0.)));
+        let body = frame.child(crate::ui::scroll::scroll_body("command-groups", body)
+            .track_scroll(&self.scroll).surface(p.card).bottom_padding(px(0.)));
         div()
             .w(px(300.))
             .flex_none()

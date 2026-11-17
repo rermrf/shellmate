@@ -97,6 +97,7 @@ pub struct RecordsWindow {
     last_tick: Instant,
     query: Entity<InputState>,
     log_lines: Vec<String>,
+    log_scroll: gpui::UniformListScrollHandle,
     filtered: Vec<usize>,
     truncated: bool,
     rename: Option<Entity<InputState>>,
@@ -187,6 +188,7 @@ impl RecordsWindow {
                 last_tick: Instant::now(),
                 query,
                 log_lines: vec![],
+                log_scroll: gpui::UniformListScrollHandle::new(),
                 filtered: vec![],
                 truncated: false,
                 rename: None,
@@ -910,7 +912,7 @@ impl Render for RecordsWindow {
                     )
                 })
                 .child(
-                    div()
+                    div().relative()
                         .flex_1()
                         .min_h_0()
                         .rounded(px(18.))
@@ -956,8 +958,10 @@ impl Render for RecordsWindow {
                                         .collect::<Vec<_>>()
                                 }),
                             )
+                            .track_scroll(&self.log_scroll)
                             .size_full(),
-                        ),
+                        )
+                        .child(crate::ui::scroll::scroll_fades(self.log_scroll.0.borrow().base_handle.clone(), p.card)),
                 );
         } else {
             let row = self.recordings.get(self.selected);

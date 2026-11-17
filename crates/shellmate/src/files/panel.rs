@@ -122,6 +122,7 @@ pub struct FilesPanel {
     pub(super) scroll: UniformListScrollHandle,
     /// The scroll position of the queue card's list.
     pub(super) queue_scroll: ScrollHandle,
+    pub(super) detail_scroll: ScrollHandle,
     pub(super) hint_open: bool,
     /// The connection's transfer queue and what it has in it (shared by all its tabs).
     pub(super) queue: Option<TransferQueue>,
@@ -176,6 +177,7 @@ impl FilesPanel {
             perm_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             queue_scroll: ScrollHandle::new(),
+            detail_scroll: ScrollHandle::new(),
             hint_open: false,
             queue: None,
             transfers: None,
@@ -924,6 +926,12 @@ impl FilesPanel {
 
 #[cfg(debug_assertions)]
 impl FilesPanel {
+    pub fn fixture_scroll(&self, window: &mut Window) {
+        let index = self.model.selected_index().unwrap_or(4);
+        crate::proto::scroll_after_layout(self.scroll.0.borrow().base_handle.clone(), move |_| (index as f32 + 0.5) * 38., window);
+        crate::proto::scroll_after_layout(self.detail_scroll.clone(), |handle| f32::from(handle.max_offset().y) / 2., window);
+    }
+
     pub fn proto_fixture(&mut self,scene:&str,cx:&mut Context<Self>){
         use shellmate_sftp::{Entry,EntryKind};
         use crate::theme::ActivePalette;
@@ -934,6 +942,15 @@ impl FilesPanel {
         self.model.on_terminal_cwd(directory);
         let request=self.model.set_link(LinkStatus::Ready).expect("first fixture listing");
         let mut entries:Vec<Entry>=data["FILES"].a().iter().map(|f|Entry{name:f["n"].s().into(),path:format!("/var/www/app/{}",f["n"].s()),kind:if f["t"].s()=="d"{EntryKind::Dir}else{EntryKind::File},size:if f["n"].s()=="nginx.conf"{2316}else{crate::proto::bytes(f["s"].s())},modified:Some(crate::proto::timestamp(f["m"].s())),mode:u32::from_str_radix(f["p"].s(),8).ok(),uid:Some(1000),gid:Some(33),owner:"deploy".into(),group:"www".into(),link:None}).collect();
+        if scene == "files-scrolled" {
+            let sample = entries.iter().find(|entry| entry.name == "nginx.conf").unwrap().clone();
+            entries = (0..40).map(|i| {
+                let mut entry = sample.clone();
+                entry.name = format!("service-{i:02}.conf");
+                entry.path = format!("{directory}/{}", entry.name);
+                entry
+            }).collect();
+        }
         if stress {
             for (i,entry) in entries.iter_mut().enumerate(){
                 entry.name=if i==0{crate::proto::stress::FILE.into()}else{format!("production-customer-data-platform-客户数据-configuration-and-archive-{i}-20261112.tar.zst")};
@@ -942,9 +959,11 @@ impl FilesPanel {
             }
         }
         self.model.apply_listed(request.id,super::model::Listed{dir:Some(directory.into()),entries:Ok(entries),stat:None});self.model.select_name(if stress{crate::proto::stress::FILE}else{"nginx.conf"});
-        let mut list=super::transfers::TransferList::new();let measured=crate::proto::reading(scene,cx.is_dark());
+        let mut list=super::transfers::TransferList::new();let measured=crate::proto::reading(if scene == "files-scrolled" { "files" } else { scene },cx.is_dark());
         for(i,t)in data["TRANSFERS"].a().iter().enumerate(){let total=(t["size"].n()*1_048_576.)as u64;let done=if i==0{(measured.transfer*1_048_576.) as u64}else{(total as f64*t["pct"].n()/100.)as u64};list.apply(&TransferEvent::Added(TransferView{id:ItemId(i as u64),direction:if t["dir"].s()=="up"{Direction::Upload}else{Direction::Download},name:if stress{format!("production-customer-database-full-backup-{i}-20261112-abcdef0123456789.tar.zst")}else{t["n"].s().into()},destination:directory.into(),state:match t["st"].s(){"run"=>TransferState::Running,"pause"=>TransferState::Paused(PauseReason::User),"done"=>TransferState::Done,_=>TransferState::Queued},bytes_done:done,bytes_total:total,files_done:0,files_total:1,scanning:false,speed:if i==0{measured.transfer_speed*1_048_576.}else{0.},current:None,skipped:Default::default(),in_place:0,failures:vec![],failure_total:0,clash:None,result:None,temp:None}));}
-        self.transfers=Some(cx.new(|_|list));cx.notify();
+        self.transfers=Some(cx.new(|_|list));
+        if scene == "files-scrolled" { self.model.select_row(4); }
+        cx.notify();
     }
 }
 

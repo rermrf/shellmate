@@ -43,6 +43,7 @@ struct FormFields {
 /// The panel.
 pub struct ForwardPanel {
     width: f32,
+    pub(crate) scroll: gpui::ScrollHandle,
     view: ForwardView,
     form: Option<FormFields>,
     focus: FocusHandle,
@@ -56,7 +57,7 @@ impl Focusable for ForwardPanel {
 
 impl ForwardPanel {
     pub fn new(view: ForwardView, cx: &mut Context<Self>) -> Self {
-        Self { width: 1144., view, form: None, focus: cx.focus_handle() }
+        Self { width: 1144., scroll: gpui::ScrollHandle::new(), view, form: None, focus: cx.focus_handle() }
     }
 
     /// What the panel shows now.
@@ -561,12 +562,13 @@ impl Render for ForwardPanel {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .overflow_y_scroll()
             .child(self.render_top(&p, cx))
-            .children(form)
-            .children(cards)
-            .children(empty.then(|| self.render_empty(&p, cx)))
+            .child(crate::ui::scroll::page_scroll("forward-fades",
+                div().id("forward-rules").flex_1().min_h_0().min_w_0()
+                    .overflow_y_scroll().flex().flex_col().gap(px(10.)).pt(px(10.))
+                    .children(form).children(cards)
+                    .children(empty.then(|| self.render_empty(&p, cx))),
+                &self.scroll, p.win, 0.))
             .child(crate::ui::observe_width(cx.entity().downgrade(), self.width, |this, width| this.width = width))
     }
 }

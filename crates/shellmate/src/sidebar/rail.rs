@@ -126,7 +126,7 @@ impl Sidebar {
             )
             .child(div().flex_none().w(px(28.)).h(px(1.)).bg(p.line))
             .child(
-                div()
+                crate::ui::scroll::page_scroll("rail-host-fades", div()
                     .id("rail-hosts")
                     .flex()
                     .flex_col()
@@ -137,7 +137,7 @@ impl Sidebar {
                     .w_full()
                     .py(px(2.))
                     .overflow_y_scroll()
-                    .children(hosts),
+                    .children(hosts), &self.rail_scroll, p.win, 2.),
             )
             .child(
                 div()
