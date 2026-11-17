@@ -144,6 +144,22 @@ impl Workspace {
                 size.cols = 160;
                 size.rows = 40;
                 t.set_size(size);
+                if scene == "prompt-plain" && i == 0 {
+                    let mut output = None;
+                    t.attach(|sink, _| {
+                        output = Some(sink);
+                        Ok(Box::new(Inert))
+                    }, cx);
+                    let sink = output.expect("fixture backend attached");
+                    cx.spawn(async move |_, cx| {
+                        cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                        for text in proto::prompt_plain::STEPS {
+                            sink.output(text.as_bytes());
+                            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                        }
+                    }).detach();
+                    return;
+                }
                 let text = if lines=="MOSH" {"\x1b[32;1mme@dev-box\x1b[0m:\x1b[34;1m~\x1b[0m$ echo mosh-$((6*7))\r\nmosh-42\r\n\x1b[32;1mme@dev-box\x1b[0m:\x1b[34;1m~\x1b[0m$ \x1b[?25l".into()}else if lines=="TELNET" {
                     "\x1b[90mTrying 192.168.1.1...\x1b[0m\r\nConnected to 192.168.1.1. Escape character is ^].\r\nRT-AX86U login: admin\r\nPassword:\r\n\x1b[32;1madmin@RT-AX86U\x1b[0m:\x1b[34;1m~\x1b[0m$ ".to_string()
                 }else if host.protocol==Protocol::Serial {

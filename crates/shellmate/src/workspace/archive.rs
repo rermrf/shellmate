@@ -77,8 +77,9 @@ impl Workspace {
                 v.history_shortcut = self.preferences.get(P::HistoryShortcut);
                 cx.notify();
             });
-            s.terminal.update(cx, |t, _| {
-                t.set_bracketed_paste(self.preferences.get(P::BracketedPaste))
+            s.terminal.update(cx, |t, cx| {
+                t.set_bracketed_paste(self.preferences.get(P::BracketedPaste));
+                t.set_prompt_highlighting(self.preferences.get(P::PromptHighlight), cx);
             });
         }
     }

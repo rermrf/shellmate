@@ -62,9 +62,10 @@ pub enum Preference {
     AutoRecord,
     LoginShell,
     FollowDirectory,
+    PromptHighlight,
 }
 impl Preference {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -74,6 +75,7 @@ impl Preference {
         Self::AutoRecord,
         Self::LoginShell,
         Self::FollowDirectory,
+        Self::PromptHighlight,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -86,6 +88,7 @@ impl Preference {
             Self::AutoRecord => "auto_record",
             Self::LoginShell => "login_shell",
             Self::FollowDirectory => "follow_directory",
+            Self::PromptHighlight => "prompt_highlight",
         }
     }
     pub fn label(self) -> &'static str {
@@ -99,6 +102,7 @@ impl Preference {
             Self::AutoRecord => "自动录制所有会话",
             Self::LoginShell => "作为登录 shell 启动（-l）",
             Self::FollowDirectory => "文件面板跟随终端目录",
+            Self::PromptHighlight => "提示符高亮",
         }
     }
     pub fn description(self) -> &'static str {
@@ -116,12 +120,12 @@ impl Preference {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
-    values: [bool; 9],
+    values: [bool; 10],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            values: [true, true, true, true, true, false, false, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true],
         }
     }
 }
@@ -136,6 +140,22 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_highlight_defaults_on_and_persists_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.db");
+        let mut store = HostStore::open(&path).unwrap();
+        assert!(store.preferences().unwrap().get(Preference::PromptHighlight));
+        assert_eq!(Preference::PromptHighlight.label(), "提示符高亮");
+        assert_eq!(Preference::PromptHighlight.description(), "");
+        store.set_preference(Preference::PromptHighlight, false).unwrap();
+        drop(store);
+        let mut store = HostStore::open(&path).unwrap();
+        assert!(!store.preferences().unwrap().get(Preference::PromptHighlight));
+        store.set_preference(Preference::PromptHighlight, true).unwrap();
+        drop(store);
+        assert!(HostStore::open(&path).unwrap().preferences().unwrap().get(Preference::PromptHighlight));
+    }
     #[test]
     fn preferences_defaults_and_each_toggle_roundtrip() {
         let mut s = HostStore::open_in_memory().unwrap();

@@ -1,5 +1,6 @@
 //! Deterministic prototype fixtures. Compiled only in debug builds, rendered by the real views.
 mod data;
+pub mod prompt_plain;
 pub mod ai;
 pub mod stress;
 pub use data::DATA;
@@ -46,7 +47,7 @@ impl Index<usize> for V {
 pub const SCENES: &[&str] = &[
     "ai-agent", "ai-agent-run", "ai-agent-redline", "ai-agent-full",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
-    "main", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
+    "main", "prompt-plain", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
     "files",
     "fwd",
     "fwd-new",
@@ -200,7 +201,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 62);
+        assert_eq!(SCENES.len(), 63);
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));

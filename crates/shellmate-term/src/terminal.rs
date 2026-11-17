@@ -211,6 +211,7 @@ impl OutputHandler for GridSink {
 
     fn transformed_output(&self,raw:&[u8],display:&[u8]) {
         if self.current.load(Ordering::Acquire)!=self.generation {return;}
+        if !raw.is_empty() || !display.is_empty() { self.agent.lock().last_output = Some(Instant::now()); }
         let mut source=self.raw_grid.lock();
         let source=source.get_or_insert_with(||{
             let term=self.term.lock();let size=TerminalSize{cols:term.columns() as u16,rows:term.screen_lines() as u16,..Default::default()};RawGrid::new(size)
@@ -267,6 +268,8 @@ pub struct Terminal {
     foreground: Option<(Instant, Option<ProcessInfo>)>,
     bracketed_paste: bool,
     replay: bool,
+    pub(crate) prompt_highlighter: crate::prompt::PromptHighlighter,
+    prompt_idle: Option<Task<()>>,
     _io: Task<()>,
 }
 
@@ -328,6 +331,8 @@ impl Terminal {
             foreground: None,
             bracketed_paste: true,
             replay: false,
+            prompt_highlighter: Default::default(),
+            prompt_idle: None,
             _io: io,
         }
     }
@@ -364,6 +369,8 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> bool {
         self.close_backend();
+        self.prompt_idle = None;
+        self.prompt_highlighter.reset();
         *self.capture.lock() = Capture::default();
         *self.raw_grid.lock()=None;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -463,8 +470,31 @@ impl Terminal {
 
     fn after_output(&mut self, cx: &mut Context<Self>) {
         self.foreground = None;
+        self.schedule_prompt_learning(cx);
         cx.emit(TerminalEvent::Output);
         cx.notify();
+    }
+
+    fn schedule_prompt_learning(&mut self, cx: &mut Context<Self>) {
+        if self.replay || self.ended.is_some() { return; }
+        // Replacing the task debounces output bursts. Recheck the shared AI
+        // output clock under the grid lock: more bytes may precede their UI wake.
+        self.prompt_idle = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(crate::prompt::QUIET).await;
+                let retry = this.update(cx, |this, cx| {
+                    let term = this.term.lock();
+                    let last_output = this.agent.lock().last_output;
+                    let now = Instant::now();
+                    if last_output.is_some_and(|at| now.saturating_duration_since(at) < crate::prompt::QUIET) {
+                        return true;
+                    }
+                    if this.prompt_highlighter.learn(&*term, last_output, now) { cx.notify(); }
+                    false
+                });
+                if !matches!(retry, Ok(true)) { break; }
+            }
+        }));
     }
 
     fn process(&mut self, batch: Vec<Msg>, cx: &mut Context<Self>) {
@@ -635,6 +665,10 @@ impl Terminal {
     }
 
     pub fn set_bracketed_paste(&mut self,enabled:bool){self.bracketed_paste=enabled;}
+    pub fn set_prompt_highlighting(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.prompt_highlighter.enabled = enabled;
+        cx.notify();
+    }
     fn paste_mode(&self)->TermMode{let source=self.raw_grid.lock();let mode=source.as_ref().map_or_else(||self.mode(),|s|*s.term.mode());crate::send::effective_mode(mode,self.bracketed_paste)}
     pub fn start_local(&mut self,options:PtyOptions,cx:&mut Context<Self>){self.local=Some(options);self.spawn_local(cx);}
     pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{self.output_capture.lock().start(path,file,header)}
@@ -925,6 +959,22 @@ mod sink_tests {
             current: current.clone(),
         });
         Fixture { term, rx, current, pending, sink,capture,raw_grid,output_capture,agent }
+    }
+
+    #[test]
+    fn prompt_learning_uses_shared_output_clock_for_normal_and_serial_streams() {
+        for transformed in [false, true] {
+            let f = fixture(1);
+            let bytes = b"root@host:~# ";
+            if transformed { f.sink.transformed_output(bytes, bytes); }
+            else { f.sink.output(bytes); }
+            let last = f.agent.lock().last_output.expect("both output paths update the clock");
+            let term = f.term.lock();
+            let mut highlighter = crate::prompt::PromptHighlighter::default();
+            assert!(!highlighter.learn(&*term, Some(last), last + Duration::from_millis(99)));
+            assert!(highlighter.learn(&*term, Some(last), last + crate::prompt::QUIET));
+            assert!(highlighter.row(&*term, Line(0)).is_some());
+        }
     }
 
     #[test]

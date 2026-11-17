@@ -2,6 +2,7 @@
 
 pub mod colors;
 mod element;
+mod prompt;
 mod resize;
 mod keys;
 pub mod history;

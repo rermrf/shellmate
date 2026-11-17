@@ -7,9 +7,10 @@
 
 use alacritty_terminal::index::{Line, Point as GridPoint};
 use alacritty_terminal::selection::SelectionRange;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{TermMode, point_to_viewport};
-use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
     FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
@@ -46,7 +47,7 @@ impl TerminalStyle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct CellStyle {
     fg: Hsla,
     bold: bool,
@@ -54,6 +55,22 @@ struct CellStyle {
     underline: bool,
     undercurl: bool,
     strike: bool,
+}
+
+fn paint_cell(cell: &Cell, palette: &TerminalPalette, overrides: &Colors, prompt: Option<NamedColor>) -> (CellStyle, Rgb) {
+    let mut fg = palette.rgb(&prompt.map_or(cell.fg, Color::Named), overrides);
+    let mut bg = palette.rgb(&cell.bg, overrides);
+    if cell.flags.contains(Flags::INVERSE) { std::mem::swap(&mut fg, &mut bg); }
+    let mut fg = to_hsla(fg);
+    if cell.flags.contains(Flags::DIM) { fg.a *= 0.66; }
+    (CellStyle {
+        fg,
+        bold: prompt.is_some() || cell.flags.contains(Flags::BOLD),
+        italic: cell.flags.contains(Flags::ITALIC),
+        underline: cell.flags.intersects(Flags::ALL_UNDERLINES) && !cell.flags.contains(Flags::UNDERCURL),
+        undercurl: cell.flags.contains(Flags::UNDERCURL),
+        strike: cell.flags.contains(Flags::STRIKEOUT),
+    }, bg)
 }
 
 struct Batch {
@@ -217,7 +234,8 @@ impl Element for TerminalElement {
             Bounds::new(cell_origin(line, col), size(cell_width * cells as f32, line_height))
         };
 
-        let term_arc = self.terminal.read(cx).term().clone();
+        let terminal = self.terminal.read(cx);
+        let term_arc = terminal.term().clone();
         let term = term_arc.lock();
         let content = term.renderable_content();
         let display_offset = content.display_offset;
@@ -230,21 +248,20 @@ impl Element for TerminalElement {
         let mut open_rect: Option<(usize, usize, usize, Hsla)> = None; // line, col, cells, color
         let mut batches: Vec<Batch> = Vec::new();
         let mut current: Option<Batch> = None;
+        let mut prompt = None;
 
         for indexed in content.display_iter {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else { continue };
             let (line, col) = (vp.line, vp.column.0);
+            if col == 0 { prompt = terminal.prompt_highlighter.row(&term, indexed.point.line); }
             let cell = &indexed.cell;
             if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
             let cells = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
-            let mut fg = palette.rgb(&cell.fg, overrides);
-            let mut bg = palette.rgb(&cell.bg, overrides);
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
+            let prompt_color = prompt.as_ref().and_then(|p| p.color(col, cell));
+            let (style, bg) = paint_cell(cell, palette, overrides, prompt_color);
 
             // Background runs.
             if bg != default_bg {
@@ -270,18 +287,6 @@ impl Element for TerminalElement {
                 }
                 continue;
             }
-            let mut fg_hsla = to_hsla(fg);
-            if cell.flags.contains(Flags::DIM) {
-                fg_hsla.a *= 0.66;
-            }
-            let style = CellStyle {
-                fg: fg_hsla,
-                bold: cell.flags.contains(Flags::BOLD),
-                italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.intersects(Flags::ALL_UNDERLINES) && !cell.flags.contains(Flags::UNDERCURL),
-                undercurl: cell.flags.contains(Flags::UNDERCURL),
-                strike: cell.flags.contains(Flags::STRIKEOUT),
-            };
             let ascii = ch.is_ascii() && cells == 1 && cell.zerowidth().is_none();
             let extends = matches!(&current, Some(b) if b.ascii && ascii && b.line == line
                 && b.col + b.cells == col && b.style == style);
@@ -446,6 +451,65 @@ impl Element for TerminalElement {
                 text.line.paint(text.origin, layout.line_height, TextAlign::Left, None, window, cx).ok();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+    use crate::{prompt::{PromptHighlighter, QUIET}, session_log::{Silent, Size}};
+    use alacritty_terminal::{grid::Dimensions, index::Column, term::{Config, Term}, vte::ansi::Processor};
+    use std::time::Instant;
+
+    #[test]
+    fn prompt_paint_exact_segments_and_weights_in_both_themes() {
+        for palette in [TerminalPalette::light(), TerminalPalette::dark()] {
+            for (prompt, green, blue) in [
+                ("root@host:~/app# ", 0..9, 10..15),
+                ("(venv) deploy@web:~/app$ ", 7..17, 18..23),
+                ("emoji@mac ~ % ", 0..9, 10..11),
+                ("[root@centos7 ~]# ", 1..13, 14..15),
+            ] {
+                let mut term = Term::new(Config::default(), &Size { cols: 80, rows: 4 }, Silent);
+                let mut parser: Processor = Processor::new();
+                parser.advance(&mut term, prompt.as_bytes());
+                let mut h = PromptHighlighter::default();
+                let now = Instant::now();
+                assert!(h.learn(&term, Some(now - QUIET), now));
+                parser.advance(&mut term, b"cd /var/www/app");
+                let row = h.row(&term, Line(0)).unwrap();
+                let terminal_style = TerminalStyle {
+                    font_family: "monospace".into(), fallbacks: Vec::new(), font_size: px(13.),
+                    line_height: 1.5, palette: palette.clone(),
+                };
+                for column in 0..prompt.len() + 15 {
+                    let cell = &term.grid()[Line(0)][Column(column)];
+                    let (style, bg) = paint_cell(cell, &palette, term.colors(), row.color(column, cell));
+                    let expected = if green.contains(&column) { Some(palette.ansi[2]) }
+                        else if blue.contains(&column) { Some(palette.ansi[4]) } else { None };
+                    assert_eq!(style.fg, to_hsla(expected.unwrap_or(palette.foreground)), "{prompt:?} column {column}");
+                    assert_eq!(style.bold, expected.is_some(), "{prompt:?} column {column}");
+                    assert_eq!(terminal_style.font(style.bold, style.italic).weight,
+                        if expected.is_some() { FontWeight::BOLD } else { FontWeight::NORMAL });
+                    assert_eq!(bg, palette.background);
+                }
+                assert_eq!(term.columns(), 80);
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_paint_uses_terminal_palette_overrides() {
+        let mut colors = Colors::default();
+        let green = Rgb { r: 12, g: 34, b: 56 };
+        let blue = Rgb { r: 78, g: 90, b: 12 };
+        colors[NamedColor::Green] = Some(green);
+        colors[NamedColor::Blue] = Some(blue);
+        for (named, rgb) in [(NamedColor::Green, green), (NamedColor::Blue, blue)] {
+            let (style, _) = paint_cell(&Cell::default(), &TerminalPalette::dark(), &colors, Some(named));
+            assert_eq!(style.fg, to_hsla(rgb));
+            assert!(style.bold);
+        }
     }
 }
 
