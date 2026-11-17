@@ -262,7 +262,7 @@ impl Workspace {
                 self.sessions[0].panel = Panel::Forward;
             }
             "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" => self.proto_monitor(scene, stress, window, cx),
-            "rv" | "rv-log" => {
+            "rv" | "rv-log" | "rv-end" | "rv-wide" | "rv-recording" => {
                 let panel = crate::records::panel::RecordsWindow::open(
                     self.store.clone(),
                     PathBuf::from("/nonexistent-shellmate-fixture"),
@@ -272,7 +272,7 @@ impl Workspace {
                     window,
                     cx,
                 );
-                panel.update(cx, |r, cx| r.proto_scene(scene == "rv-log", cx));
+                panel.update(cx, |r, cx| r.proto_scene(scene, cx));
                 self.records_window = Some(panel.downgrade());
             }
             "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),

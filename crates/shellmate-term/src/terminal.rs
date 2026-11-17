@@ -700,8 +700,10 @@ impl Terminal {
     }
     pub fn finalize_log(&mut self){self.output_capture.lock().stop_logging();}
     pub fn is_replay(&self)->bool{self.replay}
-    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
+    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.prompt_idle=None;self.prompt_highlighter.reset();self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
     pub fn replay_output(&mut self,bytes:&[u8],cx:&mut Context<Self>){self.parser.lock().advance(&mut *self.term.lock(),bytes);cx.notify();}
+    /// Run once after a batch/seek, including prompts that moved into scrollback.
+    pub fn learn_replay_prompts(&mut self) { self.prompt_highlighter.learn_replay(&*self.term.lock()); }
     pub fn screen_text(&self)->String{crate::replay::screen_text(&*self.term.lock())}
     /// Rendered cells only, including scrollback above the current viewport.
     pub fn recent_displayed_text(&self,lines:usize)->String{crate::replay::recent_text(&*self.term.lock(),lines)}

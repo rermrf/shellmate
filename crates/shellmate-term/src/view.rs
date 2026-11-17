@@ -1,6 +1,7 @@
 //! Interactive terminal view: keyboard, IME, mouse selection, scrolling and search.
 
 use std::ops::Range;
+mod replay;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Point as GridPoint, Side};
@@ -87,6 +88,7 @@ pub struct TerminalView {
     marked_text: Option<String>,
     selecting: bool,
     scroll_remainder: f32,
+    replay_viewport: replay::ReplayViewport,
     search: Option<Search>,
     search_icon: Option<Icon>,
     /// Copy the selection to the clipboard as soon as the mouse is released.
@@ -117,6 +119,7 @@ impl TerminalView {
             marked_text: None,
             selecting: false,
             scroll_remainder: 0.,
+            replay_viewport: Default::default(),
             search: None,
             search_icon: None,
             copy_on_select: true,
@@ -201,21 +204,25 @@ impl TerminalView {
     }
 
     fn scroll_page_up(&mut self, _: &ScrollPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_replay(true, false, cx) { return; }
         self.terminal.update(cx, |t, _| t.scroll_page(true));
         cx.notify();
     }
 
     fn scroll_page_down(&mut self, _: &ScrollPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_replay(false, false, cx) { return; }
         self.terminal.update(cx, |t, _| t.scroll_page(false));
         cx.notify();
     }
 
     fn scroll_to_top(&mut self, _: &ScrollToTop, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_replay(true, true, cx) { return; }
         self.terminal.update(cx, |t, _| t.scroll_to_edge(true));
         cx.notify();
     }
 
     fn scroll_to_bottom(&mut self, _: &ScrollToBottom, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scroll_replay(false, true, cx) { return; }
         self.terminal.update(cx, |t, _| t.scroll_to_edge(false));
         cx.notify();
     }
@@ -383,6 +390,7 @@ impl TerminalView {
     }
 
     fn scroll_wheel(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal.read(cx).is_replay() { return; }
         let Some(g) = self.geometry else { return };
         let delta = match event.delta {
             ScrollDelta::Lines(p) => p.y,
@@ -501,6 +509,11 @@ impl Render for TerminalView {
             active,
         );
         let search = self.search.as_ref().map(|s| self.render_search(s, cx));
+        let content = if self.terminal.read(cx).is_replay() {
+            self.render_replay(element, cx).into_any_element()
+        } else {
+            div().size_full().px(px(18.)).py(px(14.)).cursor(CursorStyle::IBeam).child(element).into_any_element()
+        };
 
         div()
             .id("terminal-view")
@@ -534,7 +547,7 @@ impl Render for TerminalView {
             .rounded_tr(self.top_radius)
             .when(self.terminal.read(cx).is_replay(), |d| d.rounded_bl(self.top_radius).rounded_br(self.top_radius))
             .bg(to_hsla(self.style.palette.background))
-            .child(div().size_full().px(px(18.)).py(px(14.)).cursor(CursorStyle::IBeam).child(element))
+            .child(content)
             .children(search)
     }
 }

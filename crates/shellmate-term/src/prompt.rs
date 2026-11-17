@@ -214,6 +214,52 @@ impl PromptHighlighter {
         self.signatures.clear();
     }
 
+    /// Replay has no idle shell. Count complete, unstyled, column-zero prompt
+    /// prefixes in the current primary screen and history. Repeated scans do
+    /// not inflate counts; ties use identity order, independent of playback speed.
+    /// Require two occurrences per identity to avoid learning one-off quoted output.
+    pub(crate) fn learn_replay<T>(&mut self, term: &Term<T>) {
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let mut counts = std::collections::BTreeMap::<String, (usize, Vec<Shape>)>::new();
+        for line in term.topmost_line().0..=term.bottommost_line().0 {
+            let line = Line(line);
+            if continuation(term, line) {
+                continue;
+            }
+            let (text, columns) = row_text(term, line, term.columns());
+            let Some(parsed) = parse(&text) else {
+                continue;
+            };
+            // A prefix that ends at the screen edge may have wrapped; do not
+            // infer its missing delimiter/space from terminal padding.
+            if parsed.end >= columns.len()
+                || !(0..columns[parsed.end]).all(|c| plain(&term.grid()[line][Column(c)]))
+            {
+                continue;
+            }
+            let entry = counts.entry(text[parsed.identity].to_owned()).or_default();
+            entry.0 += 1;
+            if !entry.1.contains(&parsed.shape) {
+                entry.1.push(parsed.shape);
+            }
+        }
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        self.signatures = counts
+            .into_iter()
+            .filter(|(_, (count, _))| *count >= 2)
+            .take(MAX_SIGNATURES)
+            .flat_map(|(identity, (_, shapes))| {
+                shapes.into_iter().map(move |shape| Signature {
+                    identity: identity.clone(),
+                    shape,
+                })
+            })
+            .collect();
+    }
+
     /// Called after the output idle timer. Learning continues while disabled so
     /// enabling the setting can immediately paint already observed identities.
     pub(crate) fn learn<T>(

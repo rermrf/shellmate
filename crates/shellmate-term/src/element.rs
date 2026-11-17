@@ -22,6 +22,23 @@ use crate::colors::{TerminalPalette, to_hsla};
 use crate::terminal::{SearchMatch, Terminal, TerminalSize};
 use crate::view::{Geometry, TerminalView};
 
+fn rendered_cursor_shape(
+    mode: TermMode,
+    shape: CursorShape,
+    focused: bool,
+    replay: bool,
+) -> CursorShape {
+    if !mode.contains(TermMode::SHOW_CURSOR) || shape == CursorShape::Hidden {
+        CursorShape::Hidden
+    } else if replay {
+        CursorShape::Block
+    } else if focused {
+        shape
+    } else {
+        CursorShape::HollowBlock
+    }
+}
+
 /// Font and colors used to draw the grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalStyle {
@@ -34,6 +51,12 @@ pub struct TerminalStyle {
 }
 
 impl TerminalStyle {
+    pub fn for_replay(mut self) -> Self {
+        self.font_size = px(crate::replay::FONT_SIZE);
+        self.line_height = crate::replay::LINE_HEIGHT / crate::replay::FONT_SIZE;
+        self
+    }
+
     pub fn font(&self, bold: bool, italic: bool) -> Font {
         let mut font = gpui::font(self.font_family.clone());
         font.fallbacks = Some(gpui::FontFallbacks::from_fonts(self.fallbacks.clone()));
@@ -190,8 +213,17 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
+        if self.terminal.read(cx).is_replay() {
+            self.style = self.style.clone().for_replay();
+            let (cell_width, _) = self.cell_metrics(window);
+            let extent = crate::replay::content_size(crate::replay::grid_size(self.terminal.read(cx).size(), cell_width));
+            style.size.width = extent.width.into();
+            style.size.height = extent.height.into();
+            style.flex_shrink = 0.;
+        } else {
+            style.size.width = relative(1.).into();
+            style.size.height = relative(1.).into();
+        }
         (window.request_layout(style, None, cx), ())
     }
 
@@ -204,14 +236,10 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (mut cell_width, mut line_height) = self.cell_metrics(window);
+        let (cell_width, line_height) = self.cell_metrics(window);
         let replay=self.terminal.read(cx).is_replay();
         let recorded=self.terminal.read(cx).size();
-        if replay {
-            self.style.font_size=px(crate::replay::fit_font(f32::from(self.style.font_size),f32::from(bounds.size.width),f32::from(bounds.size.height),recorded.cols,recorded.rows,f32::from(cell_width),f32::from(line_height)));
-            (cell_width,line_height)=self.cell_metrics(window);
-        }
-        let grid = if replay { TerminalSize {cell_width,line_height,..recorded} } else {TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height)};
+        let grid = if replay { crate::replay::grid_size(recorded, cell_width) } else {TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height)};
         let (cols, rows) = (grid.cols, grid.rows);
         let size_changed = self.terminal.read(cx).size() != grid;
         if size_changed || self.terminal.read(cx).resize_pending() {
@@ -344,8 +372,8 @@ impl Element for TerminalElement {
         let cursor_cell = &term.grid()[cursor_point];
         let cursor_wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
         let cursor_char = cursor_cell.c;
-        let show_cursor = mode.contains(TermMode::SHOW_CURSOR) && content.cursor.shape != CursorShape::Hidden;
-        let cursor_shape = if self.focused { content.cursor.shape } else { CursorShape::HollowBlock };
+        let cursor_shape = rendered_cursor_shape(mode, content.cursor.shape, self.focused, replay);
+        let show_cursor = cursor_shape != CursorShape::Hidden;
         drop(term);
 
         let texts = batches
@@ -451,6 +479,47 @@ impl Element for TerminalElement {
                 text.line.paint(text.origin, layout.line_height, TextAlign::Left, None, window, cx).ok();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod replay_cursor_tests {
+    use super::*;
+    use crate::session_log::{Silent, Size};
+    use alacritty_terminal::{
+        term::{Config, Term},
+        vte::ansi::Processor,
+    };
+
+    #[test]
+    fn replay_cursor_stays_block_without_focus_and_respects_dectcem() {
+        let mut term = Term::new(
+            Config::default(),
+            &Size { cols: 100, rows: 26 },
+            Silent,
+        );
+        let mut parser: Processor = Processor::new();
+        let prompt = "deploy@prod-web-01:/var/www/app$ ";
+        parser.advance(&mut term, prompt.as_bytes());
+        assert_eq!(term.grid().cursor.point.column.0, prompt.len());
+        assert_eq!(term.grid().cursor.point.line.0, 0);
+        let shape = |term: &Term<Silent>, focused, replay| {
+            rendered_cursor_shape(
+                *term.mode(),
+                term.renderable_content().cursor.shape,
+                focused,
+                replay,
+            )
+        };
+        for focused in [false, true] {
+            assert_eq!(shape(&term, focused, true), CursorShape::Block);
+        }
+        parser.advance(&mut term, b"\x1b[?25l");
+        assert_eq!(shape(&term, false, true), CursorShape::Hidden);
+        parser.advance(&mut term, b"\x1b[?25h\x1b[5 q");
+        assert_eq!(shape(&term, false, true), CursorShape::Block);
+        assert_eq!(shape(&term, true, false), CursorShape::Beam);
+        assert_eq!(shape(&term, false, false), CursorShape::HollowBlock);
     }
 }
 

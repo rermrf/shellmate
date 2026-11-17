@@ -1,6 +1,7 @@
 //! Deterministic prototype fixtures. Compiled only in debug builds, rendered by the real views.
 mod data;
 pub mod prompt_plain;
+pub mod replay;
 pub mod ai;
 pub mod stress;
 pub use data::DATA;
@@ -63,6 +64,9 @@ pub const SCENES: &[&str] = &[
     "split",
     "rv",
     "rv-log",
+    "rv-end",
+    "rv-wide",
+    "rv-recording",
     "set-cred",
     "set-cred-master",
     "vault-unlock",
@@ -173,6 +177,11 @@ pub fn ansi_line(segments: &V, dark: bool) -> String {
     let colors = &DATA["TERM"][if dark { "dark" } else { "light" }];
     let mut output = String::new();
     for s in segments.a() {
+        // The HTML fixture's background-filled space is its drawn cursor,
+        // not recorded output. Replay paints the emulator's own block cursor.
+        if !s["bg"].s().is_empty() || s["t"].s().is_empty() {
+            continue;
+        }
         let key = s["c"].s().trim_start_matches("var(").trim_end_matches(')');
         let color = u32::from_str_radix(colors[key].s().trim_start_matches('#'), 16).unwrap_or(0x24272e);
         output.push_str(&format!(
@@ -184,7 +193,7 @@ pub fn ansi_line(segments: &V, dark: bool) -> String {
             s["t"].s()
         ));
     }
-    output.push_str("\x1b[0m\x1b[?25l");
+    output.push_str("\x1b[0m");
     output
 }
 #[cfg(test)]
@@ -201,7 +210,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 63);
+        assert_eq!(SCENES.len(), 66);
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));

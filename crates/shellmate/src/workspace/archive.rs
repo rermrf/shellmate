@@ -235,6 +235,10 @@ impl Workspace {
         for id in stopped {
             let _ = self.stop_recording(id, cx);
         }
+        if !crate::prototype_fixture() && let Some(panel) = self.records_window.as_ref().and_then(|p| p.upgrade()) {
+            let active = self.running_recordings.values().map(|r| r.row.id).collect();
+            panel.update(cx, |p, cx| p.sync_recordings(active, self.preferences.get(P::PromptHighlight), cx));
+        }
         if !self.running_recordings.is_empty() {
             cx.notify();
         }

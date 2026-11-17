@@ -993,7 +993,12 @@ impl Workspace {
         }else{status_fields};
         let view = focused.view.clone();
         let recording=self.running_recordings.get(&focused.id);
-        let recording_label=recording.map_or_else(||"● 录制".to_string(),|r|format!("REC {} · .cast",shellmate_term::archive::mmss(r.display_seconds())));
+        let recording_seconds = recording.map(|r| r.display_seconds());
+        #[cfg(debug_assertions)]
+        let recording_seconds = if std::env::var("SHELLMATE_DEMO").is_ok_and(|s| crate::proto::request(s.strip_prefix("proto:").unwrap_or(&s)).0 == "rv-recording") {
+            Some(29.)
+        } else { recording_seconds };
+        let recording_label = crate::records::recording_label(recording_seconds);
 
         let pill = |id: &'static str, label: &'static str, tip: &'static str, enabled: bool| {
             div()
@@ -1051,7 +1056,7 @@ impl Workspace {
                             .children(status_fields.into_iter().map(|text|div().flex_none().line_height(px(15.)).child(text))),
                     )
                     .child(div().id("record-session").h(px(22.)).font_family(theme::MONO_FONT).px(px(9.)).flex().items_center().rounded(px(7.)).cursor_pointer().text_size(px(11.5))
-                        .line_height(px(15.)).font_weight(FontWeight::NORMAL).bg(if recording.is_some(){p.err}else{gpui::rgba(0x7f7f7f29).into()}).text_color(if recording.is_some(){gpui::white()}else{term_fg}).child(recording_label)
+                        .line_height(px(15.)).font_weight(FontWeight::NORMAL).bg(if recording_seconds.is_some(){to_hsla(cx.terminal_style().palette.ansi[1])}else{gpui::rgba(0x7f7f7f29).into()}).text_color(if recording_seconds.is_some(){gpui::white()}else{term_fg}).child(recording_label)
                         .on_click(cx.listener(|this,_,w,cx|this.toggle_recording(w,cx))))
                     .child(pill("logs", "记录", "会话记录与回放", true).on_click(cx.listener(|this,_,w,cx|this.open_records(None,false,w,cx))))
                     .child(

@@ -15,6 +15,97 @@ fn learn(highlighter: &mut PromptHighlighter, term: &Term<Silent>) -> bool {
 }
 
 #[test]
+fn replay_learns_plain_prompts_from_screen_and_scrollback_without_idle() {
+    let term = grid(
+        "root@host:~/x# pwd\r\n/x\r\nroot@host:~/x# ls\r\nfile\r\nroot@host:~/x# ",
+        80,
+        3,
+    );
+    let before = crate::replay::recent_text(&term, 10);
+    let mut highlighter = PromptHighlighter::default();
+    highlighter.learn_replay(&term);
+    assert_eq!(highlighter.signatures.len(), 1);
+    for line in [-2, 0, 2] {
+        let prompt = highlighter.row(&term, Line(line)).unwrap();
+        let cell = |col| &term.grid()[Line(line)][Column(col)];
+        assert_eq!(prompt.color(0, cell(0)), Some(NamedColor::Green));
+        assert_eq!(prompt.color(10, cell(10)), Some(NamedColor::Blue));
+        for col in [9, 13, 14, 15] {
+            assert_eq!(prompt.color(col, cell(col)), None);
+        }
+    }
+    assert_eq!(crate::replay::recent_text(&term, 10), before);
+    highlighter.enabled = false;
+    assert!(highlighter.row(&term, Line(2)).is_none());
+    highlighter.reset();
+    assert!(highlighter.signatures.is_empty());
+}
+
+#[test]
+fn replay_rejects_output_colours_wrapped_prefixes_and_alternate_screens() {
+    for text in [
+        "mention root@host:~/x# text\r\nmention root@host:~/x# text",
+        "root@host:relative# text\r\nroot@host:relative# text",
+        "root@host:~/x# one-off quoted example",
+        "\x1b[31mroot@host:~/x# cmd\r\nroot@host:~/x# ",
+        "\x1b[44mroot@host:~/x# cmd\r\nroot@host:~/x# ",
+        "\x1b[1mroot@host:~/x# cmd\r\nroot@host:~/x# ",
+        "\x1b[?1049hroot@host:~/x# cmd\r\nroot@host:~/x# ",
+    ] {
+        let term = grid(text, 80, 5);
+        let mut highlighter = PromptHighlighter::default();
+        highlighter.learn_replay(&term);
+        assert!(highlighter.signatures.is_empty(), "{text:?}");
+    }
+    let term = grid(
+        &format!(
+            "{}root@host:~/x# cmd\r\n{}root@host:~/x# cmd",
+            "x".repeat(40),
+            "x".repeat(40)
+        ),
+        40,
+        6,
+    );
+    let mut highlighter = PromptHighlighter::default();
+    highlighter.learn_replay(&term);
+    assert!(highlighter.signatures.is_empty());
+}
+
+#[test]
+fn replay_frequency_cap_counts_identities_and_is_stable_across_scans() {
+    let mut text = String::new();
+    for (host, count) in [
+        ("rare", 2),
+        ("alpha", 3),
+        ("beta", 4),
+        ("gamma", 5),
+        ("delta", 6),
+    ] {
+        for _ in 0..count {
+            text.push_str(&format!("root@{host}:~/x# pwd\r\n"));
+        }
+    }
+    // The same identity in another supported shape occupies no extra token slot.
+    text.push_str("[root@delta ~]# ls\r\n");
+    let term = grid(&text, 80, 4);
+    let mut highlighter = PromptHighlighter::default();
+    highlighter.learn_replay(&term);
+    let signatures = highlighter.signatures.clone();
+    let identities = signatures
+        .iter()
+        .map(|s| s.identity.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identities,
+        ["root@alpha", "root@beta", "root@delta", "root@gamma"].into()
+    );
+    assert_eq!(signatures[0].identity, "root@delta");
+    assert!(signatures.iter().any(|s| s.shape == Shape::Bracket));
+    highlighter.learn_replay(&term);
+    assert_eq!(highlighter.signatures, signatures);
+}
+
+#[test]
 fn shape_parser_positive_table() {
     for (text, shape, identity, path, command) in [
         (
