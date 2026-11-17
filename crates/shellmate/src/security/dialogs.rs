@@ -477,18 +477,12 @@ impl Render for PasswordDialog {
         if matches!(self.purpose, Purpose::Reset) {
             body = body.child(notice(Notice::Error, model::RESET_WARNING, &p));
         }
-        if matches!(self.purpose, Purpose::SwitchKeychain) {
-            body = body.child(hint(
-                "全部凭据复制并回读验证成功后，才删除本地加密副本。",
-                &p,
-            ));
-        }
         if matches!(self.purpose, Purpose::DisableTouch) {
             body = body.child(hint("删除本机钥匙串中的解锁密钥，之后使用主密码解锁。", &p));
         }
         if matches!(self.purpose, Purpose::Export) {
             body = body.child(hint(
-                "选择要带到另一台设备的内容。导出口令独立于主密码，请单独妥善保存。",
+                "导出口令独立于主密码，请单独妥善保存。",
                 &p,
             ));
             for (index, label, checked) in [

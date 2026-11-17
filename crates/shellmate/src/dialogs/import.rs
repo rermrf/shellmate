@@ -275,7 +275,7 @@ impl Render for ImportDialog {
         });
 
         let count = self.selected_count();
-        let summary = format!("解析到 {} 个 Host · 私钥只记录路径，不复制文件", self.rows.len());
+        let summary = format!("解析到 {} 个 Host", self.rows.len());
         let remarks = self.notes.lines();
         stack()
             .child(hint(summary, &p))
@@ -292,7 +292,7 @@ impl Render for ImportDialog {
                     .child(div().id("import-rows").max_h(px(300.)).overflow_y_scroll().children(rows)),
             )
             .child(field(
-                "导入到分组（输入新名称会新建分组，留空则不分组）",
+                "导入到分组",
                 &p,
                 stack().gap(px(8.)).child(Input::new(&self.group)).children(group_chips),
             ))

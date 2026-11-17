@@ -356,9 +356,10 @@ impl Workspace {
             }
         };
         let host = chain.last().cloned()?;
+        // Existing SSH tabs can outlive an edit that changes the saved host's protocol.
         if !matches!(host.protocol,shellmate_core::Protocol::Ssh|shellmate_core::Protocol::Mosh) {
-            let note = format!("{} 将在后续阶段（P7）实现，目前只能连接 SSH 主机。", host.protocol.label());
-            window.push_notification(Notification::info(note).title(format!("暂不能连接 {}", host.name)), cx);
+            let note = format!("主机配置已改为{}，请关闭该主机的旧标签后重新连接。", host.protocol.label());
+            window.push_notification(Notification::info(note).title(format!("{} 的协议已更改", host.name)), cx);
             return None;
         }
         if host.protocol==shellmate_core::Protocol::Mosh {
@@ -1036,7 +1037,7 @@ impl Workspace {
                 "密码"
             };
             window.push_notification(
-                Notification::success(format!("{what}已保存到凭据存储，下次自动填写")).title("凭据"),
+                Notification::success(format!("已保存{what}")).title("凭据"),
                 cx,
             );
         }

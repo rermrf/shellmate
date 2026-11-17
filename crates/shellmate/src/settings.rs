@@ -17,6 +17,10 @@ use gpui::{
     px,
 };
 use shellmate_store::{Backend, Preference as P, Preferences};
+
+// Re-enable the placeholder rows when remote sync is available.
+const SHOW_REMOTE_SYNC: bool = false;
+
 pub struct SettingsWindow {
     workspace: WeakEntity<Workspace>,
     preferences: Preferences,
@@ -279,25 +283,16 @@ impl Render for SettingsWindow {
                 .child(
                     div().w_full().min_w_0().flex().gap(px(10.)).children(
                         [
-                            (
-                                !self.selected_master,
-                                "系统钥匙串",
-                                "密码与私钥口令交给 macOS 钥匙串（keyring crate），随系统登录解锁",
-                            ),
-                            (
-                                self.selected_master,
-                                "主密码加密本地库",
-                                "Argon2id 派生密钥 + XChaCha20-Poly1305 加密 SQLite，跨平台同步更方便",
-                            ),
+                            (!self.selected_master, "系统钥匙串"),
+                            (self.selected_master, "主密码加密本地库"),
                         ]
                         .into_iter()
-                        .enumerate().map(|(index,(selected, title, description))| {
+                        .enumerate().map(|(index,(selected, title))| {
                             div()
                                 .id(("credential-backend",index)).cursor_pointer().on_click(cx.listener(move|s,_,w,cx|{if index==1{s.selected_master=true;cx.notify();}else if s.credentials.backend()==Backend::Master{s.operation(Purpose::SwitchKeychain,true,w,cx);}else{s.selected_master=false;cx.notify();}}))
                                 .relative().flex_1().min_w_0()
                                 .whitespace_normal()
                                 .p(px(16.))
-                                .min_h(px(100.))
                                 .rounded(px(18.))
                                 .bg(if selected { p.accs } else { p.card })
                                 .child(
@@ -311,16 +306,6 @@ impl Render for SettingsWindow {
                                             .flex().items_center().justify_center().when(selected,|d|d.child(div().size(px(8.)).rounded_full().bg(p.acc))))
                                         .child(title)
 ,
-                                )
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .whitespace_normal()
-                                        .mt(px(10.))
-                                        .text_size(px(12.5))
-                                        .line_height(px(20.))
-                                        .text_color(p.tx2)
-                                        .child(description),
                                 )
                                 .child(crate::ui::surface_ring(18., 1.5, if selected { p.acc } else { p.line }))
                         }),
@@ -373,18 +358,17 @@ impl Render for SettingsWindow {
             let rows = [
                 (
                     "用 Touch ID 解锁凭据",
-                    (if demo_master {
+                    if demo_master {
                         None
                     } else {
                         touch_reason.clone()
-                    })
-                    .unwrap_or_else(|| "需要密码或口令时验证指纹".into()),
+                    },
                     security_model.touch_enabled || demo_master,
                     touch_reason.is_some() && !security_model.touch_enabled && !demo_master,
                 ),
                 (
                     "闲置 15 分钟后锁定",
-                    "锁定后需重新解锁才能读取凭据".into(),
+                    None,
                     security_model.idle_enabled,
                     self.credentials.backend() != Backend::Master && !demo_master,
                 ),
@@ -401,7 +385,8 @@ impl Render for SettingsWindow {
                     .children(rows.into_iter().enumerate().map(
                         |(index, (label, description, checked, disabled))| {
                             div()
-                                .h(px(56.))
+                                .min_h(px(44.))
+                                .py(px(12.))
                                 .flex_none()
                                 .flex()
                                 .items_center()
@@ -415,15 +400,15 @@ impl Render for SettingsWindow {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(p.tx)
                                         .child(label)
-                                        .child(
+                                        .children(description.map(|description| {
                                             div()
                                                 .mt(px(4.))
                                                 .text_size(px(12.))
                                                 .line_height(px(15.))
                                                 .font_weight(FontWeight::NORMAL)
                                                 .text_color(p.tx2)
-                                                .child(description),
-                                        ),
+                                                .child(description)
+                                        })),
                                 )
                                 .child(
                                     Switch::new(("security-pref", index))
@@ -495,12 +480,11 @@ impl Render for SettingsWindow {
                 );
             }
         } else if self.section == 1 {
-            content=content.child(div().flex_none().min_h(px(75.)).p(px(18.)).py(px(16.)).rounded(px(18.)).bg(p.card).flex().items_center().gap(px(14.))
-                .child(div().flex_1().min_w_0().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child("导出加密配置包")
-                    .child(div().mt(px(3.)).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::NORMAL).text_color(p.tx2).whitespace_normal().child("主机、分组、快捷命令、转发规则和凭据打包为 .smbundle，用导出口令加密")))
+            content=content.child(div().flex_none().p(px(18.)).py(px(16.)).rounded(px(18.)).bg(p.card).flex().items_center().gap(px(14.))
+                .child(div().flex_1().min_w_0().text_size(px(14.)).line_height(px(20.)).font_weight(FontWeight::BOLD).child("导出加密配置包"))
                 .child(dialogs::button("bundle-export","导出…",dialogs::Tone::Primary,true).h(px(36.)).on_click(cx.listener(|s,_,w,cx|s.export_bundle(w,cx))))
                 .child(dialogs::button("bundle-import","导入…",dialogs::Tone::Plain,true).h(px(36.)).on_click(cx.listener(|s,_,w,cx|s.import_bundle(w,cx)))));
-            content = content
+            content = content.when(SHOW_REMOTE_SYNC, |content| content
                 .child(
                     div()
                         .flex_none()
@@ -544,7 +528,7 @@ impl Render for SettingsWindow {
                 )
                 .child(div().flex().justify_end().child(
                     dialogs::button("sync-now", "立即同步", dialogs::Tone::Plain, false).h(px(36.)),
-                ));
+                )));
         } else if self.section==5 {
             content=content.child(self.ai.clone());
         } else {

@@ -616,15 +616,7 @@ impl Render for RecordsWindow {
                             },
                         )),
                 )
-                .child(list)
-                .child(
-                    div()
-                        .p(px(8.))
-                        .text_size(px(11.))
-                        .line_height(px(18.))
-                        .text_color(p.tx2)
-                        .child("录制保存为 asciinema v2 .cast，日志为纯文本，按主机和日期归档"),
-                );
+                .child(list);
         let mut body = div()
             .flex_1()
             .min_w_0()

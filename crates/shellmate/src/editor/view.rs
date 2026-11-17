@@ -590,7 +590,6 @@ impl Render for FileEditor {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .gap(px(16.))
                     .px(px(22.))
                     .h(px(38.))
                     .border_t_1()
@@ -598,8 +597,7 @@ impl Render for FileEditor {
                     .text_size(px(12.))
                     .line_height(px(15.))
                     .text_color(p.tx2)
-                    .child(footer)
-                    .child("保存时经 SFTP 原子写回（临时文件 + rename），保留原权限与属主"),
+                    .child(footer),
             )
     }
 }

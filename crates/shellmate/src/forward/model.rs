@@ -409,9 +409,9 @@ pub fn summary_view(
 pub const EMPTY_TITLE: &str = "还没有端口转发规则";
 /// The three lines of the empty state.
 pub const EMPTY_KINDS: [(&str, &str); 3] = [
-    ("-L 本地转发", "把本机的一个端口接到服务器那一侧能访问的地址，例如在本机用 127.0.0.1:5433 访问内网数据库。"),
-    ("-R 远程转发", "把服务器上的一个端口接回本机的服务，例如让服务器访问你本机 localhost:3000 上的开发服务。"),
-    ("-D 动态转发", "在本机开一个 SOCKS5 代理，浏览器等程序经服务器上网，访问哪里由客户端决定。"),
+    ("-L 本地转发", "本机端口 → 服务器侧地址"),
+    ("-R 远程转发", "服务器端口 → 本机服务"),
+    ("-D 动态转发", "本机 SOCKS5 代理"),
 ];
 
 // ---- confirmations -----------------------------------------------------------------------------
@@ -804,6 +804,6 @@ mod tests {
     #[test]
     fn the_empty_state_explains_all_three_kinds() {
         assert_eq!(EMPTY_KINDS.map(|(name, _)| name), ["-L 本地转发", "-R 远程转发", "-D 动态转发"]);
-        assert!(EMPTY_KINDS.iter().all(|(_, what)| what.ends_with('。')));
+        assert_eq!(EMPTY_KINDS.map(|(_, what)| what), ["本机端口 → 服务器侧地址", "服务器端口 → 本机服务", "本机 SOCKS5 代理"]);
     }
 }

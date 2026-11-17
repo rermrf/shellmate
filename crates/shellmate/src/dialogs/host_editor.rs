@@ -16,7 +16,7 @@ use gpui::{
 use shellmate_core::{AuthMethod, Host, HostBook, HostId, Protocol};
 use shellmate_ssh::KeyInfo;
 
-use super::{DialogBody, Notice, Tone, button, hint, notice, palette, stack};
+use super::{DialogBody, Notice, Tone, button, notice, palette, stack};
 use crate::library::{EditorFields, build_draft};
 use crate::theme::Palette;
 use crate::ui::{SegmentItem, segmented};
@@ -622,8 +622,8 @@ impl HostEditor {
             .child(control)
     }
 
-    fn render_auth_details(&self, p: &Palette, cx: &mut Context<Self>) -> gpui::Div {
-        match self.auth {
+    fn render_auth_details(&self, p: &Palette, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        Some(match self.auth {
             AuthMethod::Password => stack().gap(px(10.)).child(self.field(
                 "密码",
                 p,
@@ -698,15 +698,8 @@ impl HostEditor {
                         ))
                     },
                 ),
-            AuthMethod::Agent => stack().child(hint(
-                "使用 SSH_AUTH_SOCK 指向的 ssh-agent 里的密钥（如 1Password、macOS 钥匙串代理）。",
-                p,
-            )),
-            AuthMethod::KeyboardInteractive => stack().child(hint(
-                "服务端会依次发起提示（如密码 → 动态验证码）；验证码每次手动输入。",
-                p,
-            )),
-        }
+            AuthMethod::Agent | AuthMethod::KeyboardInteractive => return None,
+        })
     }
 
     fn render_jumps(&self, p: &Palette, cx: &mut Context<Self>) -> gpui::Div {
@@ -745,23 +738,10 @@ impl HostEditor {
             .mt(px(6.))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .line_height(px(20.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("跳板机 ProxyJump"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .line_height(px(17.))
-                            .text_color(p.tx2)
-                            .child("按顺序逐跳连接，每跳独立校验指纹"),
-                    ),
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .child("跳板机 ProxyJump"),
             )
             .child(div().flex().child(add))
             .child(
@@ -1035,7 +1015,7 @@ impl Render for HostEditor {
                     .child(self.field("标签（逗号分隔）", &p, self.input(&self.tags, &p, false)))
                     )
                     .children((self.protocol==Protocol::Serial).then(||self.render_serial_fields(&p,cx)))
-                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。登录密码保存在所选凭据存储中。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
+                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
                     .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d
                     .child(
                         div().flex_none()
@@ -1052,7 +1032,7 @@ impl Render for HostEditor {
                             )
                             .child(auth_picker),
                     )
-                    .child(self.render_auth_details(&p, cx))
+                    .children(self.render_auth_details(&p, cx))
 )
                     .when(self.protocol!=Protocol::Serial,|d|d
                     .child(
@@ -1090,7 +1070,7 @@ impl Render for HostEditor {
                     )
 )
                     .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d.child(self.render_jumps(&p,cx)))
-                    .when(self.protocol==Protocol::Mosh,|d|d.child(div().flex_none().text_size(px(12.5)).line_height(px(20.)).text_color(p.tx2).child("Mosh 先经 SSH 启动 mosh-server（UDP 60000–61000），之后网络漫游、休眠唤醒都无需重连。")))
+                    .when(self.protocol==Protocol::Mosh,|d|d.child(div().flex_none().text_size(px(12.5)).line_height(px(20.)).text_color(p.tx2).child("需要服务器开放 UDP 60000–61000")))
                     .children(self.error.clone().map(|e| notice(Notice::Error, e, &p)))
                     .children(
                         self.test_result

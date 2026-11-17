@@ -131,7 +131,7 @@ impl Render for SecretDialog {
             .children((self.attempt == 0).then(|| hint(hint_text, &p)))
             .child(field(caption, &p, Input::new(&self.input).mask_toggle()))
             .children(error.map(|text| notice(Notice::Error, text, &p)))
-            .child(Checkbox::new("save-secret").label("保存到当前凭据存储，下次自动填写").checked(self.save).on_click(
+            .child(Checkbox::new("save-secret").label(match self.kind { SecretKind::Password { .. } => "记住密码", SecretKind::Passphrase { .. } => "记住口令" }).checked(self.save).on_click(
                 cx.listener(|this, checked: &bool, _, cx| {
                     this.save = *checked;
                     cx.notify();

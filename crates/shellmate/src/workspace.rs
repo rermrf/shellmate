@@ -290,7 +290,7 @@ impl Workspace {
             _editor_subscription: None,
             _subscriptions: subscriptions,
         };
-        this.security_task=Some(cx.spawn_in(window,async move|this,cx|{loop{cx.background_executor().timer(std::time::Duration::from_secs(1)).await; if this.update_in(cx,|s,w,cx|{if s.secrets.tick(){w.push_notification(Notification::info("凭据库已闲置锁定；运行中的连接继续保持"),cx);}}).is_err(){break}}}));
+        this.security_task=Some(cx.spawn_in(window,async move|this,cx|{loop{cx.background_executor().timer(std::time::Duration::from_secs(1)).await; if this.update_in(cx,|s,w,cx|{if s.secrets.tick(){w.push_notification(Notification::info("凭据库已锁定"),cx);}}).is_err(){break}}}));
         if let Some(message) = store_notice {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
@@ -942,7 +942,7 @@ impl Workspace {
         if let SessionKind::Stream(s)=&session.kind {return if let Some(state)=&s.snapshot {format!("{} · {} {} · 串口",s.host.addr,state.settings.baud,state.settings.framing())}else{format!("{} · Telnet",s.host.address_line())};}
 
         if let Some(ssh)=session.ssh().filter(|s|s.mosh.is_some()){return ssh::subtitle(&ssh.host,&ssh.via(),&connect::default_user());}
-        #[cfg(debug_assertions)] if crate::proto::requested(){if session.ssh().is_none(){return "chen@MacBook-Pro · /bin/zsh -l · ~ · 本机进程，不经过网络".into();}
+        #[cfg(debug_assertions)] if crate::proto::requested(){if session.ssh().is_none(){return "chen@MacBook-Pro · /bin/zsh -l · ~".into();}
         if let Some(ssh)=session.ssh(){return format!("{}@{}:{} · {} · {}",ssh.host.user.as_deref().unwrap_or(""),ssh.host.addr,ssh.host.port,ssh.host.protocol.label(),ssh.host.auth.label());}}
         match session.ssh() {
             Some(ssh) => {
@@ -956,7 +956,7 @@ impl Workspace {
         }
     }
 
-    /// `chen@MacBook-Pro · /bin/zsh -l · ~/projects · 本机进程，不经过网络`
+    /// `chen@MacBook-Pro · /bin/zsh -l · ~/projects`
     fn local_subtitle(&self, session: &Session, cx: &mut Context<Self>) -> String {
         let terminal = session.terminal.clone();
         let (command, shell, fg) = terminal.update(cx, |t, _| {
@@ -967,9 +967,8 @@ impl Workspace {
         if let Some(cwd) = fg.as_ref().and_then(|f| f.cwd.as_deref()) {
             parts.push(tilde(cwd));
         }
-        match fg {
-            Some(fg) if fg.name != shell && !session.exited => parts.push(format!("正在运行 {}", fg.name)),
-            _ => parts.push("本机进程，不经过网络".into()),
+        if let Some(fg) = fg.filter(|fg| fg.name != shell && !session.exited) {
+            parts.push(format!("正在运行 {}", fg.name));
         }
         if session.exited {
             parts.push("已退出".into());

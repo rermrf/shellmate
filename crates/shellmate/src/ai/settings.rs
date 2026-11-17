@@ -397,26 +397,8 @@ impl Render for AiSettings {
             &p,
             Input::new(&self.base),
         ));
-        if self.provider {
-            form = form.child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(p.tx2)
-                    .child("可填写官方地址或兼容 Anthropic 协议的代理地址"),
-            );
-        }
         form = form
             .child(crate::dialogs::field("模型", &p, Input::new(&self.model)))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(p.tx2)
-                    .child(if self.provider {
-                        "例如 claude-sonnet-4-6"
-                    } else {
-                        "例如 gpt-4o-mini、deepseek-chat、qwen3；以服务商的模型 ID 为准"
-                    }),
-            )
             .child(crate::dialogs::field(
                 "思考等级",
                 &p,
@@ -438,7 +420,7 @@ impl Render for AiSettings {
                 ),
             ))
             .child(div().text_size(px(12.)).text_color(p.tx2).child(
-                "「默认」不发送该参数，由服务商决定；等级越高，回答越慢、消耗的 token 越多",
+                "等级越高，回答越慢、越耗 token",
             ));
         if self.key_saved && !self.replace {
             form = form.child(
@@ -510,15 +492,7 @@ impl Render for AiSettings {
                             .flex_1()
                             .text_size(px(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("保存对话")
-                            .child(
-                                div()
-                                    .mt(px(4.))
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(p.tx2)
-                                    .child("只保存已脱敏的提问、上下文和回答；关闭后仅保留在内存"),
-                            ),
+                            .child("保存对话"),
                     )
                     .child(
                         crate::ui::Toggle::new("ai-save-history")

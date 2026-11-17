@@ -331,15 +331,6 @@ impl HostEditor {
                         cx,
                     )),
             )
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .line_height(px(20.))
-                    .text_color(p.tx2)
-                    .child(
-                        "打开端口时会拉高 DTR；ESP32 可在会话工具条中用 RTS/EN 复位进入下载模式。",
-                    ),
-            )
             .when(self.advanced, |d| {
                 d.child(
                     div()

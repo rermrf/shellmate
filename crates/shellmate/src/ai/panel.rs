@@ -860,7 +860,7 @@ impl Render for Drawer {
                         .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
                 );
         } else if self.model.conversation.turns.is_empty() {
-            body=body.child(div().flex_none().pt(px(6.)).flex().flex_col().gap(px(8.)).child(div().text_size(px(13.)).line_height(px(20.8)).text_color(p.tx2).child("用自然语言描述想做的事，或让我解释终端里的报错。执行命令遵循这台主机的审批设置。"))
+            body=body.child(div().flex_none().pt(px(6.)).flex().flex_col().gap(px(8.)).child(div().text_size(px(13.)).line_height(px(20.8)).text_color(p.tx2).child("用自然语言描述想做的事，或让我解释终端里的报错。"))
         .children(SUGGESTIONS.into_iter().enumerate().map(|(i,label)|div().id(("ai-suggestion",i)).py(px(10.)).px(px(12.)).rounded(px(12.)).bg(p.card2).cursor_pointer().hover(|d|d.bg(p.card3)).text_size(px(13.)).line_height(px(17.)).child(label).on_click(cx.listener(move|s,_,w,cx|s.ask(label.into(),w,cx))))));
         }
         if !self.history {
@@ -1147,13 +1147,6 @@ impl Render for Drawer {
                             }
                         })),
                     ),
-            )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .line_height(px(16.))
-                    .text_color(p.tx2)
-                    .child("发送前会自动去掉 .env、私钥、密码等敏感内容"),
             );
         div()
             .w_full()

@@ -432,10 +432,7 @@ impl Render for Picker {
                     } else {
                         "↵ 执行"
                     })
-                    .child("esc 关闭")
-                    .when(history, |d| {
-                        d.child(div().flex_1()).child("历史保存在本机，可在设置中关闭")
-                    }),
+                    .child("esc 关闭"),
             )
     }
 }
@@ -1181,7 +1178,7 @@ impl Render for Manager {
             list = list.child(section);
         }
         stack()
-            .child(hint("编辑名称与命令，使用 ↑↓ 调整顺序。保存后生效。", &p))
+            .child(hint("编辑名称与命令，使用 ↑↓ 调整顺序。", &p))
             .child(list)
             .child(
                 Button::new("group-add")
