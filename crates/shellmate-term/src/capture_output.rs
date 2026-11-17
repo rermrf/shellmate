@@ -27,8 +27,17 @@ pub(crate) struct OutputCapture {
     error: Option<String>,
 }
 impl OutputCapture {
-    pub fn start(&mut self, path: PathBuf, file: File, header: &Header) -> io::Result<()> {
-        let writer = cast::Writer::new(BufWriter::new(file), header)?;
+    pub fn start(
+        &mut self,
+        path: PathBuf,
+        file: File,
+        header: &Header,
+        seed: Option<&str>,
+    ) -> io::Result<()> {
+        let mut writer = cast::Writer::new(BufWriter::new(file), header)?;
+        if let Some(seed) = seed {
+            writer.output(0., seed.as_bytes())?;
+        }
         self.recording = Some(Recording {
             writer,
             path,
@@ -37,7 +46,9 @@ impl OutputCapture {
         Ok(())
     }
     pub fn seconds(&self) -> Option<f64> {
-        self.recording.as_ref().map(|r| r.start.elapsed().as_secs_f64())
+        self.recording
+            .as_ref()
+            .map(|r| r.start.elapsed().as_secs_f64())
     }
     pub fn playback_duration(&self) -> Option<f64> {
         self.recording.as_ref().map(|r| r.writer.duration())
@@ -147,14 +158,46 @@ mod tests {
     use super::*;
     use crate::archive;
     fn root() -> PathBuf {
-        std::env::temp_dir().join(format!("shellmate-output-{}", shellmate_core::HostId::generate()))
+        std::env::temp_dir().join(format!(
+            "shellmate-output-{}",
+            shellmate_core::HostId::generate()
+        ))
+    }
+    #[test]
+    fn recording_seed_is_first_output_and_never_enters_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, file) = archive::recording_file(dir.path(), "host", 1700000000).unwrap();
+        let logs = dir.path().join("logs");
+        let mut capture = OutputCapture::default();
+        capture.logging(
+            LineTracker::new(80, 24),
+            LogWriter::new(logs.clone(), "host"),
+        );
+        let seed = "root@host:~# \x1b[0m\r\x1b[13C";
+        capture
+            .start(path.clone(), file, &Header::new(80, 24), Some(seed))
+            .unwrap();
+        capture.output(b"pwd\r\n");
+        capture.stop().unwrap();
+        capture.stop_logging();
+        let cast = cast::Cast::open(&path).unwrap();
+        assert_eq!(cast.events.len(), 2);
+        assert_eq!(cast.events[0].recorded_at, 0.);
+        assert_eq!(cast.events[0].data, cast::Data::Output(seed.into()));
+        assert_eq!(cast.events[1].data, cast::Data::Output("pwd\r\n".into()));
+        let files = crate::session_log::list(&logs).unwrap();
+        let text = std::fs::read_to_string(&files[0].path).unwrap();
+        assert!(text.ends_with("  pwd\n"));
+        assert!(!text.contains("root@host"));
     }
     #[test]
     fn stream_flush_stop_and_output_only_events() {
         let dir = root();
         let (path, file) = archive::recording_file(&dir, "host", 1_700_000_000).unwrap();
         let mut capture = OutputCapture::default();
-        capture.start(path.clone(), file, &Header::new(80, 24)).unwrap();
+        capture
+            .start(path.clone(), file, &Header::new(80, 24), None)
+            .unwrap();
         capture.output(b"\x1b[31mhello\x1b[0m\r\n");
         capture.resize(100, 30);
         capture.flush();
@@ -179,7 +222,9 @@ mod tests {
         let dir = root();
         let (path, file) = archive::recording_file(&dir, "host", 1_700_000_000).unwrap();
         let mut capture = OutputCapture::default();
-        capture.start(path.clone(), file, &Header::new(80, 24)).unwrap();
+        capture
+            .start(path.clone(), file, &Header::new(80, 24), None)
+            .unwrap();
         let recording = capture.recording.as_mut().unwrap();
         recording.writer.output(1., b"first").unwrap();
         recording.writer.output(5., b"last").unwrap();
@@ -196,7 +241,9 @@ mod tests {
         drop(file);
         let file = File::open(&path).unwrap();
         let mut capture = OutputCapture::default();
-        capture.start(path, file, &Header::new(80, 24)).unwrap();
+        capture
+            .start(path, file, &Header::new(80, 24), None)
+            .unwrap();
         capture.output(&vec![b'x'; 16_384]);
         assert!(capture.seconds().is_none());
         assert!(capture.error().unwrap().starts_with("录制已停止"));
@@ -207,7 +254,10 @@ mod tests {
     fn close_finalizes_nonempty_primary_lines_and_flushes() {
         let dir = root();
         let mut capture = OutputCapture::default();
-        capture.logging(LineTracker::new(80, 24), LogWriter::new(dir.clone(), "host"));
+        capture.logging(
+            LineTracker::new(80, 24),
+            LogWriter::new(dir.clone(), "host"),
+        );
         capture.output(b"final output");
         capture.stop_logging();
         let files = crate::session_log::list(&dir).unwrap();

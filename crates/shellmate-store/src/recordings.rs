@@ -63,9 +63,10 @@ pub enum Preference {
     LoginShell,
     FollowDirectory,
     PromptHighlight,
+    ReplayTimestamps,
 }
 impl Preference {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -76,6 +77,7 @@ impl Preference {
         Self::LoginShell,
         Self::FollowDirectory,
         Self::PromptHighlight,
+        Self::ReplayTimestamps,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -89,6 +91,7 @@ impl Preference {
             Self::LoginShell => "login_shell",
             Self::FollowDirectory => "follow_directory",
             Self::PromptHighlight => "prompt_highlight",
+            Self::ReplayTimestamps => "replay_timestamps",
         }
     }
     pub fn label(self) -> &'static str {
@@ -103,6 +106,7 @@ impl Preference {
             Self::LoginShell => "作为登录 shell 启动（-l）",
             Self::FollowDirectory => "文件面板跟随终端目录",
             Self::PromptHighlight => "提示符高亮",
+            Self::ReplayTimestamps => "回放时间",
         }
     }
     pub fn description(self) -> &'static str {
@@ -120,12 +124,12 @@ impl Preference {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
-    values: [bool; 10],
+    values: [bool; 11],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            values: [true, true, true, true, true, false, false, true, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true],
         }
     }
 }
@@ -140,6 +144,19 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_timestamps_default_on_and_persist_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.db");
+        let mut store = HostStore::open(&path).unwrap();
+        assert!(store.preferences().unwrap().get(Preference::ReplayTimestamps));
+        for on in [false, true] {
+            store.set_preference(Preference::ReplayTimestamps, on).unwrap();
+            drop(store);
+            store = HostStore::open(&path).unwrap();
+            assert_eq!(store.preferences().unwrap().get(Preference::ReplayTimestamps), on);
+        }
+    }
     #[test]
     fn prompt_highlight_defaults_on_and_persists_after_reopen() {
         let dir = tempfile::tempdir().unwrap();

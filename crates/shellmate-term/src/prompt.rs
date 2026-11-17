@@ -198,6 +198,7 @@ impl RowPrompt {
 pub(crate) struct PromptHighlighter {
     pub(crate) enabled: bool,
     signatures: Vec<Signature>,
+    replay_seed: Option<Signature>,
 }
 
 impl Default for PromptHighlighter {
@@ -205,6 +206,7 @@ impl Default for PromptHighlighter {
         Self {
             enabled: true,
             signatures: Vec::new(),
+            replay_seed: None,
         }
     }
 }
@@ -212,6 +214,15 @@ impl Default for PromptHighlighter {
 impl PromptHighlighter {
     pub(crate) fn reset(&mut self) {
         self.signatures.clear();
+        self.replay_seed = None;
+    }
+
+    /// A t=0 cursor-row seed is a complete prompt waiting for input. Apply the
+    /// same strict cursor/unstyled checks as live learning, before commands arrive.
+    pub(crate) fn learn_replay_seed<T>(&mut self, term: &Term<T>) {
+        let now = Instant::now();
+        self.learn(term, Some(now - QUIET), now);
+        self.replay_seed = self.signatures.first().cloned();
     }
 
     /// Replay has no idle shell. Count complete, unstyled, column-zero prompt
@@ -258,6 +269,11 @@ impl PromptHighlighter {
                 })
             })
             .collect();
+        if let Some(seed) = &self.replay_seed {
+            self.signatures.retain(|signature| signature != seed);
+            self.signatures.insert(0, seed.clone());
+            self.signatures.truncate(MAX_SIGNATURES);
+        }
     }
 
     /// Called after the output idle timer. Learning continues while disabled so

@@ -5,7 +5,7 @@
 //! aligned; anything else (CJK, box drawing, emoji) is shaped per character and
 //! placed at its own cell origin, centered when it is narrower than its cells.
 
-use alacritty_terminal::index::{Line, Point as GridPoint};
+use alacritty_terminal::{grid::Dimensions, index::{Column, Line, Point as GridPoint}};
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
@@ -216,7 +216,9 @@ impl Element for TerminalElement {
         if self.terminal.read(cx).is_replay() {
             self.style = self.style.clone().for_replay();
             let (cell_width, _) = self.cell_metrics(window);
-            let extent = crate::replay::content_size(crate::replay::grid_size(self.terminal.read(cx).size(), cell_width));
+            let terminal = self.terminal.read(cx);
+            let history = terminal.term().lock().history_size();
+            let extent = crate::replay::scrollback_content_size(crate::replay::grid_size(terminal.size(), cell_width), history);
             style.size.width = extent.width.into();
             style.size.height = extent.height.into();
             style.flex_shrink = 0.;
@@ -266,7 +268,7 @@ impl Element for TerminalElement {
         let term_arc = terminal.term().clone();
         let term = term_arc.lock();
         let content = term.renderable_content();
-        let display_offset = content.display_offset;
+        let display_offset = if replay { term.history_size() } else { content.display_offset };
         let overrides = content.colors;
         let mode = content.mode;
         let default_bg: Rgb = palette.rgb(&alacritty_terminal::vte::ansi::Color::Named(NamedColor::Background), overrides);
@@ -278,11 +280,16 @@ impl Element for TerminalElement {
         let mut current: Option<Batch> = None;
         let mut prompt = None;
 
-        for indexed in content.display_iter {
-            let Some(vp) = point_to_viewport(display_offset, indexed.point) else { continue };
-            let (line, col) = (vp.line, vp.column.0);
-            if col == 0 { prompt = terminal.prompt_highlighter.row(&term, indexed.point.line); }
-            let cell = &indexed.cell;
+        let clip = window.content_mask().bounds;
+        let first_visible = ((f32::from(clip.top() - origin.y) / f32::from(line_height)).floor() as i32).max(0);
+        let last_visible = (f32::from(clip.bottom() - origin.y) / f32::from(line_height)).ceil() as i32;
+        let top = if replay { first_visible - display_offset as i32 } else { -(display_offset as i32) };
+        let bottom = if replay { rows as i32 } else { rows as i32 - display_offset as i32 };
+        let bottom = if replay { bottom.min(last_visible - display_offset as i32) } else { bottom };
+        for (gline, col) in (top..bottom).flat_map(|line| (0..cols as usize).map(move |col| (Line(line), col))) {
+            let line = (gline.0 + display_offset as i32) as usize;
+            if col == 0 { prompt = terminal.prompt_highlighter.row(&term, gline); }
+            let cell = &term.grid()[gline][Column(col)];
             if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
@@ -341,7 +348,7 @@ impl Element for TerminalElement {
         }
 
         // Selection and search highlights.
-        let rows_usize = rows as usize;
+        let rows_usize = if replay { term.total_lines() } else { rows as usize };
         let last_col = cols as usize - 1;
         let mut highlights = Vec::new();
         let mut highlight_range = |start: GridPoint, end: GridPoint, block: bool, color: Hsla| {

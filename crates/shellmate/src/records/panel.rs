@@ -20,7 +20,7 @@ use gpui::{
 use shellmate_store::Recording;
 use shellmate_term::{
     Terminal, TerminalView, archive,
-    cast::{Cast, Data, Playback},
+    cast::{Cast, Playback},
     replay::Timeline,
     session_log::{self, LogFile},
 };
@@ -93,6 +93,7 @@ pub struct RecordsWindow {
     view: Entity<TerminalView>,
     timeline: Option<Timeline>,
     play: Playback,
+    show_times: bool,
     last_tick: Instant,
     query: Entity<InputState>,
     log_lines: Vec<String>,
@@ -133,10 +134,18 @@ impl RecordsWindow {
                     cx,
                 );
             });
+            let show_times = store
+                .borrow()
+                .preferences()
+                .unwrap_or_default()
+                .get(shellmate_store::Preference::ReplayTimestamps);
             let view = cx.new(|cx| {
                 let mut view = TerminalView::new(terminal.clone(), cx.terminal_style(), cx)
                     .with_search_icon(crate::icons::AppIcon::Search.at(14.));
                 view.top_radius = px(18.);
+                view.replay_show_times = show_times;
+                view.replay_time_font = MONO_FONT.into();
+                view.replay_time_color = cx.palette().tx3;
                 view
             });
             let query = cx.new(|cx| InputState::new(window, cx).placeholder("过滤日志"));
@@ -170,6 +179,7 @@ impl RecordsWindow {
                 terminal,
                 view,
                 timeline: None,
+                show_times,
                 play: Playback {
                     speed: 1,
                     ..Default::default()
@@ -393,15 +403,7 @@ impl RecordsWindow {
                 t.replay_reset(timeline.cast.header.cols, timeline.cast.header.rows);
             }
             for event in &timeline.cast.events[range] {
-                match &event.data {
-                    Data::Output(text) => t.replay_output(text.as_bytes(), cx),
-                    Data::Resize(cols, rows) => {
-                        let mut size = t.size();
-                        size.cols = *cols;
-                        size.rows = *rows;
-                        t.set_size(size);
-                    }
-                }
+                t.replay_event(event, timeline.cast.header.timestamp, cx);
             }
             if changed {
                 t.learn_replay_prompts();
@@ -599,6 +601,9 @@ fn date_label(unix: i64) -> String {
 impl Render for RecordsWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
+        self.view.update(cx, |view, _| {
+            view.replay_time_color = p.tx3;
+        });
         let mut list = div()
             .id("archive-list")
             .flex_1()
@@ -1138,6 +1143,51 @@ impl Render for RecordsWindow {
                             })),
                     )
                     .child(
+                        div()
+                            .flex_none()
+                            .p(px(2.))
+                            .rounded(px(9.))
+                            .bg(p.card3)
+                            .child(
+                                div()
+                                    .id("replay-timestamps")
+                                    .h(px(26.))
+                                    .px(px(9.))
+                                    .rounded(px(7.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.))
+                                    .line_height(px(15.))
+                                    .text_color(p.tx3)
+                                    .cursor_pointer()
+                                    .when(self.show_times, |d| {
+                                        d.bg(p.card)
+                                            .text_color(p.tx)
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .child("时间")
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        let on = !s.show_times;
+                                        let result = s.store.borrow_mut().set_preference(
+                                            shellmate_store::Preference::ReplayTimestamps,
+                                            on,
+                                        );
+                                        if let Err(error) = result {
+                                            s.error =
+                                                Some(format!("时间显示偏好保存失败：{error}"));
+                                        } else {
+                                            s.show_times = on;
+                                            s.view.update(cx, |v, cx| {
+                                                v.replay_show_times = on;
+                                                cx.notify();
+                                            });
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
                         Button::new("copy-recording")
                             .ghost()
                             .border_0()
@@ -1225,6 +1275,11 @@ impl RecordsWindow {
         self.loading = false;
         self.play.playing = false;
         self.play.speed = 2;
+        self.show_times = true;
+        self.view.update(cx, |view, cx| {
+            view.replay_show_times = true;
+            cx.notify();
+        });
         self.recordings = DATA["REC"]
             .a()
             .iter()

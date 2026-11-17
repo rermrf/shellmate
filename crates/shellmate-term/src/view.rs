@@ -89,6 +89,9 @@ pub struct TerminalView {
     selecting: bool,
     scroll_remainder: f32,
     replay_viewport: replay::ReplayViewport,
+    pub replay_show_times: bool,
+    pub replay_time_font: gpui::SharedString,
+    pub replay_time_color: gpui::Hsla,
     search: Option<Search>,
     search_icon: Option<Icon>,
     /// Copy the selection to the clipboard as soon as the mouse is released.
@@ -114,12 +117,15 @@ impl TerminalView {
         Self {
             terminal,
             focus_handle: cx.focus_handle(),
-            style,
+            style: style.clone(),
             geometry: None,
             marked_text: None,
             selecting: false,
             scroll_remainder: 0.,
             replay_viewport: Default::default(),
+            replay_show_times: true,
+            replay_time_font: style.font_family.clone(),
+            replay_time_color: to_hsla(style.palette.dim),
             search: None,
             search_icon: None,
             copy_on_select: true,
@@ -329,9 +335,12 @@ impl TerminalView {
         let y = f32::from(position.y - g.origin.y).max(0.);
         let (cw, lh) = (f32::from(g.size.cell_width), f32::from(g.size.line_height));
         let col = ((x / cw) as usize).min(g.size.cols as usize - 1);
-        let line = ((y / lh) as usize).min(g.size.rows as usize - 1);
+        let terminal = self.terminal.read(cx);
+        let term = terminal.term().lock();
+        let count = if terminal.is_replay() { term.total_lines() } else { g.size.rows as usize };
+        let line = ((y / lh) as usize).min(count - 1);
         let side = if (x / cw).fract() > 0.5 { Side::Right } else { Side::Left };
-        let offset = self.terminal.read(cx).term().lock().grid().display_offset();
+        let offset = if terminal.is_replay() { term.history_size() } else { term.grid().display_offset() };
         Some((viewport_to_point(offset, GridPoint::new(line, Column(col))), side))
     }
 

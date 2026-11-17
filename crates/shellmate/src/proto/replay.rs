@@ -16,6 +16,7 @@ pub fn standard(dark: bool) -> Cast {
             }
             Event {
                 at: frame["at"].n(),
+                recorded_at: frame["at"].n(),
                 data: Data::Output(line),
             }
         })
@@ -37,19 +38,24 @@ pub fn wide() -> Cast {
         };
         events.push(Event {
             at: row as f64 * 0.7,
+            recorded_at: row as f64 * 0.7,
             data: Data::Output(text),
         });
     }
     events.push(Event {
         at: 28.,
+        recorded_at: 28.,
         data: Data::Output(format!("root@host:~/x# {}", "x".repeat(120))),
     });
     events.push(Event {
         at: 29.,
+        recorded_at: 29.,
         data: Data::Output("\r\x1b[2Kroot@host:~/x# ".into()),
     });
+    let mut header = Header::new(142, 36);
+    header.timestamp = Some(super::timestamp("09:41"));
     Cast {
-        header: Header::new(142, 36),
+        header,
         events,
         duration: 29.,
     }
@@ -58,6 +64,39 @@ pub fn wide() -> Cast {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_fixtures_have_wall_clock_times_without_changing_prototype_frames() {
+        for dark in [false, true] {
+            let cast = standard(dark);
+            assert_eq!(
+                cast.header.timestamp,
+                Some(super::super::timestamp("09:41"))
+            );
+            for (index, (event, frame)) in cast
+                .events
+                .iter()
+                .zip(super::super::DATA["REC"][0]["frames"].a())
+                .enumerate()
+            {
+                assert_eq!(event.recorded_at, frame["at"].n());
+                let mut expected = super::super::ansi_line(&frame["segs"], dark);
+                if index + 1 < cast.events.len() {
+                    expected.push_str("\r\n");
+                }
+                assert_eq!(event.data, Data::Output(expected));
+            }
+        }
+        let cast = wide();
+        assert_eq!(
+            cast.header.timestamp,
+            Some(super::super::timestamp("09:41"))
+        );
+        assert!(
+            cast.events
+                .iter()
+                .all(|event| event.recorded_at == event.at)
+        );
+    }
     #[test]
     fn end_fixture_leaves_cursor_immediately_after_final_prompt() {
         for dark in [false, true] {

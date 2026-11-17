@@ -184,10 +184,10 @@ impl OutputHandler for GridSink {
         }
         let filtered = self.agent.lock().output(bytes);
         let bytes = filtered.as_slice();
-        self.output_capture.lock().output(bytes);
         let reported = self.osc7.lock().feed_with_offsets(bytes);
         {
             let mut term = self.term.lock();
+            self.output_capture.lock().output(bytes);
             let mut capture = self.capture.lock();
             let mut parser = self.parser.lock();
             let mut at = 0;
@@ -268,6 +268,8 @@ pub struct Terminal {
     foreground: Option<(Instant, Option<ProcessInfo>)>,
     bracketed_paste: bool,
     replay: bool,
+    pub(crate) replay_times: crate::replay::timestamps::LineTimes,
+    pub(crate) replay_timestamp: Option<i64>,
     pub(crate) prompt_highlighter: crate::prompt::PromptHighlighter,
     prompt_idle: Option<Task<()>>,
     _io: Task<()>,
@@ -331,6 +333,8 @@ impl Terminal {
             foreground: None,
             bracketed_paste: true,
             replay: false,
+            replay_times: Default::default(),
+            replay_timestamp: None,
             prompt_highlighter: Default::default(),
             prompt_idle: None,
             _io: io,
@@ -671,7 +675,18 @@ impl Terminal {
     }
     fn paste_mode(&self)->TermMode{let source=self.raw_grid.lock();let mode=source.as_ref().map_or_else(||self.mode(),|s|*s.term.mode());crate::send::effective_mode(mode,self.bracketed_paste)}
     pub fn start_local(&mut self,options:PtyOptions,cx:&mut Context<Self>){self.local=Some(options);self.spawn_local(cx);}
-    pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{self.output_capture.lock().start(path,file,header)}
+    pub fn start_recording(&mut self,path:std::path::PathBuf,file:std::fs::File,header:&crate::cast::Header)->std::io::Result<()>{
+        // Lock the grid before the tap, matching GridSink's output ordering.
+        let source = self.raw_grid.lock();
+        if let Some(source) = source.as_ref() {
+            let seed = crate::archive::cursor_line_seed(&source.term);
+            self.output_capture.lock().start(path, file, header, seed.as_deref())
+        } else {
+            let term = self.term.lock();
+            let seed = crate::archive::cursor_line_seed(&*term);
+            self.output_capture.lock().start(path, file, header, seed.as_deref())
+        }
+    }
     pub fn stop_recording(&mut self)->std::io::Result<Option<crate::capture_output::RecordingResult>>{self.output_capture.lock().stop()}
     pub fn recording_seconds(&self)->Option<f64>{self.output_capture.lock().seconds()}
     pub fn recording_duration(&self)->Option<f64>{self.output_capture.lock().playback_duration()}
@@ -700,8 +715,23 @@ impl Terminal {
     }
     pub fn finalize_log(&mut self){self.output_capture.lock().stop_logging();}
     pub fn is_replay(&self)->bool{self.replay}
-    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.prompt_idle=None;self.prompt_highlighter.reset();self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
-    pub fn replay_output(&mut self,bytes:&[u8],cx:&mut Context<Self>){self.parser.lock().advance(&mut *self.term.lock(),bytes);cx.notify();}
+    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.replay_timestamp=None;self.replay_times=Default::default();self.prompt_idle=None;self.prompt_highlighter.reset();self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
+    pub fn replay_event(&mut self, event: &crate::cast::Event, timestamp: Option<i64>, cx: &mut Context<Self>) {
+        self.replay_timestamp = timestamp;
+        match &event.data {
+            crate::cast::Data::Output(text) => {
+                let mut term = self.term.lock();
+                self.replay_times.advance(&mut *term, &mut self.parser.lock(), text.as_bytes(), event.recorded_at);
+                if event.recorded_at == 0. { self.prompt_highlighter.learn_replay_seed(&*term); }
+            }
+            crate::cast::Data::Resize(cols, rows) => {
+                let size = TerminalSize { cols: *cols, rows: *rows, ..self.size };
+                self.replay_times.resize(&mut *self.term.lock(), size);
+                self.size = size;
+            }
+        }
+        cx.notify();
+    }
     /// Run once after a batch/seek, including prompts that moved into scrollback.
     pub fn learn_replay_prompts(&mut self) { self.prompt_highlighter.learn_replay(&*self.term.lock()); }
     pub fn screen_text(&self)->String{crate::replay::screen_text(&*self.term.lock())}
@@ -1010,7 +1040,7 @@ mod sink_tests {
         let f=fixture(1);
         let root=std::env::temp_dir().join(format!("shellmate-serial-capture-{}",shellmate_core::HostId::generate()));
         let(path,file)=crate::archive::recording_file(&root,"fixture",1_700_000_000).unwrap();
-        f.output_capture.lock().start(path.clone(),file,&crate::cast::Header::new(80,24)).unwrap();
+        f.output_capture.lock().start(path.clone(),file,&crate::cast::Header::new(80,24),None).unwrap();
         let log_root=root.join("logs");
         f.output_capture.lock().logging(crate::session_log::LineTracker::new(80,24),crate::session_log::LogWriter::new(log_root.clone(),"fixture"));
         f.sink.transformed_output(b"device> ",b"HEX display\r\n");

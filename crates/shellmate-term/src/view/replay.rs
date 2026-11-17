@@ -78,12 +78,22 @@ impl TerminalView {
         let thumb = to_hsla(self.style.palette.dim);
         let background = to_hsla(self.style.palette.background);
         let hovered = self.replay_viewport.hovered;
+        let show_times = self.replay_show_times;
+        let time_font = gpui::font(self.replay_time_font.clone());
+        let time_color = self.replay_time_color;
+        let time_handle = handle.clone();
+        let time_terminal = terminal.clone();
 
-        // Reuse the existing right/bottom padding for gutters, preserving the
-        // text origin and available grid area of the 13 px player.
+        // Reserve the left gutter outside horizontal scrolling.
         div()
             .size_full()
-            .pl(px(PADDING_X))
+            .relative()
+            .pl(px(PADDING_X
+                + if show_times {
+                    crate::replay::TIME_GUTTER
+                } else {
+                    0.
+                }))
             .pr(px(PADDING_X - GUTTER))
             .pt(px(PADDING_Y))
             .pb(px(PADDING_Y - GUTTER))
@@ -163,8 +173,10 @@ impl TerminalView {
                                 }
                                 let terminal = terminal.read(cx);
                                 let grid = terminal.size();
-                                let content = crate::replay::content_size(grid);
-                                let cursor = terminal.term().lock().grid().cursor.point;
+                                let term = terminal.term().lock();
+                                let history = term.history_size();
+                                let content = crate::replay::scrollback_content_size(grid, history);
+                                let cursor = term.grid().cursor.point;
                                 let offset = paint_handle.offset();
                                 let next = follow.borrow().position(
                                     [-f32::from(offset.x), -f32::from(offset.y)],
@@ -172,7 +184,7 @@ impl TerminalView {
                                     [content.width.into(), content.height.into()],
                                     [
                                         f32::from(grid.cell_width) * cursor.column.0 as f32,
-                                        f32::from(grid.line_height) * cursor.line.0.max(0) as f32,
+                                        crate::replay::row_y(cursor.line.0, history, 0.),
                                     ],
                                     [grid.cell_width.into(), grid.line_height.into()],
                                 );
@@ -293,6 +305,88 @@ impl TerminalView {
                             )
                     })),
             )
+            .when(show_times, |d| {
+                d.child(
+                    canvas(
+                        move |_, _, _| (time_handle.bounds(), time_handle.offset()),
+                        move |bounds, (viewport, offset), window, cx| {
+                            let terminal = time_terminal.read(cx);
+                            let term = terminal.term().lock();
+                            let history = term.history_size();
+                            let clip = Bounds::new(
+                                point(bounds.left(), viewport.top()),
+                                size(px(crate::replay::TIME_WIDTH), viewport.size.height),
+                            );
+                            let first =
+                                ((-f32::from(offset.y) / crate::replay::LINE_HEIGHT).floor()
+                                    as i32
+                                    - history as i32)
+                                    .max(-(history as i32));
+                            let last = ((f32::from(viewport.size.height - offset.y)
+                                / crate::replay::LINE_HEIGHT)
+                                .ceil() as i32
+                                - history as i32)
+                                .min(term.screen_lines() as i32);
+                            let labels: Vec<_> = (first..last)
+                                .filter_map(|line| {
+                                    terminal
+                                        .replay_times
+                                        .label(
+                                            &term,
+                                            alacritty_terminal::index::Line(line),
+                                            terminal.replay_timestamp,
+                                        )
+                                        .map(|text| (line, text))
+                                })
+                                .collect();
+                            drop(term);
+                            window.with_content_mask(
+                                Some(gpui::ContentMask { bounds: clip }),
+                                |window| {
+                                    for (line, text) in labels {
+                                        let run = gpui::TextRun {
+                                            len: text.len(),
+                                            font: time_font.clone(),
+                                            color: time_color,
+                                            background_color: None,
+                                            underline: None,
+                                            strikethrough: None,
+                                        };
+                                        let shaped = window.text_system().shape_line(
+                                            text.into(),
+                                            px(crate::replay::TIME_FONT_SIZE),
+                                            &[run],
+                                            None,
+                                        );
+                                        let y = viewport.top()
+                                            + px(crate::replay::row_y(
+                                                line,
+                                                history,
+                                                offset.y.into(),
+                                            ));
+                                        let origin = point(clip.right() - shaped.width, y);
+                                        shaped
+                                            .paint(
+                                                origin,
+                                                px(crate::replay::LINE_HEIGHT),
+                                                gpui::TextAlign::Left,
+                                                None,
+                                                window,
+                                                cx,
+                                            )
+                                            .ok();
+                                    }
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .left(px(PADDING_X))
+                    .top(px(PADDING_Y))
+                    .w(px(crate::replay::TIME_WIDTH))
+                    .bottom(px(PADDING_Y)),
+                )
+            })
     }
 }
 

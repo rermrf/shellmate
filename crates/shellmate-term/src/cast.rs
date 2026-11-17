@@ -44,7 +44,10 @@ pub enum Data {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
+    /// Playback offset after idle-gap compression.
     pub at: f64,
+    /// Original cast offset, used for line timestamps.
+    pub recorded_at: f64,
     pub data: Data,
 }
 #[derive(Default)]
@@ -227,6 +230,7 @@ impl Cast {
             };
             emit(Event {
                 at: clock.duration,
+                recorded_at: at,
                 data,
             });
         }

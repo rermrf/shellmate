@@ -1,4 +1,5 @@
 //! Replay timeline shared by the UI and deterministic emulator tests.
+pub mod timestamps;
 use crate::cast::{Cast, Data};
 use alacritty_terminal::{
     grid::Dimensions,
@@ -94,6 +95,24 @@ pub fn recent_text<T>(term: &Term<T>, limit: usize) -> String {
 }
 pub const FONT_SIZE: f32 = 13.;
 pub const LINE_HEIGHT: f32 = 20.;
+pub const TIME_FONT_SIZE: f32 = 12.5;
+pub const TIME_GAP: f32 = 14.;
+pub const TIME_WIDTH: f32 = 64.;
+pub const TIME_GUTTER: f32 = TIME_WIDTH + TIME_GAP;
+
+/// Both terminal cells and the fixed gutter use this content-relative row origin.
+pub fn row_y(line: i32, history: usize, scroll_y: f32) -> f32 {
+    (line as f32 + history as f32) * LINE_HEIGHT + scroll_y
+}
+
+pub fn scrollback_content_size(
+    grid: crate::TerminalSize,
+    history: usize,
+) -> gpui::Size<gpui::Pixels> {
+    let mut extent = content_size(grid);
+    extent.height += grid.line_height * history as f32;
+    extent
+}
 
 /// Replay metrics never depend on the available viewport or live font size.
 pub fn grid_size(recorded: crate::TerminalSize, cell_width: gpui::Pixels) -> crate::TerminalSize {
@@ -189,6 +208,26 @@ mod tests {
         session_log::{Silent, Size},
     };
     use alacritty_terminal::{term::Config, vte::ansi::Processor};
+    #[test]
+    fn gutter_rows_align_with_terminal_at_fixed_replay_metrics() {
+        for (history, line, scroll) in [
+            (0, 0, 0.),
+            (8, -8, -7.5),
+            (8, -3, -81.),
+            (10_000, 23, -200_000.),
+        ] {
+            let y = row_y(line, history, scroll);
+            assert_eq!(y, (line + history as i32) as f32 * 20. + scroll);
+            assert_eq!(row_y(line + 1, history, scroll) - y, 20.);
+        }
+        assert_eq!(TIME_FONT_SIZE, 12.5);
+        assert_eq!(TIME_GUTTER - TIME_WIDTH, 14.);
+        let grid = grid_size(crate::TerminalSize::default(), gpui::px(7.8));
+        assert_eq!(
+            scrollback_content_size(grid, 10).height - content_size(grid).height,
+            gpui::px(200.)
+        );
+    }
     #[test]
     fn ai_context_uses_displayed_cells_and_scrollback_only() {
         let mut term = Term::new(Config::default(), &Size { cols: 80, rows: 3 }, Silent);
