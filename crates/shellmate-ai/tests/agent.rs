@@ -718,8 +718,9 @@ async fn anthropic_text_after_a_call_stays_after_its_step() {
 #[tokio::test]
 async fn default_output_budget_is_cumulative_across_resume() {
     for a in [false, true] {
+        // Distinct commands: an identical consecutive repeat is refused without running.
         let calls: Vec<_> = (0..5)
-            .map(|i| (format!("call-{i}"), args("docker ps")))
+            .map(|i| (format!("call-{i}"), args(&format!("ls /tmp/d{i}"))))
             .collect();
         let borrowed: Vec<_> = calls
             .iter()
@@ -1253,4 +1254,118 @@ fn early_v9_steps_default_to_manual_and_automatic_tag_roundtrips() {
     let restored: AnswerItem =
         serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
     assert_eq!(restored, item);
+}
+/// Regression: rig's `CompletionRequest::message` inserts before the prompt, which once left
+/// the question after the tool results; the model then treated it as new and re-ran commands.
+#[tokio::test]
+async fn continuation_keeps_question_before_tool_results_on_both_wires() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[("call-1", "run_command", args("docker ps"))],
+                "",
+                false,
+            ),
+            response(a, &[], "web 正在运行。", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([completed("web")]);
+        let mut c = conversation();
+        let mut stream =
+            agent::run(&client, &mut c, capabilities(), &host, Limits::default()).unwrap();
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Error(e) = event {
+                panic!("{e}");
+            }
+        }
+        drop(stream);
+        let body = &bodies(&http)[1];
+        let messages = body["messages"].as_array().unwrap();
+        let text = |m: &Value| m.to_string();
+        let question = messages
+            .iter()
+            .position(|m| text(m).contains("检查容器"))
+            .expect("question present");
+        let result = messages
+            .iter()
+            .position(|m| {
+                m["role"] == "tool"
+                    || m["content"]
+                        .as_array()
+                        .is_some_and(|b| b.iter().any(|b| b["type"] == "tool_result"))
+            })
+            .expect("tool result present");
+        assert!(question < result, "question must precede the tool result");
+        assert_eq!(result, messages.len() - 1, "tool result must be last");
+        assert!(
+            messages[question + 1..result]
+                .iter()
+                .any(|m| m["role"] == "assistant"),
+            "the assistant tool call sits between question and result"
+        );
+    }
+}
+#[tokio::test]
+async fn identical_consecutive_command_is_not_rerun_on_both_wires() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[("call-1", "run_command", args("docker ps"))],
+                "",
+                false,
+            ),
+            response(
+                a,
+                &[("call-2", "run_command", args("docker  ps"))],
+                "",
+                false,
+            ),
+            response(a, &[], "完成。", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        // Only one outcome: a second host call would panic.
+        let host = Host::new([completed("web")]);
+        let mut c = conversation();
+        let mut stream =
+            agent::run(&client, &mut c, capabilities(), &host, Limits::default()).unwrap();
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Error(e) = event {
+                panic!("{e}");
+            }
+        }
+        drop(stream);
+        assert_eq!(host.calls.lock().unwrap().len(), 1);
+        let bodies = bodies(&http);
+        assert_eq!(bodies.len(), 3);
+        assert!(tool_result(&bodies[2], a, "call-2").contains("刚刚已经执行过"));
+    }
+}
+#[test]
+fn explicit_target_words_narrow_the_offered_targets() {
+    use shellmate_ai::agent::{Target, explicit_target};
+    for (q, want) in [
+        ("你直接在当前终端运行命令看看", Some(Target::Terminal)),
+        ("在终端里执行 ls -la", Some(Target::Terminal)),
+        ("帮我在这个终端跑一下 top", Some(Target::Terminal)),
+        ("后台跑一下 df -h", Some(Target::Background)),
+        ("单独执行，不要在终端里", Some(Target::Background)),
+        ("别在终端 跑", Some(Target::Background)),
+        ("看看 docker 运行了哪些服务", None),
+    ] {
+        assert_eq!(explicit_target(q), want, "{q}");
+    }
+    let both = capabilities();
+    let t = both.clone().for_question("在当前终端运行");
+    assert!(t.terminal && !t.background);
+    let b = both.clone().for_question("后台执行");
+    assert!(!b.terminal && b.background);
+    assert_eq!(both.clone().for_question("看看磁盘"), both);
+    let only_bg = Capabilities {
+        terminal: false,
+        ..both
+    };
+    // Asking for an unavailable target leaves what exists.
+    assert!(only_bg.clone().for_question("在终端里执行").background);
 }

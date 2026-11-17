@@ -195,10 +195,58 @@ pub(crate) fn write_secret(
     Ok(())
 }
 
+/// Remembers keychain secrets for the life of the process. macOS asks the user to allow every
+/// keychain read by a binary it does not yet trust (each rebuild of an unsigned build is a new
+/// binary), so reading once per item per launch keeps that to a single prompt, instead of one
+/// per connection, auxiliary channel or AI message. Secrets stay zeroized on drop.
+pub(crate) struct CachedStore {
+    inner: Arc<dyn SecretStore>,
+    cache: Mutex<std::collections::HashMap<SecretKey, Secret>>,
+}
+impl CachedStore {
+    fn new(inner: Arc<dyn SecretStore>) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(Default::default()),
+        }
+    }
+    fn clear(&self) {
+        lock(&self.cache).clear();
+    }
+}
+impl SecretStore for CachedStore {
+    fn keys(&self) -> Result<Vec<SecretKey>, SecretError> {
+        self.inner.keys()
+    }
+    fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+    fn get(&self, key: &SecretKey) -> Result<Option<Secret>, SecretError> {
+        if let Some(secret) = lock(&self.cache).get(key) {
+            return Ok(Some(secret.clone()));
+        }
+        let secret = self.inner.get(key)?;
+        if let Some(secret) = &secret {
+            lock(&self.cache).insert(key.clone(), secret.clone());
+        }
+        Ok(secret)
+    }
+    fn set(&self, key: &SecretKey, secret: &Secret) -> Result<(), SecretError> {
+        lock(&self.cache).remove(key);
+        self.inner.set(key, secret)?;
+        lock(&self.cache).insert(key.clone(), secret.clone());
+        Ok(())
+    }
+    fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
+        lock(&self.cache).remove(key);
+        self.inner.delete(key)
+    }
+}
 pub struct CredentialStore {
     pub(crate) db: SharedStore,
     pub(crate) vault: VaultStore,
     pub(crate) external: Arc<dyn SecretStore>,
+    cached: Arc<CachedStore>,
     pub(crate) operation: Mutex<()>,
     master: AtomicBool,
     touch: AtomicBool,
@@ -250,10 +298,12 @@ impl CredentialStore {
             .flatten()
             .as_deref()
             == Some("1");
+        let cached = Arc::new(CachedStore::new(external.clone()));
         Self {
             vault: VaultStore::new(db.clone()),
             db,
             external,
+            cached,
             operation: Mutex::new(()),
             master: AtomicBool::new(master),
             touch: AtomicBool::new(touch),
@@ -302,6 +352,7 @@ impl CredentialStore {
     pub fn lock(&self) {
         let _op = lock(&self.operation);
         self.vault.lock();
+        self.cached.clear();
     }
     pub fn unlock(&self, password: &str) -> Result<(), SecretError> {
         let _op = lock(&self.operation);
@@ -479,6 +530,7 @@ impl CredentialStore {
         *lock(&self.vault.key) = Some(key);
         self.vault.unlocked.store(true, Ordering::SeqCst);
         self.master.store(true, Ordering::SeqCst);
+        self.cached.clear();
         self.activity();
         Ok(())
     }
@@ -525,6 +577,7 @@ impl CredentialStore {
         self.vault.lock();
         self.master.store(false, Ordering::SeqCst);
         self.touch.store(false, Ordering::SeqCst);
+        self.cached.clear();
         Ok(())
     }
     /// Hosts and configuration are retained. Call only after explicit destructive confirmation.
@@ -543,11 +596,14 @@ impl CredentialStore {
         self.touch.store(false, Ordering::SeqCst);
         Ok(())
     }
+    /// Everyday reads and writes. Keychain access goes through the per-launch cache; backend
+    /// switches still use `external` directly so their write-then-verify reads the real keychain
+    /// (and clear the cache afterwards).
     pub(crate) fn active(&self) -> &dyn SecretStore {
         if self.backend() == Backend::Master {
             &self.vault
         } else {
-            self.external.as_ref()
+            self.cached.as_ref()
         }
     }
 }
@@ -847,6 +903,68 @@ pub(crate) mod tests {
             }
             self.inner.delete(k)
         }
+    }
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        reads: AtomicUsize,
+    }
+    impl SecretStore for CountingStore {
+        fn keys(&self) -> Result<Vec<SecretKey>, SecretError> {
+            self.inner.keys()
+        }
+        fn get(&self, k: &SecretKey) -> Result<Option<Secret>, SecretError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(k)
+        }
+        fn set(&self, k: &SecretKey, s: &Secret) -> Result<(), SecretError> {
+            self.inner.set(k, s)
+        }
+        fn delete(&self, k: &SecretKey) -> Result<(), SecretError> {
+            self.inner.delete(k)
+        }
+    }
+    /// Each keychain item is read at most once per launch (one macOS prompt), and writes,
+    /// deletes, locking and backend switches keep the cache honest.
+    #[test]
+    fn keychain_reads_are_cached_per_launch() {
+        let db = SharedStore::new(HostStore::open_in_memory().unwrap());
+        let external = Arc::new(CountingStore::default());
+        external.inner.set(&key(1), &Secret::new("one")).unwrap();
+        let m = CredentialStore::new(
+            db,
+            external.clone(),
+            Arc::new(Auth),
+            Arc::new(Keys::default()),
+        );
+        assert_eq!(m.backend(), Backend::Keychain);
+        let reads = || external.reads.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(m.get(&key(1)).unwrap().unwrap().expose(), "one");
+        }
+        assert_eq!(reads(), 1);
+        // A missing item is not cached as missing.
+        assert!(m.get(&key(2)).unwrap().is_none());
+        assert!(m.get(&key(2)).unwrap().is_none());
+        assert_eq!(reads(), 3);
+        m.set(&key(2), &Secret::new("two")).unwrap();
+        assert_eq!(m.get(&key(2)).unwrap().unwrap().expose(), "two");
+        assert_eq!(reads(), 3);
+        m.set(&key(1), &Secret::new("uno")).unwrap();
+        assert_eq!(m.get(&key(1)).unwrap().unwrap().expose(), "uno");
+        m.delete(&key(1)).unwrap();
+        assert!(m.get(&key(1)).unwrap().is_none());
+        assert_eq!(reads(), 4);
+        m.lock();
+        assert_eq!(m.get(&key(2)).unwrap().unwrap().expose(), "two");
+        assert_eq!(reads(), 5);
+        // A switch reads the real keychain and leaves no stale cache behind.
+        m.switch_to_master("Master9!Meadow", fast()).unwrap();
+        assert_eq!(m.get(&key(2)).unwrap().unwrap().expose(), "two");
+        m.switch_to_keychain().unwrap();
+        let before = reads();
+        assert_eq!(m.get(&key(2)).unwrap().unwrap().expose(), "two");
+        assert_eq!(reads(), before + 1);
     }
     #[test]
     fn keychain_destination_nth_write_rolls_back() {

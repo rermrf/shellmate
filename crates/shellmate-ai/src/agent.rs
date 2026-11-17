@@ -72,6 +72,61 @@ impl Capabilities {
             Target::Background => self.background,
         }
     }
+    /// When the user explicitly asks for the terminal or for a separate run, offer only
+    /// that target for this turn, so the model cannot pick the other one.
+    pub fn for_question(mut self, question: &str) -> Self {
+        match explicit_target(question) {
+            Some(Target::Terminal) if self.terminal => self.background = false,
+            Some(Target::Background) if self.background => self.terminal = false,
+            _ => {}
+        }
+        self
+    }
+}
+/// The target a question names explicitly, if any.
+pub fn explicit_target(question: &str) -> Option<Target> {
+    let q: String = question.chars().filter(|c| !c.is_whitespace()).collect();
+    let negated_terminal = [
+        "不要在终端",
+        "别在终端",
+        "不在终端",
+        "不要用终端",
+        "别用终端",
+    ]
+    .iter()
+    .any(|p| q.contains(p));
+    let background = negated_terminal
+        || [
+            "后台",
+            "单独执行",
+            "单独运行",
+            "独立执行",
+            "独立运行",
+            "独立通道",
+            "单独跑",
+        ]
+        .iter()
+        .any(|p| q.contains(p));
+    let terminal = !negated_terminal
+        && [
+            "在终端",
+            "当前终端",
+            "终端里",
+            "终端中",
+            "终端上",
+            "我的终端",
+            "这个终端",
+            "终端执行",
+            "终端运行",
+            "终端跑",
+        ]
+        .iter()
+        .any(|p| q.contains(p));
+    match (terminal, background) {
+        (true, false) => Some(Target::Terminal),
+        (false, true) => Some(Target::Background),
+        _ => None,
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
@@ -207,6 +262,8 @@ pub struct Resume {
     output_chars: usize,
     steps: usize,
     invalid_calls: usize,
+    /// The last command that completed in this turn, to refuse an immediate identical repeat.
+    last_run: Option<(String, Target)>,
     turn: UserTurn,
     turns: usize,
     parallel_disabled: bool,
@@ -263,6 +320,7 @@ pub fn run<'a>(
             dropped_turns,
         });
     }
+    let capabilities = capabilities.for_question(&conversation.turns.last().unwrap().user.question);
     let prepared =
         conversation.prepare_with_capabilities(client.character_budget, &capabilities)?;
     conversation.turns.last_mut().unwrap().answer = Some(Answer::default());
@@ -273,6 +331,7 @@ pub fn run<'a>(
         output_chars: 0,
         steps: 0,
         invalid_calls: 0,
+        last_run: None,
         turn: conversation.turns.last().unwrap().user.clone(),
         turns: conversation.turns.len(),
         parallel_disabled: false,
@@ -407,12 +466,15 @@ fn stream<'a>(
                 };
                 let call = resolved;
                 let turn = s.turn.as_mut().unwrap();
+                turn.last_run = matches!(outcome, ToolOutcome::Completed(_))
+                    .then(|| (normalized(&call.command), call.target));
                 turn.output_chars = turn.output_chars.saturating_add(wire.chars().count());
                 turn.steps += 1;
                 s.steps += 1;
-                turn.request = turn.request.clone().message(Message::tool_results(vec![
-                    raw.result(vec![ToolResultContent::text(wire)]),
-                ]));
+                append(
+                    &mut turn.request,
+                    Message::tool_results(vec![raw.result(vec![ToolResultContent::text(wire)])]),
+                );
                 if turn.output_chars >= s.limits.output_chars.min(64_000) {
                     s.error = Some(AiError::ToolOutputLimit);
                 }
@@ -437,6 +499,16 @@ fn stream<'a>(
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
                 match pending {
+                    Pending::Call(raw, call)
+                        if s.turn.as_ref().unwrap().last_run
+                            == Some((normalized(&call.command), call.target)) =>
+                    {
+                        s.turn.as_mut().unwrap().pending.push_front(Pending::Invalid(
+                            raw,
+                            "这条命令刚刚已经执行过，结果就在上一条工具结果中，本次未重复执行。请直接根据已有结果回答；确需再次执行时，先说明原因并调整命令。".into(),
+                        ));
+                        continue;
+                    }
                     Pending::Call(raw, call) => {
                         s.turn.as_mut().unwrap().invalid_calls = 0;
                         s.active = Some((*raw, call.clone()));
@@ -446,10 +518,7 @@ fn stream<'a>(
                         let turn = s.turn.as_mut().unwrap();
                         let mut result = raw.result(vec![ToolResultContent::text(error)]);
                         result.is_error = true;
-                        turn.request = turn
-                            .request
-                            .clone()
-                            .message(Message::tool_results(vec![result]));
+                        append(&mut turn.request, Message::tool_results(vec![result]));
                         turn.steps += 1;
                         s.steps += 1;
                         turn.invalid_calls += 1;
@@ -587,7 +656,7 @@ fn stream<'a>(
                         return Some((AgentEvent::Done(usage), s));
                     }
                     let turn = s.turn.as_mut().unwrap();
-                    turn.request = turn.request.clone().message(message);
+                    append(&mut turn.request, message);
                     turn.pending = pending;
                 }
             }
@@ -597,6 +666,17 @@ fn stream<'a>(
         inner: Box::pin(inner),
         dropped_turns,
     }
+}
+fn normalized(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+/// Append after the current question. `CompletionRequest::message` inserts *before* the
+/// prompt (its last message), which would leave the question after the tool results and make
+/// the model treat it as a new request and run the same command again.
+fn append(request: &mut CompletionRequest, message: impl Into<Message>) {
+    request
+        .chat_history
+        .push(std::sync::Arc::new(message.into()));
 }
 fn parse_call(raw: &RigCall, capabilities: &Capabilities) -> Result<ToolCall, String> {
     #[derive(Deserialize)]
