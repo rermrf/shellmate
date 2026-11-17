@@ -41,8 +41,8 @@ docker inspect nginx --format '{{.Name}} {{.Config.Image}} {{json .NetworkSettin
 
 | 名称 | 镜像版本 | 端口映射 | 挂载目录 | 健康状态 |
 | --- | --- | --- | --- | --- |
-| production-nginx-gateway | registry.example.com/production/nginx:1.27-alpine | 0.0.0.0:443->443/tcp | /srv/production/nginx/configuration | 正常，连续运行 12 天 |
-| production-api-service | registry.example.com/production/shellmate-api:2.8.1 | 127.0.0.1:8080->8080/tcp | /srv/production/api/application-data | 正常，连续运行 3 天 |
+| nginx | registry.example.com/nginx:1.27 | 443/tcp | /srv/nginx | 正常 |
+| api | registry.example.com/api:2.8.1 | 8080/tcp | /srv/api | 正常 |
 
 ![容器服务拓扑](https://example.invalid/never-fetch.png)
 "#;
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn ai_fixtures_have_both_themes_and_requested_sizes() {
-        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-markdown"] {
+        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-markdown", "ai-markdown-wide"] {
             assert!(super::super::SCENES.contains(&scene));
             for dark in [false, true] {
                 assert!(

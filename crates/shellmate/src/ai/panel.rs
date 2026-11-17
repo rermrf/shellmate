@@ -1156,7 +1156,7 @@ impl Render for Drawer {
                     .child("发送前会自动去掉 .env、私钥、密码等敏感内容"),
             );
         div()
-            .w(px(340.))
+            .w_full()
             .flex_none()
             .h_full()
             .min_h_0()

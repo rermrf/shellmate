@@ -249,6 +249,8 @@ pub struct Terminal {
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
     local: Option<PtyOptions>,
     size: TerminalSize,
+    resize_throttle: crate::resize::ResizeThrottle,
+    resize_clock: Instant,
     palette: TerminalPalette,
     title: Option<SharedString>,
     /// `Some` once the attached session has ended.
@@ -313,6 +315,8 @@ impl Terminal {
             backend: None,
             local,
             size,
+            resize_throttle: Default::default(),
+            resize_clock: Instant::now(),
             palette,
             title: None,
             ended: None,
@@ -682,22 +686,27 @@ impl Terminal {
         }
     }
 
+    /// Call before/after a continuous layout drag. Release flushes from the next
+    /// measured bounds, including a mouse-up that arrives before the last paint.
+    pub fn set_interactive_resize(&mut self, active: bool) {
+        self.resize_throttle.set_dragging(active);
+    }
+
+    pub(crate) fn resize_pending(&self) -> bool { self.resize_throttle.pending() }
+
     pub fn set_size(&mut self, size: TerminalSize) {
-        if size == self.size {
-            return;
-        }
         let grid_changed = (size.cols, size.rows) != (self.size.cols, self.size.rows);
         self.size = size;
         if grid_changed {
             self.output_capture.lock().resize(size.cols,size.rows);
             if let Some(source)=self.raw_grid.lock().as_mut(){source.term.resize(size);}
             self.term.lock().resize(size);
-            let dims = size.dims();
-            if let Some(backend) = self.backend.as_mut()
-                && let Err(err) = backend.resize(dims.cols, dims.rows, dims.pixel_width, dims.pixel_height)
-            {
-                log::warn!("backend resize failed: {err}");
-            }
+        }
+        if let Some(dims) = self.resize_throttle.update(size.dims(), self.resize_clock.elapsed())
+            && let Some(backend) = self.backend.as_mut()
+            && let Err(err) = backend.resize(dims.cols, dims.rows, dims.pixel_width, dims.pixel_height)
+        {
+            log::warn!("backend resize failed: {err}");
         }
     }
 

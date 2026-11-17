@@ -44,6 +44,7 @@ mod ssh;
 mod streams;
 mod mosh;
 mod ai;
+mod drawer_resize;
 
 actions!(
     shellmate,
@@ -181,6 +182,8 @@ pub struct Workspace {
     commands_open: bool,
     ai_drawer: Option<Entity<crate::ai::panel::Drawer>>,
     ai_open: bool,
+    ai_drawer_width: f32,
+    ai_drawer_drag: drawer_resize::Drag,
     broadcast: crate::productivity::multi::Broadcast,
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
@@ -232,6 +235,7 @@ impl Workspace {
                 false
             }
         };
+        let ai_drawer_width = drawer_resize::stored_width(store.setting(drawer_resize::SETTING).ok().flatten().as_deref());
         let sidebar = cx.new(|cx| Sidebar::new(book.clone(), window, cx));
         sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(collapsed, cx));
         let commands = cx.new(|_| crate::productivity::panel::Drawer {
@@ -241,6 +245,9 @@ impl Workspace {
         let broadcast_bar=cx.new(|cx|crate::productivity::broadcast::BroadcastBar::new(window,cx));
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
+            cx.observe_window_activation(window, |s, w, cx| {
+                if !w.is_window_active() { s.end_drawer_drag(cx); }
+            }),
             cx.subscribe_in(&commands, window, Self::on_command_event),
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
         ];
@@ -263,6 +270,7 @@ impl Workspace {
             temporary_hosts: HashMap::new(),
             commands,
             commands_open: false, ai_drawer:None,ai_open:false,
+            ai_drawer_width, ai_drawer_drag: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),recent_sessions:Vec::new(),session_menu:None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -1110,6 +1118,7 @@ impl Render for Workspace {
             None => self.render_empty(cx).into_any_element(),
         };
 
+        let drag_owner = cx.entity().downgrade();
         let body = div()
             .relative().flex_1().min_w_0().min_h_0().flex().child(content)
             .children(self.picker.as_ref().filter(|picker| picker.read(cx).is_history()).map(|picker| {
@@ -1165,7 +1174,10 @@ impl Render for Workspace {
                     .child(self.render_header(cx))
                     .child(
                         div().flex_1().min_h_0().flex().gap(px(12.)).child(body)
-                            .when(self.commands_open, |d| d.child(self.commands.clone())).when(self.ai_open,|d|d.children(self.ai_drawer.clone())),
+                            .when(self.commands_open, |d| d.child(self.commands.clone())).when(self.ai_open, |d| d.child(
+                                div().relative().w(px(self.drawer_width(_window))).flex_none().h_full().min_h_0()
+                                    .children(self.ai_drawer.clone()).child(self.drawer_handle(cx))
+                            )),
                     ),
             )
             .children(self.session_menu.as_ref().map(|menu| gpui::deferred(
@@ -1173,6 +1185,24 @@ impl Render for Workspace {
             ).with_priority(3)))
             .children(palette)
             .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
+                if let Some(owner) = drag_owner.upgrade() {
+                    let moved = owner.clone();
+                    window.on_mouse_event::<gpui::MouseMoveEvent>(move |e, phase, w, cx| {
+                        if phase == gpui::DispatchPhase::Capture {
+                            moved.update(cx, |s, cx| s.move_drawer_drag(e, w, cx));
+                        }
+                    });
+                    window.on_mouse_event::<gpui::MouseUpEvent>(move |e, phase, _, cx| {
+                        if phase == gpui::DispatchPhase::Capture && e.button == MouseButton::Left {
+                            owner.update(cx, |s, cx| {
+                                if s.ai_drawer_drag.active() {
+                                    s.end_drawer_drag(cx);
+                                    cx.stop_propagation();
+                                }
+                            });
+                        }
+                    });
+                }
                 let moved=activity.clone();window.on_mouse_event::<gpui::MouseMoveEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{moved.activity();}});
                 let clicked=activity.clone();window.on_mouse_event::<gpui::MouseDownEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{clicked.activity();}});
                 let scrolled=activity.clone();window.on_mouse_event::<gpui::ScrollEvent>(move|_,phase,_,_|{if phase==gpui::DispatchPhase::Capture{scrolled.activity();}});

@@ -7,6 +7,7 @@ use gpui::{
         ActiveTheme,
         text::{SelectionFormat, TextView, TextViewStyle},
     },
+    prelude::*,
     px, rems,
 };
 use markdown::{ParseOptions, mdast::Node};
@@ -83,6 +84,18 @@ fn blocked_image() -> ImageSource {
 }
 
 pub(super) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
+    let scope = format!("{id:?}");
+    base_view(id, text, window, cx)
+        .markdown_block_parser(blocks::parse)
+        .markdown_block_renderer("ai-scroll-block", move |node, window, cx| {
+            blocks::render(&scope, node, window, cx)
+        })
+}
+
+mod blocks;
+mod cells;
+
+fn base_view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
     let p = cx.palette();
     let terminal = cx.terminal_style().palette;
     let code_bg = shellmate_term::colors::to_hsla(terminal.background);
@@ -96,10 +109,9 @@ pub(super) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App)
         .font_family(MONO_FONT)
         .text_size(px(12.5))
         .line_height(px(18.))
-        .whitespace_nowrap()
-        .max_h(px(320.));
-    code.overflow.x = Some(Overflow::Scroll);
-    code.overflow.y = Some(Overflow::Scroll);
+        .whitespace_nowrap();
+    code.overflow.x = Some(Overflow::Hidden);
+    code.overflow.y = Some(Overflow::Visible);
     let mut table = StyleRefinement::default()
         .border_color(p.line)
         .rounded(px(8.));
@@ -122,7 +134,7 @@ pub(super) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App)
     .table_head(StyleRefinement::default().bg(p.card2).text_color(p.tx2))
     .table_cell(
         StyleRefinement::default()
-            .whitespace_nowrap()
+            .py(px(8.))
             .border_color(p.line),
     );
 

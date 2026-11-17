@@ -196,13 +196,17 @@ impl Element for TerminalElement {
         }
         let grid = if replay { TerminalSize {cell_width,line_height,..recorded} } else {TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height)};
         let (cols, rows) = (grid.cols, grid.rows);
-        if self.terminal.read(cx).size()!=grid {
+        let size_changed = self.terminal.read(cx).size() != grid;
+        if size_changed || self.terminal.read(cx).resize_pending() {
             self.terminal.update(cx, |t, cx| {
                 t.set_size(grid);
-                let terminal=cx.entity();
-                cx.defer(move |cx|terminal.update(cx,|_,cx|cx.emit(crate::TerminalEvent::SizeChanged)));
+                if size_changed {
+                    let terminal=cx.entity();
+                    cx.defer(move |cx|terminal.update(cx,|_,cx|cx.emit(crate::TerminalEvent::SizeChanged)));
+                }
             });
         }
+        if self.terminal.read(cx).resize_pending() { window.request_animation_frame(); }
         self.view.update(cx, |v, _| v.geometry = Some(Geometry { origin: bounds.origin, size: grid }));
 
         let palette = &self.style.palette;

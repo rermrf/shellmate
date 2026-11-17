@@ -1,6 +1,8 @@
 use super::*;
 use crate::ai::host::{Approval, Ui};
+use crate::ai::scroll::ScrollArea;
 use crate::dialogs::{self, DialogBody, Tone};
+use gpui::component::button::ButtonVariants;
 use gpui::component::input::{Textarea, TextareaState};
 use shellmate_ai::{
     Answer, AnswerItem, StepStatus,
@@ -397,7 +399,11 @@ impl Drawer {
                     .font_family(MONO_FONT),
             )
         } else {
-            card.child(command_block(&step.call.command, cx))
+            card.child(command_block(
+                &step.call.command,
+                SharedString::from(format!("{}:active-command", self.id)),
+                cx,
+            ))
         };
         if step.started.is_some() {
             card = card.child(gpui::component::spinner::Spinner::new()).child(
@@ -561,8 +567,6 @@ impl Drawer {
             let overflowing = self.overflowing_output.contains(&key);
             let drawer = cx.entity().downgrade();
             let epoch = self.epoch;
-            let scrolls_vertically = std::rc::Rc::new(std::cell::Cell::new(false));
-            let measured_scroll = scrolls_vertically.clone();
             let content = div()
                 .flex_none()
                 .flex()
@@ -590,8 +594,6 @@ impl Drawer {
                     .flex_none()
                     .child(content)
                     .on_children_prepainted(move |bounds, _, cx| {
-                        measured_scroll
-                            .set(bounds.first().is_some_and(|b| b.size.height > px(320.)));
                         let over = bounds.first().is_some_and(|b| b.size.height > px(8. * 18.));
                         if over != overflowing {
                             let drawer = drawer.clone();
@@ -615,65 +617,49 @@ impl Drawer {
                         }
                     });
             card = card.child(
-                div()
-                    // Distinct scroll state resets vertical position when collapsing.
-                    .id(SharedString::from(format!(
-                        "ai-step-output-{}-{}-{expanded}",
-                        key.0, key.1
-                    )))
-                    .flex_none()
-                    .min_w_0()
-                    .max_w_full()
-                    .max_h(px(if expanded { 320. } else { 8. * 18. }))
-                    .overflow_x_scroll()
-                    .overflow_y_hidden()
-                    .when(expanded, |d| d.overflow_y_scroll())
-                    .restrict_scroll_to_axis()
-                    .on_scroll(move |event, _, cx| {
-                        // GPUI has already scrolled this viewport. Keep an expanded
-                        // output's vertical gesture from also moving the message list.
-                        if expanded
-                            && scrolls_vertically.get()
-                            && event.delta.pixel_delta(px(18.)).y != px(0.)
-                        {
-                            cx.stop_propagation();
-                        }
-                    })
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .text_size(px(12.5))
-                    .line_height(px(18.))
-                    .font_family(MONO_FONT)
-                    .whitespace_nowrap()
-                    .text_color(p.tx2)
-                    .child(measured),
+                ScrollArea::new(
+                    SharedString::from(format!(
+                        "{}:ai-step-output-{}-{}-{expanded}",
+                        self.id, key.0, key.1
+                    )),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .text_size(px(12.5))
+                        .line_height(px(18.))
+                        .font_family(MONO_FONT)
+                        .whitespace_nowrap()
+                        .text_color(p.tx2)
+                        .child(measured),
+                    p.card2,
+                )
+                .height_limit(if expanded { 320. } else { 8. * 18. }, expanded),
             );
             if has_output && !self.readonly {
                 let copy = output.clone();
-                let mut actions = div().flex_none().flex().gap(px(8.));
+                let mut actions = step_actions();
                 if overflowing {
                     actions = actions.child(
-                        Button::new(("ai-step-expand", key.0 * 1000 + key.1))
-                            .label(if expanded { "收起" } else { "展开" })
-                            .h(px(24.))
-                            .text_size(px(11.))
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                if !s.expanded.remove(&key) {
-                                    s.expanded.insert(key);
-                                }
-                                cx.notify();
-                            })),
+                        step_action(
+                            ("ai-step-expand", key.0 * 1000 + key.1),
+                            if expanded { "收起" } else { "展开" },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if !s.expanded.remove(&key) {
+                                s.expanded.insert(key);
+                            }
+                            cx.notify();
+                        })),
                     );
                 }
                 actions = actions.child(
-                    Button::new(("ai-step-copy", key.0 * 1000 + key.1))
-                        .label("复制")
-                        .h(px(24.))
-                        .text_size(px(11.))
-                        .on_click(move |_, _, cx| {
+                    step_action(("ai-step-copy", key.0 * 1000 + key.1), "复制", cx).on_click(
+                        move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                        }),
+                        },
+                    ),
                 );
                 card = card.child(actions);
             }
@@ -688,12 +674,10 @@ impl Drawer {
         let drawer = cx.entity().downgrade();
         let epoch = self.epoch;
         let conversation = self.id.clone();
-        // Measure the full, wrapped text at the available width even when clipped.
-        // This also updates on resize and handles one very long physical line.
+        // Measure all physical lines before applying the collapsed height cap.
         let measured = div()
             .flex_none()
-            .w_full()
-            .child(div().w_full().child(command.to_owned()))
+            .child(div().child(command.to_owned()))
             .on_children_prepainted(move |bounds, _, cx| {
                 let over = bounds
                     .first()
@@ -720,34 +704,97 @@ impl Drawer {
                     });
                 }
             });
-        let mut block = command_surface(cx).child(
+        let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);
+        let viewport = ScrollArea::new(
+            SharedString::from(format!(
+                "{}:command:{}:{}:{expanded}",
+                self.id, key.0, key.1
+            )),
             div()
-                .w_full()
-                .when(!expanded, |d| d.max_h(px(3. * 18.)).overflow_hidden())
+                .flex()
+                .flex_col()
+                .items_start()
+                .whitespace_nowrap()
                 .child(measured),
+            bg,
         );
-        if overflowing {
-            block = block.child(
-                Button::new(markdown::element_id(
-                    &format!("{}:command-toggle", self.id),
-                    key.0,
-                    key.1,
-                ))
-                .label(if expanded { "收起" } else { "展开" })
-                .mt(px(6.))
-                .h(px(24.))
-                .text_size(px(11.))
-                .on_click(cx.listener(move |s, _, _, cx| {
-                    if !s.expanded_commands.remove(&key) {
-                        s.expanded_commands.insert(key);
-                    }
-                    cx.notify();
-                })),
-            );
+        let mut block =
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(command_surface(cx).child(if expanded {
+                    viewport
+                } else {
+                    viewport.height_limit(3. * 18., false)
+                }));
+        if overflowing || !self.readonly {
+            let mut actions = step_actions();
+            if overflowing {
+                actions = actions.child(
+                    step_action(
+                        markdown::element_id(&format!("{}:command-toggle", self.id), key.0, key.1),
+                        if expanded { "收起" } else { "展开" },
+                        cx,
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if !s.expanded_commands.remove(&key) {
+                            s.expanded_commands.insert(key);
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            if !self.readonly {
+                let copy = command.to_owned();
+                actions = actions.child(
+                    step_action(
+                        markdown::element_id(&format!("{}:command-copy", self.id), key.0, key.1),
+                        "复制",
+                        cx,
+                    )
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                    }),
+                );
+            }
+            block = block.child(actions);
         }
         block
     }
 }
+
+fn step_actions() -> Div {
+    div()
+        .flex_none()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(12.))
+}
+
+fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &App) -> Button {
+    let p = cx.palette();
+    Button::new(id)
+        .text()
+        .h(px(24.))
+        .accessibility_label(label)
+        // Button's built-in label applies its own size and hover foreground.
+        // Style the content directly to keep these controls at 12.5 px / tx2.
+        .child(
+            div()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(p.tx2)
+                .hover(|style| style.text_color(p.acc))
+                .child(label),
+        )
+}
+
 // Keep the persisted v9 output representation compatible; labels are presentation only.
 fn output_sections(output: &str) -> (&str, &str) {
     match output.strip_prefix("标准输出：\n") {
@@ -817,8 +864,18 @@ fn step_header(
                 .child(purpose.to_owned()),
         )
 }
-fn command_block(command: &str, cx: &App) -> Div {
-    command_surface(cx).child(command.to_owned())
+fn command_block(command: &str, id: SharedString, cx: &App) -> Div {
+    let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);
+    command_surface(cx).child(ScrollArea::new(
+        id,
+        div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .whitespace_nowrap()
+            .child(div().flex_none().child(command.to_owned())),
+        bg,
+    ))
 }
 fn command_surface(cx: &App) -> Div {
     div()

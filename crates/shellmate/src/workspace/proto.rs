@@ -24,6 +24,7 @@ impl Workspace {
         let stress=scene.starts_with("stress-");
         let scene=scene.strip_prefix("stress-").unwrap_or(scene);
         self.ai_drawer=None;self.ai_open=false;
+        self.ai_drawer_width = if scene == "ai-markdown-wide" { 560. } else { drawer_resize::DEFAULT_WIDTH };
         self.sessions.clear();
         self.groups.clear();
         self.active = None;
@@ -260,7 +261,7 @@ impl Workspace {
             }
             "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
-            "ai-agent"|"ai-agent-run"|"ai-agent-redline"|"ai-agent-full"|"ai"|"ai-chat"|"ai-markdown"|"ai-history"|"ai-error"|"ai-unconfigured" => {self.open_ai(window,cx);if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|d,cx|{d.scene(scene,cx);if scene=="ai-agent-full"{d.confirm_full(window,cx);}});}},
+            "ai-agent"|"ai-agent-run"|"ai-agent-redline"|"ai-agent-full"|"ai"|"ai-chat"|"ai-markdown"|"ai-markdown-wide"|"ai-history"|"ai-error"|"ai-unconfigured" => {self.open_ai(window,cx);if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|d,cx|{d.scene(if scene == "ai-markdown-wide" { "ai-markdown" } else { scene },cx);if scene=="ai-agent-full"{d.confirm_full(window,cx);}});}},
             "ai-explain"=>{self.sessions[0].terminal.update(cx,|t,cx|t.notice("[error] connect() failed: Connection refused",cx));},
             "set-ai"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-ai-anthropic"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},

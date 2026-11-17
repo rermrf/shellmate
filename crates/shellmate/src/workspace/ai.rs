@@ -146,6 +146,7 @@ impl Workspace {
         }
     }
     pub(crate) fn close_ai(&mut self, cx: &mut Context<Self>) {
+        self.end_drawer_drag(cx);
         self.ai_open = false;
         cx.notify();
     }
