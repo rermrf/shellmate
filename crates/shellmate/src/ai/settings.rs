@@ -9,7 +9,7 @@ use gpui::{
     prelude::*,
     *,
 };
-use shellmate_ai::{Event, Provider, RigClient};
+use shellmate_ai::{Event, Provider, ReasoningLevel, RigClient};
 use shellmate_store::{CredentialStore, SecretKey, SecretStore, SharedStore, ai::Settings};
 use std::sync::Arc;
 pub struct AiSettings {
@@ -19,6 +19,7 @@ pub struct AiSettings {
     provider: bool,
     base: Entity<InputState>,
     model: Entity<InputState>,
+    reasoning: ReasoningLevel,
     key: Entity<PasswordInput>,
     key_saved: bool,
     replace: bool,
@@ -37,27 +38,23 @@ impl AiSettings {
         cx: &mut Context<Self>,
     ) -> Self {
         let s = db.borrow().ai_settings().unwrap_or_default();
-        let base = db
-            .borrow()
-            .setting("ai_base_url")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "https://api.openai.com/v1".into());
+        let anthropic = matches!(s.provider, Provider::Anthropic { .. });
         Self {
             workspace,
             db,
             credentials,
-            provider: s.provider == Provider::Anthropic,
+            provider: anthropic,
             base: cx.new(|cx| {
                 InputState::new(w, cx)
-                    .default_value(base)
-                    .placeholder("https://api.openai.com/v1")
+                    .default_value(s.provider.base_url())
+                    .placeholder(base_placeholder(anthropic))
             }),
             model: cx.new(|cx| {
                 InputState::new(w, cx)
                     .default_value(s.model)
                     .placeholder("gpt-4o-mini / deepseek-chat / qwen…")
             }),
+            reasoning: s.reasoning,
             key: cx.new(|cx| PasswordInput::new("输入 API Key", cx)),
             key_saved: false,
             replace: false,
@@ -69,21 +66,21 @@ impl AiSettings {
         }
     }
     fn values(&self, cx: &App) -> Settings {
+        let base_url = self
+            .base
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
         Settings {
             provider: if self.provider {
-                Provider::Anthropic
+                Provider::Anthropic { base_url }
             } else {
-                Provider::OpenAiCompatible {
-                    base_url: self
-                        .base
-                        .read(cx)
-                        .value()
-                        .trim()
-                        .trim_end_matches('/')
-                        .into(),
-                }
+                Provider::OpenAiCompatible { base_url }
             },
             model: self.model.read(cx).value().trim().into(),
+            reasoning: self.reasoning,
             save_conversations: self.save,
         }
     }
@@ -249,14 +246,12 @@ impl AiSettings {
             cx.notify();
             return;
         }
-        if self.db.borrow_mut().save_ai_settings(&settings).is_err() {
-            return;
-        }
         self.busy = true;
         let this = cx.entity().downgrade();
-        super::authorize(
+        super::authorize_settings(
             self.db.clone(),
             self.credentials.clone(),
+            settings,
             w,
             cx,
             move |result, w, cx| {
@@ -328,6 +323,13 @@ impl AiSettings {
         );
     }
 }
+fn base_placeholder(anthropic: bool) -> &'static str {
+    if anthropic {
+        "https://api.anthropic.com"
+    } else {
+        "https://api.openai.com/v1"
+    }
+}
 impl Drop for AiSettings {
     fn drop(&mut self) {
         if let Some(abort) = self.abort.take() {
@@ -364,6 +366,22 @@ impl Render for AiSettings {
                                     return;
                                 }
                                 s.provider = anthropic;
+                                let saved = s.db.borrow().ai_settings_for_provider(anthropic);
+                                let (base, reasoning) = saved
+                                    .map(|saved| {
+                                        (saved.provider.base_url().to_owned(), saved.reasoning)
+                                    })
+                                    .unwrap_or_else(|_| {
+                                        (
+                                            base_placeholder(anthropic).into(),
+                                            ReasoningLevel::Default,
+                                        )
+                                    });
+                                s.reasoning = reasoning;
+                                s.base.update(cx, |i, cx| {
+                                    i.set_value(base, w, cx);
+                                    i.set_placeholder(base_placeholder(anthropic), w, cx);
+                                });
                                 s.key.update(cx, |i, cx| {
                                     i.take(cx);
                                 });
@@ -374,12 +392,18 @@ impl Render for AiSettings {
                     }),
             ),
         ));
-        if !self.provider {
-            form = form.child(crate::dialogs::field(
-                "Base URL",
-                &p,
-                Input::new(&self.base),
-            ));
+        form = form.child(crate::dialogs::field(
+            "Base URL",
+            &p,
+            Input::new(&self.base),
+        ));
+        if self.provider {
+            form = form.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(p.tx2)
+                    .child("可填写官方地址或兼容 Anthropic 协议的代理地址"),
+            );
         }
         form = form
             .child(crate::dialogs::field("模型", &p, Input::new(&self.model)))
@@ -392,7 +416,30 @@ impl Render for AiSettings {
                     } else {
                         "例如 gpt-4o-mini、deepseek-chat、qwen3；以服务商的模型 ID 为准"
                     }),
-            );
+            )
+            .child(crate::dialogs::field(
+                "思考等级",
+                &p,
+                div().flex().flex_wrap().gap(px(8.)).children(
+                    ReasoningLevel::options(&self.values(cx).provider)
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(index, level)| {
+                            Button::new(("ai-reasoning", index))
+                                .label(level.label())
+                                .disabled(self.busy)
+                                .when(self.reasoning == level, |b| b.bg(p.accs).text_color(p.acc))
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    s.reasoning = level;
+                                    cx.notify();
+                                }))
+                        }),
+                ),
+            ))
+            .child(div().text_size(px(12.)).text_color(p.tx2).child(
+                "「默认」不发送该参数，由服务商决定；等级越高，回答越慢、消耗的 token 越多",
+            ));
         if self.key_saved && !self.replace {
             form = form.child(
                 div()

@@ -5,7 +5,7 @@ mod config;
 mod conversation;
 pub mod redact;
 pub use client::{Event, ProviderClient, ResponseStream, RigClient, Usage};
-pub use config::{ApiKey, Config, Provider, Timeouts};
+pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts};
 pub use conversation::{
     Answer, ContextSnapshot, Conversation, DEFAULT_BUDGET, Prepared, Turn, UserTurn,
 };
@@ -39,6 +39,8 @@ pub enum AiError {
     NotConfigured,
     #[error("AI 配置无效，请检查 Base URL 和模型名称")]
     InvalidConfig,
+    #[error("当前模型不支持所选思考等级，请在设置中改为「默认」或其他等级")]
+    UnsupportedReasoning,
     #[error("Key 无效或无权限")]
     Authentication,
     #[error("模型名称不存在")]

@@ -9,7 +9,10 @@ fn config() -> Result<Config, &'static str> {
             base_url: std::env::var("SHELLMATE_AI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
         },
-        Ok("anthropic") => Provider::Anthropic,
+        Ok("anthropic") => Provider::Anthropic {
+            base_url: std::env::var("SHELLMATE_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".into()),
+        },
         _ => return Err("set SHELLMATE_AI_PROVIDER to openai or anthropic"),
     };
     let model = std::env::var("SHELLMATE_AI_MODEL").map_err(|_| "set SHELLMATE_AI_MODEL")?;
@@ -22,11 +25,15 @@ fn config() -> Result<Config, &'static str> {
     if key.len() > 4096 || key.trim().is_empty() {
         return Err("key file is empty or too large");
     }
+    let reasoning =
+        ReasoningLevel::from_id(&std::env::var("SHELLMATE_AI_REASONING").unwrap_or_default())
+            .for_provider(&provider);
     Ok(Config {
         provider,
         model,
         api_key: ApiKey::new(key.trim()),
-        timeouts: Default::default(),
+        reasoning,
+        timeouts: reasoning.timeouts(),
     })
 }
 async fn answer(client: &dyn ProviderClient, c: &Conversation) -> Result<(Answer, usize), AiError> {
@@ -35,6 +42,7 @@ async fn answer(client: &dyn ProviderClient, c: &Conversation) -> Result<(Answer
     let mut deltas = 0;
     while let Some(event) = stream.next().await {
         match event {
+            Event::Thinking => {}
             Event::TextDelta(text) => {
                 deltas += 1;
                 a.text.push_str(&text)
@@ -81,10 +89,15 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         .unwrap_or_else(|e| panic!("follow-up failed: {e}"));
     // Models often write `grep '[n]ginx'` so grep does not match itself; ignore bracket expressions.
     let mentions = |command: &str, word: &str| {
-        command.replace(['[', ']'], "").to_lowercase().contains(word)
+        command
+            .replace(['[', ']'], "")
+            .to_lowercase()
+            .contains(word)
     };
     assert!(
-        a.commands.iter().any(|card| mentions(&card.command, "nginx")),
+        a.commands
+            .iter()
+            .any(|card| mentions(&card.command, "nginx")),
         "follow-up command did not retain requested filter"
     );
     println!("PASS: two-turn continuity and streamed answer");

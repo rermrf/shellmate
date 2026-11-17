@@ -21,6 +21,17 @@ pub fn authorize(
             return;
         }
     };
+    authorize_settings(db, credentials, settings, window, cx, done);
+}
+/// Authorize an unsaved form against its actual destination without persisting it.
+pub fn authorize_settings(
+    db: SharedStore,
+    credentials: Arc<CredentialStore>,
+    settings: shellmate_store::ai::Settings,
+    window: &mut Window,
+    cx: &mut App,
+    done: impl FnOnce(Result<Config, AiError>, &mut Window, &mut App) + 'static,
+) {
     let manager = credentials.clone();
     crate::security::ensure_unlocked(
         credentials,

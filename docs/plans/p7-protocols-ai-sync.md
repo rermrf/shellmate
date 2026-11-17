@@ -140,4 +140,13 @@
 - 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1220 通过、0 失败。
 - 真实接口测试（2026-11-17，用户提供的 OpenAI 兼容服务，模型 gpt-5.6-luna）：`cargo test -p shellmate-ai --test e2e real_two_turn_stream_commands_and_invalid_key -- --ignored`（Key 只经 `SHELLMATE_AI_KEY_FILE` 传入）连续两次通过：流式回答、两轮对话连贯、端口命令卡片、错误 Key 的中文提示。第一次失败是测试断言过严：模型把后续命令写成 `grep '[n]ginx'`（避免匹配 grep 自身），断言改为忽略方括号。
 
-需要用户手测（写入 `docs/manual-tests.md` A1–A10）。
+需要用户手测（写入 `docs/manual-tests.md` A1–A12）。
+
+### M5 补充：思考等级与 Anthropic 自定义地址（2026-11-17）
+
+- 用户要求：两种协议都提供思考等级；Anthropic 也能自定义 Base URL。
+- Base URL：两种服务商都可填，分别保存（`ai_base_url` / `ai_anthropic_base_url`），切换服务商不丢另一个。Anthropic 地址交给 rig 的 `with_base_url`，末尾带 `/v1` 或 `/v1/messages` 都能识别。首次说明按地址记录，换代理会重新确认。
+- 思考等级：OpenAI 兼容为 默认 / 关闭 / 最低 / 低 / 中 / 高 / 超高，Anthropic 为 默认 / 关闭 / 低 / 中 / 高 / 最高，按服务商分别保存。「默认」不发送任何参数，请求与之前完全一样。其他等级走 rig 的通用 reasoning 选项：OpenAI 发 `reasoning_effort`；新款 Claude 用 adaptive thinking + effort；catalog 里只接受预算的旧款 Claude 换算成 `budget_tokens`。
+- 等级越高，输出上限（4096–32000）和首字超时（45–240 秒）越大，避免推理用光额度或误判超时。模型不支持所选等级时提示「当前模型不支持所选思考等级」，不转发服务商原文。
+- 思考过程只用来在抽屉里显示「正在思考…」，内容不展示、不保存、不回传。测试连接改为直接测试表单里尚未保存的值，并带上所选等级。
+- 复跑（沙箱外）：clippy 零警告；`cargo test --workspace` 1234 通过、0 失败。真实接口（同一 OpenAI 兼容服务，gpt-5.6-luna）在「高」和「关闭」两个等级下 e2e 均通过。Anthropic 没有真实 Key，只做了离线请求体测试。

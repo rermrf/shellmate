@@ -2,13 +2,15 @@
 use crate::{HostStore, Result, StoreError};
 use rusqlite::{OptionalExtension, params};
 use shellmate_ai::{
-    Answer, CommandCard, ContextSnapshot, Conversation, Provider, Turn, UserTurn, redact::redact,
+    Answer, CommandCard, ContextSnapshot, Conversation, Provider, ReasoningLevel, Turn, UserTurn,
+    redact::redact,
 };
 pub const SAVE_CONVERSATIONS: &str = "ai_save_conversations";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub provider: Provider,
     pub model: String,
+    pub reasoning: ReasoningLevel,
     pub save_conversations: bool,
 }
 impl Default for Settings {
@@ -16,6 +18,7 @@ impl Default for Settings {
         Self {
             provider: Provider::default(),
             model: String::new(),
+            reasoning: ReasoningLevel::Default,
             save_conversations: true,
         }
     }
@@ -49,16 +52,36 @@ pub struct ConversationSummary {
 }
 impl HostStore {
     pub fn ai_settings(&self) -> Result<Settings> {
+        self.ai_settings_for_provider(self.setting("ai_provider")?.as_deref() == Some("anthropic"))
+    }
+    /// Read one provider's saved form without changing the active provider.
+    pub fn ai_settings_for_provider(&self, anthropic: bool) -> Result<Settings> {
+        let provider = if anthropic {
+            Provider::Anthropic {
+                base_url: self
+                    .setting("ai_anthropic_base_url")?
+                    .unwrap_or_else(|| "https://api.anthropic.com".into()),
+            }
+        } else {
+            Provider::OpenAiCompatible {
+                base_url: self
+                    .setting("ai_base_url")?
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            }
+        };
+        let reasoning = ReasoningLevel::from_id(
+            &self
+                .setting(if anthropic {
+                    "ai_anthropic_reasoning"
+                } else {
+                    "ai_openai_reasoning"
+                })?
+                .unwrap_or_default(),
+        )
+        .for_provider(&provider);
         Ok(Settings {
-            provider: if self.setting("ai_provider")?.as_deref() == Some("anthropic") {
-                Provider::Anthropic
-            } else {
-                Provider::OpenAiCompatible {
-                    base_url: self
-                        .setting("ai_base_url")?
-                        .unwrap_or_else(|| "https://api.openai.com/v1".into()),
-                }
-            },
+            provider,
+            reasoning,
             model: self.setting("ai_model")?.unwrap_or_default(),
             save_conversations: self.setting(SAVE_CONVERSATIONS)?.as_deref() != Some("0"),
         })
@@ -78,8 +101,15 @@ impl HostStore {
         ] {
             tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![k,v])?;
         }
-        if let Provider::OpenAiCompatible { base_url } = &s.provider {
-            tx.execute("INSERT INTO settings VALUES('ai_base_url',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[base_url])?;
+        let (base_key, reasoning_key) = match s.provider {
+            Provider::OpenAiCompatible { .. } => ("ai_base_url", "ai_openai_reasoning"),
+            Provider::Anthropic { .. } => ("ai_anthropic_base_url", "ai_anthropic_reasoning"),
+        };
+        for (key, value) in [
+            (base_key, s.provider.base_url()),
+            (reasoning_key, s.reasoning.for_provider(&s.provider).id()),
+        ] {
+            tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         }
         tx.commit()?;
         Ok(())
@@ -204,6 +234,96 @@ impl HostStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_urls_and_reasoning_round_trip_independently() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        assert_eq!(db.ai_settings().unwrap().reasoning, ReasoningLevel::Default);
+        let default_anthropic = db.ai_settings_for_provider(true).unwrap();
+        assert_eq!(
+            default_anthropic.provider.base_url(),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(default_anthropic.reasoning, ReasoningLevel::Default);
+        let openai = Settings {
+            provider: Provider::OpenAiCompatible {
+                base_url: "https://openai-proxy.example/v1".into(),
+            },
+            model: "shared-model".into(),
+            reasoning: ReasoningLevel::XHigh,
+            ..Default::default()
+        };
+        let anthropic = Settings {
+            provider: Provider::Anthropic {
+                base_url: "https://anthropic-proxy.example/api/v1/messages".into(),
+            },
+            reasoning: ReasoningLevel::Max,
+            ..openai.clone()
+        };
+        db.save_ai_settings(&openai).unwrap();
+        assert_eq!(db.ai_settings().unwrap(), openai);
+        db.save_ai_settings(&anthropic).unwrap();
+        assert_eq!(db.ai_settings().unwrap(), anthropic);
+        assert_eq!(db.ai_settings_for_provider(false).unwrap(), openai);
+        // Loading another provider's form must not change saved selection.
+        assert_eq!(db.ai_settings().unwrap(), anthropic);
+        db.save_ai_settings(&openai).unwrap();
+        assert_eq!(db.ai_settings_for_provider(true).unwrap(), anthropic);
+        assert_eq!(anthropic.key_account(), "ai:anthropic:api_key");
+        assert_eq!(default_anthropic.key_account(), anthropic.key_account());
+    }
+    #[test]
+    fn unknown_and_unoffered_stored_reasoning_fall_back_to_default() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        for (anthropic, key, ids) in [
+            (false, "ai_openai_reasoning", &["unknown", "max"][..]),
+            (
+                true,
+                "ai_anthropic_reasoning",
+                &["unknown", "minimal", "xhigh"][..],
+            ),
+        ] {
+            for id in ids {
+                db.set_setting(key, id).unwrap();
+                assert_eq!(
+                    db.ai_settings_for_provider(anthropic).unwrap().reasoning,
+                    ReasoningLevel::Default
+                );
+            }
+        }
+    }
+    #[test]
+    fn anthropic_proxy_disclosure_requires_each_destination() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        let destination = |url: &str| {
+            Provider::Anthropic {
+                base_url: url.into(),
+            }
+            .destination()
+            .unwrap()
+        };
+        let official = destination("https://api.anthropic.com/v1");
+        db.accept_ai_disclosure(&official).unwrap();
+        let proxy = destination("https://proxy.example/v1/messages");
+        assert!(!db.ai_disclosed(&proxy).unwrap());
+        db.accept_ai_disclosure(&proxy).unwrap();
+        assert!(
+            db.ai_disclosed(&destination("https://proxy.example/messages"))
+                .unwrap()
+        );
+        assert!(db.ai_disclosed(&official).unwrap());
+        assert!(
+            !db.ai_disclosed(&destination("https://other.example/v1"))
+                .unwrap()
+        );
+        assert!(
+            !db.ai_disclosed(&destination("http://proxy.example/v1"))
+                .unwrap()
+        );
+        assert!(
+            !db.ai_disclosed(&destination("https://proxy.example:8443/v1"))
+                .unwrap()
+        );
+    }
     fn saved() -> SavedConversation {
         SavedConversation {
             id: "c1".into(),

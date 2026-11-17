@@ -44,7 +44,8 @@ pub fn load_config(
         provider: settings.provider.clone(),
         model: settings.model.clone(),
         api_key: shellmate_ai::ApiKey::new(secret.expose()),
-        timeouts: Default::default(),
+        reasoning: settings.reasoning,
+        timeouts: settings.reasoning.timeouts(),
     };
     config.validate()?;
     Ok(config)
@@ -66,6 +67,7 @@ pub fn needs_disclosure(destination: &str, accepted: &[String]) -> bool {
 pub struct DrawerModel {
     pub conversation: Conversation,
     pub busy: bool,
+    pub thinking: bool,
     pub error: Option<AiError>,
     pub dropped: usize,
 }
@@ -79,6 +81,7 @@ impl DrawerModel {
             answer: None,
         });
         self.busy = true;
+        self.thinking = false;
         self.error = None;
         true
     }
@@ -89,6 +92,7 @@ impl DrawerModel {
         self.conversation.turns.last_mut().unwrap().answer = None;
         self.error = None;
         self.busy = true;
+        self.thinking = false;
         true
     }
     pub fn event(&mut self, event: Event) {
@@ -96,11 +100,18 @@ impl DrawerModel {
             return;
         };
         match event {
-            Event::TextDelta(text) => turn
-                .answer
-                .get_or_insert_with(Answer::default)
-                .text
-                .push_str(&text),
+            Event::Thinking => {
+                self.thinking = turn.answer.as_ref().is_none_or(|a| a.text.is_empty());
+            }
+            Event::TextDelta(text) => {
+                if !text.is_empty() {
+                    self.thinking = false;
+                }
+                turn.answer
+                    .get_or_insert_with(Answer::default)
+                    .text
+                    .push_str(&text);
+            }
             Event::Command(card) => turn
                 .answer
                 .get_or_insert_with(Answer::default)
@@ -108,10 +119,12 @@ impl DrawerModel {
                 .push(card),
             Event::Done(_) => {
                 self.busy = false;
+                self.thinking = false;
                 self.error = None
             }
             Event::Error(e) => {
                 self.busy = false;
+                self.thinking = false;
                 self.error = Some(e)
             }
         }
@@ -185,13 +198,46 @@ mod tests {
         let mut d = DrawerModel::default();
         assert!(d.start("TOKEN=hidden", ContextSnapshot::default()));
         assert!(!d.start("duplicate", ContextSnapshot::default()));
+        d.event(Event::Thinking);
+        assert!(d.thinking);
+        assert!(d.conversation.turns[0].answer.is_none());
         d.event(Event::TextDelta("answer".into()));
+        assert!(!d.thinking);
+        d.event(Event::Thinking);
+        assert!(!d.thinking);
         d.event(Event::Error(AiError::RateLimited));
         assert!(d.retry());
+        assert!(!d.thinking);
+        d.event(Event::Thinking);
+        d.event(Event::Error(AiError::Timeout));
+        assert!(!d.thinking && !d.busy);
         assert!(d.conversation.turns[0].answer.is_none());
         assert_eq!(d.conversation.turns[0].user.redactions, 1);
         d.clear();
         assert!(d.conversation.turns.is_empty());
+    }
+    #[test]
+    fn unsaved_settings_config_uses_reasoning_timeouts_and_provider_key() {
+        use shellmate_ai::{Provider, ReasoningLevel};
+        let secrets = MemoryStore::new();
+        let settings = Settings {
+            provider: Provider::Anthropic {
+                base_url: "https://proxy.example/v1".into(),
+            },
+            model: "claude-sonnet-4-6".into(),
+            reasoning: ReasoningLevel::High,
+            ..Default::default()
+        };
+        secrets
+            .set(
+                &SecretKey::Account(settings.key_account()),
+                &shellmate_core::Secret::new("fixture-key"),
+            )
+            .unwrap();
+        let config = load_config(&settings, &secrets).unwrap();
+        assert_eq!(config.provider, settings.provider);
+        assert_eq!(config.reasoning, ReasoningLevel::High);
+        assert_eq!(config.timeouts, ReasoningLevel::High.timeouts());
     }
     #[test]
     fn locked_vault_and_cancel_never_reach_request_factory() {

@@ -11,7 +11,9 @@ use std::time::Duration;
 fn config(anthropic: bool) -> Config {
     Config {
         provider: if anthropic {
-            Provider::Anthropic
+            Provider::Anthropic {
+                base_url: "https://api.anthropic.com".into(),
+            }
         } else {
             Provider::OpenAiCompatible {
                 base_url: "https://custom.example/api/v1".into(),
@@ -24,6 +26,7 @@ fn config(anthropic: bool) -> Config {
         }
         .into(),
         api_key: ApiKey::new("fixture-api-key"),
+        reasoning: ReasoningLevel::Default,
         timeouts: Timeouts::default(),
     }
 }
@@ -120,6 +123,7 @@ async fn both_wires_stream_tools_and_use_exact_request_shape() {
         let mut done = false;
         while let Some(e) = stream.next().await {
             match e {
+                Event::Thinking => panic!("unexpected reasoning"),
                 Event::TextDelta(d) => text.push_str(&d),
                 Event::Command(c) => cards.push(c),
                 Event::Done(u) => {
@@ -408,4 +412,281 @@ async fn dropping_started_stream_releases_transport_body() {
         drop(stream);
         assert!(dropped.load(Ordering::SeqCst));
     }
+}
+
+async fn request_body(cfg: &Config, connection_test: bool) -> Value {
+    let a = matches!(cfg.provider, Provider::Anthropic { .. });
+    let http = SequencedHttpClient::new([MockHttpResponse::success_typed(
+        sse(a, "连接成功", false),
+        "text/event-stream",
+    )]);
+    let client = RigClient::with_http(cfg, http.clone()).unwrap();
+    let mut stream = if connection_test {
+        client.test_connection().unwrap()
+    } else {
+        client.start(&conversation()).unwrap()
+    };
+    let mut done = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            Event::Error(e) => panic!("safe error: {e}"),
+            Event::Done(_) => done = true,
+            _ => {}
+        }
+    }
+    assert!(done);
+    serde_json::from_slice(&http.requests()[0].body).unwrap()
+}
+
+#[tokio::test]
+async fn openai_reasoning_and_connection_test_use_level_output_caps() {
+    for (level, effort, cap) in [
+        (ReasoningLevel::Default, None, 2048),
+        (ReasoningLevel::Off, Some("none"), 2048),
+        (ReasoningLevel::Minimal, Some("minimal"), 4096),
+        (ReasoningLevel::Low, Some("low"), 4096),
+        (ReasoningLevel::Medium, Some("medium"), 8192),
+        (ReasoningLevel::High, Some("high"), 16384),
+        (ReasoningLevel::XHigh, Some("xhigh"), 32000),
+    ] {
+        let mut cfg = config(false);
+        cfg.reasoning = level;
+        for connection_test in [false, true] {
+            let body = request_body(&cfg, connection_test).await;
+            assert_eq!(body["max_tokens"], cap);
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), effort);
+            if effort.is_none() {
+                assert!(body.get("reasoning_effort").is_none());
+            }
+            if connection_test {
+                assert_eq!(body["messages"][0]["content"], "请仅回答：连接成功");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_custom_base_normalizes_endpoint_and_keeps_sensitive_auth() {
+    for suffix in ["", "/", "/v1", "/messages", "/v1/messages", "/v1/messages/"] {
+        let mut cfg = config(true);
+        cfg.provider = Provider::Anthropic {
+            base_url: format!("https://proxy.example/anthropic{suffix}"),
+        };
+        let http = SequencedHttpClient::new([MockHttpResponse::success_typed(
+            anthropic("ok", false),
+            "text/event-stream",
+        )]);
+        let client = RigClient::with_http(&cfg, http.clone()).unwrap();
+        let events = client.test_connection().unwrap().collect::<Vec<_>>().await;
+        assert!(matches!(events.last(), Some(Event::Done(_))));
+        let requests = http.requests();
+        assert_eq!(
+            requests[0].uri,
+            "https://proxy.example/anthropic/v1/messages"
+        );
+        let auth = &requests[0].headers["x-api-key"];
+        // A boolean assertion never prints even the fixture credential on failure.
+        assert!(
+            auth.to_str()
+                .is_ok_and(|value| value == cfg.api_key.expose())
+        );
+        assert!(auth.is_sensitive());
+        assert!(!requests[0].headers.contains_key("authorization"));
+    }
+}
+
+#[tokio::test]
+async fn anthropic_reasoning_uses_catalog_effort_budget_and_off_shapes() {
+    for connection_test in [false, true] {
+        let mut cfg = config(true);
+        let body = request_body(&cfg, connection_test).await;
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["max_tokens"], 2048);
+        for model in ["claude-sonnet-4-6", "unlisted-proxy-model"] {
+            cfg.model = model.into();
+            cfg.reasoning = ReasoningLevel::High;
+            let body = request_body(&cfg, connection_test).await;
+            assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+            assert_eq!(body["output_config"]["effort"], "high");
+            assert_eq!(body["max_tokens"], 16384);
+        }
+        cfg.model = "claude-opus-4-6".into();
+        cfg.reasoning = ReasoningLevel::Max;
+        let body = request_body(&cfg, connection_test).await;
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["max_tokens"], 32000);
+        // Dated ids must resolve with the same rule as rig's Messages wire.
+        cfg.model = "claude-haiku-4-5-20251001".into();
+        for (level, budget, cap) in [
+            (ReasoningLevel::Low, 2048, 6144),
+            (ReasoningLevel::Medium, 6144, 10240),
+            (ReasoningLevel::High, 14336, 18432),
+            (ReasoningLevel::Max, 30000, 34096),
+        ] {
+            cfg.reasoning = level;
+            let body = request_body(&cfg, connection_test).await;
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled", "budget_tokens":budget})
+            );
+            assert!(body.get("output_config").is_none());
+            assert_eq!(body["max_tokens"], cap);
+            let facts = rig_core::catalog::ModelFacts::default();
+            let range = facts
+                .for_model("anthropic", &cfg.model)
+                .unwrap()
+                .reasoning
+                .budget()
+                .unwrap();
+            assert!(range.contains(&budget));
+            assert!(budget >= 1024 && u64::from(budget) < body["max_tokens"].as_u64().unwrap());
+        }
+        for model in ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"] {
+            cfg.model = model.into();
+            cfg.reasoning = ReasoningLevel::Off;
+            let body = request_body(&cfg, connection_test).await;
+            assert_eq!(body["thinking"], json!({"type":"disabled"}));
+            assert_eq!(body["max_tokens"], 2048);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_reasoning_is_safe_for_encoding_and_http_errors() {
+    let mut cfg = config(true);
+    cfg.model = "claude-opus-4-5".into();
+    cfg.reasoning = ReasoningLevel::Max; // Catalog lists low / medium / high only.
+    let http = SequencedHttpClient::new([]);
+    let client = RigClient::with_http(&cfg, http.clone()).unwrap();
+    for result in [client.start(&conversation()), client.test_connection()] {
+        assert!(matches!(result, Err(AiError::UnsupportedReasoning)));
+    }
+    assert!(http.requests().is_empty());
+    for a in [false, true] {
+        for field in [
+            "reasoning_effort",
+            "thinking",
+            "budget_tokens",
+            "output_config",
+        ] {
+            let http = SequencedHttpClient::new([MockHttpResponse::error(
+                StatusCode::BAD_REQUEST,
+                json!({"error":{"type":"invalid_request_error","message":format!("SECRET {field} rejected")}}).to_string(),
+            )]);
+            let client = RigClient::with_http(&config(a), http).unwrap();
+            let event = client.test_connection().unwrap().next().await;
+            assert!(matches!(
+                event,
+                Some(Event::Error(AiError::UnsupportedReasoning))
+            ));
+        }
+    }
+    assert_eq!(
+        AiError::UnsupportedReasoning.to_string(),
+        "当前模型不支持所选思考等级，请在设置中改为「默认」或其他等级"
+    );
+}
+
+fn reasoning_sse(a: bool) -> String {
+    if a {
+        let events = [
+            json!({"type":"message_start","message":{"id":"msg_r","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"PRIVATE_REASONING"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"_MORE"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"PRIVATE_SIGNATURE"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"公开回答"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
+            json!({"type":"message_stop"}),
+        ];
+        events
+            .into_iter()
+            .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+            .collect()
+    } else {
+        let reasoning = ["PRIVATE_REASONING", "_MORE"].into_iter().map(|text| {
+            let v = json!({"id":"chat-1","object":"chat.completion.chunk","created":1,"model":"custom-model","choices":[{"index":0,"delta":{"reasoning_content":text},"finish_reason":null}]});
+            format!("data: {v}\n\n")
+        }).collect::<String>();
+        reasoning + &openai("公开回答", false)
+    }
+}
+
+#[tokio::test]
+async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_history() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            MockHttpResponse::success_typed(reasoning_sse(a), "text/event-stream"),
+            MockHttpResponse::success_typed(sse(a, "后续回答", false), "text/event-stream"),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let mut c = conversation();
+        let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
+        assert!(matches!(events.first(), Some(Event::Thinking)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Thinking))
+                .count(),
+            1
+        );
+        assert!(matches!(events.last(), Some(Event::Done(_))));
+        let mut answer = Answer::default();
+        for event in events {
+            match event {
+                Event::TextDelta(text) => answer.text.push_str(&text),
+                Event::Command(card) => answer.commands.push(card),
+                Event::Error(e) => panic!("safe error: {e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(answer.text, "公开回答");
+        assert!(answer.commands.is_empty());
+        c.turns[0].answer = Some(answer);
+        c.turns.push(Turn {
+            user: UserTurn::redacted("继续", ContextSnapshot::default()),
+            answer: None,
+        });
+        let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
+        assert!(matches!(events.last(), Some(Event::Done(_))));
+        let body = String::from_utf8(http.requests()[1].body.to_vec()).unwrap();
+        assert!(!body.contains("PRIVATE_"));
+        assert!(!body.contains("thinking"));
+        assert!(!body.contains("reasoning_content"));
+        assert!(body.contains("公开回答"));
+    }
+}
+
+#[tokio::test]
+async fn reasoning_activity_resets_idle_timeout() {
+    // Each fragment arrives within idle, but the answer takes longer than idle.
+    // PacedStreamingClient intentionally stays open after its last chunk.
+    let chunks = [
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private one\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private two\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private three\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+    ];
+    let mut cfg = config(false);
+    cfg.timeouts.idle = Duration::from_millis(100);
+    let client = RigClient::with_http(
+        &cfg,
+        PacedStreamingClient {
+            chunks: chunks.into(),
+            gap: Duration::from_millis(40),
+        },
+    )
+    .unwrap();
+    let mut stream = client.start(&conversation()).unwrap();
+    assert!(matches!(stream.next().await, Some(Event::Thinking)));
+    assert!(matches!(stream.next().await, Some(Event::TextDelta(text)) if text == "answer"));
+    assert!(matches!(
+        stream.next().await,
+        Some(Event::Error(AiError::Timeout))
+    ));
 }

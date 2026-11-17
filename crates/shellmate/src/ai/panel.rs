@@ -789,10 +789,21 @@ impl Render for Drawer {
                     body = body.child(reply);
                 }
             }
-            if self.pending || self.model.busy {
+            if self.pending
+                || (self.model.busy
+                    && self
+                        .model
+                        .conversation
+                        .turns
+                        .last()
+                        .and_then(|t| t.answer.as_ref())
+                        .is_none_or(|a| a.text.is_empty()))
+            {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(
                     if self.pending {
                         "正在准备请求…"
+                    } else if self.model.thinking {
+                        "正在思考…"
                     } else {
                         "正在分析当前会话输出…"
                     },
