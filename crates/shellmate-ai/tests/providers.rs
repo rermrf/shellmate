@@ -666,24 +666,18 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
 
 #[tokio::test]
 async fn reasoning_activity_resets_idle_timeout() {
-    // Each fragment arrives within idle, but the answer takes longer than idle.
+    // Each reasoning fragment arrives well within idle (60 ms of 300 ms, so a busy CI runner
+    // has room), but together they keep the answer back for longer than idle.
     // PacedStreamingClient intentionally stays open after its last chunk.
-    let chunks = [
-        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private one\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private two\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private three\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
-    ];
+    const REASONING: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private\"},\"finish_reason\":null}]}\n\n";
+    const ANSWER: &str = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n";
+    let gap = Duration::from_millis(60);
     let mut cfg = config(false);
-    cfg.timeouts.idle = Duration::from_millis(100);
-    let client = RigClient::with_http(
-        &cfg,
-        PacedStreamingClient {
-            chunks: chunks.into(),
-            gap: Duration::from_millis(40),
-        },
-    )
-    .unwrap();
+    cfg.timeouts.idle = Duration::from_millis(300);
+    let mut chunks = vec![REASONING; 8];
+    chunks.push(ANSWER);
+    assert!(gap * (chunks.len() as u32 - 1) > cfg.timeouts.idle);
+    let client = RigClient::with_http(&cfg, PacedStreamingClient { chunks, gap }).unwrap();
     let mut stream = client.start(&conversation()).unwrap();
     assert!(matches!(stream.next().await, Some(Event::Thinking)));
     assert!(matches!(stream.next().await, Some(Event::TextDelta(text)) if text == "answer"));
