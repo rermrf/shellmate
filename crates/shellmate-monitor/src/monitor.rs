@@ -65,7 +65,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            grace: Duration::from_secs(10),
+            grace: Duration::from_secs(60),
             stall: Duration::from_secs(20),
             probe_timeout: Duration::from_secs(25),
             action_timeout: Duration::from_secs(30),
@@ -193,6 +193,7 @@ struct State {
     grace: Option<AbortOnDrop>,
     /// Which run is current; tasks of older runs change nothing.
     generation: u64,
+    probe_cell: Arc<tokio::sync::OnceCell<Arc<Probe>>>,
     phase: Phase,
     probe: Option<Arc<Probe>>,
     engine: Option<Engine>,
@@ -215,6 +216,7 @@ struct Inner {
     wake_docker: Arc<Notify>,
     /// The next look at the containers also asks for the disk usage (somebody pressed a button).
     docker_full: Arc<AtomicBool>,
+    disconnect: watch::Sender<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -225,7 +227,11 @@ impl Inner {
     /// Sends `event` unless the monitor was shut down. Called with the state locked, so that nothing
     /// slips out after `shutdown` has returned.
     fn emit(&self, state: &State, event: MonitorEvent) {
-        if !state.closed {
+        if !state.closed
+            && (state.run_alive
+                || state.active
+                || !matches!(event, MonitorEvent::Probe(_) | MonitorEvent::Services(_) | MonitorEvent::Docker(_)))
+        {
             // A UI that stopped listening is not an error.
             let _ = self.events.try_send(event);
         }
@@ -258,13 +264,18 @@ impl Inner {
             engine.reset_baselines();
         }
         self.set_phase(state, Phase::Starting);
-        let task = Task {
+        let task = self.task(state);
+        state.run = Some(AbortOnDrop(self.runtime.spawn(task.run())));
+    }
+
+    fn task(self: &Arc<Self>, state: &State) -> Task {
+        Task {
             inner: Arc::downgrade(self),
             slot: self.slot.clone(),
             generation: state.generation,
             options: self.options.clone(),
-        };
-        state.run = Some(AbortOnDrop(self.runtime.spawn(task.run())));
+            probe_cell: state.probe_cell.clone(),
+        }
     }
 
     /// The grace period after the last viewer left is over.
@@ -287,6 +298,7 @@ struct Task {
     slot: Arc<Mutex<Option<WeakConnection>>>,
     generation: u64,
     options: Options,
+    probe_cell: Arc<tokio::sync::OnceCell<Arc<Probe>>>,
 }
 
 impl Task {
@@ -322,7 +334,7 @@ impl Task {
 
             let probe = match self.with(|_, state| state.probe.clone()) {
                 Some(Some(probe)) => probe,
-                Some(None) => match self.probe(&connection).await {
+                Some(None) => match self.shared_probe(&connection).await {
                     Ok(probe) => {
                         let stored = self.with(|inner, state| {
                             state.probe = Some(probe.clone());
@@ -431,6 +443,10 @@ impl Task {
         true
     }
 
+    async fn shared_probe(&self, connection: &Connection) -> Result<Arc<Probe>, String> {
+        self.probe_cell.get_or_try_init(|| self.probe(connection)).await.cloned()
+    }
+
     async fn probe(&self, connection: &Connection) -> Result<Arc<Probe>, String> {
         let token = self.options.token.clone().unwrap_or_else(new_token);
         let options = ExecOptions { timeout: self.options.probe_timeout, max_output: 512 << 10 };
@@ -486,6 +502,7 @@ impl Monitor {
             run: None,
             grace: None,
             generation: 0,
+            probe_cell: Arc::default(),
             phase: Phase::Idle,
             probe: None,
             engine: None,
@@ -502,6 +519,7 @@ impl Monitor {
                 options,
                 slot: Arc::new(Mutex::new(None)),
                 state: Mutex::new(state),
+                disconnect: watch::channel(()).0,
                 focus: watch::channel(Focus::Overview).0,
                 wake_services: Arc::new(Notify::new()),
                 wake_docker: Arc::new(Notify::new()),
@@ -519,8 +537,19 @@ impl Monitor {
         if state.closed {
             return;
         }
-        state.active = active;
+        let was_active = std::mem::replace(&mut state.active, active);
         if active {
+            if !was_active {
+                if let Some(probe) = &state.probe {
+                    inner.emit(&state, MonitorEvent::Probe(probe.clone()));
+                }
+                if let Some(services) = &state.services {
+                    inner.emit(&state, MonitorEvent::Services(services.clone()));
+                }
+                if let Some(view) = state.docker.as_ref().and_then(|docker| docker.view()) {
+                    inner.emit(&state, MonitorEvent::Docker(view));
+                }
+            }
             state.grace = None;
             inner.ensure_running(&mut state);
         } else if state.run_alive && state.grace.is_none() {
@@ -554,6 +583,9 @@ impl Monitor {
             return;
         }
         *lock(&inner.slot) = None;
+        state.generation += 1;
+        state.probe_cell = Arc::default();
+        inner.disconnect.send_replace(());
         state.run = None;
         state.run_alive = false;
         state.actions.clear();
@@ -576,12 +608,48 @@ impl Monitor {
     pub fn shutdown(&self) {
         let mut state = lock(&self.inner.state);
         state.closed = true;
+        self.inner.disconnect.send_replace(());
         *lock(&self.inner.slot) = None;
         // Dropped here, under the lock, so no task can start or report in between.
         let (run, grace, actions) = (state.run.take(), state.grace.take(), std::mem::take(&mut state.actions));
         state.run_alive = false;
         drop(state);
         drop((run, grace, actions));
+    }
+
+    /// Warm the inactive monitor once, without starting a collector, events or stats streams.
+    pub async fn prefetch(&self) {
+        let (task, connection, mut disconnect) = {
+            let state = lock(&self.inner.state);
+            if state.closed || state.run_alive || state.active {
+                return;
+            }
+            let Some(connection) = self.inner.connection() else { return };
+            (self.inner.task(&state), connection, self.inner.disconnect.subscribe())
+        };
+        let warm = async {
+            let probe = match task.with(|_, state| state.probe.clone()) {
+                Some(Some(probe)) => probe,
+                Some(None) => {
+                    let Ok(probe) = task.shared_probe(&connection).await else { return };
+                    if task
+                        .with(|_, state| {
+                            state.probe = Some(probe.clone());
+                            state.engine = Some(Engine::new(probe.clone()));
+                        })
+                        .is_none()
+                    {
+                        return;
+                    }
+                    probe
+                }
+                None => return,
+            };
+            if probe.can_collect() {
+                task.prefetch_pages(&probe).await;
+            }
+        };
+        tokio::select! { biased; _ = disconnect.changed() => {}, () = warm => {} }
     }
 
     /// The newest numbers, if any frame came in yet.

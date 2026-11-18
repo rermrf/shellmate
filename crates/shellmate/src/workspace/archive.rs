@@ -255,6 +255,12 @@ impl Workspace {
             .set_preference(key, value)
             .map_err(|e| e.to_string())?;
         self.preferences.set(key, value);
+        if key == P::PreloadPanels && !value {
+            for group in &mut self.groups {
+                group.preload = None;
+                group.preload_after = None;
+            }
+        }
         let ids = self.sessions.iter().map(|s| s.id).collect::<Vec<_>>();
         for id in ids {
             self.apply_terminal_preferences(id, cx);

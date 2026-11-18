@@ -98,14 +98,16 @@ fn the_script_writes_frames_on_schedule_under_every_shell() {
         assert_eq!(ticks, 41, "{shell}: a tick line every tick, 0 to 40");
         let count = |kind| frames.iter().filter(|frame| frame.kind == kind).count();
         // Ticks 0, 2, ..., 40 (21 system frames); 0, 3, ..., 39 (14 process frames); tick 1 (the first slow one).
-        assert_eq!(count(FrameKind::Stats), 20, "{shell}: every 2nd tick (the last one is cut off by the stop marker)");
-        assert_eq!(count(FrameKind::Procs), 14, "{shell}: every 3rd tick");
+        assert_eq!(count(FrameKind::Stats), 21, "{shell}: baseline plus every 2nd tick");
+        assert_eq!(count(FrameKind::Procs), 15, "{shell}: baseline plus every 3rd tick");
         assert_eq!(count(FrameKind::Slow), 2, "{shell}: ticks 1 and 31");
         assert!(frames.iter().all(|f| f.stamp > 190000.0), "{shell}: the stamp is the uptime of the fake");
         // The frames are in tick order: a stats frame first, as the first thing the engine needs (memory
         // total) comes before the processes.
         assert_eq!(frames[0].kind, FrameKind::Stats, "{shell}");
         assert_eq!(frames[1].kind, FrameKind::Procs, "{shell}");
+        assert_eq!(frames[2].kind, FrameKind::Stats, "{shell}: warm system frame");
+        assert_eq!(frames[3].kind, FrameKind::Procs, "{shell}: warm process frame");
         // The process frames say which process the script is (`$$`), and only they: the monitor hides it.
         let pids: Vec<Option<u32>> = frames.iter().filter(|f| f.kind == FrameKind::Procs).map(|f| f.pid).collect();
         assert!(pids.iter().all(|pid| pid.is_some_and(|pid| pid > 1)), "{shell}: {pids:?}");
@@ -184,6 +186,20 @@ fn what_the_frames_hold_after_the_engine_has_read_them() {
 }
 
 #[test]
+fn warmup_falls_back_when_sleep_rejects_fractions() {
+    let root = FakeRoot::new(Ps::Busybox);
+    std::fs::write(root.bin().join("sleep"), "#!/bin/sh\necho \"sleep $1\" >> \"$CALLS\"\n[ \"$1\" != 0.5 ]\n")
+        .unwrap();
+    let (frames, _) = frames(&run("/bin/sh", &root, &config(&root), 1));
+    let calls = std::fs::read_to_string(root.calls_log()).unwrap();
+    assert!(calls.contains("sleep 0.5\nsleep 1\n"));
+    assert_eq!(
+        frames.iter().map(|frame| frame.kind).collect::<Vec<_>>(),
+        [FrameKind::Stats, FrameKind::Procs, FrameKind::Stats, FrameKind::Procs]
+    );
+}
+
+#[test]
 fn busybox_style_ps_is_found_by_trying_and_without_ps_the_short_names_are_used() {
     for shell in shells() {
         let root = FakeRoot::new(Ps::Busybox);
@@ -228,11 +244,12 @@ fn at_most_three_forks_per_tick_and_the_disk_check_only_asks_about_local_file_sy
         per_tick[0] -= 1;
         let busiest = per_tick.iter().copied().max().unwrap();
         assert_eq!(busiest, 3, "{shell}: sleep + cut + ps on a process tick that asks for ps: {per_tick:?}");
-        for (tick, forks) in per_tick.iter().enumerate().take(64) {
+        assert_eq!(per_tick[0], 3, "baseline: cut, ps, short sleep");
+        for (tick, forks) in per_tick.iter().skip(1).enumerate().take(64) {
             // `ps` only when the list of processes changed (the first frame) or after 10 frames without it:
             // process frames 0 and 11, ticks 0 and 33.
             let process = tick % 3 == 0;
-            let ps = process && (tick == 0 || tick == 33);
+            let ps = process && (tick == 30 || tick == 63);
             let expected = 1 + usize::from(process) + usize::from(ps) + usize::from(tick % 30 == 1);
             assert_eq!(*forks, expected, "{shell}: tick {tick}");
         }
@@ -243,8 +260,8 @@ fn at_most_three_forks_per_tick_and_the_disk_check_only_asks_about_local_file_sy
         // Fewer processes are asked about at all: ps ran at tick 0 and 33 only.
         assert_eq!(
             calls.lines().filter(|line| line.starts_with("ps ")).count(),
-            3,
-            "{shell}: tick 0, 33 and the detection"
+            4,
+            "{shell}: detection, baseline, ticks 30 and 63"
         );
         // Every forked process is one of ours.
         assert!(
@@ -269,7 +286,7 @@ fn the_script_ends_by_itself_when_its_output_is_closed() {
         let mut reader = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
-        assert!(line.starts_with("@@tok123 tick 0"), "{line}");
+        assert!(line.starts_with("@@tok123 stats "), "{line}");
         // The reader goes away, as the SSH channel does when it is closed.
         drop(reader);
         let started = Instant::now();

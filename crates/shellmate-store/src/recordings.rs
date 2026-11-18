@@ -64,9 +64,10 @@ pub enum Preference {
     FollowDirectory,
     PromptHighlight,
     ReplayTimestamps,
+    PreloadPanels,
 }
 impl Preference {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -78,6 +79,7 @@ impl Preference {
         Self::FollowDirectory,
         Self::PromptHighlight,
         Self::ReplayTimestamps,
+        Self::PreloadPanels,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -92,6 +94,7 @@ impl Preference {
             Self::FollowDirectory => "follow_directory",
             Self::PromptHighlight => "prompt_highlight",
             Self::ReplayTimestamps => "replay_timestamps",
+            Self::PreloadPanels => "preload_panels",
         }
     }
     pub fn label(self) -> &'static str {
@@ -107,6 +110,7 @@ impl Preference {
             Self::FollowDirectory => "文件面板跟随终端目录",
             Self::PromptHighlight => "提示符高亮",
             Self::ReplayTimestamps => "回放时间",
+            Self::PreloadPanels => "连接后预加载文件与监控",
         }
     }
     pub fn description(self) -> &'static str {
@@ -118,18 +122,19 @@ impl Preference {
             Self::AutoRecord => "对新会话生效",
             Self::LoginShell => "加载 ~/.zprofile，PATH 与系统终端一致 · 对新会话生效",
             Self::FollowDirectory => "通过 OSC 7 / shell 集成上报当前目录",
+            Self::PreloadPanels => "SSH 连接后在后台打开文件列表、探测系统信息，打开文件、监控时无需等待",
             _ => "",
         }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
-    values: [bool; 11],
+    values: [bool; 12],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            values: [true, true, true, true, true, false, false, true, true, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true, true],
         }
     }
 }
@@ -177,6 +182,7 @@ mod tests {
     fn preferences_defaults_and_each_toggle_roundtrip() {
         let mut s = HostStore::open_in_memory().unwrap();
         let p = s.preferences().unwrap();
+        assert!(p.get(Preference::PreloadPanels));
         for key in Preference::ALL {
             assert_eq!(
                 p.get(key),

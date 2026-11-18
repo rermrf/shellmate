@@ -11,6 +11,57 @@ fn names(entries: &[shellmate_sftp::Entry]) -> Vec<&str> {
 }
 
 #[tokio::test]
+async fn openssh_first_paint_over_stdio_preserves_all_pages_and_canonical_paths() {
+    use std::{
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        path::Path,
+        process::{Command, Stdio},
+    };
+    let Some(server) =
+        ["/usr/libexec/sftp-server", "/usr/lib/openssh/sftp-server"].into_iter().find(|path| Path::new(path).exists())
+    else {
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    for index in 0..251 {
+        std::fs::write(home.path().join(format!("file{index}")), []).unwrap();
+    }
+    std::os::unix::fs::symlink("file0", home.path().join("link")).unwrap();
+    let (client, peer) = UnixStream::pair().unwrap();
+    let mut child = Command::new(server)
+        .args(["-d"])
+        .arg(home.path())
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .stdin(Stdio::from(OwnedFd::from(peer.try_clone().unwrap())))
+        .stdout(Stdio::from(OwnedFd::from(peer)))
+        .spawn()
+        .unwrap();
+    client.set_nonblocking(true).unwrap();
+    let session =
+        shellmate_sftp::SftpSession::from_stream(tokio::net::UnixStream::from_std(client).unwrap()).await.unwrap();
+    let result = session.listing(".").await;
+    let canonical = home.path().canonicalize().unwrap();
+    assert_eq!(result.dir.as_deref(), canonical.to_str());
+    let mut rows = result.entries.clone().unwrap();
+    assert_eq!(rows.len(), 252);
+    for row in &rows {
+        assert_eq!(Path::new(&row.path), canonical.join(&row.name));
+    }
+    let link = rows.iter().find(|row| row.name == "link").unwrap();
+    assert!(link.link.is_none());
+    session.describe_links(&mut rows).await;
+    assert_eq!(rows.iter().find(|row| row.name == "link").unwrap().link.as_ref().unwrap().target, "file0");
+    assert!(session.cached(".").is_some() && session.cached(canonical.to_str().unwrap()).is_some());
+    session.mkdir(canonical.join("new").to_str().unwrap()).await.unwrap();
+    assert!(session.cached(".").is_none());
+    assert!(session.info().await.posix_rename());
+    drop(session);
+    let _ = child.kill();
+    child.wait().unwrap();
+}
+
+#[tokio::test]
 async fn the_session_starts_in_the_home_directory() {
     let fx = Fixture::default().await;
     assert_eq!(fx.session.home().await.unwrap(), "/home/tester");
@@ -22,12 +73,12 @@ async fn the_session_starts_in_the_home_directory() {
 #[tokio::test]
 async fn the_server_extensions_are_reported() {
     let with = Fixture::default().await;
-    assert!(with.session.info().posix_rename());
-    assert!(with.session.info().has("fsync@openssh.com"));
-    assert_eq!(with.session.info().version, 3);
+    assert!(with.session.info().await.posix_rename());
+    assert!(with.session.info().await.has("fsync@openssh.com"));
+    assert_eq!(with.session.info().await.version, 3);
     let without = Fixture::start(SftpOptions { posix_rename: false, ..Default::default() }).await;
-    assert!(!without.session.info().posix_rename());
-    assert!(!without.session.info().has("posix-rename@openssh.com"));
+    assert!(!without.session.info().await.posix_rename());
+    assert!(!without.session.info().await.has("posix-rename@openssh.com"));
 }
 
 #[tokio::test]

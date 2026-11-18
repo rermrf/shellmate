@@ -845,6 +845,11 @@ impl Terminal {
         self.cwd.as_deref()
     }
 
+    /// Whether this attached backend has produced bytes, excluding local connection notices.
+    pub fn has_backend_output(&self) -> bool {
+        self.agent.lock().last_output.is_some()
+    }
+
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
     }

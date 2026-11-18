@@ -38,7 +38,7 @@ impl Rig {
         fx.logs.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         let session = fx.new_session().await;
         if let Some(seconds) = timeout_secs {
-            session.set_request_timeout(seconds);
+            session.set_request_timeout(seconds).await;
         }
         queue.set_session(Some(Arc::new(session)));
         let local = tempfile::tempdir().unwrap();
@@ -1021,7 +1021,7 @@ async fn a_session_replaced_without_a_gap_carries_running_items_over() {
 #[tokio::test]
 async fn requests_follow_the_servers_limits() {
     let rig = Rig::with(SftpOptions { limits: Some((65_536, 16_384, 20_000)), ..Default::default() }).await;
-    assert!(rig.fx.session.info().limits.is_some());
+    assert!(rig.fx.session.info().await.limits.is_some());
     let content = pattern(600_000, 80);
     let id = rig.queue.enqueue_upload(vec![rig.source("a.bin", &content, 0o644)], "/up");
     assert_eq!(rig.finished(id).await.state, TransferState::Done);
@@ -1039,7 +1039,7 @@ async fn requests_follow_the_servers_limits() {
 #[tokio::test]
 async fn without_limits_requests_are_modest() {
     let rig = Rig::new().await;
-    assert!(rig.fx.session.info().limits.is_none());
+    assert!(rig.fx.session.info().await.limits.is_none());
     let id = rig.queue.enqueue_upload(vec![rig.source("a.bin", &pattern(300_000, 81), 0o644)], "/up");
     rig.finished(id).await;
     let longest = rig.fx.logs.writes.lock().unwrap().iter().map(|(_, _, len)| *len).max().unwrap();

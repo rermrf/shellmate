@@ -20,23 +20,7 @@ pub enum LinkStatus {
     Disconnected,
 }
 
-/// What a listing task found.
-#[derive(Debug)]
-pub struct Listed {
-    /// The directory as the server spells it (`.` asks for the home directory); `None` if even that failed.
-    pub dir: Option<String>,
-    /// The entries, or why the directory cannot be listed.
-    pub entries: Result<Vec<Entry>, SftpError>,
-    /// `stat` of the directory itself. Known even when listing it is refused (`/root`).
-    pub stat: Option<Entry>,
-}
-
-impl Listed {
-    /// A listing that could not even start.
-    pub fn failed(error: SftpError) -> Self {
-        Self { dir: None, entries: Err(error), stat: None }
-    }
-}
+pub use shellmate_sftp::Listed;
 
 /// What an answer from a listing task did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,7 +420,10 @@ impl FilesModel {
                 let _ = was_ready;
                 None
             }
-            LinkStatus::Connecting => None,
+            LinkStatus::Connecting => {
+                self.pending = None;
+                None
+            }
         }
     }
 
@@ -459,7 +446,7 @@ impl FilesModel {
     /// Where the panel starts: the directory the terminal reported, else the home directory
     /// (`None`; the caller asks the server).
     fn start_dir(&self) -> Option<String> {
-        self.terminal_cwd.clone()
+        self.terminal_cwd.clone().filter(|_| self.follow)
     }
 
     // ---- loading ------------------------------------------------------------------------------------
@@ -582,6 +569,19 @@ impl FilesModel {
             }
         }
         Applied::Shown
+    }
+
+    pub fn show_cached(&mut self, request: &Request, listed: Listed) {
+        if self.apply_listed(request.id, listed) == Applied::Shown {
+            self.pending = Some(Request { cause: Cause::Refresh, ..request.clone() });
+        }
+    }
+
+    pub fn describe_rows(&mut self, id: u64, mut entries: Vec<Entry>) {
+        if self.link == LinkStatus::Ready && self.next_request == id + 1 && self.pending.is_none() {
+            entries.retain(|entry| !self.hidden.contains(&entry.path));
+            self.entries = entries;
+        }
     }
 
     fn selection_exists(&self, selection: &Selection) -> bool {
@@ -990,6 +990,25 @@ mod tests {
         first.apply(request.id, ok(&request, vec![file("hosts")]));
         assert_eq!((first.cwd(), second.cwd()), ("/etc", "/var/log"));
         assert_eq!(second.selected_entry().map(|e| e.name.as_str()), Some("syslog"));
+    }
+
+    #[test]
+    fn cached_navigation_keeps_rows_on_failure_and_ignores_old_descriptions() {
+        let mut model = at_app();
+        let request = model.go_to("/cached").unwrap();
+        model.show_cached(
+            &request,
+            Listed { dir: Some("/cached".into()), entries: Ok(vec![file("cached")]), stat: None },
+        );
+        assert_eq!(model.cwd(), "/cached");
+        model.apply_listed(request.id, Listed::failed(SftpError::PermissionDenied { path: "/cached".into() }));
+        assert!(model.banner().is_some());
+        let next = model.go_to("/new").unwrap();
+        model.describe_rows(request.id, vec![]);
+        assert_eq!(model.entries()[0].name, "cached");
+        model.apply(next.id, ok(&next, vec![file("new")]));
+        model.describe_rows(request.id, vec![]);
+        assert_eq!(model.entries()[0].name, "new");
     }
 
     #[test]

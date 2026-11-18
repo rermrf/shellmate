@@ -22,7 +22,7 @@ use shellmate_ssh::SshRuntime;
 use shellmate_term::{Terminal, TerminalEvent};
 use tokio::task::AbortHandle;
 
-use super::model::{Applied, DeleteRequest, FilesModel, LinkStatus, Listed, Request, Row};
+use super::model::{Applied, DeleteRequest, FilesModel, LinkStatus, Request, Row};
 use super::transfers::{Reveal, RowAction, TransferList, ensure_downloads_dir, reveal};
 use crate::dialogs::confirm::ConfirmDialog;
 use crate::editor::refusal::is_refusal;
@@ -203,6 +203,9 @@ impl FilesPanel {
         if !session_changed && self.model.link() == &status {
             return;
         }
+        if session_changed && let Some(task) = self.listing_abort.take() {
+            task.abort();
+        }
         self.session = session;
         if !matches!(status, LinkStatus::Ready) {
             self.menu = None;
@@ -262,33 +265,47 @@ impl FilesPanel {
         if let Some(previous) = self.listing_abort.take() {
             previous.abort();
         }
+        if let Some(cached) = session.cached(&request.dir) {
+            let changed_dir = cached.dir.as_deref() != Some(self.model.cwd());
+            self.model.show_cached(&request, (*cached).clone());
+            if changed_dir {
+                self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+            }
+        }
         let used = session.clone();
-        let join = self.runtime.spawn(async move {
-            // `.` is the home directory: ask the server where that is.
-            let dir = if request.dir == "." {
-                match session.home().await {
-                    Ok(home) => home,
-                    Err(err) => return Listed::failed(err),
-                }
-            } else {
-                request.dir.clone()
-            };
-            // The directory's own attributes come even when listing it is refused (`/root`).
-            let (entries, stat) = tokio::join!(session.list(&dir), session.stat_named(&dir));
-            Listed { dir: Some(dir), entries, stat: stat.ok() }
-        });
+        let join = self.runtime.spawn(async move { session.listing(&request.dir).await });
         self.listing_abort = Some(join.abort_handle());
         cx.spawn(async move |this, cx| {
-            let result =
-                join.await.unwrap_or_else(|err| Listed::failed(SftpError::Protocol(format!("任务异常终止：{err}"))));
+            let Ok(result) = join.await else { return };
             this.update(cx, |this, cx| {
                 let listed = began.elapsed();
                 let summary =
                     result.entries.as_ref().ok().zip(result.dir.clone()).map(|(entries, dir)| (dir, entries.len()));
                 let before = this.model.cwd().to_string();
                 let applying = Instant::now();
-                if this.model.apply_listed(id, result) == Applied::SessionLost {
-                    cx.emit(FilesEvent::SessionLost(used));
+                match this.model.apply_listed(id, (*result).clone()) {
+                    Applied::SessionLost => cx.emit(FilesEvent::SessionLost(used)),
+                    Applied::Stale => return,
+                    Applied::Shown => {
+                        if let Ok(entries) = &result.entries
+                            && entries.iter().any(|entry| entry.kind == shellmate_sftp::EntryKind::Symlink)
+                        {
+                            let job = this.runtime.spawn(async move { used.enrich(&result).await });
+                            this.listing_abort = Some(job.abort_handle());
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(Some(updated)) = job.await
+                                    && let Ok(entries) = &updated.entries
+                                {
+                                    this.update(cx, |this, cx| {
+                                        this.model.describe_rows(id, entries.clone());
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }
+                            })
+                            .detach();
+                        }
+                    }
                 }
                 if let Some((dir, count)) = summary {
                     log::info!(
@@ -396,6 +413,12 @@ impl FilesPanel {
         let request = self.model.refresh();
         self.start(request, cx);
         cx.notify();
+    }
+
+    pub(crate) fn refresh_visible(&mut self, cx: &mut Context<Self>) {
+        if self.model.link() == &LinkStatus::Ready && !self.model.is_loading() {
+            self.refresh(cx);
+        }
     }
 
     pub(super) fn go_to(&mut self, dir: &str, cx: &mut Context<Self>) {

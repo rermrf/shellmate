@@ -146,16 +146,21 @@ async fn a_session_that_will_not_open_is_reported_and_not_retried_on_its_own() {
         SshHost::new("127.0.0.1", server.port, "alice", AuthMethod::Password).with_password(Secret::new("secret"));
     let connection: Connection = Connection::connect(Route::direct(host), env.trusting()).await.unwrap();
     let link = new_link();
+    link.connection_restored(&connection);
+    link.prefetch(".".into(), true).await;
+    assert!(lock(&server.state.subsystem_requests).is_empty(), "reconnect without a previous open");
+    link.prefetch(".".into(), false).await;
+    assert!(matches!(link.state(), LinkState::Idle), "a speculative refusal stays silent");
     link.open(&connection);
     eventually("the failure", || matches!(link.state(), LinkState::Failed(_)).then_some(())).await;
     let LinkState::Failed(reason) = link.state() else { unreachable!() };
     assert_eq!(reason, "无法打开会话：服务器拒绝了「sftp」子系统请求");
     link.handle_event(&TransferEvent::SessionLost);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(lock(&server.state.subsystem_requests).len(), 1, "no loop");
+    assert_eq!(lock(&server.state.subsystem_requests).len(), 2, "no loop");
     // Asking again (the refresh button) is allowed to try.
     link.open(&connection);
-    eventually("a second try", || (lock(&server.state.subsystem_requests).len() == 2).then_some(())).await;
+    eventually("another foreground try", || (lock(&server.state.subsystem_requests).len() == 3).then_some(())).await;
 }
 
 #[tokio::test]

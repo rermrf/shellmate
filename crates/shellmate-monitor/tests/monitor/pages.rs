@@ -98,13 +98,8 @@ const INSPECT: &str = r#"{"id":"aaaa1111","name":"/shop-web-1","restarts":0,"oom
 #[tokio::test]
 async fn services_are_listed_with_their_details_while_the_monitor_collects() {
     let (server, fake) = server(probe(true, None, "alice adm")).await;
-    fake.answer("systemctl list-units", UNITS);
-    fake.answer("systemctl list-unit-files", FILES);
-    fake.answer("systemctl show", SHOW);
-    fake.answer(
-        "journalctl -u shellmate-broken.service",
-        "ERROR: cannot start the broken demo\nFailed to start shellmate-broken.service - Shellmate test (broken).\n",
-    );
+    fake.answer("systemctl list-units", &format!("{UNITS}\0{FILES}\0"));
+    fake.answer("systemctl show", &format!("{SHOW}\0ERROR: cannot start the broken demo\nFailed to start shellmate-broken.service - Shellmate test (broken).\n\0"));
     let connection = connect(&server, &Env::new()).await;
     let (monitor, events) = monitor(options());
     monitor.connection_restored(&connection);
@@ -132,7 +127,7 @@ async fn services_are_listed_with_their_details_while_the_monitor_collects() {
     assert_eq!(asked, 1);
 
     // Asking again at once, after an action: a changed answer arrives without waiting for the timer.
-    fake.answer("systemctl show", &SHOW.replace("MemoryCurrent=2203648", "MemoryCurrent=3000000"));
+    fake.answer("systemctl show", &format!("{}\0", SHOW.replace("MemoryCurrent=2203648", "MemoryCurrent=3000000")));
     monitor.refresh(Topic::Services);
     let changed = next_event(&events, "the changed list", |event| match event {
         MonitorEvent::Services(list) if list.get("cron.service").and_then(|s| s.memory) == Some(3_000_000) => {
@@ -148,9 +143,8 @@ async fn services_are_listed_with_their_details_while_the_monitor_collects() {
 #[tokio::test]
 async fn the_journal_is_not_asked_when_the_user_may_not_read_it() {
     let (server, fake) = server(probe(true, None, "alice").replace("nopasswd", "password")).await;
-    fake.answer("systemctl list-units", UNITS);
-    fake.answer("systemctl list-unit-files", FILES);
-    fake.answer("systemctl show", SHOW);
+    fake.answer("systemctl list-units", &format!("{UNITS}\0{FILES}\0"));
+    fake.answer("systemctl show", &format!("{SHOW}\0"));
     let connection = connect(&server, &Env::new()).await;
     let (monitor, events) = monitor(options());
     monitor.connection_restored(&connection);
@@ -180,8 +174,7 @@ async fn a_server_without_systemd_and_docker_is_asked_neither() {
 #[tokio::test]
 async fn containers_events_trigger_a_new_look_and_statistics_run_only_on_the_docker_page() {
     let (server, fake) = server(probe(false, Some("user"), "alice docker")).await;
-    fake.answer("docker ps", PS);
-    fake.answer("docker inspect", INSPECT);
+    fake.answer("docker ps", &docker_reply());
     fake.answer("docker system df", "{\"Size\":\"1.33GB\",\"TotalCount\":\"14\",\"Type\":\"Images\"}\n{\"TotalCount\":\"3\",\"Type\":\"Local Volumes\"}\n");
     fake.answer("docker images", "{\"ID\":\"sha256:1\",\"Size\":\"7.8MB\"}\n");
     fake.stream("docker events");
@@ -264,8 +257,7 @@ async fn containers_events_trigger_a_new_look_and_statistics_run_only_on_the_doc
 #[tokio::test]
 async fn a_docker_that_answers_with_an_error_is_reported_and_the_containers_stay() {
     let (server, fake) = server(probe(false, Some("sudo"), "alice")).await;
-    fake.answer("sudo -n docker ps", PS);
-    fake.answer("sudo -n docker inspect", INSPECT);
+    fake.answer("sudo -n docker ps", &docker_reply());
     fake.stream("docker events");
     let connection = connect(&server, &Env::new()).await;
     let (monitor, events) = monitor(options());
@@ -276,7 +268,7 @@ async fn a_docker_that_answers_with_an_error_is_reported_and_the_containers_stay
     })
     .await;
     assert!(
-        fake.count("sudo -n docker") >= 2,
+        fake.count("sudo -n docker inspect") == 1,
         "docker is run with sudo -n when only that works: {:?}",
         lock(&fake.actions)
     );
@@ -294,6 +286,33 @@ async fn a_docker_that_answers_with_an_error_is_reported_and_the_containers_stay
     .await;
     assert_eq!(broken.containers.len(), 2, "the containers from before stay");
     assert!(broken.error.as_deref().unwrap().contains("Cannot connect to the Docker daemon"), "{:?}", broken.error);
+}
+
+fn docker_reply() -> String {
+    PS.lines().map(|line| format!("P{line}\n")).collect::<String>() + INSPECT
+}
+
+#[tokio::test]
+async fn prefetch_is_quiet_until_activation_and_never_starts_streams() {
+    let (server, fake) = server(probe(true, Some("user"), "alice adm docker")).await;
+    fake.answer("systemctl list-units", &format!("{UNITS}\0{FILES}\0"));
+    fake.answer("systemctl show", &format!("{SHOW}\0"));
+    fake.answer("docker ps", &docker_reply());
+    let connection = connect(&server, &Env::new()).await;
+    let (monitor, events) = monitor(options());
+    monitor.connection_restored(&connection);
+    monitor.prefetch().await;
+    assert!(events.is_empty() && monitor.snapshot().is_none());
+    assert_eq!(fake.collectors_started.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.open_streams.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.count("docker ps"), 1);
+    assert_eq!(fake.count("systemctl"), 2);
+    monitor.set_active(true);
+    let replay: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).take(4).collect();
+    assert!(replay.iter().any(|event| matches!(event, MonitorEvent::Services(_))));
+    assert!(replay.iter().any(|event| matches!(event, MonitorEvent::Docker(_))));
+    assert_eq!(fake.probes.load(Ordering::SeqCst), 1);
+    monitor.shutdown();
 }
 
 #[tokio::test]

@@ -546,7 +546,7 @@ async fn push(
     shown: &str,
     reporter: &Reporter,
 ) -> Result<End, SftpError> {
-    let tuning = session.info().tuning();
+    let tuning = session.info().await.tuning();
     let (chunk, window) = (tuning.write_chunk, tuning.write_window);
     let drain = drain_timeout(session);
     let mut file = tokio::fs::File::open(local).await.map_err(|err| local_error(local, err))?;
@@ -577,7 +577,9 @@ async fn push(
             offset += len as u64;
             let raw = &session.raw;
             inflight.push(async move {
-                raw.write(handle, at, buffer)
+                raw.read()
+                    .await
+                    .write(handle, at, buffer)
                     .await
                     .map(|_| (at, len as u64))
                     .map_err(|err| SftpError::from_raw(err, shown))
@@ -830,11 +832,11 @@ async fn pull(
     shown: &str,
     mut progress: impl FnMut(u64),
 ) -> Result<End, SftpError> {
-    let tuning = session.info().tuning();
+    let tuning = session.info().await.tuning();
     let (chunk, window) = (tuning.read_chunk, tuning.read_window);
     let raw = &session.raw;
     let request = |offset: u64, len: u32| async move {
-        let result = raw.read(handle.to_string(), offset, len).await;
+        let result = raw.read().await.read(handle.to_string(), offset, len).await;
         (offset, len, result)
     };
 

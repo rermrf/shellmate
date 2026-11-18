@@ -676,6 +676,14 @@ mod tests {
     }
 
     #[test]
+    fn warm_process_rate_uses_half_a_second_of_remote_uptime() {
+        let mut engine = Engine::new(probe());
+        engine.apply(&procs_frame(10.0, &[stat_line(11, "work", 'S', 1, 100, 0, 60, 1)], ""));
+        let next = engine.apply(&procs_frame(10.5, &[stat_line(11, "work", 'S', 1, 125, 0, 60, 1)], ""));
+        assert_eq!(next.process(11).unwrap().cpu_percent, Some(50.0));
+    }
+
+    #[test]
     fn the_collector_and_what_it_started_are_not_listed_counted_or_busiest() {
         let mut engine = Engine::new(probe());
         let ps = "  4   0 bash -c sh -c # shellmate-collector abc\n  5   0 sh -c # shellmate-collector abc\n  7  1000 /usr/bin/editor\n";

@@ -26,7 +26,7 @@ use super::*;
 use crate::commands::Command;
 use crate::docker::{self, Container, StatsEntry};
 use crate::probe::{ContainerAccess, ContainerRuntime, JournalAccess};
-use crate::services::{self, Service};
+use crate::services;
 
 /// What `ps`, `inspect`, `system df` and the dangling images last said.
 #[derive(Clone, Default)]
@@ -89,7 +89,64 @@ const SHOW_LIMIT: usize = 400;
 /// How many failed units get their last error line looked up in one round.
 const ERRORS_PER_ROUND: usize = 4;
 
+fn section_script(commands: &[String]) -> String {
+    let body = commands.iter().map(|command| format!("{command}\nprintf '\\000'\n")).collect::<String>();
+    crate::script::sh_command(&body)
+}
+
+fn sections(text: &str) -> impl Iterator<Item = &str> {
+    text.rsplit_once('\0').into_iter().flat_map(|(complete, _)| complete.split('\0'))
+}
+
+fn docker_script(runtime: &ContainerRuntime) -> String {
+    let tool = runtime.kind.command();
+    let ps = Command::new([tool, "ps", "-a", "--no-trunc", "--format", "{{.ID}}:{{json .}}"]).unwrap();
+    let ps = Task::docker_line(runtime, ps);
+    let inspect = Task::docker_line(runtime, docker::inspect(tool, &[]).unwrap());
+    crate::script::sh_command(&format!(
+        r#"{{ {ps} && echo END; }} | (
+set --
+while IFS= read -r row; do
+  if [ "$row" = END ]; then
+    if [ "$#" -gt 0 ]; then {inspect} "$@"; fi
+    exit 0
+  fi
+  id=${{row%%:*}}
+  printf 'P%s\n' "${{row#*:}}"
+  case "$id" in ""|*[!0-9a-fA-F]*) continue;; esac
+  set -- "$@" "$id"
+  if [ "$#" -eq {batch} ]; then {inspect} "$@"; set --; fi
+done
+exit 1
+)"#,
+        batch = docker::INSPECT_BATCH
+    ))
+}
+
+fn parse_containers(text: &str) -> Vec<Container> {
+    let mut entries = Vec::new();
+    let mut inspected = Vec::new();
+    for line in text.lines() {
+        if let Some(row) = line.strip_prefix('P') {
+            entries.extend(docker::parse_ps(row));
+        } else {
+            inspected.extend(docker::parse_inspect(line));
+        }
+    }
+    docker::merge(&entries, &inspected)
+}
+
 impl Task {
+    pub(super) async fn prefetch_pages(&self, probe: &Probe) {
+        if probe.systemd.as_ref().is_some_and(|systemd| systemd.running) {
+            self.refresh_services(probe, &mut HashMap::new()).await;
+        }
+        if self.with(|_, _| ()).is_some()
+            && let Some(runtime) = probe.usable_container_runtime()
+        {
+            self.refresh_docker(runtime, false, &mut Default::default()).await;
+        }
+    }
     /// Runs a line on the connection.
     async fn exec(&self, line: String) -> Result<ExecOutput, String> {
         let connection = self.connection().ok_or_else(|| "没有可用的 SSH 连接".to_string())?;
@@ -167,30 +224,52 @@ impl Task {
         probe: &Probe,
         errors: &mut HashMap<(String, Option<u64>), Option<String>>,
     ) -> bool {
-        let (units, files) =
-            tokio::join!(self.exec(services::list_units().line()), self.exec(services::list_unit_files().line()));
-        let (Ok(units), Ok(files)) = (units, files) else {
-            log::debug!("监控：没有读到服务列表");
+        let commands = [services::list_units().line(), services::list_unit_files().line()];
+        let Ok(output) = self.exec(section_script(&commands)).await else {
             return self.inner.strong_count() > 0;
         };
-        if !units.status.success() && !files.status.success() {
-            log::debug!("监控：systemctl 失败");
-            return self.inner.strong_count() > 0;
-        }
-        let rows = services::parse_list_units(&units.stdout_text());
-        let unit_files = services::parse_unit_files(&files.stdout_text());
+        let text = output.stdout_text();
+        let mut parts = sections(&text);
+        let rows = services::parse_list_units(parts.next().unwrap_or_default());
+        let unit_files = services::parse_unit_files(parts.next().unwrap_or_default());
         if rows.is_empty() && unit_files.is_empty() {
             return self.inner.strong_count() > 0;
         }
-        let mut props = Vec::new();
-        for names in services::names_to_show(&rows, &unit_files, SHOW_LIMIT).chunks(services::SHOW_BATCH) {
-            let Ok(command) = services::show(names) else { continue };
-            if let Ok(output) = self.exec(command.line()).await {
-                props.extend(services::parse_show(&output.stdout_text()));
+        let mut commands: Vec<_> = services::names_to_show(&rows, &unit_files, SHOW_LIMIT)
+            .chunks(services::SHOW_BATCH)
+            .filter_map(|batch| services::show(batch).ok().map(|command| command.line()))
+            .collect();
+        let show_count = commands.len();
+        let access = probe.journal_access();
+        let mut asked = Vec::new();
+        if access != JournalAccess::None {
+            for row in rows
+                .iter()
+                .filter(|row| row.active == "failed" && !errors.keys().any(|(name, _)| name == &row.name))
+                .take(ERRORS_PER_ROUND)
+            {
+                if let Ok(command) = services::journal_last_error(&row.name) {
+                    commands.push(if access == JournalAccess::Sudo { command.sudo_n() } else { command }.line());
+                    asked.push(&row.name);
+                }
             }
         }
+        let details = self.exec(section_script(&commands)).await.ok().map(|out| out.stdout_text()).unwrap_or_default();
+        let mut parts = sections(&details);
+        let props: Vec<_> = parts.by_ref().take(show_count).flat_map(services::parse_show).collect();
         let mut list = services::merge(&rows, &unit_files, &props);
-        self.add_last_errors(probe.journal_access(), &mut list, errors).await;
+        for (name, text) in asked.into_iter().zip(parts) {
+            if let Some(service) = list.iter().find(|service| &service.name == name && service.is_failed()) {
+                errors.insert((name.clone(), service.since_monotonic_us), services::pick_error_line(text));
+            }
+        }
+        errors.retain(|(name, since), _| {
+            list.iter()
+                .any(|service| service.is_failed() && service.name == *name && service.since_monotonic_us == *since)
+        });
+        for service in list.iter_mut().filter(|service| service.is_failed()) {
+            service.last_error = errors.get(&(service.name.clone(), service.since_monotonic_us)).cloned().flatten();
+        }
         let list = Arc::new(ServiceList { services: list });
         self.with(|inner, state| {
             if state.services.as_deref() != Some(&*list) {
@@ -199,49 +278,6 @@ impl Task {
             }
         })
         .is_some()
-    }
-
-    /// The last error of the journal for the units that failed (when the journal can be read): looked up
-    /// once for every failure, a few per round.
-    async fn add_last_errors(
-        &self,
-        access: JournalAccess,
-        list: &mut [Service],
-        errors: &mut HashMap<(String, Option<u64>), Option<String>>,
-    ) {
-        let failed: std::collections::HashSet<(String, Option<u64>)> = list
-            .iter()
-            .filter(|service| service.is_failed())
-            .map(|service| (service.name.clone(), service.since_monotonic_us))
-            .collect();
-        errors.retain(|key, _| failed.contains(key));
-        if access == JournalAccess::None {
-            return;
-        }
-        let mut asked = 0;
-        for service in list.iter_mut().filter(|service| service.is_failed()) {
-            let key = (service.name.clone(), service.since_monotonic_us);
-            if let Some(known) = errors.get(&key) {
-                service.last_error = known.clone();
-                continue;
-            }
-            if asked >= ERRORS_PER_ROUND {
-                continue;
-            }
-            asked += 1;
-            let found = match services::journal_last_error(&service.name) {
-                Ok(command) => {
-                    let command = if access == JournalAccess::Sudo { command.sudo_n() } else { command };
-                    match self.exec(command.line()).await {
-                        Ok(output) if output.status.success() => services::pick_error_line(&output.stdout_text()),
-                        _ => None,
-                    }
-                }
-                Err(_) => None,
-            };
-            errors.insert(key, found.clone());
-            service.last_error = found;
-        }
     }
 
     // ---- containers ----------------------------------------------------------------------------
@@ -310,50 +346,59 @@ impl Task {
         oom: &mut std::collections::HashSet<String>,
     ) -> bool {
         let tool = runtime.kind.command();
-        let (containers, error) = match self.exec(Self::docker_line(runtime, docker::ps(tool))).await {
-            Ok(output) if output.status.success() => {
-                let entries = docker::parse_ps(&output.stdout_text());
-                let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
-                let mut inspected = Vec::new();
-                for chunk in ids.chunks(docker::INSPECT_BATCH) {
-                    let Ok(command) = docker::inspect(tool, chunk) else { continue };
-                    // Part of the answer is fine: a container that vanished in between only makes `inspect` complain.
-                    if let Ok(output) = self.exec(Self::docker_line(runtime, command)).await {
-                        inspected.extend(docker::parse_inspect(&output.stdout_text()));
-                    }
-                }
-                let mut containers = docker::merge(&entries, &inspected);
-                remember_oom(&mut containers, oom);
-                (Some(containers), None)
+        let base = self.refresh_containers(runtime, oom);
+        let usage = async {
+            if !want_usage {
+                return None;
             }
-            Ok(output) => (None, Some(explain_failure(&output))),
-            Err(why) => (None, Some(why)),
-        };
-        let usage = if want_usage && containers.is_some() {
             let (df, dangling) = tokio::join!(
                 self.exec(Self::docker_line(runtime, docker::system_df(tool))),
                 self.exec(Self::docker_line(runtime, docker::dangling_images(tool)))
             );
-            let usage = df.ok().filter(|o| o.status.success()).map(|o| docker::parse_system_df(&o.stdout_text()));
-            let dangling =
-                dangling.ok().filter(|o| o.status.success()).map(|o| docker::parse_dangling(&o.stdout_text()));
-            Some((usage, dangling))
-        } else {
-            None
+            Some((
+                df.ok().filter(|out| out.status.success()).map(|out| docker::parse_system_df(&out.stdout_text())),
+                dangling.ok().filter(|out| out.status.success()).map(|out| docker::parse_dangling(&out.stdout_text())),
+            ))
         };
-        self.with(|inner, state| {
-            apply_docker(inner, state, runtime, |base, _| {
-                base.error = error;
-                if let Some(containers) = containers {
-                    base.containers = containers;
-                }
-                if let Some((usage, dangling)) = usage {
+        let (alive, usage) = tokio::join!(base, usage);
+        if let Some((usage, dangling)) = usage {
+            self.with(|inner, state| {
+                apply_docker(inner, state, runtime, |base, _| {
                     if let Some(usage) = usage {
                         base.usage = usage;
                     }
                     if let Some(dangling) = dangling {
                         base.dangling = dangling;
                     }
+                })
+            });
+        }
+        alive
+    }
+
+    async fn refresh_containers(
+        &self,
+        runtime: &ContainerRuntime,
+        oom: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        let (containers, error) = match self.exec(docker_script(runtime)).await {
+            Ok(output) if output.truncated => (None, Some("容器列表超过输出上限".into())),
+            Ok(output) if output.status.success() => {
+                let mut containers = parse_containers(&output.stdout_text());
+                remember_oom(&mut containers, oom);
+                (Some(containers), None)
+            }
+            Ok(output) => (None, Some(explain_failure(&output))),
+            Err(why) => (None, Some(why)),
+        };
+        self.with(|inner, state| {
+            if error.is_some() && !state.run_alive {
+                return;
+            }
+            apply_docker(inner, state, runtime, |base, _| {
+                base.error = error;
+                if let Some(containers) = containers {
+                    base.containers = containers;
                 }
             });
         })
@@ -524,6 +569,66 @@ pub(super) fn follow(inner: &Arc<Inner>, command: String) -> Follow {
 mod tests {
     use super::*;
     use crate::docker::ContainerState;
+
+    #[test]
+    fn marked_sections_keep_empty_answers_and_discard_a_truncated_tail() {
+        let value = "two lines\na quote ' and $HOME";
+        let command = Command::new(["printf", "%s", value]).unwrap();
+        let script = section_script(&[command.line(), "false".into(), "printf last".into()]);
+        let output = std::process::Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(sections(&text).collect::<Vec<_>>(), [value, "", "last"]);
+        assert_eq!(sections(text.trim_end_matches('\0')).collect::<Vec<_>>(), [value, ""]);
+    }
+
+    #[test]
+    fn docker_script_lists_once_batches_valid_ids_and_propagates_ps_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let tool = temp.path().join("docker");
+        std::fs::write(
+            &tool,
+            r##"#!/bin/sh
+case $1 in
+ps)
+  [ -z "$FAIL_PS" ] || exit 9
+  index=0
+  while [ "$index" -lt 101 ]; do
+    printf '%x:{"ID":"%x","Names":"test"}\n' "$index" "$index"
+    index=$((index+1))
+  done
+  printf '%s:{}\n' '-bad;exit 42'
+  ;;
+inspect)
+  shift 3
+  echo "$#" >> batches
+  for id do printf '{"id":"%s","restarts":7}\n' "$id"; done
+  ;;
+esac
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: crate::probe::RuntimeKind::Docker,
+            access: ContainerAccess::User,
+            path: "docker".into(),
+            version: None,
+        };
+        let mut shell = std::process::Command::new("/bin/sh");
+        shell
+            .current_dir(temp.path())
+            .env("PATH", format!("{}:/bin", temp.path().display()))
+            .args(["-c", &docker_script(&runtime)]);
+        let out = shell.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let rows = parse_containers(&String::from_utf8(out.stdout).unwrap());
+        assert_eq!(rows.len(), 101);
+        assert!(rows.iter().all(|row| row.restart_count == 7));
+        assert_eq!(std::fs::read_to_string(temp.path().join("batches")).unwrap(), "100\n1\n");
+        assert!(!shell.env("FAIL_PS", "1").output().unwrap().status.success());
+    }
 
     fn looping(id: &str, oom: bool) -> Container {
         Container {

@@ -10,6 +10,9 @@
 //! if neither MON credential is supplied. Only use these trusting test options on the fixtures.
 //! `SHELLMATE_BENCH_RTTS` (0,100,250) are added RTTs in ms; `SHELLMATE_BENCH_RUNS` (5) is per RTT/target.
 //! Have at least one container (running or stopped) for a nonempty Docker measurement. No fixtures are created.
+//! `files.list+stat` includes overlapping home resolution; `files.home` times a separate REALPATH
+//! after first paint and is not additive. `files.cached` includes copying the cached rows for display.
+//! Warm page metrics exclude prefetch and start at activation of a fresh inactive monitor.
 
 mod proxy;
 mod results;
@@ -64,22 +67,25 @@ impl Target {
 async fn files(connection: &Connection, connected: Instant, run: &mut Run) {
     let session = SftpSession::open(connection).await.expect("open SFTP");
     let opened = Instant::now();
-    let home = session.home().await.expect("resolve home");
-    let resolved = Instant::now();
-    let (entries, _) = tokio::join!(session.list(&home), session.stat_named(&home));
+    let listing = session.listing(".").await;
     let listed = Instant::now();
-    entries.expect("list home");
+    listing.entries.as_ref().expect("list home");
+    let cached = Instant::now();
+    std::hint::black_box((*session.cached(".").expect("cached home")).clone());
+    run.insert("files.cached", Ok(cached.elapsed()));
+    let resolving = Instant::now();
+    let home = session.home().await.expect("resolve home");
     run.extend([
         ("files.first", Ok(listed - connected)),
         ("files.open", Ok(opened - connected)),
-        ("files.home", Ok(resolved - opened)),
-        ("files.list+stat", Ok(listed - resolved)),
+        ("files.home", Ok(resolving.elapsed())),
+        ("files.list+stat", Ok(listed - opened)),
     ]);
     let dir = if home == "/etc" { "/" } else { "/etc" };
     let start = Instant::now();
-    let (entries, _) = tokio::join!(session.list(dir), session.stat_named(dir));
+    let listing = session.listing(dir).await;
     let elapsed = start.elapsed();
-    entries.expect("list next directory");
+    listing.entries.as_ref().expect("list next directory");
     run.insert("files.next", Ok(elapsed));
 }
 
@@ -91,10 +97,19 @@ struct ActiveMonitor {
 }
 
 impl ActiveMonitor {
-    fn new(connection: &Connection, focus: Focus) -> Self {
+    async fn new(connection: &Connection, focus: Focus, warm: bool) -> Self {
         let (events, receiver) = async_channel::unbounded();
         let monitor = Monitor::with_options(tokio::runtime::Handle::current(), events, Options::default());
         monitor.connection_restored(connection);
+        if warm {
+            monitor.prefetch().await;
+            assert!(receiver.is_empty(), "no pre-activation events");
+            match focus {
+                Focus::Services => assert!(monitor.services().is_some(), "services prefetch failed"),
+                Focus::Docker => assert!(monitor.docker().is_some(), "docker prefetch failed"),
+                _ => (),
+            }
+        }
         let start = Instant::now();
         monitor.set_active(true);
         monitor.set_focus(focus);
@@ -123,7 +138,7 @@ impl Drop for ActiveMonitor {
 }
 
 async fn overview(connection: &Connection, run: &mut Run) -> Arc<Probe> {
-    let active = ActiveMonitor::new(connection, Focus::Overview);
+    let active = ActiveMonitor::new(connection, Focus::Overview, false).await;
     let mut probe = None;
     while let Some((event, elapsed)) = active.next().await {
         match event {
@@ -149,8 +164,8 @@ async fn overview(connection: &Connection, run: &mut Run) -> Arc<Probe> {
     panic!("Overview timed out; reached {:?}", run.keys());
 }
 
-async fn first_page(connection: &Connection, focus: Focus) -> Sample {
-    let active = ActiveMonitor::new(connection, focus);
+async fn first_page(connection: &Connection, focus: Focus, warm: bool) -> Sample {
+    let active = ActiveMonitor::new(connection, focus, warm).await;
     let mut saw_empty = false;
     while let Some((event, elapsed)) = active.next().await {
         match (focus, event) {
@@ -185,18 +200,26 @@ async fn measure(target: &Target, rtt_ms: u64) -> Run {
     files(&connection, connected, &mut run).await;
     run.insert("connect", Ok(connected - start));
     let probe = overview(&connection, &mut run).await;
-    let services = if probe.systemd.as_ref().is_some_and(|systemd| systemd.running) {
-        first_page(&connection, Focus::Services).await
-    } else {
-        Err("no running systemd")
-    };
-    run.insert("services.first", services);
-    let docker = if probe.usable_container_runtime().is_some_and(|runtime| runtime.kind == RuntimeKind::Docker) {
-        first_page(&connection, Focus::Docker).await
-    } else {
-        Err("no usable Docker runtime")
-    };
-    run.insert("docker.first", docker);
+    for (warm, services, docker) in
+        [(false, "services.first", "docker.first"), (true, "services.prefetched", "docker.prefetched")]
+    {
+        run.insert(
+            services,
+            if probe.systemd.as_ref().is_some_and(|systemd| systemd.running) {
+                first_page(&connection, Focus::Services, warm).await
+            } else {
+                Err("no running systemd")
+            },
+        );
+        run.insert(
+            docker,
+            if probe.usable_container_runtime().is_some_and(|runtime| runtime.kind == RuntimeKind::Docker) {
+                first_page(&connection, Focus::Docker, warm).await
+            } else {
+                Err("no usable Docker runtime")
+            },
+        );
+    }
     connection.disconnect().await;
     drop(connection);
     if let Err(err) = proxy.finish().await {

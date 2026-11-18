@@ -1,7 +1,8 @@
 //! The SFTP session and the operations on it that the file panel and the editor need.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::stream::{self, StreamExt as _};
@@ -11,9 +12,11 @@ use russh_sftp::client::rawsession::Limits;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use shellmate_ssh::Connection;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{RwLock, watch};
 
 use crate::entry::{Entry, EntryKind, Link, Revision, sort_entries};
 use crate::error::SftpError;
+use crate::listing::{Cache, Listed};
 use crate::path;
 
 /// Size of one read or write request when the server names no limit.
@@ -102,8 +105,12 @@ impl ServerInfo {
 /// Created on the SSH runtime (the client library drives the stream with tasks of the current
 /// tokio runtime); the methods are plain async functions and may be awaited from anywhere.
 pub struct SftpSession {
-    pub(crate) raw: Arc<RawSftpSession>,
+    pub(crate) raw: Arc<RwLock<RawSftpSession>>,
+    runtime: tokio::runtime::Handle,
     info: ServerInfo,
+    negotiated: watch::Receiver<Option<ServerLimits>>,
+    limits_task: Option<tokio::task::JoinHandle<()>>,
+    cache: Mutex<Cache>,
     timeout_secs: AtomicU64,
 }
 
@@ -121,34 +128,45 @@ impl SftpSession {
     {
         let raw = RawSftpSession::new(stream);
         raw.set_timeout(REQUEST_TIMEOUT_SECS);
-        let mut raw = raw;
         let version = raw.init().await.map_err(|err| SftpError::from_raw(err, ""))?;
         let extensions: BTreeMap<String, String> = version.extensions.into_iter().collect();
-        let mut limits = None;
-        if extensions.get(LIMITS).is_some_and(|version| version == "1") {
-            match raw.limits().await {
-                Ok(found) => {
-                    let known = Limits::from(found);
-                    limits = Some(ServerLimits {
-                        packet_len: known.packet_len,
-                        read_len: known.read_len,
-                        write_len: known.write_len,
-                    });
-                    raw.set_limits(known);
+        let raw = Arc::new(RwLock::new(raw));
+        let (ready, negotiated) = watch::channel(None);
+        let limits_task = extensions.get(LIMITS).is_some_and(|version| version == "1").then(|| {
+            let raw = raw.clone();
+            tokio::spawn(async move {
+                let answer = raw.read().await.limits().await;
+                match answer {
+                    Ok(found) => {
+                        let known = Limits::from(found);
+                        raw.write().await.set_limits(known);
+                        ready.send_replace(Some(ServerLimits {
+                            packet_len: known.packet_len,
+                            read_len: known.read_len,
+                            write_len: known.write_len,
+                        }));
+                    }
+                    Err(err) => log::warn!("limits@openssh.com failed: {err}"),
                 }
-                // Not fatal: without limits we send modest requests.
-                Err(err) => log::warn!("limits@openssh.com failed: {err}"),
-            }
-        }
-        let info = ServerInfo { version: version.version, extensions, limits };
-        Ok(Self { raw: Arc::new(raw), info, timeout_secs: AtomicU64::new(REQUEST_TIMEOUT_SECS) })
+            })
+        });
+        let info = ServerInfo { version: version.version, extensions, limits: None };
+        Ok(Self {
+            raw,
+            runtime: tokio::runtime::Handle::current(),
+            info,
+            negotiated,
+            limits_task,
+            cache: Mutex::default(),
+            timeout_secs: AtomicU64::new(REQUEST_TIMEOUT_SECS),
+        })
     }
 
     /// How long a request may wait for its answer before the session counts as stalled
     /// ([`SftpError::Timeout`]); 30 seconds by default.
-    pub fn set_request_timeout(&self, seconds: u64) {
+    pub async fn set_request_timeout(&self, seconds: u64) {
         self.timeout_secs.store(seconds, Ordering::Relaxed);
-        self.raw.set_timeout(seconds);
+        self.raw.read().await.set_timeout(seconds);
     }
 
     /// The current request timeout.
@@ -156,16 +174,22 @@ impl SftpSession {
         std::time::Duration::from_secs(self.timeout_secs.load(Ordering::Relaxed))
     }
 
-    /// What the server advertised.
-    pub fn info(&self) -> &ServerInfo {
-        &self.info
+    /// What the server advertised, including completion of optional limits negotiation.
+    pub async fn info(&self) -> ServerInfo {
+        ServerInfo { limits: self.server_limits().await, ..self.info.clone() }
+    }
+
+    async fn server_limits(&self) -> Option<ServerLimits> {
+        let mut negotiated = self.negotiated.clone();
+        let _ = negotiated.changed().await;
+        *negotiated.borrow()
     }
 
     // ---- paths and metadata ----------------------------------------------------------------
 
     /// The absolute, symlink-free form of `path` as the server sees it (`.` is the home directory).
     pub async fn canonicalize(&self, path: &str) -> Result<String, SftpError> {
-        let name = self.raw.realpath(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+        let name = self.raw.read().await.realpath(path).await.map_err(|err| SftpError::from_raw(err, path))?;
         name.files
             .into_iter()
             .next()
@@ -180,7 +204,7 @@ impl SftpSession {
 
     /// Metadata of `path`, following a symlink to what it points at.
     pub async fn stat(&self, path: &str) -> Result<Entry, SftpError> {
-        let attrs = self.raw.stat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
+        let attrs = self.raw.read().await.stat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         Ok(entry_at(path, "", &attrs))
     }
 
@@ -207,7 +231,7 @@ impl SftpSession {
             data.extend_from_slice(&4u32.to_be_bytes());
             data.extend_from_slice(&id.to_be_bytes());
         }
-        match self.raw.extended(USERS_GROUPS_BY_ID, data).await {
+        match self.raw.read().await.extended(USERS_GROUPS_BY_ID, data).await {
             Ok(Packet::ExtendedReply(reply)) => parse_names(&reply.data).unwrap_or_default(),
             _ => (None, None),
         }
@@ -223,23 +247,25 @@ impl SftpSession {
     }
 
     pub(crate) async fn lstat_plain(&self, path: &str) -> Result<Entry, SftpError> {
-        let attrs = self.raw.lstat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
+        let attrs = self.raw.read().await.lstat(path).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         Ok(entry_at(path, "", &attrs))
     }
 
     /// The text of the symlink at `path`.
     pub(crate) async fn read_link(&self, path: &str) -> Result<String, SftpError> {
-        let name = self.raw.readlink(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+        let name = self.raw.read().await.readlink(path).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(name.files.into_iter().next().map(|file| file.filename).unwrap_or_default())
     }
 
     /// Where the link at `path` points and what is there.
     async fn describe_link(&self, path: &str) -> Link {
-        let target = match self.raw.readlink(path).await {
+        let raw = self.raw.read().await;
+        let (link, stat) = tokio::join!(raw.readlink(path), raw.stat(path));
+        let target = match link {
             Ok(name) => name.files.into_iter().next().map(|file| file.filename).unwrap_or_default(),
             Err(_) => String::new(),
         };
-        let resolved = match self.raw.stat(path).await {
+        let resolved = match stat {
             Ok(attrs) => Some(attrs.attrs.permissions.map_or(EntryKind::Other, EntryKind::from_mode)),
             Err(_) => None,
         };
@@ -261,7 +287,8 @@ impl SftpSession {
             if here.kind != EntryKind::Symlink {
                 return Ok((target, entry));
             }
-            let link = self.raw.readlink(&target).await.map_err(|err| SftpError::from_raw(err, &target))?;
+            let link =
+                self.raw.read().await.readlink(&target).await.map_err(|err| SftpError::from_raw(err, &target))?;
             let next = link.files.into_iter().next().map(|file| file.filename).unwrap_or_default();
             target = path::normalize(&path::join(&path::parent(&target).unwrap_or_else(|| "/".into()), &next));
         }
@@ -304,26 +331,99 @@ impl SftpSession {
     /// The entries of a directory, directories first and then by name (case-insensitive, numbers
     /// by value). Hidden files are included; `.` and `..` are not. Links carry their target.
     pub async fn list(&self, dir: &str) -> Result<Vec<Entry>, SftpError> {
-        let handle = match self.raw.opendir(dir).await {
-            Ok(handle) => handle.handle,
+        let mut entries = self.list_plain(dir).await?;
+        self.describe_links(&mut entries).await;
+        Ok(entries)
+    }
+
+    /// A cached first paint, without server I/O. `.` and its resolved home share one slot.
+    pub fn cached(&self, dir: &str) -> Option<Arc<Listed>> {
+        self.cache.lock().unwrap().get(dir)
+    }
+
+    /// Evict a changed directory and prevent in-flight listings from repopulating it.
+    pub fn invalidate(&self, dir: &str) {
+        self.cache.lock().unwrap().invalidate(dir);
+    }
+
+    pub(crate) fn changed_path(&self, path: &str) {
+        self.invalidate(path);
+        if let Some(dir) = path::parent(path) {
+            self.invalidate(&dir);
+        }
+    }
+
+    /// Refresh first-paint data. Directory metadata, home resolution and enumeration overlap.
+    pub async fn listing(&self, path: &str) -> Arc<Listed> {
+        let started = Instant::now();
+        let epoch = self.cache.lock().unwrap().epoch;
+        let (dir, mut entries, stat) = tokio::join!(
+            async { if path == "." { self.home().await } else { Ok(path.to_string()) } },
+            self.list_plain(path),
+            self.stat_named(path)
+        );
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(error) => return Arc::new(Listed::failed(error)),
+        };
+        let mut stat = stat.ok();
+        if path == "." {
+            if let Ok(entries) = &mut entries {
+                for entry in entries {
+                    entry.path = path::join(&dir, &entry.name);
+                }
+            }
+            if let Some(entry) = &mut stat {
+                entry.path.clone_from(&dir);
+                entry.name = path::file_name(&dir).unwrap_or("/").into();
+            }
+        }
+        let listed = Arc::new(Listed { dir: Some(dir), entries, stat });
+        self.cache.lock().unwrap().put(path, epoch, started, listed.clone());
+        listed
+    }
+
+    async fn list_plain(&self, dir: &str) -> Result<Vec<Entry>, SftpError> {
+        let raw = self.raw.clone();
+        let name = dir.to_owned();
+        let open = self.runtime.spawn(async move {
+            let handle = raw.read().await.opendir(name).await?.handle;
+            Ok::<_, RawError>(DirectoryHandle { handle, raw, runtime: tokio::runtime::Handle::current() })
+        });
+        let directory = match open.await.map_err(|err| SftpError::Protocol(err.to_string()))? {
+            Ok(directory) => directory,
             Err(err) => return Err(self.explain_dir_error(dir, err).await),
         };
-        let mut files = Vec::new();
-        let read = loop {
-            match self.raw.readdir(handle.as_str()).await {
-                Ok(batch) => files.extend(batch.files),
-                Err(RawError::Status(status)) if status.status_code == StatusCode::Eof => break Ok(()),
-                Err(err) => break Err(SftpError::from_raw(err, dir)),
+        let handle = directory.handle.as_str();
+        let mut entries = Vec::new();
+        loop {
+            let raw = self.raw.read().await;
+            let (first, second) = tokio::join!(raw.readdir(handle), raw.readdir(handle));
+            let mut eof = false;
+            for batch in [first, second] {
+                match batch {
+                    Ok(batch) => entries.extend(
+                        batch
+                            .files
+                            .iter()
+                            .filter(|file| file.filename != "." && file.filename != "..")
+                            .map(|file| Entry::from_attrs(dir, &file.filename, &file.longname, &file.attrs)),
+                    ),
+                    Err(RawError::Status(status)) if status.status_code == StatusCode::Eof => eof = true,
+                    Err(err) => return Err(SftpError::from_raw(err, dir)),
+                }
             }
-        };
-        let _ = self.raw.close(handle).await;
-        read?;
+            if eof {
+                break;
+            }
+        }
+        drop(directory);
+        sort_entries(&mut entries);
+        Ok(entries)
+    }
 
-        let mut entries: Vec<Entry> = files
-            .iter()
-            .filter(|file| file.filename != "." && file.filename != "..")
-            .map(|file| Entry::from_attrs(dir, &file.filename, &file.longname, &file.attrs))
-            .collect();
+    /// Fill in symlink targets after the initial rows are visible, then restore directory-first order.
+    pub async fn describe_links(&self, entries: &mut [Entry]) {
         let links: Vec<(usize, String)> = entries
             .iter()
             .enumerate()
@@ -338,8 +438,16 @@ impl SftpSession {
         for (ix, link) in described {
             entries[ix].link = Some(link);
         }
-        sort_entries(&mut entries);
-        Ok(entries)
+        sort_entries(entries);
+    }
+
+    /// Enrich a first paint, updating the cache only if no newer refresh or mutation won the race.
+    pub async fn enrich(&self, first: &Arc<Listed>) -> Option<Arc<Listed>> {
+        let mut updated = (**first).clone();
+        self.describe_links(updated.entries.as_mut().ok()?).await;
+        let updated = Arc::new(updated);
+        self.cache.lock().unwrap().replace(first, updated.clone());
+        Some(updated)
     }
 
     /// SFTP v3 has no "not a directory" status (OpenSSH answers "no such file" or "failure"):
@@ -358,7 +466,8 @@ impl SftpSession {
     /// Creates a directory. Fails with [`SftpError::AlreadyExists`] if something is there.
     pub async fn mkdir(&self, dir: &str) -> Result<(), SftpError> {
         self.ensure_absent(dir).await?;
-        self.raw.mkdir(dir, FileAttributes::empty()).await.map_err(|err| SftpError::from_raw(err, dir))?;
+        self.raw.read().await.mkdir(dir, FileAttributes::empty()).await.map_err(|err| SftpError::from_raw(err, dir))?;
+        self.changed_path(dir);
         Ok(())
     }
 
@@ -383,7 +492,8 @@ impl SftpSession {
     pub async fn mkdir_with_mode(&self, dir: &str, mode: u32) -> Result<(), SftpError> {
         self.ensure_absent(dir).await?;
         let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
-        self.raw.mkdir(dir, attrs).await.map_err(|err| SftpError::from_raw(err, dir))?;
+        self.raw.read().await.mkdir(dir, attrs).await.map_err(|err| SftpError::from_raw(err, dir))?;
+        self.changed_path(dir);
         self.chmod(dir, mode).await
     }
 
@@ -394,14 +504,17 @@ impl SftpSession {
             return Ok(());
         }
         self.ensure_absent(to).await?;
-        self.raw.rename(from, to).await.map_err(|err| SftpError::from_raw(err, from))?;
+        self.raw.read().await.rename(from, to).await.map_err(|err| SftpError::from_raw(err, from))?;
+        self.changed_path(from);
+        self.changed_path(to);
         Ok(())
     }
 
     /// Sets the permission bits (`0o644`) of a file or directory (of the target, for a link).
     pub async fn chmod(&self, path: &str, mode: u32) -> Result<(), SftpError> {
         let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
-        self.raw.setstat(path, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.raw.read().await.setstat(path, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.changed_path(path);
         Ok(())
     }
 
@@ -427,14 +540,16 @@ impl SftpSession {
             for child in self.list(path).await? {
                 self.remove_tree(&child.path).await?;
             }
-            self.raw.rmdir(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+            self.raw.read().await.rmdir(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+            self.changed_path(path);
             Ok(())
         })
     }
 
     /// Deletes a single file or link.
     pub async fn remove_file(&self, path: &str) -> Result<(), SftpError> {
-        self.raw.remove(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.raw.read().await.remove(path).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.changed_path(path);
         Ok(())
     }
 
@@ -464,13 +579,21 @@ impl SftpSession {
             Err(err) => return Err(err),
         };
         if !exists {
-            return self.raw.rename(temp, target).await.map(|_| ()).map_err(|err| SftpError::from_raw(err, target));
+            return self
+                .raw
+                .read()
+                .await
+                .rename(temp, target)
+                .await
+                .map(|_| ())
+                .map_err(|err| SftpError::from_raw(err, target));
         }
         let backup = crate::text::sibling(target, |name| format!(".{name}.shellmate-bak"));
         // A backup left by an earlier crash would block the move: it is older than the file we hold.
         let _ = self.remove_file(&backup).await;
-        self.raw.rename(target, &backup).await.map_err(|err| SftpError::from_raw(err, target))?;
-        match self.raw.rename(temp, target).await {
+        self.raw.read().await.rename(target, &backup).await.map_err(|err| SftpError::from_raw(err, target))?;
+        let renamed = self.raw.read().await.rename(temp, target).await;
+        match renamed {
             Ok(_) => {
                 if let Err(err) = self.remove_file(&backup).await {
                     log::warn!("could not delete the backup {backup}: {err}");
@@ -479,7 +602,7 @@ impl SftpSession {
             }
             Err(err) => {
                 let error = SftpError::from_raw(err, target);
-                match self.raw.rename(&backup, target).await {
+                match self.raw.read().await.rename(&backup, target).await {
                     Ok(_) => Err(error),
                     Err(restore) => Err(SftpError::Failed {
                         path: target.to_string(),
@@ -496,7 +619,7 @@ impl SftpSession {
             data.extend_from_slice(&(text.len() as u32).to_be_bytes());
             data.extend_from_slice(text.as_bytes());
         }
-        match self.raw.extended(POSIX_RENAME, data).await.map_err(|err| SftpError::from_raw(err, to))? {
+        match self.raw.read().await.extended(POSIX_RENAME, data).await.map_err(|err| SftpError::from_raw(err, to))? {
             Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
             Packet::Status(status) => Err(SftpError::from_raw(RawError::Status(status), to)),
             _ => Err(SftpError::Protocol("服务器对 posix-rename 返回了意外的数据包".into())),
@@ -543,12 +666,14 @@ impl SftpSession {
         flags: OpenFlags,
         attrs: FileAttributes,
     ) -> Result<String, SftpError> {
-        let handle = self.raw.open(path, flags, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.server_limits().await;
+        let handle =
+            self.raw.read().await.open(path, flags, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(handle.handle)
     }
 
     pub(crate) async fn close_handle(&self, handle: &str, path: &str) -> Result<(), SftpError> {
-        self.raw.close(handle).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.raw.read().await.close(handle).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(())
     }
 
@@ -557,17 +682,18 @@ impl SftpSession {
     pub async fn read_file(&self, path: &str, max: u64) -> Result<(Vec<u8>, Revision), SftpError> {
         let handle = self.open_handle(path, OpenFlags::READ, FileAttributes::empty()).await?;
         let read = self.read_open_file(&handle, path, max).await;
-        let _ = self.raw.close(handle).await;
+        let _ = self.raw.read().await.close(handle).await;
         read
     }
 
     async fn read_open_file(&self, handle: &str, path: &str, max: u64) -> Result<(Vec<u8>, Revision), SftpError> {
-        let attrs = self.raw.fstat(handle).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
+        let attrs = self.raw.read().await.fstat(handle).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         let size = attrs.size.unwrap_or(0);
         if size > max {
             return Err(SftpError::TooLarge { size });
         }
         let mut buf = Vec::with_capacity(size as usize);
+        let raw = self.raw.read().await;
         'reading: while (buf.len() as u64) < size {
             let start = buf.len() as u64;
             let requests: Vec<(u64, u32)> = (0..WINDOW as u64)
@@ -576,7 +702,7 @@ impl SftpSession {
                 .map(|offset| (offset, (size - offset).min(CHUNK as u64) as u32))
                 .collect();
             let results =
-                futures::future::join_all(requests.iter().map(|(offset, len)| self.raw.read(handle, *offset, *len)))
+                futures::future::join_all(requests.iter().map(|(offset, len)| raw.read(handle, *offset, *len)))
                     .await;
             for ((_, len), result) in requests.iter().zip(results) {
                 match result {
@@ -603,11 +729,12 @@ impl SftpSession {
     /// Writes `data` at the start of the open file `handle`.
     pub(crate) async fn write_all(&self, handle: &str, data: &[u8], path: &str) -> Result<(), SftpError> {
         let mut offset = 0usize;
+        let raw = self.raw.read().await;
         for batch in data.chunks(CHUNK * WINDOW) {
             let writes = batch
                 .chunks(CHUNK)
                 .enumerate()
-                .map(|(i, chunk)| self.raw.write(handle, (offset + i * CHUNK) as u64, chunk.to_vec()));
+                .map(|(i, chunk)| raw.write(handle, (offset + i * CHUNK) as u64, chunk.to_vec()));
             futures::future::try_join_all(writes).await.map_err(|err| SftpError::from_raw(err, path))?;
             offset += batch.len();
         }
@@ -621,13 +748,13 @@ impl SftpSession {
         attrs: FileAttributes,
         path: &str,
     ) -> Result<(), SftpError> {
-        self.raw.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.raw.read().await.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(())
     }
 
     pub(crate) async fn set_handle_mode(&self, handle: &str, mode: u32, path: &str) -> Result<(), SftpError> {
         let attrs = FileAttributes { permissions: Some(mode & 0o7777), ..FileAttributes::empty() };
-        self.raw.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
+        self.raw.read().await.fsetstat(handle, attrs).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(())
     }
 
@@ -635,14 +762,38 @@ impl SftpSession {
     pub(crate) async fn try_set_handle_owner(&self, handle: &str, original: Option<&Entry>) {
         let Some(Entry { uid: Some(uid), gid: Some(gid), .. }) = original else { return };
         let attrs = FileAttributes { uid: Some(*uid), gid: Some(*gid), ..FileAttributes::empty() };
-        let _ = self.raw.fsetstat(handle, attrs).await;
+        let _ = self.raw.read().await.fsetstat(handle, attrs).await;
     }
 
     /// Asks the server to flush the file to disk, if it can.
     pub(crate) async fn sync_handle(&self, handle: &str) {
         if self.info.has(FSYNC) {
-            let _ = self.raw.fsync(handle).await;
+            let _ = self.raw.read().await.fsync(handle).await;
         }
+    }
+}
+
+impl Drop for SftpSession {
+    fn drop(&mut self) {
+        if let Some(task) = &self.limits_task {
+            task.abort();
+        }
+    }
+}
+
+struct DirectoryHandle {
+    raw: Arc<RwLock<RawSftpSession>>,
+    handle: String,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for DirectoryHandle {
+    fn drop(&mut self) {
+        let raw = self.raw.clone();
+        let handle = std::mem::take(&mut self.handle);
+        self.runtime.spawn(async move {
+            let _ = raw.read().await.close(handle).await;
+        });
     }
 }
 

@@ -624,7 +624,8 @@ impl Render for SettingsWindow {
                     P::AutoRecord,
                 ],
                 3 => &[P::LoginShell],
-                _ => &[P::FollowDirectory],
+                _ if crate::prototype_fixture() => &[P::FollowDirectory],
+                _ => &[P::FollowDirectory, P::PreloadPanels],
             };
             let mut rows = div()
                 .flex_none()

@@ -451,6 +451,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
+            if matches!(event, TerminalEvent::Output) {
+                this.preload_on_output(id, cx);
+            }
             if let TerminalEvent::Command { command, cwd, time } = event {
                 this.save_command_history(id, command, cwd.clone(), *time, cx);
                 return;
@@ -516,6 +519,7 @@ impl Workspace {
         // connection that is still being made is cancelled together with the dialog it asked.
         let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
         let closed=self.sessions[ix].id;
+        if let Some(group) = group.and_then(|id| self.group_mut(id)) && group.preload.as_ref().is_some_and(|(owner, _)| *owner == closed) { group.preload = None; }
         let was_recording=self.running_recordings.contains_key(&closed);
         if let Some(error)=self.finalize_archives(closed,cx){window.push_notification(Notification::error(error),cx);}
         else if was_recording{window.push_notification(Notification::success("已保存 .cast · 可在「记录」中回放"),cx);}

@@ -6,7 +6,8 @@
 //! # The collector
 //!
 //! POSIX `sh` (dash, bash, BusyBox ash) with `LC_ALL=C`. One tick a second, at most **three forks** per
-//! tick, on every shell:
+//! tick, on every shell. A baseline system/process pair precedes tick 0 by one short sleep
+//! (0.5 s, or 1 s when the host rejects fractions); tick 0 starts the regular cadence:
 //!
 //! | tick                      | forks                                          |
 //! |---------------------------|------------------------------------------------|
@@ -154,6 +155,9 @@ slow() {{
   printf "%s end\n" "$T"
 }}
 n=0
+stats
+procs
+sleep 0.5 2>/dev/null || sleep 1
 while :; do
   printf "%s tick %s\n" "$T" "$n" || exit 0
   [ $((n % {system})) -eq 0 ] && stats

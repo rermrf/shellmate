@@ -118,7 +118,7 @@ const LF: SaveFormat = SaveFormat { line_ending: LineEnding::Lf, bom: false };
 #[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
 async fn e2e_the_server_lists_its_extensions_and_a_directory() {
     let (sftp, _connection, _env) = session().await;
-    let info = sftp.info();
+    let info = sftp.info().await;
     eprintln!("SFTP version {}; extensions advertised by this server:", info.version);
     for (name, version) in &info.extensions {
         eprintln!("  {name} = {version}");
@@ -166,7 +166,7 @@ async fn e2e_the_server_lists_its_extensions_and_a_directory() {
 #[ignore = "needs a real OpenSSH server (see the SSH crate's e2e docs)"]
 async fn e2e_stat_of_a_directory_can_name_its_owner() {
     let (sftp, _connection, _env) = session().await;
-    assert!(sftp.info().has("users-groups-by-id@openssh.com"), "OpenSSH offers the id lookup");
+    assert!(sftp.info().await.has("users-groups-by-id@openssh.com"), "OpenSSH offers the id lookup");
     let home = sftp.home().await.unwrap();
     let user = setting("SHELLMATE_E2E_USER", "tester");
     // A bare stat has only numbers ...

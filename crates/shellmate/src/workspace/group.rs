@@ -178,6 +178,8 @@ pub struct ConnGroup {
     pub link: Option<SftpLink>,
     /// The UI tasks that follow the link; they end with the group.
     pub link_tasks: Vec<Task<()>>,
+    pub preload_after: Option<(std::time::Instant, bool)>,
+    pub preload: Option<(usize, Task<()>)>,
     /// What the connection's transfer queue holds, as every one of its panels shows it.
     pub transfers: Option<Entity<TransferList>>,
     /// The dialog about names that exist.
@@ -206,6 +208,8 @@ impl ConnGroup {
             timer: None,
             link: None,
             link_tasks: Vec::new(),
+            preload_after: None,
+            preload: None,
             transfers: None,
             clash: ClashState::default(),
             forward: None,

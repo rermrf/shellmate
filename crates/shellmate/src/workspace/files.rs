@@ -56,6 +56,56 @@ pub fn link_status(state: &LinkState, tab: SshStatus) -> LinkStatus {
 }
 
 impl Workspace {
+    pub(super) fn preload_on_output(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.iter().find(|session| session.id == id) else { return };
+        let Some(group_id) = session.ssh().map(|ssh| ssh.group) else { return };
+        if self.group(group_id).is_none_or(|group| group.preload_after.is_none())
+            || !session.supports_panel(Panel::Files)
+            || !session.terminal.read(cx).has_backend_output()
+        {
+            return;
+        }
+        let Some((after, reconnect)) = self.group_mut(group_id).and_then(|group| group.preload_after.take()) else {
+            return;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(after.saturating_duration_since(std::time::Instant::now())).await;
+            let job = this.update(cx, |this, cx| {
+                if !this.preferences.get(shellmate_store::Preference::PreloadPanels) {
+                    return None;
+                }
+                let session = this
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id && session.ssh().is_some_and(|ssh| ssh.group == group_id))?;
+                let dir = session
+                    .terminal
+                    .read(cx)
+                    .cwd()
+                    .filter(|_| this.preferences.get(shellmate_store::Preference::FollowDirectory))
+                    .unwrap_or(".")
+                    .to_string();
+                let group = this.group(group_id)?;
+                group.live_connection()?;
+                let files = group.link.as_ref()?.prefetch(dir, reconnect);
+                let monitor = group.monitor.as_ref().map(|monitor| monitor.monitor.clone());
+                Some(runtime::get(cx)?.spawn(async move {
+                    files.await;
+                    if let Some(monitor) = monitor {
+                        monitor.prefetch().await;
+                    }
+                }))
+            });
+            if let Ok(Some(job)) = job {
+                let _abort = super::group::AbortOnDrop::new(job.abort_handle());
+                let _ = job.await;
+            }
+        });
+        if let Some(group) = self.group_mut(group_id) {
+            group.preload = Some((id, task));
+        }
+    }
+
     /// Gives a new connection its SFTP link (the session itself is opened lazily) and starts
     /// following it.
     pub(super) fn attach_link(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -117,6 +167,11 @@ impl Workspace {
 
     /// Something changed in `dir` on the server: every panel of the connection that shows it lists it again.
     fn remote_changed(&mut self, group_id: usize, dir: &str, cx: &mut Context<Self>) {
+        if let Some(LinkState::Ready(session)) =
+            self.group(group_id).and_then(|group| group.link.as_ref()).map(SftpLink::state)
+        {
+            session.invalidate(dir);
+        }
         let panels: Vec<_> = self
             .sessions
             .iter()
@@ -241,6 +296,10 @@ impl Workspace {
 
     /// The connection was lost: the session is gone, the transfers wait.
     pub(super) fn link_lost(&mut self, group_id: usize, cx: &mut Context<Self>) {
+        if let Some(group) = self.group_mut(group_id) {
+            group.preload = None;
+            group.preload_after = None;
+        }
         if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
             link.connection_lost();
         }
@@ -288,6 +347,7 @@ impl Workspace {
         if !session.supports_panel(panel) {
             return;
         }
+        let revisit = panel == Panel::Files && session.files.is_some() && session.panel != panel;
         if panel == Panel::Files && !self.ensure_files_tab(ix, window, cx) {
             return;
         }
@@ -302,6 +362,9 @@ impl Workspace {
             && let Some(group) = self.sessions[ix].ssh().map(|ssh| ssh.group)
         {
             self.open_sftp(group, cx);
+            if revisit && let Some(files) = &self.sessions[ix].files {
+                files.panel.update(cx, |panel, cx| panel.refresh_visible(cx));
+            }
         }
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);

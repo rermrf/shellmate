@@ -241,6 +241,7 @@ impl SftpSession {
                     let _ = self.remove_file(&temp).await;
                     return Err(err.at(&target));
                 }
+                self.changed_path(&target);
                 let revision = self.stat(&target).await?.revision();
                 Ok(SaveOutcome::Saved { revision, mode: WriteMode::Atomic })
             }
@@ -262,6 +263,7 @@ impl SftpSession {
         reason: InPlaceReason,
     ) -> Result<SaveOutcome, SftpError> {
         self.write_in_place(target, bytes).await?;
+        self.changed_path(target);
         let revision = self.stat(target).await?.revision();
         Ok(SaveOutcome::Saved { revision, mode: WriteMode::InPlace(reason) })
     }
@@ -322,7 +324,7 @@ impl SftpSession {
     async fn owner_kept(&self, handle: &str, original: Option<&Entry>, path: &str) -> Result<bool, SftpError> {
         let Some(Entry { uid: Some(uid), gid: Some(gid), .. }) = original else { return Ok(true) };
         self.try_set_handle_owner(handle, original).await;
-        let attrs = self.raw.fstat(handle).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
+        let attrs = self.raw.read().await.fstat(handle).await.map_err(|err| SftpError::from_raw(err, path))?.attrs;
         Ok(attrs.uid.is_none_or(|actual| actual == *uid) && attrs.gid.is_none_or(|actual| actual == *gid))
     }
 

@@ -70,6 +70,7 @@ struct Inner {
     state: LinkState,
     /// A session has been open at some point: it is worth reopening after a reconnect.
     opened_before: bool,
+    silent: bool,
     /// The connection to open sessions on (it must not be kept alive by the link).
     connection: Option<WeakConnection>,
     /// Identifies the attempt in progress; the answer of an older one is thrown away.
@@ -84,6 +85,7 @@ struct Shared {
     runtime: Handle,
     queue: TransferQueue,
     changed: async_channel::Sender<()>,
+    progress: tokio::sync::watch::Sender<()>,
 }
 
 /// The session and transfer queue of one connection. See the module docs.
@@ -110,6 +112,7 @@ impl Shared {
     }
 
     fn notify(&self) {
+        self.progress.send_replace(());
         let _ = self.changed.try_send(());
     }
 
@@ -144,7 +147,7 @@ impl Shared {
                     Some(session)
                 }
                 Err(err) => {
-                    inner.state = LinkState::Failed(err.to_string());
+                    inner.state = if inner.silent { LinkState::Idle } else { LinkState::Failed(err.to_string()) };
                     None
                 }
             }
@@ -164,12 +167,19 @@ impl SftpLink {
         let inner = Inner {
             state: LinkState::Idle,
             opened_before: false,
+            silent: false,
             connection: None,
             attempt: 0,
             opening: None,
             reopens: VecDeque::new(),
         };
-        let shared = Arc::new(Shared { inner: Mutex::new(inner), runtime, queue, changed });
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(inner),
+            runtime,
+            queue,
+            changed,
+            progress: tokio::sync::watch::channel(()).0,
+        });
         (Self { shared }, changes, events)
     }
 
@@ -187,6 +197,7 @@ impl SftpLink {
     /// A link that failed or lost its connection tries again.
     pub fn open(&self, connection: &Connection) {
         let mut inner = self.shared.lock();
+        inner.silent = false;
         if matches!(inner.state, LinkState::Closed) {
             return;
         }
@@ -198,10 +209,55 @@ impl SftpLink {
         }
     }
 
+    /// Warm this connection's listing. Foreground demand adopts an open already in progress.
+    pub fn prefetch(&self, dir: String, reconnect: bool) -> impl Future<Output = ()> + Send + 'static {
+        let shared = self.shared.clone();
+        async move {
+            let mut progress = shared.progress.subscribe();
+            let token = {
+                let mut inner = shared.lock();
+                if reconnect && !inner.opened_before {
+                    return;
+                }
+                if matches!(inner.state, LinkState::Idle | LinkState::Disconnected) {
+                    let Some(connection) = inner.connection.as_ref().and_then(WeakConnection::upgrade) else { return };
+                    inner.silent = true;
+                    shared.start_open(&mut inner, connection);
+                }
+                inner.attempt
+            };
+            let _guard = SilentOpen(shared.clone(), token);
+            loop {
+                let state = {
+                    let inner = shared.lock();
+                    if inner.attempt != token {
+                        return;
+                    }
+                    inner.state.clone()
+                };
+                match state {
+                    LinkState::Ready(session) => {
+                        if session.cached(&dir).is_none() {
+                            session.listing(&dir).await;
+                        }
+                        return;
+                    }
+                    LinkState::Opening => {
+                        if progress.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        }
+    }
+
     /// The connection is gone: the session is dropped and the transfers pause.
     pub fn connection_lost(&self) {
         {
             let mut inner = self.shared.lock();
+            inner.connection = None;
             if matches!(inner.state, LinkState::Closed | LinkState::Idle) {
                 return;
             }
@@ -224,6 +280,7 @@ impl SftpLink {
         }
         inner.connection = Some(connection.downgrade());
         if inner.opened_before
+            && !inner.silent
             && matches!(inner.state, LinkState::Idle | LinkState::Failed(_) | LinkState::Disconnected)
         {
             self.shared.start_open(&mut inner, connection.clone());
@@ -293,6 +350,23 @@ impl SftpLink {
             inner.state = LinkState::Closed;
         }
         self.shared.queue.shutdown();
+        self.shared.progress.send_replace(());
+    }
+}
+
+struct SilentOpen(Arc<Shared>, u64);
+
+impl Drop for SilentOpen {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        if inner.attempt == self.1 && inner.silent && matches!(inner.state, LinkState::Opening) {
+            if let Some(opening) = inner.opening.take() {
+                opening.abort();
+            }
+            inner.attempt += 1;
+            inner.state = LinkState::Idle;
+            self.0.notify();
+        }
     }
 }
 

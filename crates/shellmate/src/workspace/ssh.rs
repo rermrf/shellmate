@@ -666,8 +666,10 @@ impl Workspace {
         // because its terminal is a local client PTY, not an SSH channel.
         let live = Some(connection.clone());
         let mosh_group=self.sessions.iter().any(|s|s.ssh().is_some_and(|ssh|ssh.group==group_id && ssh.mosh.is_some()));
+        let preload = self.preferences.get(shellmate_store::Preference::PreloadPanels) && std::env::var_os("SHELLMATE_DEMO").is_none();
         let Some(group) = self.group_mut(group_id) else { return };
         let reconnected = matches!(group.machine.step(Input::Succeeded).first(), Some(Output::Connected { reconnected: true }));
+        group.preload_after = preload.then(|| (std::time::Instant::now() + Duration::from_secs(1), reconnected));
         let manual = std::mem::take(&mut group.manual);
         group.stop();
         group.last_failure = None;
