@@ -14,6 +14,7 @@ mod files;
 mod forward;
 mod library;
 mod layout;
+mod motion;
 mod tabs;
 mod monitor;
 mod productivity;

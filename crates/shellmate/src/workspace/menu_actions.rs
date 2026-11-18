@@ -95,7 +95,6 @@ impl Workspace {
     }
 
     pub(super) fn toggle_broadcast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_ai(cx);
         self.set_broadcast(!self.broadcast.enabled, window, cx);
     }
 

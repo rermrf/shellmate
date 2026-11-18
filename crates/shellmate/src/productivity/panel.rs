@@ -672,7 +672,7 @@ impl Render for Drawer {
         let body = frame.child(crate::ui::scroll::scroll_body("command-groups", body)
             .track_scroll(&self.scroll).surface(p.card).bottom_padding(px(0.)));
         div()
-            .w(px(300.))
+            .w(px(DRAWER_WIDTH))
             .flex_none()
             .h_full()
             .min_h_0()
@@ -683,6 +683,8 @@ impl Render for Drawer {
             .child(body)
     }
 }
+
+pub(crate) const DRAWER_WIDTH: f32 = 300.;
 
 type TargetAvailable = Box<dyn Fn(usize, &App) -> bool>;
 type SendCommand = Box<dyn Fn(&str, &mut Window, &mut App) -> Result<(), String>>;

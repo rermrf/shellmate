@@ -91,6 +91,27 @@ mod tests {
     }
 
     #[test]
+    fn drawer_open_and_swap_each_deliver_one_final_pty_resize() {
+        let mut throttle = ResizeThrottle::default();
+        let grid = |cols| TerminalSize { cols, ..Default::default() };
+        let mut current = grid(140);
+        throttle.update(current.dims(), Duration::ZERO);
+        for widths in [[132, 109, 102, 100], [101, 103, 104, 105]] {
+            let initial = current;
+            let mut sent = Vec::new();
+            for (index, cols) in widths.into_iter().chain([widths[3]]).enumerate() {
+                let held = index < 3;
+                if let Some(next) = layout_resize(current, grid(cols), held, throttle.pending()) {
+                    current = next;
+                    sent.extend(throttle.update(next.dims(), Duration::ZERO));
+                }
+                if held { assert_eq!(current, initial); }
+            }
+            assert_eq!(sent, [grid(widths[3]).dims()]);
+        }
+    }
+
+    #[test]
     fn held_layout_sends_only_the_final_measurement_even_after_reversal() {
         let grid = |cols| TerminalSize { cols, ..Default::default() };
         let mut current = grid(120);

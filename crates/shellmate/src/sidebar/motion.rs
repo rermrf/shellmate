@@ -1,7 +1,7 @@
 use super::{RAIL_WIDTH, SIDEBAR_WIDTH};
 use std::time::{Duration, Instant};
 
-const DURATION: Duration = Duration::from_millis(220);
+use crate::motion::{CHROME_DURATION as DURATION, ease_out};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SidebarFrame {
@@ -28,7 +28,7 @@ impl SidebarFrame {
             return end;
         }
         let time = elapsed.as_secs_f32() / duration.as_secs_f32();
-        let ease_out = 1. - (1. - time).powi(3);
+        let ease_out = ease_out(time);
         let fade_out = if self.content * end.content < 0. { 0.4 * self.content.abs() } else { 0. };
         let content = if time < fade_out {
             self.content * (1. - time / fade_out)

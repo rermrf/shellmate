@@ -195,12 +195,12 @@ impl FilesPanel {
             )
     }
 
-    fn render_top_bar(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_top_bar(&self, opacity: f32, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.model.ops_enabled() && !self.model.cwd().is_empty();
         let offline = (!ready).then_some(if self.is_local() { "目录就绪后可用" } else { "连接就绪后可用" });
         let no_selection = if ready { Some("先选中要下载的文件或目录") } else { offline };
         let can_download = self.model.download_path().is_some();
-        div().w_full().min_w_0()
+        div().w_full().min_w_0().opacity(opacity)
             .flex().flex_wrap()
             .items_center()
             .gap(px(10.))
@@ -500,7 +500,7 @@ impl FilesPanel {
         }
     }
 
-    fn render_files_card(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_files_card(&self, toolbar_opacity: f32, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let banner = self.model.banner().map(|text| {
             div()
                 .mx(px(18.))
@@ -564,7 +564,7 @@ impl FilesPanel {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.drop_paths(paths.paths().to_vec(), window, cx)))
             .shadow(card_shadow(p))
             .overflow_hidden()
-            .child(self.render_top_bar(p, cx))
+            .child(self.render_top_bar(toolbar_opacity, p, cx))
             .child(label)
             .children(banner)
             .child(self.render_header(p))
@@ -830,15 +830,20 @@ impl Render for FilesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_rename_input(window,cx);
         let p=cx.palette().clone();
-        let inline=crate::layout::Responsive::at(self.width).files_inline_details;
+        let viewport = crate::motion::Viewport::read("files-width", self.width, window, cx);
+        self.width = viewport.width;
+        let layout = crate::layout::Responsive::at(self.width);
+        let inline = layout.files_inline_details;
+        let details = viewport.clock.fade("files-details-layout", inline, window, cx);
+        let toolbar = viewport.clock.fade("files-toolbar-layout", layout.files_toolbar_stacked, window, cx);
         div().id("files-panel").relative().key_context(CONTEXT).track_focus(&self.focus)
             .on_action(cx.listener(Self::on_previous)).on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_open)).on_action(cx.listener(Self::on_parent))
             .on_action(cx.listener(Self::on_delete)).on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_cancel_rename))
             .size_full().min_w_0().min_h_0().flex().flex_col().gap(px(10.)).overflow_hidden()
-            .child(div().flex().flex_1().min_w_0().min_h_0().gap(px(10.))
-                .child(self.render_files_card(&p,cx))
+            .child(div().flex().flex_1().min_w_0().min_h_0().gap(px(10.)).opacity(details)
+                .child(self.render_files_card(toolbar,&p,cx))
                 .when(inline,|d|d.child(self.render_details(window,&p,cx))))
             .children(self.render_queue(&p,cx))
             .children(self.render_menu(&p,cx))
@@ -852,6 +857,6 @@ impl Render for FilesPanel {
                             .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("详情"))
                             .child(Self::button("close-details","关闭",false,&p).on_click(cx.listener(|this,_,_,cx|{this.details_open=false;cx.notify();}))))
                         .child(div().flex_1().min_h_0().child(self.render_details(window,&p,cx))))))
-            .child(crate::ui::observe_width(cx.entity().downgrade(),self.width,|this,width|this.width=width))
+            .child(viewport.observer(cx))
     }
 }

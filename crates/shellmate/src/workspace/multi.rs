@@ -103,6 +103,7 @@ impl Workspace {
         self.broadcast
             .enable(enabled, self.focused_session().map(|s| s.id), &rows);
         self.commands_open = true;
+        self.close_ai(cx);
         self.sync_productivity(cx);
         self.refresh_suggestions(cx);
         if enabled {
@@ -305,12 +306,13 @@ impl Workspace {
         });
         cx.notify();
     }
-    pub(super) fn render_panes(&self, main: &Session, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn render_panes(&self, main: &Session, _ai_width: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         let terminal_view = |session: &Session, cx: &mut Context<Self>| {
             session.view.update(cx, |view, _| {
-                view.hold_grid_size = self.sidebar_motion.running();
+                view.hold_grid_size = self.sidebar_motion.running() || self.drawer_motion.running();
                 #[cfg(debug_assertions)]
-                { view.fixture_grid_width_offset = self.sidebar_motion.fixture_grid_width_offset(self.sidebar_open); }
+                { view.fixture_grid_width_offset = self.sidebar_motion.fixture_grid_width_offset(self.sidebar_open)
+                    + self.drawer_motion.grid_offset(_ai_width); }
             });
             session.view.clone()
         };

@@ -402,7 +402,9 @@ impl MonitorPanel {
         &self,
         stale: bool,
         banner: Option<Banner>,
+        clock: super::Clock,
         p: &Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let layout=crate::layout::Responsive::at(self.width);
@@ -410,6 +412,7 @@ impl MonitorPanel {
             let page = crate::monitor::model::loading("服务列表");
             return self.message_card(&page.title, &page.detail, false, p, cx);
         };
+        let opacity = clock.fade("services-layout", (layout.services_stacked, layout.service_extra_columns), window, cx);
         let filters = ServiceFilter::ALL
             .iter()
             .map(|filter| SegmentItem::new(filter.label(), *filter == self.service_filter))
@@ -539,7 +542,7 @@ impl MonitorPanel {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .flex().min_w_0().when(layout.services_stacked,|d|d.flex_col().flex_none())
+                    .flex().min_w_0().opacity(opacity).when(layout.services_stacked,|d|d.flex_col().flex_none())
                     .gap(px(10.))
                     .child(list_card)
                     .children(detail.map(|detail| self.render_service_detail(&detail, stale, p, cx))),

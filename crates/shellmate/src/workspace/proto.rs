@@ -26,6 +26,8 @@ impl Workspace {
         let stress=scene.starts_with("stress-");
         let scene=scene.strip_prefix("stress-").unwrap_or(scene);
         self.ai_drawer=None;self.ai_open=false;
+        self.commands_open = false;
+        self.drawer_motion = Default::default();
         self.ai_drawer_width = if scene == "ai-markdown-wide" { 560. } else { drawer_resize::DEFAULT_WIDTH };
         self.sessions.clear();
         self.groups.clear();
@@ -267,6 +269,19 @@ impl Workspace {
                 self.update_pane_radii(cx);
             }
             "rail" => self.set_sidebar_open(false, cx),
+            "drawer-mid" | "drawer-swap-mid" => {
+                use drawer_motion::Drawer;
+                self.open_ai(window, cx);
+                if let Some(drawer) = &self.ai_drawer {
+                    drawer.update(cx, |drawer, cx| drawer.scene("ai", cx));
+                }
+                if scene == "drawer-swap-mid" {
+                    self.toggle_commands(window, cx);
+                    self.drawer_motion.freeze(Drawer::Ai, Drawer::Commands);
+                } else {
+                    self.drawer_motion.freeze(Drawer::Closed, Drawer::Ai);
+                }
+            }
             "rail-mid" | "rail-mid-expand" => {
                 let open = scene == "rail-mid-expand";
                 self.set_sidebar_open(open, cx);
@@ -299,7 +314,7 @@ impl Workspace {
                 });
                 self.sessions[0].panel = Panel::Forward;
             }
-            "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" => self.proto_monitor(scene, stress, window, cx),
+            "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" | "mon-ov-reflow-mid" => self.proto_monitor(scene, stress, window, cx),
             local if matches!(local, "mon-local" | "mon-local-proc" | "mon-local-disks") || proto::monitor::PORT_SCENES.contains(&local) || proto::monitor::SERVICE_SCENES.contains(&local) => {
                 self.proto_local(window, cx);
                 self.proto_monitor(scene, false, window, cx);
@@ -479,6 +494,7 @@ impl Workspace {
         };
         panel.update(cx, |p, cx| {
             p.set_page(page, cx);
+            p.frozen_reflow = scene == "mon-ov-reflow-mid";
             if scene == "mon-local-svc-sel" {
                 p.demo_services("", crate::monitor::services::ServiceFilter::All, Some("gui/501/homebrew.mxcl.redis"), window, cx);
             }

@@ -308,7 +308,7 @@ impl ForwardPanel {
         }
     }
 
-    fn render_card(&self, ix: usize, card: &RuleCard, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_card(&self, ix: usize, card: &RuleCard, opacity: f32, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
         let stacked = crate::layout::Responsive::at(self.width).forward_stacked_stats;
         let (bg, fg) = match card.kind {
             ForwardKind::Local => (p.accs, p.acc),
@@ -318,7 +318,7 @@ impl ForwardPanel {
         let color = if card.tone == Tone::Off { p.tx2 } else { Self::tone_color(p, card.tone) };
         let toggle_id = card.id.clone();
         let delete_id = card.id.clone();
-        let status = div()
+        let status = div().opacity(opacity)
             .min_w_0()
             .flex_none()
             .flex()
@@ -524,11 +524,16 @@ impl ForwardPanel {
 }
 
 impl Render for ForwardPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
+        let viewport = crate::motion::Viewport::read("forward-width", self.width, window, cx);
+        self.width = viewport.width;
+        let opacity = if self.view.cards.is_empty() { 1. } else {
+            viewport.clock.fade("forward-stats-layout", crate::layout::Responsive::at(self.width).forward_stacked_stats, window, cx)
+        };
         let mut cards = Vec::new();
         for (ix, card) in self.view.cards.iter().enumerate() {
-            cards.push(self.render_card(ix, card, &p, cx));
+            cards.push(self.render_card(ix, card, opacity, &p, cx));
         }
         let form = self.form.as_ref().map(|form| self.render_form(form, &p, cx));
         let empty = self.view.cards.is_empty() && self.form.is_none();
@@ -548,6 +553,6 @@ impl Render for ForwardPanel {
                     .children(form).children(cards)
                     .children(empty.then(|| self.render_empty(&p, cx))),
                 &self.scroll, p.win, 0.))
-            .child(crate::ui::observe_width(cx.entity().downgrade(), self.width, |this, width| this.width = width))
+            .child(viewport.observer(cx))
     }
 }

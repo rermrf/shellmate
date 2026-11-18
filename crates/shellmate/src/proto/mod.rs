@@ -92,7 +92,7 @@ pub const SCENES: &[&str] = &[
     "set-local",
     "set-conn",
     "host-new", "host-new-focus",
-    "rail", "rail-mid", "rail-mid-expand",
+    "rail", "rail-mid", "rail-mid-expand", "drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid",
     "local",
     "files-local", "files-local-trash",
     "mon-local", "mon-local-proc", "mon-local-disks",
@@ -121,6 +121,7 @@ pub fn window_size() -> (u32,u32) {
 }
 
 pub fn default_window_size(scene: &str) -> (u32, u32) {
+    if scene == "mon-ov-reflow-mid" { return (1295, 900); }
     PAGE_SCROLL_SCENES.iter().find(|(name, _)| *name == scene).map(|(_, size)| *size)
         .unwrap_or(if scene.starts_with("stress-") { (1776, 901) } else { (1440, 900) })
 }
@@ -224,6 +225,9 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
         match scene {
             _ if monitor::PORT_SCENES.contains(&scene) || monitor::SERVICE_SCENES.contains(&scene) => "local",
             "rail-mid" | "rail-mid-expand" => "main",
+            "drawer-mid" => "ai",
+            "drawer-swap-mid" => "cmds",
+            "mon-ov-reflow-mid" => "mon-ov",
             "set-cred-focus" | "set-cred-typed" => "set-cred-master",
             "set-ai-replace" => "set-ai",
             "host-new-focus" => "host-new",
@@ -286,7 +290,10 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 79 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 82 + PAGE_SCROLL_SCENES.len());
+        for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
+            assert!(SCENES.contains(&scene));
+        }
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
@@ -297,6 +304,9 @@ mod tests {
                     if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
                 } else { match *scene {
                     "rail-mid" | "rail-mid-expand" => "main",
+                    "drawer-mid" => "ai",
+                    "drawer-swap-mid" => "cmds",
+                    "mon-ov-reflow-mid" => "mon-ov",
                     "set-cred-focus" | "set-cred-typed" => "set-cred-master",
                     "set-ai-replace" => "set-ai",
                     "host-new-focus" => "host-new",

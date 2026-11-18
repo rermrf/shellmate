@@ -444,13 +444,16 @@ impl MonitorPanel {
         &self,
         stale: bool,
         banner: Option<Banner>,
+        clock: super::Clock,
         p: &Palette,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (Some(view), Some(runtime)) = (self.data.docker.clone(), self.runtime().cloned()) else {
             let page = crate::monitor::model::loading("容器列表");
             return self.message_card(&page.title, &page.detail, false, p, cx);
         };
+        let opacity = clock.fade("docker-compact-layout", crate::layout::Responsive::at(self.width).docker_compact, window, cx);
         let header = containers::header(&view, &runtime);
         let groups = containers::groups(&view, &self.data.forwards);
         let stat = |value: String, caption: &'static str| {
@@ -565,7 +568,7 @@ impl MonitorPanel {
                     .flex_col()
                     .gap(px(10.))
                     .pb(px(10.))
-                    .when(stale, |d| d.opacity(0.5))
+                    .opacity(opacity * if stale { 0.5 } else { 1. })
                     .children(groups.iter().enumerate().map(|(i, group)| self.group_card(i, group, p, cx)))
                     .when(groups.is_empty(), |d| {
                         d.child(

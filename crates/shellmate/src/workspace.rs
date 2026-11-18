@@ -45,6 +45,7 @@ mod streams;
 mod mosh;
 mod ai;
 mod drawer_resize;
+mod drawer_motion;
 mod menu_actions;
 
 actions!(
@@ -208,6 +209,7 @@ pub struct Workspace {
     ai_open: bool,
     ai_drawer_width: f32,
     ai_drawer_drag: drawer_resize::Drag,
+    drawer_motion: drawer_motion::DrawerMotion,
     broadcast: crate::productivity::multi::Broadcast,
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
@@ -299,6 +301,7 @@ impl Workspace {
             commands,
             commands_open: false, ai_drawer:None,ai_open:false,
             ai_drawer_width, ai_drawer_drag: Default::default(),
+            drawer_motion: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),recent_sessions:Vec::new(),session_menu:None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -672,7 +675,7 @@ impl Workspace {
 
     // ---- rendering -----------------------------------------------------
 
-    fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, inset: f32, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         // Shape the same fonts/weights the strip renders; titles are capped, chips are not.
         let measure = |text: &str, size: f32, weight: FontWeight, window: &mut Window| {
@@ -716,13 +719,14 @@ impl Workspace {
                 .iter()
                 .map(|(label, icon)| 24. + icon + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window))
                 .sum::<f32>();
-        let content_width = f32::from(window.viewport_size().width) - self.sidebar_motion.frame.width - 12.;
+        let content_width = f32::from(window.viewport_size().width) - self.sidebar_motion.frame.width - 12.
+            - inset;
         let available = (content_width - toolbar_width - 4. * 8.).max(0.);
         let overflow_label = format!("{} 个会话 ▾", self.sessions.len());
         let overflow_width = measure(&overflow_label, 12., FontWeight::NORMAL, window) + 16.;
         let cap = None;
         #[cfg(debug_assertions)]
-        let cap = if crate::proto::requested()
+        let cap = if crate::proto::requested() && inset == 0.
             && std::env::var("SHELLMATE_DEMO").is_ok_and(|s| !s.starts_with("proto:stress-"))
         {
             // Ordinary prototype scenes use a count-based sliding window, even when another
@@ -834,7 +838,7 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx)));
 
         let theme_icon = if cx.is_dark() { AppIcon::Sun } else { AppIcon::Moon };
-        div()
+        div().mr(px(inset))
             .h(px(58.))
             .flex_none()
             .pt(px(4.))
@@ -904,7 +908,7 @@ impl Workspace {
             )
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, inset: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let session = self.active.and_then(|ix| self.sessions.get(ix));
         let (title, subtitle) = match session {
@@ -926,7 +930,7 @@ impl Workspace {
             })
             .collect();
 
-        window_drag_area(div().id("header-drag"))
+        window_drag_area(div().id("header-drag")).mr(px(inset))
             .h(px(50.)).flex_none().px(px(4.)).pr(px(0.)).pb(px(6.))
             .flex()
             .items_center()
@@ -997,7 +1001,7 @@ impl Workspace {
         parts.join(" · ")
     }
 
-    fn render_terminal_card(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal_card(&self, session: &Session, ai_width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let term_bg = to_hsla(cx.terminal_style().palette.background);
         let term_fg = to_hsla(cx.terminal_style().palette.foreground);
@@ -1051,7 +1055,7 @@ impl Workspace {
             .rounded(CARD_RADIUS)
             .bg(term_bg)
             .shadow(crate::ui::terminal_shadow(&p))
-            .child(self.render_panes(session,cx))
+            .child(self.render_panes(session,ai_width,cx))
             .when(crate::ai::model::error_line(&focused.terminal.read(cx).recent_displayed_text(size.rows as usize)).is_some(),|d|d.child(div().absolute().top(px(if focused.host().is_some_and(|h|h.protocol==shellmate_core::Protocol::Serial){56.}else{12.})).right(px(14.))
                 .child(toolbar_button("ai-explain",AppIcon::Ai,Some("AI 解释这个报错"),"解释当前终端报错",true,cx).bg(p.card).text_color(p.acc).on_click(cx.listener(|s,_,w,cx|s.explain_ai(w,cx))))))
             .when(self.broadcast.enabled,|d|d.child(self.broadcast_bar.clone()))
@@ -1127,8 +1131,14 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sidebar_motion.advance(cx.background_executor().now(), cx.reduce_motion());
-        if self.sidebar_motion.running() {
+        let now = cx.background_executor().now();
+        self.sidebar_motion.advance(now, cx.reduce_motion());
+        let target = self.drawer_kind();
+        if self.drawer_motion.changing_target(target) { crate::motion::refresh_preference(cx); }
+        self.drawer_motion.update(target, now, crate::motion::enabled(cx) && !self.ai_drawer_drag.active());
+        let ai_width = self.drawer_width(_window);
+        let chrome_inset = self.chrome_inset(ai_width);
+        if self.sidebar_motion.running() || self.drawer_motion.running() {
             _window.request_animation_frame();
         }
         self.sidebar.update(cx, |sidebar, _| sidebar.frame = self.sidebar_motion.frame);
@@ -1145,7 +1155,7 @@ impl Render for Workspace {
             Some(Session { panel: Panel::Monitor, monitor: Some(monitor), .. }) => {
                 div().flex_1().min_w_0().min_h_0().flex().child(monitor.panel.clone()).into_any_element()
             }
-            Some(session) => self.render_terminal_card(session, cx).into_any_element(),
+            Some(session) => self.render_terminal_card(session, ai_width, cx).into_any_element(),
             None => self.render_empty(cx).into_any_element(),
         };
 
@@ -1192,14 +1202,10 @@ impl Render for Workspace {
                     .flex_col()
                     .pr(px(12.))
                     .pb(px(12.))
-                    .child(self.render_tab_bar(_window,cx))
-                    .child(self.render_header(cx))
+                    .child(self.render_tab_bar(chrome_inset,_window,cx))
+                    .child(self.render_header(chrome_inset,cx))
                     .child(
-                        div().flex_1().min_h_0().flex().gap(px(12.)).child(body)
-                            .when(self.commands_open, |d| d.child(self.commands.clone())).when(self.ai_open, |d| d.child(
-                                div().relative().w(px(self.drawer_width(_window))).flex_none().h_full().min_h_0()
-                                    .children(self.ai_drawer.clone()).child(self.drawer_handle(cx))
-                            )),
+                        div().flex_1().min_h_0().flex().child(body).children(self.drawer_slot(ai_width, cx)),
                     ),
             )
             .children(self.session_menu.as_ref().map(|menu| gpui::deferred(

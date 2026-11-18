@@ -7,6 +7,7 @@
 mod docker;
 mod logs;
 mod ports;
+mod reflow;
 mod services;
 
 use std::ops::Range;
@@ -30,6 +31,7 @@ use super::process::{
 };
 use super::services::{ServiceFilter, ServiceRow};
 use crate::theme::{ActivePalette, CARD_RADIUS, MONO_FONT, Palette};
+use crate::motion::{Clock, blocks::{Blocks, measure}};
 use crate::ui::{ellipsis, SegmentItem, card_shadow, item_shadow, segmented};
 
 /// What the panel asks of the workspace.
@@ -61,6 +63,8 @@ impl EventEmitter<MonitorPanelEvent> for MonitorPanel {}
 /// The panel.
 pub struct MonitorPanel {
     width: f32,
+    #[cfg(debug_assertions)]
+    pub(crate) frozen_reflow: bool,
     host: SharedString,
     data: MonitorData,
     /// What follows the logs (the monitor of the connection).
@@ -152,6 +156,8 @@ impl MonitorPanel {
             data,
             monitor,
             width: 1144.,
+            #[cfg(debug_assertions)]
+            frozen_reflow: false,
             page: Page::Overview,
             query,
             sort: SortKey::Cpu,
@@ -332,8 +338,7 @@ impl MonitorPanel {
             .into_any_element()
     }
 
-    fn render_header(&self, header: &HeaderView, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let stacked=crate::layout::Responsive::at(self.width).header_stacked;
+    fn header_parts(&self, header: &HeaderView, stacked: bool, p: &Palette, cx: &mut Context<Self>) -> [AnyElement; 2] {
         let facts:SharedString=format!("{}{}",header.os,header.meta).into();
         let facts_tip=facts.clone();
         let facts=div().id("monitor-facts").w_full().min_w_0().truncate().text_size(px(13.5)).font_weight(FontWeight::MEDIUM).text_color(p.tx2)
@@ -378,26 +383,12 @@ impl MonitorPanel {
             }
             button
         });
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .w_full().min_w_0().gap(px(14.)).min_h(px(64.))
-            .when(stacked,|d|d.flex_col().items_start())
-            .py(px(10.))
-            .pr(px(10.))
-            .pl(px(18.))
-            .bg(p.card)
-            .rounded(CARD_RADIUS)
-            .shadow(card_shadow(p))
-            .child(
+        [
                 div()
                     .flex_1().min_w_0().when(stacked,|d|d.w_full().flex_none())
                     .flex().flex_col().gap(px(5.))
                     .child(facts)
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(header.chips.iter().enumerate().map(|(index, chip)| self.chip(index, chip, p)))),
-            )
-            .child(
+                    .child(div().flex().flex_wrap().gap(px(6.)).children(header.chips.iter().enumerate().map(|(index, chip)| self.chip(index, chip, p)))).into_any_element(),
                 div()
                     .id("monitor-pages")
                     .flex().max_w_full()
@@ -406,9 +397,33 @@ impl MonitorPanel {
                     .gap(px(2.))
                     .rounded(px(12.))
                     .bg(p.card3)
-                    .children(tabs),
-            )
-            .into_any_element()
+                    .children(tabs).into_any_element(),
+        ]
+    }
+
+    fn frozen_reflow(&self) -> bool {
+        #[cfg(debug_assertions)] { self.frozen_reflow }
+        #[cfg(not(debug_assertions))] { false }
+    }
+
+    fn render_header(&self, header: &HeaderView, clock: Clock, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let stacked = crate::layout::Responsive::at(self.width).header_stacked;
+        let frozen = self.frozen_reflow();
+        let blocks = Blocks::region(("monitor-header-layout", self.page as usize), stacked, clock, frozen, window, cx);
+        let group = div().bg(p.card).rounded(CARD_RADIUS).shadow(card_shadow(p));
+        let parts = self.header_parts(header, stacked, p, cx);
+        if let Some(frame) = blocks.frame(|source| {
+            let (width, layout) = reflow::endpoint(self.width, frozen, source);
+            let [info, tabs] = self.header_parts(header, layout.header_stacked, p, cx);
+            let widths = reflow::header_widths(width, layout.header_stacked, measure(tabs, None, window, cx).0);
+            let info = div().w(px(widths[0])).flex().child(info).into_any_element();
+            reflow::header(widths, layout.header_stacked, measure(info, Some(widths[0]), window, cx).1)
+        }) {
+            blocks.absolute(group, frame, parts)
+        } else {
+            blocks.native(group.flex().flex_none().items_center().w_full().min_w_0().gap(px(14.)).min_h(px(64.))
+                .when(stacked, |group| group.flex_col().items_start()).py(px(10.)).pr(px(10.)).pl(px(18.)).children(parts))
+        }
     }
 
     fn banner(&self, banner: &Banner, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -482,7 +497,7 @@ impl MonitorPanel {
             .child(div().text_size(px(15.)).line_height(px(18.)).relative().top(px(-4.)).left(px(-2.)).text_color(p.tx2).font_weight(FontWeight::SEMIBOLD).child(" %"))
     }
 
-    fn render_cards(&self, cards: &Cards, p: &Palette) -> AnyElement {
+    fn render_cards(&self, cards: &Cards, clock: Clock, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let cpu = self
             .card(p)
             .flex_1()
@@ -645,10 +660,19 @@ impl MonitorPanel {
             network
         };
         let layout=crate::layout::Responsive::at(self.width);
+        let frozen = self.frozen_reflow();
+        let blocks = Blocks::region("summary-layout", layout.summary_columns == 2, clock, frozen, window, cx);
+        let frame = blocks.frame(|source| {
+            let (width, layout) = reflow::endpoint(self.width, frozen, source);
+            reflow::summary(width, layout.summary_columns)
+        });
+        let cards = [cpu, memory, disks, network].map(|card| card.overflow_hidden().into_any_element());
+        if let Some(frame) = frame.or_else(|| (!crate::prototype_fixture()).then(|| reflow::summary(self.width, layout.summary_columns))) {
+            return blocks.absolute(div(), frame, cards);
+        }
         let cell_width=layout.summary_width(self.width);
-        div().w_full().min_w_0().flex().flex_wrap().flex_none().gap(px(10.))
-            .children([cpu,memory,disks,network].into_iter().map(|card|div().w(px(cell_width)).h(px(157.)).flex_none().min_w_0().flex().child(card.overflow_hidden())))
-            .into_any_element()
+        blocks.native(div().w_full().min_w_0().flex().flex_wrap().flex_none().gap(px(10.))
+            .children(cards.into_iter().map(|card|div().w(px(cell_width)).h(px(157.)).flex_none().min_w_0().flex().child(card))))
     }
 
     fn render_attention(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -842,20 +866,39 @@ impl MonitorPanel {
             .into_any_element()
     }
 
-    fn render_overview(&self, stale: bool, banner: Option<Banner>, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
-        let cards=model::cards(self.data.snapshot.as_deref());
+    fn render_lower(&self, clock: Clock, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let stacked=crate::layout::Responsive::at(self.width).overview_stacked;
+        let frozen = self.frozen_reflow();
+        let blocks = Blocks::region("overview-lower-layout", stacked, clock, frozen, window, cx);
+        let parts = [self.render_attention(p,cx), self.render_cores_and_top(p,cx)];
+        if let Some(frame) = blocks.frame(|source| {
+            let (width, layout) = reflow::endpoint(self.width, frozen, source);
+            let widths = reflow::lower_widths(width, layout.overview_stacked);
+            let probes = [self.render_attention(p,cx), self.render_cores_and_top(p,cx)];
+            let [attention, cores] = probes;
+            let heights = [(attention, widths[0]), (cores, widths[1])].map(|(part, width)| {
+                measure(div().w(px(width)).flex().child(part).into_any_element(), Some(width), window, cx).1
+            });
+            reflow::lower(width, layout.overview_stacked, heights, self.overview_scroll.bounds().size.height.into())
+        }) {
+            blocks.absolute(div(), frame, parts)
+        } else {
+            let [attention, cores] = parts;
+            blocks.native(div().w_full().min_w_0().flex().flex_shrink(0.).gap(px(10.)).when(stacked,|d|d.flex_col()).when(!stacked,|d|d.flex_grow(1.))
+                .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.35).flex_basis(px(0.))).child(attention))
+                .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.).flex_basis(px(0.))).child(cores)))
+        }
+    }
+
+    fn render_overview(&self, stale: bool, banner: Option<Banner>, clock: Clock, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let cards=model::cards(self.data.snapshot.as_deref());
         div().id("monitor-overview").flex_1().min_h_0().min_w_0().flex().flex_col().gap(px(10.))
             .children(banner.map(|b|self.banner(&b,p,cx)))
             .child(crate::ui::scroll::page_scroll("overview-fades", div().id("monitor-overview-scroll").w_full().flex_1().min_h_0().min_w_0()
                 .overflow_y_scroll().track_scroll(&self.overview_scroll).flex().flex_col().gap(px(10.))
                 .when(stale,|d|d.opacity(0.5))
-                .child(self.render_cards(&cards,p))
-                .child(div().w_full().min_w_0().flex().flex_shrink(0.).gap(px(10.)).when(stacked,|d|d.flex_col()).when(!stacked,|d|d.flex_grow(1.))
-                    .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.35).flex_basis(px(0.)))
-                        .child(self.render_attention(p,cx)))
-                    .child(div().min_w_0().flex().when(stacked,|d|d.w_full().flex_none()).when(!stacked,|d|d.flex_grow(1.).flex_basis(px(0.)))
-                        .child(self.render_cores_and_top(p,cx)))), &self.overview_scroll, p.win, 0.))
+                .child(self.render_cards(&cards,clock,p,window,cx))
+                .child(self.render_lower(clock,p,window,cx)), &self.overview_scroll, p.win, 0.))
             .into_any_element()
     }
 
@@ -984,8 +1027,9 @@ impl MonitorPanel {
         element.into_any_element()
     }
 
-    fn render_processes(&self, stale: bool, banner: Option<Banner>, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_processes(&self, stale: bool, banner: Option<Banner>, clock: Clock, p: &Palette, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let layout=crate::layout::Responsive::at(self.width);
+        let opacity = clock.fade("process-columns-layout", (layout.process_user, layout.process_rss), window, cx);
         let user_width=crate::layout::numeric_width(self.table.rows.iter().map(|r|r.user.as_str()),7.5,96.).min(128.);
         let sorts = SortKey::ALL.iter().map(|key| SegmentItem::new(key.label(), *key == self.sort)).collect::<Vec<_>>();
         let on_pick = {
@@ -1046,7 +1090,7 @@ impl MonitorPanel {
                 None => cell.flex_1().min_w_0(),
             }
         };
-        let columns = div()
+        let columns = div().opacity(opacity)
             .flex()
             .flex_none()
             .items_center()
@@ -1152,7 +1196,7 @@ impl MonitorPanel {
                     .overflow_hidden()
                     .child(toolbar)
                     .child(columns)
-                    .child(div().flex_1().min_h_0().flex().flex_col().child(rows_area))
+                    .child(div().flex_1().min_h_0().flex().flex_col().opacity(opacity).child(rows_area))
                     .children(bar),
             )
             .into_any_element()
@@ -1160,8 +1204,11 @@ impl MonitorPanel {
 }
 
 impl Render for MonitorPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
+        let viewport = crate::motion::Viewport::read(("monitor-width", self.page as usize), self.width, window, cx);
+        self.width = viewport.width;
+        let clock = viewport.clock;
         let header = model::header(&self.data, self.page, &self.host);
         let body = model::body(&self.data);
         let probe = self.data.probe.as_deref();
@@ -1171,15 +1218,15 @@ impl Render for MonitorPanel {
             (_, Body::Message(message)) if unsupported => {
                 self.message_card(&message.title, &message.detail, message.retry, &p, cx)
             }
-            (Page::Services, Body::Data { stale, banner }) if self.data.local_services => self.render_services(stale, banner, &p, cx),
-            (Page::Services, Body::Message(_)) if self.data.local_services => self.render_services(false, None, &p, cx),
+            (Page::Services, Body::Data { stale, banner }) if self.data.local_services => self.render_services(stale, banner, clock, &p, window, cx),
+            (Page::Services, Body::Message(_)) if self.data.local_services => self.render_services(false, None, clock, &p, window, cx),
             (Page::Services, Body::Data { stale, banner }) => match model::services_page(probe) {
                 Some(page) => self.message_card(&page.title, &page.detail, false, &p, cx),
-                None => self.render_services(stale, banner, &p, cx),
+                None => self.render_services(stale, banner, clock, &p, window, cx),
             },
             (Page::Docker, Body::Data { stale, banner }) => match model::docker_page(probe) {
                 Some(page) => self.message_card(&page.title, &page.detail, false, &p, cx),
-                None => self.render_docker(stale, banner, &p, cx),
+                None => self.render_docker(stale, banner, clock, &p, window, cx),
             },
             (Page::Services, Body::Message(_)) => {
                 let page = model::services_page(probe).unwrap_or_else(|| model::loading("服务列表"));
@@ -1190,13 +1237,13 @@ impl Render for MonitorPanel {
                 self.message_card(&page.title, &page.detail, false, &p, cx)
             }
             (_, Body::Message(message)) => self.message_card(&message.title, &message.detail, message.retry, &p, cx),
-            (Page::Overview, Body::Data { stale, banner }) => self.render_overview(stale, banner, &p, cx),
-            (Page::Processes, Body::Data { stale, banner }) => self.render_processes(stale, banner, &p, cx),
+            (Page::Overview, Body::Data { stale, banner }) => self.render_overview(stale, banner, clock, &p, window, cx),
+            (Page::Processes, Body::Data { stale, banner }) => self.render_processes(stale, banner, clock, &p, window, cx),
         };
         div().id("monitor").relative().track_focus(&self.focus)
             .size_full().min_w_0().min_h_0().flex().flex_col().gap(px(10.)).overflow_hidden()
-            .child(self.render_header(&header,&p,cx))
+            .child(self.render_header(&header,clock,&p,window,cx))
             .child(content)
-            .child(crate::ui::observe_width(cx.entity().downgrade(),self.width,|this,width|this.width=width))
+            .child(viewport.observer(cx))
     }
 }
