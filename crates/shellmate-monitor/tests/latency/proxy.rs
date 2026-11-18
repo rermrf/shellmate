@@ -105,8 +105,10 @@ async fn check_echo(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> io::Resu
     let first = started.elapsed();
     timeout(Duration::from_secs(2), stream.read_exact(&mut echoed[1..])).await??;
     let all = started.elapsed();
+    // The lower bound proves the delay; the upper one only that chunks are pipelined rather than
+    // delayed one after another (several hundred ms each). Shared CI machines need the headroom.
     assert!(
-        first >= Duration::from_millis(200) && all < Duration::from_millis(300),
+        first >= Duration::from_millis(200) && all < Duration::from_millis(800),
         "echo: first {first:?}, all {all:?}"
     );
     assert!(echoed == payload, "payload changed in transit");

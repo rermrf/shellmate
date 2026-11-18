@@ -250,11 +250,15 @@ mod tests {
 
     #[test]
     fn the_real_probe_sees_a_listener_on_the_same_loopback_address_and_lets_go_again() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let taken = listener.local_addr().unwrap();
-        assert!(matches!(probe_bind(taken), Err(err) if err.kind() == ErrorKind::AddrInUse));
-        drop(listener);
-        assert!(probe_bind(taken).is_ok(), "nothing is left behind by a probe");
-        assert!(probe_bind(taken).is_ok());
+        // Other tests run in parallel and may take the freed ephemeral port between the steps;
+        // that says nothing about the probe, so try a few fresh ports before calling it a failure.
+        let attempt = || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let taken = listener.local_addr().unwrap();
+            let refused = matches!(probe_bind(taken), Err(err) if err.kind() == ErrorKind::AddrInUse);
+            drop(listener);
+            refused && probe_bind(taken).is_ok() && probe_bind(taken).is_ok()
+        };
+        assert!((0..5).any(|_| attempt()), "a probe must see a listener and leave nothing behind");
     }
 }
