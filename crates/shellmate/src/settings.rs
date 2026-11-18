@@ -161,27 +161,10 @@ impl SettingsWindow {
         );
     }
     fn export_bundle(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        security::PasswordDialog::open(
-            self.credentials.clone(),
-            Purpose::Export,
-            None,
-            Box::new(|_, _, _| {}),
-            w,
-            cx,
-        );
+        self.workspace.update(cx, |workspace, cx| workspace.export_bundle(w, cx)).ok();
     }
     fn import_bundle(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let workspace = self.workspace.clone();
-        security::open_import(
-            self.credentials.clone(),
-            move |ok, w, cx| {
-                if ok {
-                    workspace.update(cx, |s, cx| s.refresh_bundle(w, cx)).ok();
-                }
-            },
-            w,
-            cx,
-        );
+        self.workspace.update(cx, |workspace, cx| workspace.import_bundle(w, cx)).ok();
     }
     #[cfg(debug_assertions)]
     pub fn fixture_master(&mut self, cx: &mut Context<Self>) {

@@ -989,8 +989,8 @@ impl Workspace {
         let Some(ix) = self.active.filter(|ix| *ix < self.sessions.len()) else {
             return self.open_local(window, cx);
         };
+        if !Session::duplicable(self.sessions[ix].host().map(|host| host.protocol)) {window.push_notification(Notification::info("串口设备不能同时打开两次，请先关闭端口"),cx);return;}
         if let SessionKind::Stream(s)=&self.sessions[ix].kind {
-            if s.host.protocol==shellmate_core::Protocol::Serial {window.push_notification(Notification::info("串口设备不能同时打开两次，请先关闭端口"),cx);return;}
             let host=s.host.clone();self.open_stream(host,window,cx);return;
         }
         let Some(ssh) = self.sessions[ix].ssh() else {

@@ -5,6 +5,8 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 
 const EXTRA_ICONS: &[(&str, &[u8])] = &[
+    ("dock-light.png", crate::app_icon::LIGHT),
+    ("dock-dark.png", crate::app_icon::DARK),
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
     ("icons/radio-tower.svg", include_bytes!("../assets/icons/radio-tower.svg")),
     ("icons/sparkles.svg", include_bytes!("../assets/icons/sparkles.svg")),

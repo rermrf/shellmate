@@ -103,7 +103,7 @@ pub const SCENES: &[&str] = &[
     "stress-main", "stress-mon-ov", "stress-mon-proc", "stress-mon-svc", "stress-mon-dk", "stress-files", "stress-fwd",
 ];
 pub fn requested() -> bool {
-    std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s.starts_with("proto:"))
+    std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s.starts_with("proto:") || matches!(s.as_str(), "menu-empty" | "about"))
 }
 /// Optional point-size suffix, used only by the debug fixture.
 pub fn request(value: &str) -> (&str, Option<(u32,u32)>) {

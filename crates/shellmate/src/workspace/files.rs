@@ -285,11 +285,7 @@ impl Workspace {
     pub(super) fn show_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active else { return };
         let Some(session) = self.sessions.get(ix) else { return };
-        let available = match panel {
-            Panel::Terminal => true,
-            Panel::Files | Panel::Forward | Panel::Monitor => session.ssh().is_some(),
-        };
-        if !available {
+        if !session.supports_panel(panel) {
             return;
         }
         if panel == Panel::Files && !self.ensure_files_tab(ix, window, cx) {

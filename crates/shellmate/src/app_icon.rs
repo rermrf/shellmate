@@ -7,8 +7,8 @@
 
 use gpui::WindowAppearance;
 
-const LIGHT: &[u8] = include_bytes!("../assets/app-icon/dock-light.png");
-const DARK: &[u8] = include_bytes!("../assets/app-icon/dock-dark.png");
+pub(crate) const LIGHT: &[u8] = include_bytes!("../assets/app-icon/dock-light.png");
+pub(crate) const DARK: &[u8] = include_bytes!("../assets/app-icon/dock-dark.png");
 
 pub fn is_dark(appearance: WindowAppearance) -> bool {
     matches!(

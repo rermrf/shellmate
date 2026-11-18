@@ -46,7 +46,11 @@ actions!(
 const CONTEXT: &str = "Terminal";
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(bindings());
+}
+
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
@@ -63,7 +67,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-pagedown", ScrollPageDown, Some(CONTEXT)),
         KeyBinding::new("cmd-home", ScrollToTop, Some(CONTEXT)),
         KeyBinding::new("cmd-end", ScrollToBottom, Some(CONTEXT)),
-    ]);
+    ]
 }
 
 /// Where the grid was last painted, for mapping mouse and IME positions.

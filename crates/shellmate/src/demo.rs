@@ -20,6 +20,7 @@ use crate::workspace::Workspace;
 /// `files-hint:<host name>` connect one and show its files panel;
 /// `connect-dup:<host name>` does that and copies the session a few seconds later, like ⌘⇧T).
 pub const NAMES: &[&str] = &[
+    "menu-empty", "about",
     "hostkey-new",
     "hostkey-changed",
     "password",
@@ -56,6 +57,15 @@ fn challenge(round: u32, attempt: u32, prompts: &[(&str, bool)]) -> ChallengeReq
 
 /// Opens the demo named `name`, or logs the valid names.
 pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    match name.strip_prefix("proto:").unwrap_or(name) {
+        "about" => { crate::dialogs::about::open(window, cx); return; }
+        "menu-empty" => {
+            use gpui::Focusable as _;
+            window.focus(&workspace.read(cx).focus_handle(cx), cx);
+            return;
+        }
+        _ => {}
+    }
     if let Some(scene)=name.strip_prefix("proto:"){workspace.update(cx,|w,cx|w.proto_scene(scene,window,cx));return;}
     if let Some(args) = name.strip_prefix("p6live:") {
         if args.starts_with("record:")||args.starts_with("log:"){workspace.update(cx,|w,cx|w.demo_archive_live(args,window,cx));return;}

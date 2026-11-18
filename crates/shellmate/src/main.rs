@@ -27,16 +27,17 @@ mod ui;
 mod workspace;
 mod settings;
 mod records;
+mod menus;
 
 use std::borrow::Cow;
 
 use gpui::{
-    App, AppContext as _, Bounds, Menu, MenuItem, TitlebarOptions, WindowAppearance, WindowBounds,
+    App, AppContext as _, Bounds, TitlebarOptions, WindowAppearance, WindowBounds,
     WindowOptions, point, px, size,
 };
 
 use shellmate_store::HostStore;
-use workspace::{CloseTab, DuplicateSession, NewLocalTerminal, Quit, Workspace};
+use workspace::Workspace;
 
 const FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
@@ -70,20 +71,27 @@ pub(crate) fn prototype_fixture()->bool {
     #[cfg(not(debug_assertions))] {false}
 }
 
+fn init_actions(cx: &mut App) {
+    menus::init(cx);
+    gpui::init(cx);
+    shellmate_term::init(cx);
+    sidebar::init(cx);
+    workspace::init(cx);
+    files::panel::init(cx);
+    editor::view::init(cx);
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    #[cfg(target_os = "macos")]
+    menus::configure_appkit();
     gpui::application().with_assets(assets::AppAssets).run(|cx: &mut App| {
-        gpui::init(cx);
+        init_actions(cx);
         if let Err(err) = cx.text_system().add_fonts(FONTS.iter().map(|f| Cow::Borrowed(*f)).collect()) {
             log::error!("failed to load bundled fonts: {err:#}");
         }
-        shellmate_term::init(cx);
         runtime::init(cx);
-        sidebar::init(cx);
-        workspace::init(cx);
-        files::panel::init(cx);
-        editor::view::init(cx);
 
         let dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         app_icon::apply(dark);
@@ -95,15 +103,6 @@ fn main() {
         };
         theme::apply(dark, cx);
 
-        cx.set_menus(vec![
-            Menu::new("Shellmate").items(vec![MenuItem::action("退出 Shellmate", Quit)]),
-            Menu::new("会话").items(vec![
-                MenuItem::action("新建本机终端", NewLocalTerminal),
-                MenuItem::action("复制当前会话", DuplicateSession),
-                MenuItem::separator(),
-                MenuItem::action("关闭会话", CloseTab),
-            ]),
-        ]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
@@ -139,5 +138,9 @@ fn main() {
             _window.update(cx, |_, window, cx| demo::run(&name, &_workspace, window, cx)).ok();
         }
         cx.activate(true);
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("SHELLMATE_MENU_DUMP") {
+            _window.update(cx, |_, window, _| menus::dump::after_frame(path.into(), window)).ok();
+        }
     });
 }

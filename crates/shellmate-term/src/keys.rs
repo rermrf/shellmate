@@ -15,6 +15,8 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode) -> Option<Cow<'static,
     let key = keystroke.key.as_str();
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
 
+    if m.platform && m.control && !m.alt && !m.shift && key == "f" { return None; }
+
     // macOS editing conventions: ⌘← / ⌘→ / ⌘⌫ act on the whole line.
     if m.platform && !m.control && !m.alt {
         return match key {
@@ -146,6 +148,14 @@ pub fn paste_payload(text: &str, mode: &TermMode) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menubar_shortcuts_never_encode_shell_input() {
+        for key in ["cmd-n", "cmd-d", "cmd-,", "cmd-h", "alt-cmd-h", "cmd-m", "ctrl-cmd-f",
+            "alt-cmd-1", "alt-cmd-2", "alt-cmd-3", "alt-cmd-4"] {
+            assert_eq!(esc(key), None, "{key}");
+        }
+        assert_eq!(esc("ctrl-r").as_deref(), Some("\x12"));
+    }
     use super::*;
 
     fn ks(s: &'static str) -> Keystroke {

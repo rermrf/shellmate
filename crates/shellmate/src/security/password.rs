@@ -80,6 +80,19 @@ impl PasswordInput {
         cx.notify();
         true
     }
+    fn select_all(&mut self, _: &gpui::component::input::SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = 0..self.value.len();
+        cx.notify();
+        window.notify_text_input_changed(&self.focus);
+    }
+
+    fn paste(&mut self, _: &gpui::component::input::Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace(None, &Zeroizing::new(text), cx);
+        }
+        window.notify_text_input_changed(&self.focus);
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
         match key.key.as_str() {
@@ -88,15 +101,11 @@ impl PasswordInput {
                 cx.stop_propagation();
             }
             "a" if key.modifiers.platform => {
-                self.selection = 0..self.value.len();
+                self.select_all(&gpui::component::input::SelectAll, window, cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             "v" if key.modifiers.platform => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    let text = Zeroizing::new(text);
-                    self.replace(None, &text, cx);
-                }
+                self.paste(&gpui::component::input::Paste, window, cx);
                 cx.stop_propagation();
             }
             "c" | "x" if key.modifiers.platform => cx.stop_propagation(),
@@ -192,6 +201,8 @@ impl Render for PasswordInput {
                 }),
             )
             .on_key_down(cx.listener(Self::key))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::paste))
             .child(text)
             .when(focused, |d| d.child(div().w(px(1.)).h(px(17.)).bg(p.acc)))
             .child(

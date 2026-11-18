@@ -185,16 +185,17 @@ pub struct Split {
     pub focus: Pane,
 }
 impl Split {
+    pub fn candidate(main: usize, sessions: &[SessionRow], recent: &[usize]) -> Option<usize> {
+        recent.iter().copied().chain(sessions.iter().map(|session| session.id))
+            .find(|id| *id != main && sessions.iter().any(|s| s.id == *id && (s.connected() || s.local)))
+    }
+
     pub fn toggle(&mut self, main: usize, sessions: &[SessionRow], recent: &[usize]) -> bool {
         if self.other.is_some() {
             self.close();
             return true;
         }
-        self.other = recent
-            .iter()
-            .copied()
-            .chain(sessions.iter().map(|s| s.id))
-            .find(|id| *id != main && sessions.iter().any(|s| s.id == *id && (s.connected() || s.local)));
+        self.other = Self::candidate(main, sessions, recent);
         self.focus = Pane::Main;
         self.other.is_some()
     }

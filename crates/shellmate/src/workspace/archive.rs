@@ -288,6 +288,17 @@ impl Workspace {
     }
     pub(crate) fn credentials(&self)->std::sync::Arc<shellmate_store::CredentialStore>{self.secrets.clone()}
     pub(crate) fn refresh_bundle(&mut self,w:&mut Window,cx:&mut Context<Self>){self.reload_book(w,cx);self.refresh_snippets(cx);}
+    pub(crate) fn export_bundle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::security::PasswordDialog::open(self.secrets.clone(), crate::security::Purpose::Export,
+            None, Box::new(|_, _, _| {}), window, cx);
+    }
+
+    pub(crate) fn import_bundle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.weak_entity();
+        crate::security::open_import(self.secrets.clone(), move |ok, window, cx| {
+            if ok { workspace.update(cx, |workspace, cx| workspace.refresh_bundle(window, cx)).ok(); }
+        }, window, cx);
+    }
     pub(super) fn open_settings(&mut self, section: usize, window: &mut Window, cx: &mut Context<Self>) {
         crate::settings::SettingsWindow::open(
             cx.entity().downgrade(),

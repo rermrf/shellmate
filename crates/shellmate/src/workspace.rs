@@ -45,6 +45,7 @@ mod streams;
 mod mosh;
 mod ai;
 mod drawer_resize;
+mod menu_actions;
 
 actions!(
     shellmate,
@@ -71,24 +72,34 @@ pub fn init(cx: &mut App) {
     crate::productivity::panel::init(cx);
     crate::productivity::broadcast::init(cx);
     crate::productivity::session_menu::init(cx);
-    cx.bind_keys([
+    cx.bind_keys(bindings());
+}
+
+pub(crate) fn bindings() -> Vec<KeyBinding> {
+    use crate::menus::*;
+    vec![
         KeyBinding::new("cmd-t", NewLocalTerminal, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-t", DuplicateSession, Some(CONTEXT)),
         KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
-        KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
-        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-[", PreviousTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(CONTEXT)),
         KeyBinding::new("cmd-ctrl-s", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("cmd-q", Quit, None),
-    ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+        KeyBinding::new("cmd-,", Settings, Some(CONTEXT)),
+        KeyBinding::new("cmd-n", NewConnection, Some(CONTEXT)),
+        KeyBinding::new("cmd-d", ToggleSplit, Some(CONTEXT)),
+        KeyBinding::new("alt-cmd-1", ShowTerminal, Some(CONTEXT)),
+        KeyBinding::new("alt-cmd-2", ShowFiles, Some(CONTEXT)),
+        KeyBinding::new("alt-cmd-3", ShowForward, Some(CONTEXT)),
+        KeyBinding::new("alt-cmd-4", ShowMonitor, Some(CONTEXT)),
+    ]
 }
 
 /// The panels a session can show. Only SSH sessions get more than the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Panel {
+pub(crate) enum Panel {
     Terminal,
     Files,
     Forward,
@@ -96,6 +107,9 @@ enum Panel {
 }
 
 impl Panel {
+    fn supported(self, protocol: Option<shellmate_core::Protocol>) -> bool {
+        self == Panel::Terminal || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
+    }
     const ALL: [Panel; 4] = [Panel::Terminal, Panel::Files, Panel::Forward, Panel::Monitor];
 
     fn label(self) -> &'static str {
@@ -152,6 +166,14 @@ impl Drop for Session {
 }
 
 impl Session {
+    fn supports_panel(&self, panel: Panel) -> bool {
+        panel.supported(self.host().map(|host| host.protocol))
+    }
+
+    fn duplicable(protocol: Option<shellmate_core::Protocol>) -> bool {
+        protocol != Some(shellmate_core::Protocol::Serial)
+    }
+
     fn host(&self) -> Option<&shellmate_core::Host> { match &self.kind {SessionKind::Ssh(s)=>Some(&s.host),SessionKind::Stream(s)=>Some(&s.host),SessionKind::Local=>None} }
     fn stream_connected(&self)->bool { match &self.kind {SessionKind::Stream(s)=>s.connected(),_=>true} }
     fn ssh(&self) -> Option<&ssh::SshSession> {
@@ -163,6 +185,7 @@ impl Session {
 }
 
 pub struct Workspace {
+    last_menu_state: Option<crate::menus::MenuState>,
     store: shellmate_store::SharedStore,
     /// Saved passwords and key passphrases (the macOS keychain).
     secrets: Arc<shellmate_store::CredentialStore>,
@@ -259,6 +282,7 @@ impl Workspace {
         let mut subscriptions=subscriptions;
         subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
+            last_menu_state: None,
             preferences,
             data_root:shellmate_term::archive::data_root(),log_root:shellmate_term::archive::log_root(),
             running_recordings:HashMap::new(),archive_task:None,records_window:None,
@@ -561,27 +585,19 @@ impl Workspace {
 
     // ---- actions -------------------------------------------------------
 
-    fn new_local_terminal(&mut self, _: &NewLocalTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_local(window, cx);
-    }
-
-    fn duplicate_session(&mut self, _: &DuplicateSession, window: &mut Window, cx: &mut Context<Self>) {
-        self.duplicate_active(window, cx);
-    }
-
-    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.active {
             self.close(ix, window, cx);
         }
     }
 
-    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.active {
             self.activate((ix + 1) % self.sessions.len(), window, cx);
         }
     }
 
-    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
+    fn previous_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.active {
             let n = self.sessions.len();
             self.activate((ix + n - 1) % n, window, cx);
@@ -865,21 +881,13 @@ impl Workspace {
             .child(
                 toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
                     .when(self.broadcast.enabled, |b| b.bg(p.warns).text_color(p.warn))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.commands_open = true;this.ai_open=false;
-                        this.sync_productivity(cx);
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_broadcast(window, cx))),
             )
-            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手", true, cx).when(self.ai_open,|b|b.bg(p.accs).text_color(p.acc)).on_click(cx.listener(|this,_,w,cx|{if this.ai_open{this.close_ai(cx)}else{this.open_ai(w,cx)}})))
+            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手", true, cx).when(self.ai_open,|b|b.bg(p.accs).text_color(p.acc)).on_click(cx.listener(|this,_,w,cx|this.toggle_ai(w,cx))))
             .child(
                 toolbar_button("snippets", AppIcon::Commands, Some("快捷命令"), "快捷命令", true, cx)
                     .when(self.commands_open, |b| b.bg(p.accs).text_color(p.acc))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.commands_open = !this.commands_open;
-                        this.ai_open=false;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_commands(window, cx))),
             )
             .child(
                 toolbar_button("theme", theme_icon, None, "切换浅色 / 深色", true, cx)
@@ -901,8 +909,7 @@ impl Workspace {
                 let item = SegmentItem::new(panel.label(), Some(*panel) == active_panel);
                 match (session, panel) {
                     (None, _) => item.disabled("没有打开的会话"),
-                    (Some(_), Panel::Terminal) => item,
-                    (Some(s), Panel::Files | Panel::Forward | Panel::Monitor) if s.ssh().is_some() => item,
+                    (Some(s), panel) if s.supports_panel(*panel) => item,
                     (Some(s), other) if s.ssh().is_some() => item.disabled(ssh::panel_hint(*other)),
                     (Some(s), _) if s.host().is_some() => item.disabled("串口 / Telnet 会话不支持此面板"),
                     (Some(_), other) => item.disabled(other.local_hint()),
@@ -1111,6 +1118,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_menus(cx);
         let p = cx.palette().clone();
         let activity=self.secrets.clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
@@ -1151,15 +1159,8 @@ impl Render for Workspace {
             .relative()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::new_local_terminal))
-            .on_action(cx.listener(Self::duplicate_session))
-            .on_action(cx.listener(Self::close_tab))
-            .on_action(cx.listener(Self::next_tab))
-            .on_action(cx.listener(Self::previous_tab))
-            .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::toggle_theme))
+            .map(|root| self.menu_listeners(root, cx))
             .on_action(cx.listener(Self::focus_host_search))
-            .on_action(cx.listener(Self::open_palette))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::restore_terminal_focus))
             .size_full()
