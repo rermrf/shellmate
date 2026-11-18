@@ -3,7 +3,7 @@
 //! [`ForwardPanelEvent`]s (which saves rules, starts and stops them).
 
 use crate::ui::Toggle as Switch;
-use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::input::{InputEvent, InputState};
 use gpui::prelude::*;
 use gpui::{Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, Subscription, Window, div, px};
 use shellmate_forward::{ForwardKind, ForwardRule, RuleId};
@@ -12,7 +12,7 @@ use super::model::{
     EMPTY_KINDS, EMPTY_TITLE, ForwardView, KINDS, RetryAction, RuleCard, RuleForm, Tone, kind_name, segment_label,
 };
 use crate::theme::{ActivePalette, CARD_RADIUS, MONO_FONT, Palette};
-use crate::ui::{SegmentItem, card_shadow, dot, segmented};
+use crate::ui::{SegmentItem, Surface, card_shadow, dot, field_box, field_input, segmented};
 
 /// What the panel asks of the workspace.
 pub enum ForwardPanelEvent {
@@ -215,21 +215,6 @@ impl ForwardPanel {
             .into_any_element()
     }
 
-    fn field_box(&self, p: &Palette, mono: bool, input: &Entity<InputState>) -> gpui::Div {
-        div()
-            .flex_1()
-            .min_w_0()
-            .h(px(36.))
-            .px(px(12.))
-            .flex()
-            .items_center()
-            .rounded(px(11.))
-            .bg(p.card2)
-            .text_size(px(13.))
-            .when(mono, |d| d.font_family(MONO_FONT))
-            .child(div().w_full().child(Input::new(input).appearance(false).bordered(false)))
-    }
-
     fn render_form(&self, form: &FormFields, p: &Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
         let values = self.values(cx).unwrap_or_default();
         let check = values.check(&self.view.rules, RuleId::from_raw("form"));
@@ -247,21 +232,15 @@ impl ForwardPanel {
             }
         };
         let problem = |id: &'static str, text: String| div().id(id).text_size(px(12.)).text_color(p.err).child(text);
+        let slot = |state, mono| div().flex_1().min_w_0().child(field_input(state, Surface::Card, mono));
         let target_slot = if values.kind == ForwardKind::Dynamic {
-            div()
-                .flex_1()
-                .min_w_0()
-                .h(px(36.))
-                .px(px(12.))
+            field_box(div().flex_1().min_w_0(), Surface::Card, p, false)
                 .flex()
                 .items_center()
-                .rounded(px(11.))
-                .bg(p.card2)
-                .text_size(px(13.))
                 .text_color(p.tx2)
                 .child(RuleForm::DYNAMIC_TARGET)
         } else {
-            self.field_box(p, true, &form.target)
+            slot(&form.target, true)
         };
 
         div()
@@ -280,14 +259,14 @@ impl ForwardPanel {
                     .items_center()
                     .gap(px(12.))
                     .child(segmented("fwd-kind", segments, on_pick, cx).flex_none())
-                    .child(self.field_box(p, false, &form.name)),
+                    .child(slot(&form.name, false)),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(self.field_box(p, true, &form.listen))
+                    .child(slot(&form.listen, true))
                     .child(div().text_color(p.tx2).child("→"))
                     .child(target_slot)
                     .child(

@@ -236,6 +236,10 @@ impl Workspace {
         self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if matches!(scene,"telnet"|"mosh"){4}else{0}, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
+        let settings = |section, window: &mut Window, cx: &mut Context<Self>| {
+            crate::settings::SettingsWindow::open(cx.entity().downgrade(), self.preferences.clone(),
+                self.secrets.clone(), section, self.store.clone(), window, cx)
+        };
         match scene {
             "cmds" | "bc" | "qc" | "tabmenu" => {
                 self.commands_open = true;
@@ -303,7 +307,7 @@ impl Workspace {
                 panel.update(cx, |r, cx| r.proto_scene(scene, cx));
                 self.records_window = Some(panel.downgrade());
             }
-            "host-new" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
+            "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "ai-agent" | "ai-agent-run" | "ai-new-confirm" | "ai-agent-redline"
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
@@ -321,10 +325,21 @@ impl Workspace {
                 }
             }
             "ai-explain"=>{self.sessions[0].terminal.update(cx,|t,cx|t.notice("[error] connect() failed: Connection refused",cx));},
-            "set-ai"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
+            "set-ai" | "set-ai-replace" => {
+                self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();
+                let view = settings(5, window, cx);
+                if scene == "set-ai-replace" { view.update(cx, |settings, cx| settings.fixture_replace_key(cx)); }
+            }
             "set-ai-anthropic"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-cred" => self.open_settings(0, window, cx),
-            "set-cred-master" => {let settings=crate::settings::SettingsWindow::open(cx.entity().downgrade(),self.preferences.clone(),self.secrets.clone(),0,self.store.clone(),window,cx);settings.update(cx,|s,cx|s.fixture_master(cx));},
+            "set-cred-master" | "set-cred-focus" | "set-cred-typed" => {
+                let (value, focused) = match scene {
+                    "set-cred-focus" => ("", true),
+                    "set-cred-typed" => ("demo", true),
+                    _ => ("meadow river stone !", false),
+                };
+                settings(0, window, cx).update(cx, |settings, cx| settings.fixture_master(value, focused, window, cx));
+            }
             "vault-unlock" => {self.secrets.switch_to_master("Fixture9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).expect("fixture vault");self.secrets.set_touch_id(true).expect("fixture device key");self.secrets.lock();crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Unlock("连接 prod-web-01".into()),None,Box::new(|_,_,_|{}),window,cx);},
             "bundle-export" => {crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Export,None,Box::new(|_,_,_|{}),window,cx);},
             "bundle-preview" => {let mut incoming=self.secrets.export_bundle(shellmate_store::bundle::Contents{credentials:false,..Default::default()}).expect("fixture bundle");if let Some(host)=incoming.items.iter_mut().find(|i|i.kind==shellmate_store::bundle::Kind::Host){host.fields.insert("addr".into(),serde_json::json!("10.0.1.99"));}
@@ -332,11 +347,7 @@ impl Workspace {
             "set-sync" => self.open_settings(1, window, cx),
             "set-term" => self.open_settings(2, window, cx),
             "set-term-scrolled" => {
-                let settings = crate::settings::SettingsWindow::open(
-                    cx.entity().downgrade(), self.preferences.clone(), self.secrets.clone(),
-                    2, self.store.clone(), window, cx,
-                );
-                settings.update(cx, |s, cx| s.fixture_scroll(120., cx));
+                settings(2, window, cx).update(cx, |s, cx| s.fixture_scroll(120., cx));
             }
             "set-local" => self.open_settings(3, window, cx),
             "set-conn" => self.open_settings(4, window, cx),

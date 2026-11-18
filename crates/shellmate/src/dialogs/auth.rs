@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use gpui::component::checkbox::Checkbox;
-use gpui::component::input::{Input, InputEvent, InputState, OtpEvent, OtpInput, OtpState};
+use gpui::component::input::{InputEvent, InputState, OtpEvent, OtpInput, OtpState};
+use crate::ui::{Surface, field_input};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, IntoElement, KeyDownEvent, Render, SharedString, Subscription, Window, div, px};
 use shellmate_core::Secret;
@@ -129,7 +130,7 @@ impl Render for SecretDialog {
         stack()
             .child(div().font_family(crate::theme::MONO_FONT).text_size(px(12.)).text_color(p.tx2).child(subtitle))
             .children((self.attempt == 0).then(|| hint(hint_text, &p)))
-            .child(field(caption, &p, Input::new(&self.input).mask_toggle()))
+            .child(field(caption, &p, field_input(&self.input, Surface::Card, false).mask_toggle()))
             .children(error.map(|text| notice(Notice::Error, text, &p)))
             .child(Checkbox::new("save-secret").label(match self.kind { SecretKind::Password { .. } => "记住密码", SecretKind::Passphrase { .. } => "记住口令" }).checked(self.save).on_click(
                 cx.listener(|this, checked: &bool, _, cx| {
@@ -291,7 +292,8 @@ impl Render for ChallengeDialog {
                 for (prompt, input) in request.prompts.iter().zip(inputs) {
                     let label = prompt.text.trim().trim_end_matches(':').trim().to_string();
                     let label = if label.is_empty() { "回答".to_string() } else { label };
-                    let control = if prompt.echo { Input::new(input) } else { Input::new(input).mask_toggle() };
+                    let control = field_input(input, Surface::Card, false);
+                    let control = if prompt.echo { control } else { control.mask_toggle() };
                     body = body.child(field(label, &p, control));
                 }
                 body

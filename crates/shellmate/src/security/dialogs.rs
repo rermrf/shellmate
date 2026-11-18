@@ -5,6 +5,7 @@ use super::{
 use crate::{
     dialogs::{self, DialogBody, Notice, Tone, actions, button, field, hint, notice, stack},
     theme::ActivePalette,
+    ui::Surface,
 };
 use gpui::{
     component::{Disableable as _, WindowExt as _, checkbox::Checkbox, notification::Notification},
@@ -109,12 +110,12 @@ impl PasswordDialog {
         cx: &mut App,
     ) -> Entity<Self> {
         let body = cx.new(|cx| {
-            let input = cx.new(|cx| PasswordInput::new("输入口令", cx));
+            let input = cx.new(|cx| PasswordInput::new("输入口令", Surface::Window, window, cx));
             if let Some(initial) = initial {
                 input.update(cx, |i, cx| i.set(&initial, cx));
             }
-            let current = cx.new(|cx| PasswordInput::new("输入当前主密码", cx));
-            let confirm = cx.new(|cx| PasswordInput::new("再次输入口令", cx));
+            let current = cx.new(|cx| PasswordInput::new("输入当前主密码", Surface::Window, window, cx));
+            let confirm = cx.new(|cx| PasswordInput::new("再次输入口令", Surface::Window, window, cx));
             let subscriptions = [&current, &input, &confirm]
                 .into_iter()
                 .map(|input| {
@@ -553,19 +554,16 @@ impl Render for PasswordDialog {
         }
         if self.purpose.confirmation() {
             body = body
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .line_height(px(16.))
-                        .text_color(super::password::strength_color(
-                            self.input.read(cx).expose(),
-                            &p,
-                        ))
-                        .child(format!(
-                            "强度：{}",
-                            shellmate_vault::strength(self.input.read(cx).expose()).label()
-                        )),
-                )
+                // The line keeps its height while empty, so the first keystroke doesn't move the form.
+                .child(div().flex_none().h(px(16.)).children(
+                    super::password::visible_strength(self.input.read(cx).expose()).map(|strength| {
+                        div()
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(super::password::strength_color(strength, &p))
+                            .child(format!("强度：{}", strength.label()))
+                    }),
+                ))
                 .child(field(
                     if matches!(self.purpose, Purpose::Change) {
                         "确认新主密码"

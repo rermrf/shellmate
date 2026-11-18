@@ -275,7 +275,7 @@ impl HostEditor {
             .child(self.field(
                 "串口设备",
                 p,
-                self.input(&self.addr, p, true).h(px(40.)).suffix(picker),
+                field_input(&self.addr, Surface::Card, true).suffix(picker),
             ))
             .child(
                 div()
@@ -339,12 +339,12 @@ impl HostEditor {
                         .child(div().flex_1().min_w_0().child(self.field(
                             "名称（留空使用设备名）",
                             p,
-                            self.input(&self.name, p, false),
+                            field_input(&self.name, Surface::Card, false),
                         )))
                         .child(div().flex_1().min_w_0().child(self.field(
                             "分组",
                             p,
-                            self.input(&self.group, p, false),
+                            field_input(&self.group, Surface::Card, false),
                         ))),
                 )
                 .child(
@@ -354,7 +354,7 @@ impl HostEditor {
                         .child(div().flex_1().min_w_0().child(self.field(
                             "自定义波特率",
                             p,
-                            self.input(&self.baud, p, true),
+                            field_input(&self.baud, Surface::Card, true),
                         )))
                         .child(
                             self.serial_choice(

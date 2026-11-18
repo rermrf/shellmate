@@ -442,7 +442,7 @@ impl Drawer {
                 card = card.child(row);
             }
             if let Some(reason) = &step.reason {
-                card = card.child(Input::new(reason).text_size(px(12.))).child(
+                card = card.child(crate::ui::field_input(reason, crate::ui::Surface::Card2, false)).child(
                     dialogs::button("ai-step-deny-confirm", "确认拒绝", Tone::Plain, true)
                         .on_click(cx.listener(|s, _, _, cx| s.approve(true, cx))),
                 );

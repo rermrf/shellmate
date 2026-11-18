@@ -82,7 +82,7 @@ pub const SCENES: &[&str] = &[
     "rv-wide",
     "rv-recording",
     "set-cred",
-    "set-cred-master",
+    "set-cred-master", "set-cred-focus", "set-cred-typed", "set-ai-replace",
     "vault-unlock",
     "bundle-export",
     "bundle-preview",
@@ -91,7 +91,7 @@ pub const SCENES: &[&str] = &[
     "set-term-scrolled",
     "set-local",
     "set-conn",
-    "host-new",
+    "host-new", "host-new-focus",
     "rail",
     "local",
     "qc",
@@ -121,6 +121,12 @@ pub fn window_size() -> (u32,u32) {
 pub fn default_window_size(scene: &str) -> (u32, u32) {
     PAGE_SCROLL_SCENES.iter().find(|(name, _)| *name == scene).map(|(_, size)| *size)
         .unwrap_or(if scene.starts_with("stress-") { (1776, 901) } else { (1440, 900) })
+}
+
+pub fn focus_after_layout(focus: gpui::FocusHandle, window: &mut gpui::Window) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |window, cx| window.focus(&focus, cx));
+    });
 }
 
 /// Wait for layout, the responsive-width update, and conditional page padding.
@@ -212,7 +218,14 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
             "side" => "main",
             base => base,
         }
-    } else { scene };
+    } else {
+        match scene {
+            "set-cred-focus" | "set-cred-typed" => "set-cred-master",
+            "set-ai-replace" => "set-ai",
+            "host-new-focus" => "host-new",
+            _ => scene,
+        }
+    };
     readings::READINGS
         .iter()
         .find(|r| r.scene == scene && r.dark == dark)
@@ -268,7 +281,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 68 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 72 + PAGE_SCROLL_SCENES.len());
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
@@ -277,7 +290,12 @@ mod tests {
             for dark in [false, true] {
                 let expected = if PAGE_SCROLL_SCENES.iter().any(|(name, _)| name == scene) {
                     if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
-                } else { scene };
+                } else { match *scene {
+                    "set-cred-focus" | "set-cred-typed" => "set-cred-master",
+                    "set-ai-replace" => "set-ai",
+                    "host-new-focus" => "host-new",
+                    _ => scene,
+                } };
                 assert_eq!(reading(scene, dark).scene, expected);
                 assert_eq!(reading(scene, dark).dark, dark);
             }

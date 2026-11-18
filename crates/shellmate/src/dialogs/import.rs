@@ -4,7 +4,8 @@ use std::path::Path;
 
 use gpui::component::Disableable as _;
 use gpui::component::checkbox::Checkbox;
-use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::input::{InputEvent, InputState};
+use crate::ui::{Surface, field_input};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FontWeight, IntoElement, Render, SharedString, Subscription, WeakEntity, Window, div, px,
@@ -295,7 +296,7 @@ impl Render for ImportDialog {
             .child(field(
                 "导入到分组",
                 &p,
-                stack().gap(px(8.)).child(Input::new(&self.group)).children(group_chips),
+                stack().gap(px(8.)).child(field_input(&self.group, Surface::Card, false)).children(group_chips),
             ))
             .children(self.error.clone().map(|message| notice(Notice::Error, message, &p)))
             .child(actions(vec![

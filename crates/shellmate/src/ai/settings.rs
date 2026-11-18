@@ -1,10 +1,11 @@
 use crate::{security::password::PasswordInput, theme::ActivePalette};
+use crate::ui::{Surface, field_input};
 use futures::StreamExt;
 use gpui::{
     component::{
         Disableable as _,
         button::Button,
-        input::{Input, InputState},
+        input::InputState,
     },
     prelude::*,
     *,
@@ -55,7 +56,7 @@ impl AiSettings {
                     .placeholder("gpt-4o-mini / deepseek-chat / qwen…")
             }),
             reasoning: s.reasoning,
-            key: cx.new(|cx| PasswordInput::new("输入 API Key", cx)),
+            key: cx.new(|cx| PasswordInput::new("输入 API Key", Surface::Card, w, cx)),
             key_saved: false,
             replace: false,
             save: s.save_conversations,
@@ -64,6 +65,10 @@ impl AiSettings {
             abort: None,
             fixture: crate::prototype_fixture(),
         }
+    }
+    pub(crate) fn replace_key(&mut self, cx: &mut Context<Self>) {
+        self.replace = true;
+        cx.notify();
     }
     fn values(&self, cx: &App) -> Settings {
         let base_url = self
@@ -395,10 +400,10 @@ impl Render for AiSettings {
         form = form.child(crate::dialogs::field(
             "Base URL",
             &p,
-            Input::new(&self.base),
+            field_input(&self.base, Surface::Card, true),
         ));
         form = form
-            .child(crate::dialogs::field("模型", &p, Input::new(&self.model)))
+            .child(crate::dialogs::field("模型", &p, field_input(&self.model, Surface::Card, true)))
             .child(crate::dialogs::field(
                 "思考等级",
                 &p,
@@ -432,10 +437,7 @@ impl Render for AiSettings {
                     .child(
                         Button::new("ai-key-replace")
                             .label("替换")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.replace = true;
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(|s, _, _, cx| s.replace_key(cx))),
                     )
                     .child(
                         Button::new("ai-key-remove")

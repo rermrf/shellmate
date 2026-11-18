@@ -1,6 +1,8 @@
 //! Small presentational helpers shared by the sidebar and workspace.
 
 pub mod scroll;
+mod field;
+pub use field::{Surface, field_box, field_input};
 
 use gpui::component::tooltip::Tooltip;
 use gpui::prelude::*;

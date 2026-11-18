@@ -5,7 +5,7 @@ mod protocols;
 use crate::connect::{self, Answer, FormCredential, UiMsg};
 use gpui::assets::IconName as Lucide;
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::input::{InputEvent, InputState};
 use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::{Icon, WindowExt as _};
 use gpui::prelude::*;
@@ -19,7 +19,7 @@ use shellmate_ssh::KeyInfo;
 use super::{DialogBody, Notice, Tone, button, notice, palette, stack};
 use crate::library::{EditorFields, build_draft};
 use crate::theme::Palette;
-use crate::ui::{SegmentItem, segmented};
+use crate::ui::{SegmentItem, Surface, field_input, segmented};
 use crate::workspace::Workspace;
 
 /// How the editor starts.
@@ -302,7 +302,9 @@ impl HostEditor {
         #[cfg(debug_assertions)]
         body.update(cx, |body, cx| {
             let scene = std::env::var("SHELLMATE_DEMO").unwrap_or_default();
-            if scene.starts_with("proto:host-serial") {
+            if crate::proto::request(&scene).0 == "proto:host-new-focus" {
+                crate::proto::focus_after_layout(body.name.focus_handle(cx), window);
+            } else if scene.starts_with("proto:host-serial") {
                 body.change_protocol(Protocol::Serial, window, cx);
                 body.set_text(&body.addr, "/dev/cu.usbserial-0001", window, cx);
             } else if scene.starts_with("proto:host-mosh") {
@@ -587,22 +589,6 @@ impl HostEditor {
         cx.notify();
     }
 
-    fn input(&self, state: &Entity<InputState>, p: &Palette, mono: bool) -> Input {
-        Input::new(state)
-            .flex_none()
-            .bordered(false)
-            .focus_bordered(false)
-            .bg(p.card2)
-            // Input::h is a multiline option; constrain the single-line control's actual box.
-            .min_h(px(38.))
-            .max_h(px(38.))
-            .rounded(px(11.))
-            .px(px(12.))
-            .text_size(px(13.))
-            .line_height(px(18.))
-            .when(mono, |i| i.font_family(crate::theme::MONO_FONT))
-    }
-
     fn field(&self, label: &'static str, p: &Palette, control: impl IntoElement) -> gpui::Div {
         div()
             .flex_none()
@@ -625,7 +611,7 @@ impl HostEditor {
             AuthMethod::Password => stack().gap(px(10.)).child(self.field(
                 "密码",
                 p,
-                self.input(&self.password, p, false).mask_toggle(),
+                field_input(&self.password, Surface::Card, false).mask_toggle(),
             )),
             AuthMethod::PrivateKey => div()
                 .flex_none()
@@ -640,7 +626,7 @@ impl HostEditor {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .child(self.input(&self.identity, p, true)),
+                                .child(field_input(&self.identity, Surface::Card, true)),
                         )
                         .child(
                             button("pick-key", "选择…", Tone::Plain, true)
@@ -692,7 +678,7 @@ impl HostEditor {
                         d.child(self.field(
                             "私钥口令",
                             p,
-                            self.input(&self.passphrase, p, false).mask_toggle(),
+                            field_input(&self.passphrase, Surface::Card, false).mask_toggle(),
                         ))
                     },
                 ),
@@ -979,12 +965,12 @@ impl Render for HostEditor {
                             .child(div().flex_1().min_w_0().child(self.field(
                                 "名称",
                                 &p,
-                                self.input(&self.name, &p, false),
+                                field_input(&self.name, Surface::Card, false),
                             )))
                             .child(div().flex_1().min_w_0().child(self.field(
                                 "分组",
                                 &p,
-                                self.input(&self.group, &p, false).suffix(group_picker),
+                                field_input(&self.group, Surface::Card, false).suffix(group_picker),
                             ))),
                     )
                     .child(
@@ -994,18 +980,18 @@ impl Render for HostEditor {
                             .child(div().flex_1().min_w_0().mr(px(4.)).child(self.field(
                                 "主机地址 HostName",
                                 &p,
-                                self.input(&self.addr, &p, true),
+                                field_input(&self.addr, Surface::Card, true),
                             )))
                             .child(div().w(px(195.)).child(self.field(
                                 "用户 User",
                                 &p,
-                                self.input(&self.user, &p, true),
+                                field_input(&self.user, Surface::Card, true),
                             )))
-                            .child(div().w(px(90.)).child(self.field("端口", &p, self.input(&self.port, &p, true)))),
+                            .child(div().w(px(90.)).child(self.field("端口", &p, field_input(&self.port, Surface::Card, true)))),
                     )
                     )
                     .children((self.protocol==Protocol::Serial).then(||self.render_serial_fields(&p,cx)))
-                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。")).child(self.field("密码",&p,self.input(&self.password,&p,false))))
+                    .when(self.protocol==Protocol::Telnet,|d|d.child(div().flex_none().px(px(14.)).py(px(12.)).rounded(px(14.)).bg(p.warns).text_color(p.warn).text_size(px(12.5)).line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Telnet 以明文传输账号与数据，仅建议用于内网设备。")).child(self.field("密码",&p,field_input(&self.password,Surface::Card,false))))
                     .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d
                     .child(
                         div().flex_none()

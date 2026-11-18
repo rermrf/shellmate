@@ -2,9 +2,31 @@
 //! The only app-owned text buffer is zeroizing and bounded; replacement wipes
 //! the old allocation instead of leaving deleted characters in String capacity.
 use crate::theme::ActivePalette;
-use gpui::{ElementInputHandler, EntityInputHandler, prelude::*, *};
-use std::ops::Range;
+use crate::ui::{Surface, field_box};
+use gpui::{ElementInputHandler, EntityInputHandler, component::ActiveTheme, prelude::*, *};
+use std::{ops::Range, time::Duration};
 use zeroize::Zeroizing;
+
+const BULLET: char = '•';
+const BLINK: Duration = Duration::from_millis(500);
+const TYPING_PAUSE: Duration = Duration::from_millis(300);
+
+fn bullet_range(value: &str, selection: &Range<usize>) -> Range<usize> {
+    let start = value[..selection.start].chars().count();
+    start..start + value[selection.clone()].chars().count()
+}
+
+fn masked_geometry(
+    selection: Range<usize>,
+    x_for_bullet: impl Fn(usize) -> Pixels,
+) -> (Pixels, Option<Range<Pixels>>) {
+    let caret = x_for_bullet(selection.end);
+    (
+        caret,
+        (!selection.is_empty()).then(|| x_for_bullet(selection.start)..caret),
+    )
+}
+
 pub enum PasswordEvent {
     Changed,
     Submit,
@@ -15,16 +37,60 @@ pub struct PasswordInput {
     selection: Range<usize>,
     marked: Option<Range<usize>>,
     placeholder: &'static str,
+    surface: Surface,
+    caret_visible: bool,
+    blink: Option<Task<()>>,
 }
 impl EventEmitter<PasswordEvent> for PasswordInput {}
 impl PasswordInput {
-    pub fn new(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        placeholder: &'static str,
+        surface: Surface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        cx.on_focus(&focus, window, |this, _, cx| this.start_blink(BLINK, cx))
+            .detach();
+        cx.on_blur(&focus, window, |this, _, cx| {
+            this.blink = None;
+            cx.notify();
+        })
+        .detach();
         Self {
             value: Zeroizing::new(String::new()),
-            focus: cx.focus_handle(),
+            focus,
             selection: 0..0,
             marked: None,
             placeholder,
+            surface,
+            caret_visible: true,
+            blink: None,
+        }
+    }
+    fn start_blink(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        self.caret_visible = true;
+        cx.notify();
+        if crate::prototype_fixture() {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        self.blink = Some(cx.spawn(async move |this, cx| {
+            executor.timer(delay).await;
+            while this
+                .update(cx, |this, cx| {
+                    this.caret_visible = !this.caret_visible;
+                    cx.notify();
+                })
+                .is_ok()
+            {
+                executor.timer(BLINK).await;
+            }
+        }));
+    }
+    fn caret_activity(&mut self, cx: &mut Context<Self>) {
+        if self.blink.is_some() {
+            self.start_blink(TYPING_PAUSE, cx);
         }
     }
     pub fn expose(&self) -> &str {
@@ -34,6 +100,7 @@ impl PasswordInput {
         let value = std::mem::replace(&mut self.value, Zeroizing::new(String::new()));
         self.selection = 0..0;
         self.marked = None;
+        self.caret_activity(cx);
         cx.notify();
         value
     }
@@ -76,17 +143,29 @@ impl PasswordInput {
         let end = range.start + text.len();
         self.selection = end..end;
         self.marked = None;
+        self.caret_activity(cx);
         cx.emit(PasswordEvent::Changed);
         cx.notify();
         true
     }
-    fn select_all(&mut self, _: &gpui::component::input::SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_all(
+        &mut self,
+        _: &gpui::component::input::SelectAll,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.selection = 0..self.value.len();
+        self.caret_activity(cx);
         cx.notify();
         window.notify_text_input_changed(&self.focus);
     }
 
-    fn paste(&mut self, _: &gpui::component::input::Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(
+        &mut self,
+        _: &gpui::component::input::Paste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace(None, &Zeroizing::new(text), cx);
         }
@@ -150,6 +229,7 @@ impl PasswordInput {
                     }
                 };
                 self.selection = pos..pos;
+                self.caret_activity(cx);
                 cx.stop_propagation();
                 cx.notify();
             }
@@ -169,13 +249,20 @@ impl Render for PasswordInput {
         let focus = self.focus.clone();
         let entity = cx.entity();
         let focused = self.focus.is_focused(window);
-        let text = if self.value.is_empty() {
-            self.placeholder.to_owned()
+        let empty = self.value.is_empty();
+        let text: SharedString = if empty {
+            self.placeholder.into()
         } else {
-            "•".repeat(self.value.chars().count().min(60))
+            BULLET.to_string().repeat(self.value.chars().count()).into()
         };
-        div()
+        let selection = bullet_range(&self.value, &self.selection);
+        let selection_color = cx.theme().selection;
+        let active = focused && window.is_window_active();
+        let show_caret = active && self.caret_visible;
+        field_box(div(), self.surface, &p, focused)
             .id("secure-password")
+            .role(Role::PasswordInput)
+            .aria_label(self.placeholder)
             .track_focus(&self.focus)
             .tab_index(0)
             .relative()
@@ -183,41 +270,70 @@ impl Render for PasswordInput {
             .w_full()
             .min_w_0()
             .overflow_hidden()
-            .px(px(12.))
-            .rounded(px(11.))
-            .bg(p.card2)
-            .border_1()
-            .border_color(if focused { p.acc } else { p.line })
             .flex()
             .items_center()
-            .text_size(px(13.))
-            .text_color(if self.value.is_empty() { p.tx3 } else { p.tx })
+            .text_color(if empty { p.tx3 } else { p.tx })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, w, cx| {
                     this.focus(w, cx);
                     this.selection = this.value.len()..this.value.len();
+                    this.caret_activity(cx);
+                    w.notify_text_input_changed(&this.focus);
                     cx.notify();
                 }),
             )
             .on_key_down(cx.listener(Self::key))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::paste))
-            .child(text)
-            .when(focused, |d| d.child(div().w(px(1.)).h(px(17.)).bg(p.acc)))
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |bounds, _, w, cx| {
-                        w.handle_input(
+                    move |bounds, _, window, cx| {
+                        let run = window.text_style().to_run(text.len());
+                        let line = window.text_system().shape_line(text, px(13.), &[run], None);
+                        let (caret, highlight) = masked_geometry(selection, |index| {
+                            if empty {
+                                px(0.)
+                            } else {
+                                line.x_for_index(index * BULLET.len_utf8())
+                            }
+                        });
+                        let scroll = (caret + px(1.) - bounds.size.width).max(px(0.));
+                        let origin = point(bounds.left() - scroll, bounds.top());
+                        let caret_bounds = Bounds::new(
+                            origin + point(caret, px(0.)),
+                            size(px(1.), bounds.size.height),
+                        );
+                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            if active && let Some(range) = highlight {
+                                let rect = Bounds::new(
+                                    origin + point(range.start, px(0.)),
+                                    size(range.end - range.start, bounds.size.height),
+                                );
+                                window.paint_quad(fill(rect, selection_color));
+                            }
+                            let _ = line.paint(
+                                origin,
+                                bounds.size.height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                            if show_caret {
+                                window.paint_quad(fill(caret_bounds, p.acc));
+                            }
+                        });
+                        window.handle_input(
                             &focus,
-                            ElementInputHandler::new(bounds, entity.clone()),
+                            ElementInputHandler::new(caret_bounds, entity),
                             cx,
                         );
                     },
                 )
-                .absolute()
-                .inset_0(),
+                .w_full()
+                .h(px(18.)),
             )
     }
 }
@@ -291,10 +407,58 @@ impl EntityInputHandler for PasswordInput {
     }
 }
 
-pub fn strength_color(value: &str, p: &crate::theme::Palette) -> gpui::Hsla {
-    match shellmate_vault::strength(value) {
+pub fn visible_strength(value: &str) -> Option<shellmate_vault::Strength> {
+    (!value.is_empty()).then(|| shellmate_vault::strength(value))
+}
+
+pub fn strength_color(
+    strength: shellmate_vault::Strength,
+    p: &crate::theme::Palette,
+) -> gpui::Hsla {
+    match strength {
         shellmate_vault::Strength::Weak => p.err,
         shellmate_vault::Strength::Medium => p.warn,
         shellmate_vault::Strength::High => p.ok,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bullet_range, masked_geometry, visible_strength};
+    use gpui::px;
+
+    #[test]
+    fn unicode_byte_selection_maps_to_displayed_bullets() {
+        assert_eq!(bullet_range("字🦀a", &(3..7)), 1..2);
+        assert_eq!(bullet_range("字🦀a", &(8..8)), 3..3);
+    }
+
+    #[test]
+    fn strength_is_hidden_only_for_an_empty_password() {
+        assert_eq!(visible_strength(""), None);
+        assert_eq!(visible_strength("a"), Some(shellmate_vault::Strength::Weak));
+        assert_eq!(visible_strength(" "), Some(shellmate_vault::Strength::Weak));
+    }
+
+    #[test]
+    fn masked_caret_uses_empty_middle_and_end_offsets() {
+        let advance = |index: usize| px(6.75 * index as f32);
+        assert_eq!(masked_geometry(0..0, advance), (px(0.), None));
+        assert_eq!(masked_geometry(2..2, advance), (px(13.5), None));
+        assert_eq!(masked_geometry(4..4, advance), (px(27.), None));
+    }
+
+    #[test]
+    fn masked_selection_uses_shaped_endpoints() {
+        let offsets = [0., 5.5, 11.25, 17.];
+        let advance = |index: usize| px(offsets[index]);
+        assert_eq!(
+            masked_geometry(1..3, advance),
+            (px(17.), Some(px(5.5)..px(17.)))
+        );
+        assert_eq!(
+            masked_geometry(0..3, advance),
+            (px(17.), Some(px(0.)..px(17.)))
+        );
     }
 }

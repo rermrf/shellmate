@@ -46,7 +46,7 @@ impl SettingsWindow {
         cx: &mut App,
     ) -> Entity<Self> {
         let body = cx.new(|cx| {
-            let master_input = cx.new(|cx| PasswordInput::new("输入主密码", cx));
+            let master_input = cx.new(|cx| PasswordInput::new("输入主密码", crate::ui::Surface::Card, window, cx));
             let subscription = cx.subscribe_in(
                 &master_input,
                 window,
@@ -167,12 +167,18 @@ impl SettingsWindow {
         self.workspace.update(cx, |workspace, cx| workspace.import_bundle(w, cx)).ok();
     }
     #[cfg(debug_assertions)]
-    pub fn fixture_master(&mut self, cx: &mut Context<Self>) {
+    pub fn fixture_master(&mut self, value: &str, focused: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_master = true;
         self.demo_master = true;
-        self.master_input
-            .update(cx, |i, cx| i.set("meadow river stone !", cx));
+        self.master_input.update(cx, |input, cx| input.set(value, cx));
+        if focused {
+            crate::proto::focus_after_layout(gpui::Focusable::focus_handle(&self.master_input, cx), window);
+        }
         cx.notify();
+    }
+    #[cfg(debug_assertions)]
+    pub fn fixture_replace_key(&self, cx: &mut Context<Self>) {
+        self.ai.update(cx, crate::ai::settings::AiSettings::replace_key);
     }
     #[cfg(debug_assertions)]
     pub fn fixture_scroll(&mut self, offset: f32, cx: &mut Context<Self>) {
@@ -329,20 +335,16 @@ impl Render for SettingsWindow {
                         .items_center()
                         .gap(px(10.))
                         .child(div().flex_1().min_w_0().child(self.master_input.clone()))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(security::password::strength_color(
-                                    self.master_input.read(cx).expose(),
-                                    &p,
-                                ))
-                                .child(format!(
-                                    "强度：{}",
-                                    shellmate_vault::strength(self.master_input.read(cx).expose())
-                                        .label()
-                                )),
-                        )
+                        // The slot keeps its width while empty, so the first keystroke doesn't shrink the field.
+                        .child(div().flex_none().w(px(60.)).children(
+                            security::password::visible_strength(self.master_input.read(cx).expose()).map(|strength| {
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(security::password::strength_color(strength, &p))
+                                    .child(format!("强度：{}", strength.label()))
+                            }),
+                        ))
                         .child(
                             dialogs::button(
                                 "master-set",

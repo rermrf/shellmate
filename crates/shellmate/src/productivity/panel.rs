@@ -4,7 +4,7 @@ use super::{broadcast::BroadcastView, multi::SendRequest};
 use crate::{
     dialogs::{self, DialogBody, Tone, button, field, hint, stack},
     theme::{ActivePalette, MONO_FONT},
-    ui::card_shadow,
+    ui::{Surface, card_shadow, field_input},
 };
 use gpui::{
     App, Context, Entity, EventEmitter, Focusable, FontWeight, KeyBinding, ScrollHandle, SharedString,
@@ -831,28 +831,7 @@ impl Render for Confirmation {
                             .child(self.mode(cx)),
                     ),
             )
-            .child(
-                div()
-                    .font_family(MONO_FONT)
-                    .rounded(px(13.))
-                    .bg(shellmate_term::colors::to_hsla(
-                        cx.terminal_style().palette.background,
-                    ))
-                    .text_color(shellmate_term::colors::to_hsla(
-                        cx.terminal_style().palette.foreground,
-                    ))
-                    .h(px(44.))
-                    .px(px(14.))
-                    .flex()
-                    .items_center()
-                    .child(
-                        Input::new(&self.input)
-                            .appearance(false)
-                            .p_0()
-                            .h(px(44.))
-                            .text_size(px(13.5)),
-                    ),
-            )
+            .child(field_input(&self.input, Surface::Card, true))
             .child(
                 div()
                     .flex()
@@ -1050,7 +1029,7 @@ impl Render for Manager {
                         .child(
                             div()
                                 .flex_1()
-                                .child(field("分组名称", &p, Input::new(&group.name))),
+                                .child(field("分组名称", &p, field_input(&group.name, Surface::Card2, false))),
                         )
                         .child(
                             Button::new(("group-up", g))
@@ -1107,13 +1086,12 @@ impl Render for Manager {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().w(px(110.)).child(Input::new(name)))
+                            .child(div().w(px(110.)).child(field_input(name, Surface::Card2, false)))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .font_family(MONO_FONT)
-                                    .child(Input::new(command)),
+                                    .child(field_input(command, Surface::Card2, true)),
                             )
                             .child(
                                 Button::new(("cmd-up", id))
