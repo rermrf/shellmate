@@ -137,14 +137,6 @@ impl Workspace {
         }
     }
 
-    pub(super) fn chrome_inset(&self, ai_width: f32) -> f32 {
-        #[cfg(debug_assertions)]
-        if crate::prototype_fixture() && self.drawer_motion.frozen_from.is_none() {
-            return 0.;
-        }
-        self.drawer_motion.frame.occupied(ai_width)
-    }
-
     pub(super) fn drawer_slot(&self, ai_width: f32, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let frame = self.drawer_motion.frame;
         let width = frame.width(ai_width);
