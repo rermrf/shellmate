@@ -429,7 +429,7 @@ mod tests {
     fn unknown_and_unoffered_stored_reasoning_fall_back_to_default() {
         let mut db = HostStore::open_in_memory().unwrap();
         for (anthropic, key, ids) in [
-            (false, "ai_openai_reasoning", &["unknown", "max"][..]),
+            (false, "ai_openai_reasoning", &["unknown"][..]),
             (
                 true,
                 "ai_anthropic_reasoning",
@@ -444,6 +444,9 @@ mod tests {
                 );
             }
         }
+        // Both providers offer the top level.
+        db.set_setting("ai_openai_reasoning", "max").unwrap();
+        assert_eq!(db.ai_settings_for_provider(false).unwrap().reasoning, ReasoningLevel::Max);
     }
     #[test]
     fn anthropic_proxy_disclosure_requires_each_destination() {

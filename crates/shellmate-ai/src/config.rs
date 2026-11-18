@@ -99,7 +99,7 @@ impl ReasoningLevel {
     pub fn options(provider: &Provider) -> &'static [Self] {
         use ReasoningLevel::*;
         match provider {
-            Provider::OpenAiCompatible { .. } => &[Default, Off, Minimal, Low, Medium, High, XHigh],
+            Provider::OpenAiCompatible { .. } => &[Default, Off, Minimal, Low, Medium, High, XHigh, Max],
             Provider::Anthropic { .. } => &[Default, Off, Low, Medium, High, Max],
         }
     }
@@ -200,7 +200,7 @@ mod tests {
         };
         assert_eq!(
             ReasoningLevel::options(&openai),
-            &[Default, Off, Minimal, Low, Medium, High, XHigh]
+            &[Default, Off, Minimal, Low, Medium, High, XHigh, Max]
         );
         assert_eq!(
             ReasoningLevel::options(&anthropic),
@@ -208,7 +208,7 @@ mod tests {
         );
         assert_eq!(XHigh.for_provider(&anthropic), Default);
         assert_eq!(Minimal.for_provider(&anthropic), Default);
-        assert_eq!(Max.for_provider(&openai), Default);
+        assert_eq!(Max.for_provider(&openai), Max);
         assert_eq!(ReasoningLevel::from_id("future-level"), Default);
         for (level, id, label, first, total) in [
             (Default, "default", "默认", 45, 195),

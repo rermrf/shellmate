@@ -25,7 +25,7 @@ impl Render for AboutDialog {
             .child(super::hint(VERSION, palette))
             .child(div().text_size(px(14.)).child("macOS 上的 SSH 客户端"))
             .child(super::button("about-close", "关闭", Tone::Primary, true)
-                .w(px(120.))
+                .w(px(88.))
                 .on_click(cx.listener(|body, _, window, cx| body.dismiss(window, cx))))
     }
 }
