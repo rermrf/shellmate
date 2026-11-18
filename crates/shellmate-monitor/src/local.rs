@@ -1,4 +1,5 @@
 //! Native macOS measurements. The Linux frame protocol stays on the SSH side; both produce Snapshot.
+pub(crate) mod ports;
 mod processes;
 pub(crate) mod runner;
 mod system;

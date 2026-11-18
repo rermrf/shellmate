@@ -39,17 +39,20 @@ pub enum Page {
     Services,
     /// Docker
     Docker,
+    /// Local listening ports.
+    Ports,
 }
 
 impl Page {
     /// All of them, in the order of the header.
-    pub const ALL: [Page; 4] = [Page::Overview, Page::Processes, Page::Services, Page::Docker];
+    pub const ALL: [Page; 5] = [Page::Overview, Page::Processes, Page::Ports, Page::Services, Page::Docker];
 
     /// The label of the tab.
     pub fn label(self) -> &'static str {
         match self {
             Page::Overview => "概览",
             Page::Processes => "进程",
+            Page::Ports => "端口",
             Page::Services => "服务",
             Page::Docker => "Docker",
         }
@@ -78,6 +81,8 @@ pub struct MonitorData {
     pub probe: Option<Arc<Probe>>,
     /// The newest numbers (once the first frames are in).
     pub snapshot: Option<Arc<Snapshot>>,
+    /// Present when the backend offers the local ports page.
+    pub ports: Option<Arc<shellmate_monitor::ports::PortList>>,
     /// The services (once systemd has been asked).
     pub services: Option<Arc<ServiceList>>,
     /// The containers (once docker has been asked).
@@ -90,7 +95,7 @@ impl MonitorData {
     pub fn local(&self) -> bool { self.probe.as_ref().is_some_and(|probe| probe.local_hardware.is_some()) }
     /// A monitor that has not said anything yet.
     pub fn empty() -> Self {
-        Self { phase: Phase::Idle, probe: None, snapshot: None, services: None, docker: None, forwards: Arc::default() }
+        Self { phase: Phase::Idle, probe: None, snapshot: None, ports: None, services: None, docker: None, forwards: Arc::default() }
     }
 }
 
@@ -223,6 +228,7 @@ pub fn header(data: &MonitorData, page: Page, host: &str) -> HeaderView {
     let tabs = Page::ALL
         .iter()
         .filter(|page| **page != Page::Services || !data.local())
+        .filter(|page| **page != Page::Ports || data.ports.is_some())
         .map(|candidate| PageTab {
             page: *candidate,
             active: *candidate == page,
@@ -230,6 +236,7 @@ pub fn header(data: &MonitorData, page: Page, host: &str) -> HeaderView {
                 // Nothing to look at is no number: a badge that says 0 is noise.
                 Page::Overview => (attention > 0).then(|| (attention.to_string(), Tone::Err)),
                 Page::Processes => snapshot.map(|s| (s.processes.len().to_string(), Tone::Plain)),
+                Page::Ports => data.ports.as_ref().and_then(|list| list.rows.as_ref()).map(|rows| (rows.len().to_string(), Tone::Plain)),
                 Page::Services => probe.and_then(|probe| services_badge(probe, data.services.as_deref())),
                 Page::Docker => probe.and_then(|probe| docker_badge(probe, data.docker.as_deref())),
             },

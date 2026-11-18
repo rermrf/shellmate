@@ -109,6 +109,8 @@ pub enum Focus {
     Overview,
     /// 进程
     Processes,
+    /// Local listening ports.
+    Ports,
     /// 服务
     Services,
     /// Docker
@@ -133,6 +135,8 @@ pub enum MonitorEvent {
     Probe(Arc<Probe>),
     /// New numbers (after every frame: system data every 2 s, processes every 3 s, disks every 30 s).
     Snapshot(Arc<Snapshot>),
+    /// The local listener list (or its refresh error) changed.
+    Ports,
     /// The list of services changed.
     Services(Arc<ServiceList>),
     /// The containers (or what is known about them) changed.
@@ -202,6 +206,9 @@ struct State {
     probe: Option<Arc<Probe>>,
     engine: Option<Engine>,
     snapshot: Option<Arc<Snapshot>>,
+    ports: Option<Arc<crate::ports::PortList>>,
+    #[cfg(target_os = "macos")]
+    ports_task: Option<AbortOnDrop>,
     services: Option<Arc<ServiceList>>,
     docker: Option<pollers::DockerState>,
     next_action: u64,
@@ -526,6 +533,9 @@ impl Monitor {
             probe: None,
             engine: None,
             snapshot: None,
+            ports: local.then(Arc::default),
+            #[cfg(target_os = "macos")]
+            ports_task: None,
             services: None,
             docker: None,
             next_action: 0,
@@ -558,6 +568,8 @@ impl Monitor {
             return;
         }
         let was_active = std::mem::replace(&mut state.active, active);
+        #[cfg(target_os = "macos")]
+        if inner.local { inner.sync_ports(&mut state); }
         if active {
             if !was_active {
                 if let Some(probe) = &state.probe {
@@ -628,6 +640,8 @@ impl Monitor {
     pub fn shutdown(&self) {
         let mut state = lock(&self.inner.state);
         state.closed = true;
+        #[cfg(target_os = "macos")]
+        { state.ports_task = None; }
         self.inner.disconnect.send_replace(());
         *lock(&self.inner.slot) = None;
         // Dropped here, under the lock, so no task can start or report in between.
@@ -677,6 +691,11 @@ impl Monitor {
         lock(&self.inner.state).snapshot.clone()
     }
 
+    /// `Some` on a local backend, including before the first visit to the page.
+    pub fn ports(&self) -> Option<Arc<crate::ports::PortList>> {
+        lock(&self.inner.state).ports.clone()
+    }
+
     /// What the probe found out, once it has run.
     pub fn probe(&self) -> Option<Arc<Probe>> {
         lock(&self.inner.state).probe.clone()
@@ -701,7 +720,10 @@ impl Monitor {
     /// [`Options::poll_visible`] seconds while theirs is, and the container statistics run only while the
     /// Docker page is.
     pub fn set_focus(&self, focus: Focus) {
-        self.inner.focus.send_if_modified(|current| std::mem::replace(current, focus) != focus);
+        if self.inner.focus.send_if_modified(|current| std::mem::replace(current, focus) != focus) {
+            #[cfg(target_os = "macos")]
+            if self.inner.local { self.inner.sync_ports(&mut lock(&self.inner.state)); }
+        }
     }
 
     /// Asks again at once (after an action, when a page is opened).

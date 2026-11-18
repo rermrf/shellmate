@@ -1,6 +1,59 @@
 use super::*;
-use crate::local::{Sampler, host_probe, runner};
+use crate::local::{Sampler, host_probe, ports, runner};
+use crate::ports::{Listener, PortSources};
 use tokio::time::{Instant, sleep_until};
+
+impl Inner {
+    pub(super) fn sync_ports(self: &Arc<Self>, state: &mut State) {
+        self.sync_ports_with(state, Duration::from_secs(5), ports::sample);
+    }
+
+    fn sync_ports_with<Fut>(
+        self: &Arc<Self>,
+        state: &mut State,
+        period: Duration,
+        mut sample: impl FnMut() -> Fut + Send + 'static,
+    ) where
+        Fut: Future<Output = std::io::Result<(PortSources, Vec<Listener>)>> + Send,
+    {
+        if state.closed || !state.active || *self.focus.borrow() != Focus::Ports {
+            state.ports_task = None;
+        } else if state.ports_task.is_none() {
+            let weak = Arc::downgrade(self);
+            state.ports_task = Some(AbortOnDrop(self.runtime.spawn(async move {
+                let mut ticks = tokio::time::interval(period);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticks.tick().await;
+                    let result = sample().await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    let mut state = lock(&inner.state);
+                    if state
+                        .ports_task
+                        .as_ref()
+                        .is_none_or(|task| task.0.id() != tokio::task::id())
+                    {
+                        return;
+                    }
+                    let snapshot = state.snapshot.clone();
+                    let list = Arc::make_mut(state.ports.as_mut().expect("local port list"));
+                    match result {
+                        Ok((sources, mut rows)) => {
+                            for row in &mut rows {
+                                row.owner_start = row.owner(snapshot.as_deref()).map(|proc| proc.start_time);
+                            }
+                            list.rows = Some(Arc::new(rows));
+                            list.sources = sources;
+                            list.error = None;
+                        }
+                        Err(err) => list.error = Some(err.to_string()),
+                    }
+                    inner.emit(&state, MonitorEvent::Ports);
+                }
+            })));
+        }
+    }
+}
 
 impl Task {
     pub(super) async fn run_local(self) {
@@ -106,5 +159,65 @@ impl Task {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::PortSource;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn ports_cancel_on_hide_and_preserve_last_success_until_recovery() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (events, changes) = async_channel::unbounded();
+            let monitor = Monitor::local(Handle::current(), events);
+            let inner = &monitor.inner;
+            let (requested, requests) = async_channel::unbounded();
+            let start = |period| {
+                let requested = requested.clone();
+                let mut state = lock(&inner.state);
+                state.active = true;
+                inner.focus.send_replace(Focus::Ports);
+                inner.sync_ports_with(&mut state, period, move || {
+                    let (reply, result) = oneshot::channel();
+                    requested.try_send(reply).unwrap();
+                    async { result.await.unwrap() }
+                });
+            };
+            monitor.set_focus(Focus::Ports);
+            assert!(lock(&inner.state).ports_task.is_none());
+            start(Duration::from_millis(5));
+            let mixed = PortSources { tcp: PortSource::Lsof, udp: PortSource::Netstat };
+            requests.recv().await.unwrap().send(Ok((mixed, Vec::new()))).unwrap();
+            assert!(matches!(changes.recv().await.unwrap(), MonitorEvent::Ports));
+            let first = monitor.ports().unwrap().rows.clone().unwrap();
+            requests
+                .recv()
+                .await
+                .unwrap()
+                .send(Err(std::io::Error::other("denied")))
+                .unwrap();
+            assert!(matches!(changes.recv().await.unwrap(), MonitorEvent::Ports));
+            let failed = monitor.ports().unwrap();
+            assert_eq!(failed.sources, mixed);
+            assert_eq!(failed.error.as_deref(), Some("denied"));
+            assert!(Arc::ptr_eq(failed.rows.as_ref().unwrap(), &first));
+            let mut in_flight = requests.recv().await.unwrap();
+            monitor.set_focus(Focus::Processes);
+            in_flight.closed().await;
+            assert!(lock(&inner.state).ports_task.is_none());
+            start(Duration::from_secs(60));
+            requests.recv().await.unwrap().send(Ok((PortSources::default(), Vec::new()))).unwrap();
+            assert!(matches!(changes.recv().await.unwrap(), MonitorEvent::Ports));
+            assert!(monitor.ports().unwrap().error.is_none());
+            assert_eq!(monitor.ports().unwrap().sources, PortSources::default());
+            monitor.set_active(false);
+            assert!(lock(&inner.state).ports_task.is_none());
+            assert!(requests.is_empty());
+        })
+        .await
+        .expect("immediate sample, cancelled in-flight reader, and immediate reopen");
     }
 }

@@ -7,6 +7,35 @@ use shellmate_monitor::{
 };
 use std::sync::Arc;
 
+pub const PORT_SCENES: [&str; 3] = ["mon-local-ports", "mon-local-ports-sel", "mon-local-ports-lsof"];
+
+pub fn local_ports(scene: &str) -> MonitorData {
+    use shellmate_monitor::ports::{Family, Listener, PortList, PortSource, PortSources, Protocol};
+    let mut data = local();
+    let lsof = scene == "mon-local-ports-lsof";
+    let source = if lsof { PortSource::Lsof } else { PortSource::Netstat };
+    let current_user = &data.probe.as_ref().unwrap().user;
+    let snapshot = Arc::make_mut(data.snapshot.as_mut().unwrap());
+    for (pid, name, user, command) in [(4100, "mysqld", "chen", "mysqld --port=3306"),
+        (4200, "redis-server", "chen", "redis-server 127.0.0.1:6379"), (4300, "mDNSResponder", "root", "/usr/sbin/mDNSResponder")] {
+        snapshot.processes.push(Process { pid, ppid: 1, name: name.into(), user: user.into(), command: command.into(),
+            start_time: u64::from(pid) + 1, state: 'S', cpu_percent: None, rss_bytes: None, mem_percent: None, threads: 1, nice: 0 });
+    }
+    let rows = [(22, 1, Protocol::Tcp, Family::Both, "*"), (3000, 3550, Protocol::Tcp, Family::V4, "*"),
+        (3306, 4100, Protocol::Tcp, Family::V4, "127.0.0.1"), (6379, 4200, Protocol::Tcp, Family::Both, "127.0.0.1"),
+        (9010, 2207, Protocol::Tcp, Family::V4, "192.0.2.10"), (5353, 4300, Protocol::Udp, Family::Both, "*")]
+        .into_iter().filter_map(|(port, pid, protocol, family, addr)| {
+            let proc = snapshot.process(pid).unwrap();
+            if lsof && &proc.user != current_user { return None; }
+            let mut addresses = vec![addr.to_owned()];
+            if port == 6379 { addresses.push("::1".into()); }
+            Some(Listener { port, pid, protocol, family, addresses, name: proc.name.clone(),
+                user: lsof.then(|| proc.user.clone()), owner_start: Some(proc.start_time) })
+        }).collect();
+    data.ports = Some(Arc::new(PortList { rows: Some(Arc::new(rows)), sources: PortSources {tcp: source, udp: source}, error: None }));
+    data
+}
+
 pub fn local() -> MonitorData {
     use shellmate_monitor::{CpuCard, Disk, MemoryCard, Phase, Probe};
     let gib = 1u64 << 30;

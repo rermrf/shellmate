@@ -6,6 +6,7 @@
 
 mod docker;
 mod logs;
+mod ports;
 mod services;
 
 use std::ops::Range;
@@ -35,6 +36,8 @@ use crate::ui::{ellipsis, SegmentItem, card_shadow, item_shadow, segmented};
 pub enum MonitorPanelEvent {
     /// A button of the bar under the process table.
     Process(ProcessAction, ProcKey),
+    /// Confirm a graceful termination from the local listener list.
+    EndPortProcess(ProcKey),
     /// 分析目录 on a full mount point.
     AnalyzeDisk(String),
     /// 重试 after the monitor gave up.
@@ -68,6 +71,7 @@ pub struct MonitorPanel {
     tree: bool,
     selected: Option<ProcKey>,
     table: Table,
+    ports: Option<ports::PortsPage>,
     scroll: UniformListScrollHandle,
     overview_scroll: ScrollHandle,
     services_scroll: ScrollHandle,
@@ -140,6 +144,7 @@ impl MonitorPanel {
                 }
             }),
         ];
+        let ports = data.ports.as_ref().map(|_| ports::PortsPage::new(window, cx));
         let mut panel = Self {
             host: host.into(),
             data,
@@ -150,6 +155,7 @@ impl MonitorPanel {
             sort: SortKey::Cpu,
             tree: false,
             selected: None,
+            ports,
             table: Table { rows: Vec::new(), matches: 0, total: 0 },
             scroll: UniformListScrollHandle::new(),
             overview_scroll: ScrollHandle::new(),
@@ -190,6 +196,7 @@ impl MonitorPanel {
     pub fn fixture_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (handle, offset) = match self.page {
             Page::Overview => (self.overview_scroll.clone(), 120.),
+            Page::Ports => return,
             Page::Docker => (self.docker_scroll.clone(), 120.),
             Page::Services => (self.services_scroll.clone(), 120.),
             Page::Processes => {
@@ -207,7 +214,7 @@ impl MonitorPanel {
     /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
     /// page, the open container log on the Docker page, nothing elsewhere.
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
-        if page == Page::Services && self.data.local() { return; }
+        if (page == Page::Services && self.data.local()) || (page == Page::Ports && self.ports.is_none()) { return; }
         if self.page != page {
             self.page = page;
             self.sync_service_log(cx);
@@ -1145,6 +1152,7 @@ impl Render for MonitorPanel {
         let probe = self.data.probe.as_deref();
         let unsupported = matches!(self.data.phase, shellmate_monitor::Phase::Unsupported(_));
         let content = match (self.page, body) {
+            (Page::Ports, _) => self.render_ports(&p, cx),
             (_, Body::Message(message)) if unsupported => {
                 self.message_card(&message.title, &message.detail, message.retry, &p, cx)
             }

@@ -68,8 +68,17 @@ async fn bounded(mut pipe: impl AsyncRead + Unpin, limit: usize) -> io::Result<(
 }
 
 pub(crate) async fn output(cmd: &mut Command, timeout: Duration, limit: usize) -> io::Result<ExecOutput> {
+    output_with_locale(cmd, timeout, limit, "C").await
+}
+
+pub(super) async fn output_with_locale(
+    cmd: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    locale: &str,
+) -> io::Result<ExecOutput> {
     let mut child = cmd
-        .env("LC_ALL", "C")
+        .env("LC_ALL", locale)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

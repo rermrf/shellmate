@@ -1,0 +1,5 @@
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address                          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt
+udp46      0      0  *.55999                *.*                                           0            0  786896    9216      replicatord:30056  00100 00000204 0000000000f320c9 00000000 00080800
+udp4       0      0  *.*                    *.*                                           0            0  786896    9216         wifip2pd:29026  00080 00000000 0000000000f30070 00000000 00000800
+udp6       0      0  fe80::1%lo0.5353       *.*                                           0            0  786896    9216 ___go_build_yuny:4100   00100 00000204 0000000000f320ca 00000000 00080800

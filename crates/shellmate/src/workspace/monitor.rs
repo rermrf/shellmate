@@ -36,6 +36,9 @@ const TOAST_TITLE: &str = "监控";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Owner { Local, Ssh(usize) }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation { PerAction, AskTerm, Accepted }
+
 impl Session {
     fn monitor_owner(&self) -> Option<Owner> {
         match &self.kind { SessionKind::Local => Some(Owner::Local), SessionKind::Ssh(ssh) => Some(Owner::Ssh(ssh.group)), _ => None }
@@ -122,6 +125,7 @@ impl Workspace {
                     monitor.monitor.set_focus(match page {
                         Page::Overview => Focus::Overview,
                         Page::Processes => Focus::Processes,
+                        Page::Ports => Focus::Ports,
                         Page::Services => Focus::Services,
                         Page::Docker => Focus::Docker,
                     });
@@ -173,6 +177,7 @@ impl Workspace {
                 phase: monitor.monitor.phase(),
                 probe: monitor.monitor.probe().or_else(|| (owner == Owner::Local).then(|| std::sync::Arc::new(Probe { local_hardware: Some(String::new()), ..Probe::unknown() }))),
                 snapshot: monitor.monitor.snapshot(),
+                ports: monitor.monitor.ports(),
                 services: monitor.monitor.services(),
                 docker: monitor.monitor.docker(),
                 forwards: match owner { Owner::Ssh(id) => self.group(id).map(|g| self.forward_infos(g.key.host())).unwrap_or_default(), Owner::Local => Default::default() },
@@ -228,6 +233,7 @@ impl Workspace {
             MonitorEvent::Phase(phase) => log::debug!("监控 {phase:?}"),
             MonitorEvent::Probe(_)
             | MonitorEvent::Snapshot(_)
+            | MonitorEvent::Ports
             | MonitorEvent::Services(_)
             | MonitorEvent::Docker(_) => {}
             MonitorEvent::Action(report) => self.on_action_report(owner, report, window, cx),
@@ -279,8 +285,9 @@ impl Workspace {
     ) {
         match event {
             MonitorPanelEvent::Process(action, key) => {
-                self.run_process_action(session_id, *action, *key, false, window, cx)
+                self.run_process_action(session_id, *action, *key, Confirmation::PerAction, window, cx)
             }
+            MonitorPanelEvent::EndPortProcess(key) => self.run_process_action(session_id, ProcessAction::Term, *key, Confirmation::AskTerm, window, cx),
             MonitorPanelEvent::AnalyzeDisk(mount) => match shellmate_monitor::commands::analyze_directory(mount) {
                 Ok(line) => self.open_command_tab(session_id, &format!("分析 {mount}"), line, true, window, cx),
                 Err(err) => window.push_notification(Notification::error(err.to_string()).title(TOAST_TITLE), cx),
@@ -483,13 +490,13 @@ impl Workspace {
         }
     }
 
-    /// A button of the bar under the process table. `confirmed`: the question (for KILL) was answered.
+    /// Re-resolve the process identity both before and after confirmation.
     fn run_process_action(
         &mut self,
         session_id: usize,
         action: ProcessAction,
         key: ProcKey,
-        confirmed: bool,
+        confirmation: Confirmation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -503,7 +510,10 @@ impl Workspace {
             return;
         };
         let Some(planned) = process::plan(action, process, &probe) else { return };
-        if let (Some(confirm), false) = (planned.confirm.clone(), confirmed) {
+        let question = if confirmation == Confirmation::AskTerm {
+            Some(process::Confirm { title: format!("结束进程 {}？", key.pid), text: format!("{}\n将发送 SIGTERM，请求进程退出。", process.command), label: "发送 SIGTERM" })
+        } else { planned.confirm };
+        if let Some(confirm) = question && confirmation != Confirmation::Accepted {
             let workspace = cx.entity().downgrade();
             ConfirmDialog::open(
                 confirm.title,
@@ -513,7 +523,7 @@ impl Workspace {
                 move |window, cx| {
                     workspace
                         .update(cx, |workspace, cx| {
-                            workspace.run_process_action(session_id, action, key, true, window, cx)
+                            workspace.run_process_action(session_id, action, key, Confirmation::Accepted, window, cx)
                         })
                         .ok();
                     Ok(())
@@ -728,7 +738,7 @@ impl Workspace {
                     snapshot.process(pid).map(ProcKey::of)
                 });
                 if let Some(key) = key {
-                    self.run_process_action(session_id, action, key, step == "act-now", window, cx);
+                    self.run_process_action(session_id, action, key, if step == "act-now" { Confirmation::Accepted } else { Confirmation::PerAction }, window, cx);
                 } else {
                     log::warn!("监控演示：没有找到进程 {target:?}");
                 }

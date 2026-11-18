@@ -239,6 +239,7 @@ pub fn data(scenario: &str) -> MonitorData {
         snapshot: Some(Arc::new(snapshot)),
         services,
         docker,
+        ports: None,
         forwards: Arc::new(forwards),
     }
 }
