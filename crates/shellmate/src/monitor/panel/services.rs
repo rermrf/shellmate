@@ -24,6 +24,7 @@ impl MonitorPanel {
     /// Rebuilds the rows of the list for the search and the filter, and keeps the selection in what is shown.
     pub(super) fn refresh_services(&mut self, cx: &mut Context<Self>) {
         self.service_rows = match self.data.services.as_deref() {
+            Some(list) if self.show_apple => services::filtered_rows(list, self.service_query.read(cx).value().as_ref(), self.service_filter, true),
             Some(list) => services::rows(list, self.service_query.read(cx).value().as_ref(), self.service_filter),
             None => Vec::new(),
         };
@@ -33,13 +34,27 @@ impl MonitorPanel {
     /// The name of the service the detail shows: the selected one, or the first of the list.
     pub(super) fn shown_service(&self) -> Option<String> {
         let list = self.data.services.as_deref()?;
-        services::shown(list, &self.service_rows, self.service_selected.as_deref()).map(|service| service.name.clone())
+        services::shown(list, &self.service_rows, self.service_selected.as_deref()).map(|service| service.key().into())
     }
 
     /// Follows the journal of the shown service while the 服务 page is in front, and stops otherwise (and when
     /// there is another service to show).
     pub(super) fn sync_service_log(&mut self, cx: &mut Context<Self>) {
         let wanted = if self.page == Page::Services { self.shown_service() } else { None };
+        if self.data.local_services {
+            let selected = wanted.filter(|key| self.local_visible && self.following_file.as_ref() == Some(key));
+            let file = selected.as_ref().and_then(|key| self.data.services.as_ref()?.get(key)?.launchd.as_ref()?.log.as_deref());
+            if let (Some(key), Some(path)) = (selected, file) {
+                let subject = format!("file:{key}:{path}");
+                if !self.service_log.as_ref().is_some_and(|pane| pane.subject == subject) {
+                    self.service_log = Some(LogPane::start(subject, LogKind::File, services::LogSource::File { key, path: path.into() }, self.monitor.as_ref(), cx));
+                }
+            } else {
+                self.following_file = None;
+                self.service_log = None;
+            }
+            return;
+        }
         let key = wanted.as_ref().map(|name| format!("service:{name}"));
         if self.service_log.as_ref().map(|pane| &pane.subject) == key.as_ref() {
             return;
@@ -77,7 +92,7 @@ impl MonitorPanel {
         self.service_selected = Some(name.to_string());
         self.page = Page::Services;
         self.refresh_services(cx);
-        if let Some(ix) = self.service_rows.iter().position(|row| row.name == name) {
+        if let Some(ix) = self.service_rows.iter().position(|row| row.key == name) {
             self.service_scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
         }
         cx.emit(MonitorPanelEvent::PageChanged(Page::Services));
@@ -117,8 +132,8 @@ impl MonitorPanel {
     fn service_row(&self, ix: usize, shown: Option<&str>, p: &Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
         let extra=crate::layout::Responsive::at(self.width).service_extra_columns;
         let row = self.service_rows.get(ix)?;
-        let name = row.name.clone();
-        let selected = shown == Some(row.name.as_str());
+        let name = row.key.clone();
+        let selected = shown == Some(row.key.as_str());
         let (bg, fg) = tone_colors(p, row.tone);
         Some(
             div()
@@ -197,6 +212,7 @@ impl MonitorPanel {
             .id(("service-action", action as usize))
             .flex_1()
             .h(px(34.))
+            .when(self.data.local_services, |button| button.flex_auto().flex_none())
             .px(px(8.))
             .flex()
             .items_center()
@@ -243,7 +259,7 @@ impl MonitorPanel {
     fn render_service_detail(&self, detail: &Detail, stale: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let layout=crate::layout::Responsive::at(self.width);
         let (bg, fg) = tone_colors(p, detail.tone);
-        let name = detail.name.clone();
+        let name = detail.key.clone();
         let switch = &detail.autostart;
         let toggle_action = if switch.on { ServiceAction::Disable } else { ServiceAction::Enable };
         let enabled = switch.enabled;
@@ -256,7 +272,7 @@ impl MonitorPanel {
             .py(px(10.))
             .rounded(px(12.))
             .bg(p.card2)
-            .child(div().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if switch.enabled{format!("开机自启 {}",if switch.on{"enable"}else{"disable"})}else{switch.label.clone()}))
+            .child(div().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if switch.enabled && !self.data.local_services {format!("开机自启 {}",if switch.on{"enable"}else{"disable"})}else{switch.label.clone()}))
             .child({
                 let unit = name.clone();
                 let mut element = div().id("service-autostart").flex_none().child(
@@ -303,7 +319,9 @@ impl MonitorPanel {
                             .font_weight(FontWeight::BOLD)
                             .text_size(px(16.)).line_height(px(21.)),
                     )
-                    .child(ellipsis("service-detail-description",detail.description.clone()).text_size(px(12.5)).line_height(px(15.)).text_color(p.tx2)),
+                    .child(ellipsis("service-detail-description",detail.description.clone()).text_size(px(12.5)).line_height(px(15.)).text_color(p.tx2))
+                    .when(self.data.local_services, |d| d.child(ellipsis("service-target",name.clone()).text_size(px(12.)).text_color(p.tx2)))
+                    .when_some(detail.plist.clone(), |d, path| d.child(ellipsis("service-plist",path).text_size(px(12.)).text_color(p.tx2))),
             )
             .child(
                 div().flex_none().min_w_0()
@@ -338,7 +356,7 @@ impl MonitorPanel {
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .font_family(MONO_FONT)
-                        .child(ellipsis("service-failure",why)),
+                        .child(if self.data.local_services { div().children(why.lines().enumerate().map(|(index, line)| ellipsis(("service-error-line",index),line.to_owned()))) } else { div().child(ellipsis("service-failure",why)) }),
                 )
             })
             .child(
@@ -347,17 +365,27 @@ impl MonitorPanel {
                     .gap(px(8.))
                     .child(self.mini_card("主进程", detail.main_pid.clone(), p))
                     .child(self.mini_card("内存", detail.memory.clone(), p))
-                    .child(self.mini_card("CPU 时间", detail.cpu.clone(), p)),
+                    .when(!self.data.local_services, |d| d.child(self.mini_card("CPU 时间", detail.cpu.clone(), p))),
             )
             .child(
                 div().flex_none().min_w_0()
                     .flex()
                     .gap(px(6.))
+                    .when(self.data.local_services, |d| d.flex_wrap())
                     .children(detail.buttons.iter().map(|button| self.service_button(button, &name, p, cx))),
             )
             .child(switch_row)
-            .child(log_header)
-            .child(log_box(self.service_log.as_ref(), "选中服务后在这里跟随它的日志", 40, p).flex_1().min_h(px(120.)));
+            .when(!self.data.local_services, |d| d.child(log_header))
+            .when_some(detail.log.as_ref(), |d, _| {
+                let following = self.following_file.as_ref() == Some(&name);
+                d.child(div().id("follow-service-file").cursor_pointer().text_color(p.acc).text_size(px(13.))
+                    .child(if following { "关闭日志" } else { "跟随日志" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.following_file = (!following).then(|| name.clone());
+                        this.sync_service_log(cx); cx.notify();
+                    })))
+            })
+            .when(!self.data.local_services || self.service_log.is_some(), |d| d.child(log_box(self.service_log.as_ref(), "选中服务后在这里跟随它的日志", 40, p).flex_1().min_h(px(120.))));
         div().id("service-detail")
             .w(px(layout.service_detail_width)).when(layout.services_stacked, |d| d.w_full())
             .flex_none().min_h_0().when(layout.services_stacked, |d| d.min_h(px(480.)))
@@ -421,11 +449,15 @@ impl MonitorPanel {
                     ),
             )
             .child(segmented("service-filter", filters, on_pick, cx).flex_none())
+            .when(self.data.local_services, |d| d.child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).child("显示系统服务")
+                .child(Switch::new("show-apple-services").checked(self.show_apple).on_click(cx.listener(|this, value: &bool, _, cx| {
+                    this.show_apple = *value; this.refresh_services(cx); cx.notify();
+                })))))
             .child(div().flex_1().min_w_0())
             .child(div().text_size(px(12.)).text_color(p.tx2).child(format!(
                 "{} / {} 个服务",
                 self.service_rows.len(),
-                list.services.len()
+                list.services.iter().filter(|service| self.show_apple || !service.apple()).count()
             )));
 
         let heading = |text: &'static str, width: Option<f32>, right: bool| {

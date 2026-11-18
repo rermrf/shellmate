@@ -1,0 +1,7 @@
+PID	Status	Label
+742	0	homebrew.mxcl.redis
+-	78	homebrew.mxcl.mysql@8.4
+-	-15	org.example.crashed
+-	0	org.example.agent
+?	0	org.example.unknown
+912	0	com.apple.agent

@@ -1,0 +1,5 @@
+
+    disabled services = {
+        "homebrew.mxcl.redis" => enabled
+        "org.example.agent" => disabled
+    }

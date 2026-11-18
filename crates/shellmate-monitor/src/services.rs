@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use crate::commands::{BuildError, Command};
 
+pub mod launchd;
+
 /// How many units one `systemctl show` call is asked about (the command line stays short).
 pub const SHOW_BATCH: usize = 100;
 
@@ -298,6 +300,8 @@ impl ActiveState {
 /// Whether a unit starts at boot, and whether that can be changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Autostart {
+    /// No launch-at-login rule or disabled override.
+    Manual,
     /// `enabled` (also `enabled-runtime`).
     Enabled,
     /// `disabled` (also `linked`).
@@ -331,6 +335,8 @@ impl Autostart {
 /// One service, as the page shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Service {
+    /// Native macOS metadata; absent on systemd.
+    pub launchd: Option<launchd::Job>,
     /// `nginx.service`
     pub name: String,
     /// What it is for.
@@ -362,6 +368,16 @@ pub struct Service {
 }
 
 impl Service {
+    /// Stable, domain-qualified selection and action identity on macOS.
+    pub fn key(&self) -> &str {
+        self.launchd.as_ref().map_or(&self.name, |job| &job.target)
+    }
+
+    /// Whether this row is hidden by the default local filter.
+    pub fn apple(&self) -> bool {
+        self.launchd.as_ref().is_some_and(launchd::Job::apple)
+    }
+
     /// The service ended badly.
     pub fn is_failed(&self) -> bool {
         self.active == ActiveState::Failed
@@ -388,7 +404,7 @@ impl ServiceList {
 
     /// The service called `name`.
     pub fn get(&self, name: &str) -> Option<&Service> {
-        self.services.iter().find(|service| service.name == name)
+        self.services.iter().find(|service| service.key() == name)
     }
 }
 
@@ -448,6 +464,7 @@ pub fn merge(rows: &[UnitRow], files: &[(String, String)], props: &[UnitProps]) 
 
 fn blank(name: &str, description: &str, load: &str, active: &str, sub: &str) -> Service {
     Service {
+        launchd: None,
         name: name.to_string(),
         description: description.to_string(),
         active: ActiveState::parse(active),

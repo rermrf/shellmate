@@ -1,0 +1,15 @@
+system = {
+    type = system
+    unrelated = {
+        69 0 not.a.service
+    }
+    services = {
+        0   -    org.example.agent
+        501 0    com.canonical.multipassd
+        0   (pe) org.example.unknown
+        0   23   org.example.failed
+    }
+    endpoints = {
+        99 1 not.a.job
+    }
+}

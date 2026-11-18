@@ -51,6 +51,7 @@ impl ServiceFilter {
 /// A row of the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceRow {
+    pub key: String,
     /// `nginx.service`
     pub name: String,
     /// What it is for.
@@ -79,21 +80,32 @@ pub fn state_tone(service: &Service) -> Tone {
 /// The rows of `list` for a filter and a search text (name or description, any case), in the order of the
 /// list: failed first, then by name.
 pub fn rows(list: &ServiceList, query: &str, filter: ServiceFilter) -> Vec<ServiceRow> {
+    filtered_rows(list, query, filter, false)
+}
+
+pub fn filtered_rows(list: &ServiceList, query: &str, filter: ServiceFilter, show_apple: bool) -> Vec<ServiceRow> {
     let query = query.trim().to_lowercase();
     list.services
         .iter()
+        .filter(|service| show_apple || !service.apple())
         .filter(|service| filter.accepts(service))
         .filter(|service| {
             query.is_empty()
                 || service.name.to_lowercase().contains(&query)
                 || service.description.to_lowercase().contains(&query)
+                || service.key().to_lowercase().contains(&query)
         })
         .map(|service| ServiceRow {
-            name: service.name.clone(),
-            description: service.description.clone(),
+            key: service.key().into(),
+            name: display_name(service),
+            description: service.launchd.as_ref().filter(|job| job.formula().is_some()).map_or_else(|| service.description.clone(), |job| job.label().into()),
             state: if service.sub.is_empty() { state_word(&service.active) } else { service.sub.clone() },
             tone: state_tone(service),
             autostart: match service.autostart {
+                Autostart::Enabled if service.launchd.is_some() => "开机自启",
+                Autostart::Disabled if service.launchd.is_some() => "已禁用",
+                Autostart::Unknown if service.launchd.is_some() => "状态未知",
+                Autostart::Manual => "手动",
                 Autostart::Enabled => "自启",
                 Autostart::Masked => "屏蔽",
                 _ => "—",
@@ -102,6 +114,10 @@ pub fn rows(list: &ServiceList, query: &str, filter: ServiceFilter) -> Vec<Servi
             memory: service.memory.map_or_else(|| "—".into(), format::bytes),
         })
         .collect()
+}
+
+fn display_name(service: &Service) -> String {
+    if service.launchd.as_ref().is_some_and(|job| job.formula().is_some()) { format!("{}（Homebrew）", service.name) } else { service.name.clone() }
 }
 
 fn state_word(active: &ActiveState) -> String {
@@ -121,8 +137,8 @@ fn state_word(active: &ActiveState) -> String {
 pub fn shown<'a>(list: &'a ServiceList, rows: &[ServiceRow], selected: Option<&str>) -> Option<&'a Service> {
     selected
         .and_then(|name| list.get(name))
-        .filter(|service| rows.iter().any(|row| row.name == service.name))
-        .or_else(|| rows.first().and_then(|row| list.get(&row.name)))
+        .filter(|service| rows.iter().any(|row| row.key == service.key()))
+        .or_else(|| rows.first().and_then(|row| list.get(&row.key)))
 }
 
 // ---- the detail --------------------------------------------------------------------------------
@@ -190,6 +206,9 @@ pub struct AutostartSwitch {
 /// The detail of the selected service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Detail {
+    pub key: String,
+    pub plist: Option<String>,
+    pub log: Option<String>,
     /// `php8.2-fpm.service`
     pub name: String,
     /// What it is for.
@@ -234,12 +253,16 @@ pub fn failure_text(service: &Service) -> Option<String> {
 const TERMINAL_NOTE: &str = "需要 sudo 密码，应用不会收集：在新会话里打好命令，由你回车并输入密码";
 
 fn command_of(action: ServiceAction, service: &Service) -> Result<Command, BuildError> {
+    if let Some(job) = &service.launchd { return job.command(action); }
     commands::systemctl(action, &service.name)
 }
 
 /// How the command of `action` gets to run, and the line that will be run. Managing services needs root.
 fn route(action: ServiceAction, service: &Service, probe: &Probe) -> Result<(Via, String, bool), BuildError> {
     let command = command_of(action, service)?;
+    if let Some(job) = &service.launchd {
+        return Ok(if job.system() { (Via::Terminal, command.prefixed(&["sudo"]).line(), false) } else { (Via::Direct, command.line(), true) });
+    }
     Ok(match commands::plan(&command, Privilege::Root, probe) {
         Plan::Exec { line } if line.starts_with("sudo -n ") => (Via::Sudo, line, true),
         Plan::Exec { line } => (Via::Direct, line, true),
@@ -278,14 +301,17 @@ fn unavailable(action: ServiceAction, service: &Service) -> Option<&'static str>
     }
     match action {
         ServiceAction::Reload | ServiceAction::Stop if !service.active.is_running() => Some("服务没有在运行"),
+        // launchd's kickstart of a running job does nothing; say so instead of offering it.
+        ServiceAction::Start if service.launchd.is_some() && service.active.is_running() => Some("服务已在运行"),
         _ => None,
     }
 }
 
 fn button(action: ServiceAction, service: &Service, probe: Option<&Probe>) -> ServiceButton {
+    let label = if keep_alive_stop(action, service) { KEEP_ALIVE_STOP } else { action_label(action) };
     let off = |why: &str| ServiceButton {
         action,
-        label: action_label(action).into(),
+        label: label.into(),
         enabled: false,
         via: Via::Direct,
         tooltip: Some(why.into()),
@@ -299,35 +325,46 @@ fn button(action: ServiceAction, service: &Service, probe: Option<&Probe>) -> Se
         Ok((via, line, _)) => ServiceButton {
             action,
             label: if via == Via::Terminal {
-                format!("{} · 终端", action_label(action))
+                format!("{label} · 终端")
             } else {
-                action_label(action).to_string()
+                label.to_string()
             },
             enabled: true,
             via,
             tooltip: match via {
                 Via::Sudo => Some(format!("以 sudo -n 执行：{line}")),
-                Via::Terminal => Some(format!("{TERMINAL_NOTE}：{line}")),
+                Via::Terminal => Some(terminal_note(service, &line)),
                 Via::Direct => None,
             },
         },
     }
 }
 
+const KEEP_ALIVE_STOP: &str = "停止（本次登录内不再自动启动）";
+
+fn keep_alive_stop(action: ServiceAction, service: &Service) -> bool {
+    action == ServiceAction::Stop && service.launchd.as_ref().is_some_and(|job| job.keep_alive == Some(true))
+}
+
+fn terminal_note(service: &Service, line: &str) -> String {
+    if service.launchd.is_some() { format!("在当前本机终端填入命令，由你回车：{line}") } else { format!("{TERMINAL_NOTE}：{line}") }
+}
+
 /// The detail of `service`. `uptime_secs`: the server's uptime now (for how long it has been in its state).
 pub fn detail(service: &Service, uptime_secs: Option<f64>, probe: Option<&Probe>) -> Detail {
-    let state = if service.sub.is_empty() || state_word(&service.active) == service.sub {
+    let state = if service.launchd.is_some() { service.sub.clone() } else if service.sub.is_empty() || state_word(&service.active) == service.sub {
         state_word(&service.active)
     } else {
         format!("{} ({})", state_word(&service.active), service.sub)
     };
     let buttons = [ServiceAction::Start, ServiceAction::Restart, ServiceAction::Reload, ServiceAction::Stop]
         .into_iter()
+        .filter(|action| service.launchd.is_none() || *action != ServiceAction::Reload)
         .map(|action| button(action, service, probe))
         .collect();
     let (on, toggle) = match service.autostart {
         Autostart::Enabled => (true, Some(ServiceAction::Disable)),
-        Autostart::Disabled => (false, Some(ServiceAction::Enable)),
+        Autostart::Disabled | Autostart::Manual => (false, Some(ServiceAction::Enable)),
         _ => (false, None),
     };
     let autostart = match (toggle, probe) {
@@ -337,10 +374,10 @@ pub fn detail(service: &Service, uptime_secs: Option<f64>, probe: Option<&Probe>
             AutostartSwitch {
                 on,
                 enabled: !line.is_empty(),
-                label: format!("开机自启 {}", action.verb()),
+                label: if service.launchd.is_some() { if on { "取消开机自启" } else { "设为开机自启" }.into() } else { format!("开机自启 {}", action.verb()) },
                 tooltip: match via {
                     Via::Sudo => Some(format!("以 sudo -n 执行：{line}")),
-                    Via::Terminal => Some(format!("{TERMINAL_NOTE}：{line}")),
+                    Via::Terminal => Some(terminal_note(service, &line)),
                     Via::Direct => None,
                 },
                 via,
@@ -359,7 +396,10 @@ pub fn detail(service: &Service, uptime_secs: Option<f64>, probe: Option<&Probe>
         },
     };
     Detail {
-        name: service.name.clone(),
+        name: display_name(service),
+        key: service.key().into(),
+        plist: service.launchd.as_ref().and_then(|job| job.plist.clone()),
+        log: service.launchd.as_ref().and_then(|job| job.log.clone()),
         description: service.description.clone(),
         state,
         tone: state_tone(service),
@@ -379,14 +419,16 @@ pub fn plan(action: ServiceAction, service: &Service, probe: &Probe) -> Option<P
         return None;
     }
     let (via, line, enter) = route(action, service, probe).ok()?;
-    let run = match via {
+    let run = if let Some(job) = &service.launchd {
+        Run::LocalService { key: service.key().into(), action, words: job.command(action).ok()?, done: done_text(action) }
+    } else { match via {
         Via::Terminal => Run::Terminal { line, enter, title: format!("{} {}", action.verb(), service.name) },
         _ => Run::Exec { line, done: done_text(action) },
-    };
+    } };
     let confirm = (action == ServiceAction::Stop).then(|| Confirm {
         title: format!("停止 {}？", service.name),
-        text: format!("{}\n依赖它的服务和正在处理的请求会立即中断。", service.description),
-        label: "停止服务",
+        text: if keep_alive_stop(action, service) { format!("{}\n将卸载此服务，本次登录内不再自动启动。可用「启动」重新加载。", service.key()) } else { format!("{}\n依赖它的服务和正在处理的请求会立即中断。", service.description) },
+        label: if keep_alive_stop(action, service) { KEEP_ALIVE_STOP } else { "停止服务" },
     });
     Some(Planned { run, confirm })
 }
@@ -396,6 +438,8 @@ pub fn plan(action: ServiceAction, service: &Service, probe: &Probe) -> Option<P
 /// What the journal pane does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogSource {
+    /// Follow an explicitly selected local job's file.
+    File { key: String, path: String },
     /// Follow this command line.
     Follow(String),
     /// The journal cannot be read: the pane says so.

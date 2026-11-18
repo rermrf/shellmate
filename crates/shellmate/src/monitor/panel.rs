@@ -79,6 +79,8 @@ pub struct MonitorPanel {
     // the 服务 page
     service_query: Entity<InputState>,
     service_filter: ServiceFilter,
+    show_apple: bool,
+    following_file: Option<String>,
     service_selected: Option<String>,
     service_rows: Vec<ServiceRow>,
     service_scroll: UniformListScrollHandle,
@@ -163,6 +165,8 @@ impl MonitorPanel {
             service_detail_scroll: ScrollHandle::new(),
             service_query,
             service_filter: ServiceFilter::All,
+            show_apple: false,
+            following_file: None,
             service_selected: None,
             service_rows: Vec::new(),
             service_scroll: UniformListScrollHandle::new(),
@@ -214,7 +218,7 @@ impl MonitorPanel {
     /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
     /// page, the open container log on the Docker page, nothing elsewhere.
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
-        if (page == Page::Services && self.data.local()) || (page == Page::Ports && self.ports.is_none()) { return; }
+        if (page == Page::Services && self.data.local() && !self.data.local_services) || (page == Page::Ports && self.ports.is_none()) { return; }
         if self.page != page {
             self.page = page;
             self.sync_service_log(cx);
@@ -227,6 +231,7 @@ impl MonitorPanel {
     pub fn set_local_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.local_visible != visible {
             self.local_visible = visible;
+            if self.data.local_services { self.sync_service_log(cx); }
             self.sync_container_log(cx);
         }
     }
@@ -1156,6 +1161,8 @@ impl Render for MonitorPanel {
             (_, Body::Message(message)) if unsupported => {
                 self.message_card(&message.title, &message.detail, message.retry, &p, cx)
             }
+            (Page::Services, Body::Data { stale, banner }) if self.data.local_services => self.render_services(stale, banner, &p, cx),
+            (Page::Services, Body::Message(_)) if self.data.local_services => self.render_services(false, None, &p, cx),
             (Page::Services, Body::Data { stale, banner }) => match model::services_page(probe) {
                 Some(page) => self.message_card(&page.title, &page.detail, false, &p, cx),
                 None => self.render_services(stale, banner, &p, cx),

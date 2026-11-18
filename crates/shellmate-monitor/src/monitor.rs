@@ -209,6 +209,8 @@ struct State {
     ports: Option<Arc<crate::ports::PortList>>,
     #[cfg(target_os = "macos")]
     ports_task: Option<AbortOnDrop>,
+    #[cfg(target_os = "macos")]
+    services_task: Option<(Focus, AbortOnDrop)>,
     services: Option<Arc<ServiceList>>,
     docker: Option<pollers::DockerState>,
     next_action: u64,
@@ -225,6 +227,8 @@ struct Inner {
     /// The sub-page in front.
     focus: watch::Sender<Focus>,
     wake_services: Arc<Notify>,
+    #[cfg(target_os = "macos")]
+    inventory: Arc<tokio::sync::Mutex<crate::local::services::Inventory>>,
     wake_docker: Arc<Notify>,
     /// The next look at the containers also asks for the disk usage (somebody pressed a button).
     docker_full: Arc<AtomicBool>,
@@ -536,6 +540,8 @@ impl Monitor {
             ports: local.then(Arc::default),
             #[cfg(target_os = "macos")]
             ports_task: None,
+            #[cfg(target_os = "macos")]
+            services_task: None,
             services: None,
             docker: None,
             next_action: 0,
@@ -552,6 +558,8 @@ impl Monitor {
                 disconnect: watch::channel(()).0,
                 focus: watch::channel(Focus::Overview).0,
                 wake_services: Arc::new(Notify::new()),
+                #[cfg(target_os = "macos")]
+                inventory: Arc::default(),
                 wake_docker: Arc::new(Notify::new()),
                 docker_full: Arc::new(AtomicBool::new(false)),
             }),
@@ -569,7 +577,7 @@ impl Monitor {
         }
         let was_active = std::mem::replace(&mut state.active, active);
         #[cfg(target_os = "macos")]
-        if inner.local { inner.sync_ports(&mut state); }
+        if inner.local { inner.sync_native(&mut state); }
         if active {
             if !was_active {
                 if let Some(probe) = &state.probe {
@@ -641,7 +649,7 @@ impl Monitor {
         let mut state = lock(&self.inner.state);
         state.closed = true;
         #[cfg(target_os = "macos")]
-        { state.ports_task = None; }
+        { state.ports_task = None; state.services_task = None; }
         self.inner.disconnect.send_replace(());
         *lock(&self.inner.slot) = None;
         // Dropped here, under the lock, so no task can start or report in between.
@@ -722,7 +730,7 @@ impl Monitor {
     pub fn set_focus(&self, focus: Focus) {
         if self.inner.focus.send_if_modified(|current| std::mem::replace(current, focus) != focus) {
             #[cfg(target_os = "macos")]
-            if self.inner.local { self.inner.sync_ports(&mut lock(&self.inner.state)); }
+            if self.inner.local { self.inner.sync_native(&mut lock(&self.inner.state)); }
         }
     }
 

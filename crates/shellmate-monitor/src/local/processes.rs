@@ -1,5 +1,4 @@
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -43,10 +42,11 @@ fn row(bytes: &[u8], owner_column: usize, total: u64) -> Option<(Process, f64)> 
     let state = word(&mut rest)?.chars().next()?;
     let nice = word(&mut rest)?.parse().ok()?;
     let cpu = seconds(word(&mut rest)?)?;
-    let mut birth = DefaultHasher::new();
-    for _ in 0..5 {
-        word(&mut rest)?.hash(&mut birth);
-    }
+    let start = rest.trim_start();
+    for _ in 0..5 { word(&mut rest)?; }
+    let stamp = std::ffi::CString::new(&start[..start.len() - rest.len()]).ok()?;
+    let mut birth: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::strptime(stamp.as_ptr(), c"%a %b %e %T %Y".as_ptr(), &mut birth) }.is_null() { return None; }
     let args = rest.trim_start();
     let command = if args.is_empty() { &name } else { args }.chars().take(2048).collect();
     Some((
@@ -58,7 +58,7 @@ fn row(bytes: &[u8], owner_column: usize, total: u64) -> Option<(Process, f64)> 
             command,
             state,
             nice,
-            start_time: birth.finish(),
+            start_time: unsafe { libc::timegm(&mut birth) }.try_into().ok()?,
             threads: 0,
             rss_bytes: Some(rss),
             cpu_percent: None,

@@ -119,7 +119,7 @@ impl Workspace {
         for owner in self.groups.iter().map(|g| Owner::Ssh(g.id)).chain([Owner::Local]) {
             if let Some(monitor) = self.backend(owner) {
                 let here = showing.filter(|(id, _)| *id == owner);
-                monitor.monitor.set_active(here.is_some());
+                if here.is_none() { monitor.monitor.set_active(false); }
                 if owner == Owner::Local && here.is_none() { monitor.monitor.set_focus(Focus::Overview); }
                 if let Some((_, page)) = here {
                     monitor.monitor.set_focus(match page {
@@ -129,6 +129,7 @@ impl Workspace {
                         Page::Services => Focus::Services,
                         Page::Docker => Focus::Docker,
                     });
+                    monitor.monitor.set_active(true);
                 }
             }
         }
@@ -174,6 +175,7 @@ impl Workspace {
     fn monitor_data(&self, owner: Owner) -> MonitorData {
         match self.backend(owner) {
             Some(monitor) => MonitorData {
+                local_services: owner == Owner::Local,
                 phase: monitor.monitor.phase(),
                 probe: monitor.monitor.probe().or_else(|| (owner == Owner::Local).then(|| std::sync::Arc::new(Probe { local_hardware: Some(String::new()), ..Probe::unknown() }))),
                 snapshot: monitor.monitor.snapshot(),
@@ -367,6 +369,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match run {
+            Run::LocalService { key, action, words, done } => {
+                #[cfg(target_os = "macos")]
+                if let Some((Owner::Local, monitor)) = self.monitor_of(session_id)
+                    && let Some(id) = monitor.run_local_service(&key, action, &words)
+                    && let Some(group) = self.backend_mut(Owner::Local) {
+                    group.pending.insert(id, PendingAction { done, topic, session_id });
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = (key, action, words, done);
+            }
             Run::Exec { line, done } => {
                 let Some((owner, monitor)) = self.monitor_of(session_id) else { return };
                 let id = monitor.run_action(line);
@@ -544,7 +556,7 @@ impl Workspace {
                     group.pending.insert(id, PendingAction { done, topic: None, session_id });
                 }
             }
-            Run::Terminal { line, enter, title } => self.open_command_tab(session_id, &title, line, enter, window, cx),
+            run => self.execute_run(session_id, run, None, window, cx),
         }
     }
 

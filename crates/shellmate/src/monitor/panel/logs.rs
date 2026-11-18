@@ -18,6 +18,7 @@ pub(super) const KEEP: usize = 300;
 /// Where the lines come from, and so how they are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LogKind {
+    File,
     /// `journalctl -o short-iso`.
     Journal,
     /// `docker logs -t`.
@@ -27,6 +28,7 @@ pub(super) enum LogKind {
 impl LogKind {
     fn parse(self, line: &str) -> LogLine {
         match self {
+            LogKind::File => LogLine { time: String::new(), text: line.into(), level: LogLevel::Plain },
             LogKind::Journal => shellmate_monitor::services::parse_journal_line(line),
             LogKind::Docker => shellmate_monitor::docker::parse_log_line(line),
         }
@@ -77,11 +79,16 @@ impl LogPane {
             _follow: None,
             _task: None,
         };
-        match (source, monitor) {
-            (LogSource::Denied(why), _) => pane.note = Some(why.to_string()),
-            (LogSource::Follow(_), None) => pane.note = Some("没有可用的监控连接".into()),
-            (LogSource::Follow(line), Some(monitor)) => {
-                let follow = monitor.follow(line);
+        let follow = match (source, monitor) {
+            (LogSource::Denied(why), _) => { pane.note = Some(why.to_string()); return pane; }
+            (_, None) => { pane.note = Some("没有可用的监控连接".into()); return pane; }
+            (LogSource::Follow(line), Some(monitor)) => Some(monitor.follow(line)),
+            #[cfg(target_os = "macos")]
+            (LogSource::File { key, path }, Some(monitor)) => monitor.follow_service_file(&key, &path),
+            #[cfg(not(target_os = "macos"))]
+            (LogSource::File { .. }, Some(_)) => None,
+        };
+        if let Some(follow) = follow {
                 let events = follow.events.clone();
                 pane._task = Some(cx.spawn(async move |this, cx| {
                     while let Ok(first) = events.recv().await {
@@ -100,7 +107,8 @@ impl LogPane {
                     }
                 }));
                 pane._follow = Some(follow);
-            }
+        } else {
+            pane.note = Some("日志文件不可用".into());
         }
         pane
     }

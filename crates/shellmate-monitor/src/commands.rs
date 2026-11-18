@@ -7,6 +7,9 @@ use crate::quote::{self, QuoteError};
 /// Why a command could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BuildError {
+    /// Unknown or invalid launchd target or unsupported operation.
+    #[error("无法确认 launchd 服务或操作")]
+    InvalidJob,
     /// There is nothing to run.
     #[error("命令是空的")]
     Empty,

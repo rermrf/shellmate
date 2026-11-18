@@ -4,6 +4,48 @@ use crate::ports::{Listener, PortSources};
 use tokio::time::{Instant, sleep_until};
 
 impl Inner {
+    pub(super) fn sync_native(self: &Arc<Self>, state: &mut State) {
+        self.sync_ports(state);
+        let inventory = self.inventory.clone();
+        self.sync_services_with(state, move |snapshot, previous| {
+            let inventory = inventory.clone();
+            async move { inventory.lock().await.sample(snapshot, previous).await }
+        });
+    }
+
+    fn sync_services_with<Fut>(self: &Arc<Self>, state: &mut State,
+        mut sample: impl FnMut(Option<Arc<Snapshot>>, Option<Arc<ServiceList>>) -> Fut + Send + 'static)
+    where Fut: Future<Output = ServiceList> + Send {
+        let focus = *self.focus.borrow();
+        if state.closed || !state.active || !matches!(focus, Focus::Services | Focus::Overview) {
+            state.services_task = None;
+            return;
+        }
+        if state.services_task.as_ref().is_some_and(|(current, _)| *current == focus) { return; }
+        let period = if focus == Focus::Services { self.options.poll_visible } else { self.options.poll_hidden };
+        let weak = Arc::downgrade(self);
+        let wake = self.wake_services.clone();
+        state.services_task = Some((focus, AbortOnDrop(self.runtime.spawn(async move {
+            loop {
+                let Some((snapshot, previous)) = weak.upgrade().map(|inner| {
+                    let state = lock(&inner.state);
+                    (state.snapshot.clone(), state.services.clone())
+                }) else { return };
+                let list = Arc::new(sample(snapshot, previous).await);
+                {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let mut state = lock(&inner.state);
+                    if state.services_task.as_ref().is_none_or(|(_, task)| task.0.id() != tokio::task::id()) { return; }
+                    if state.services.as_ref() != Some(&list) {
+                        state.services = Some(list.clone());
+                        inner.emit(&state, MonitorEvent::Services(list));
+                    }
+                }
+                tokio::select! { () = tokio::time::sleep(period) => {}, () = wake.notified() => {} }
+            }
+        }))));
+    }
+
     pub(super) fn sync_ports(self: &Arc<Self>, state: &mut State) {
         self.sync_ports_with(state, Duration::from_secs(5), ports::sample);
     }
@@ -52,6 +94,34 @@ impl Inner {
                 }
             })));
         }
+    }
+}
+
+impl Monitor {
+    /// Follow the selected job's configured file while the pane owns the returned guard.
+    pub fn follow_service_file(&self, key: &str, path: &str) -> Option<Follow> {
+        if !self.inner.local || !crate::services::launchd::safe_path(path) { return None; }
+        let list = self.services()?;
+        if list.get(key)?.launchd.as_ref()?.log.as_deref() != Some(path) { return None; }
+        let path = path.to_owned();
+        let (tx, events) = async_channel::bounded(300);
+        let task = self.inner.runtime.spawn(async move {
+            if let Err(err) = crate::local::services::follow_file(&path, &tx).await {
+                let _ = tx.send(FollowEvent::Ended(err.to_string())).await;
+            }
+        });
+        Some(Follow { events, _task: AbortOnDrop(task) })
+    }
+
+    /// Re-resolve the confirmed words against the latest domain-qualified inventory before dispatch.
+    pub fn run_local_service(&self, key: &str, action: crate::commands::ServiceAction, expected: &crate::commands::Command) -> Option<ActionId> {
+        if !self.inner.local { return None; }
+        let list = self.services()?;
+        let (system, words) = crate::local::services::validated(&list, key, action, expected)?;
+        let timeout = self.inner.options.action_timeout;
+        Some(self.spawn_action(words.line(), crate::local::services::dispatch(system, words, move |mut cmd| async move {
+            runner::output(&mut cmd, timeout, 64 << 10).await
+        })))
     }
 }
 
@@ -167,6 +237,45 @@ mod tests {
     use super::*;
     use crate::ports::PortSource;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn service_polling_wakes_for_actions_and_cancels_when_hidden() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (events, changes) = async_channel::unbounded();
+            let monitor = Monitor::local(Handle::current(), events);
+            let inner = &monitor.inner;
+            let (requests, samples) = async_channel::unbounded();
+            let focus = |active, focus| {
+                let requests = requests.clone();
+                let mut state = lock(&inner.state);
+                state.active = active;
+                inner.focus.send_replace(focus);
+                inner.sync_services_with(&mut state, move |_, _| {
+                    let (reply, result) = oneshot::channel();
+                    requests.try_send(reply).unwrap();
+                    async { result.await.unwrap() }
+                });
+            };
+            focus(false, Focus::Services);
+            focus(true, Focus::Docker);
+            assert!(samples.is_empty());
+            focus(true, Focus::Overview);
+            let mut overview = samples.recv().await.unwrap();
+            focus(true, Focus::Services);
+            overview.closed().await;
+            samples.recv().await.unwrap().send(ServiceList::default()).unwrap();
+            assert!(matches!(changes.recv().await.unwrap(), MonitorEvent::Services(_)));
+            monitor.refresh(Topic::Services);
+            let mut refresh = samples.recv().await.unwrap();
+            focus(true, Focus::Processes);
+            refresh.closed().await;
+            focus(true, Focus::Services);
+            let mut reopened = samples.recv().await.unwrap();
+            monitor.set_active(false);
+            reopened.closed().await;
+            assert!(changes.is_empty());
+        }).await.unwrap();
+    }
 
     #[tokio::test]
     async fn ports_cancel_on_hide_and_preserve_last_success_until_recovery() {

@@ -427,6 +427,8 @@ pub struct Confirm {
 /// What to do for a button.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Run {
+    /// Execute this action only if the current launchd inventory still resolves these words.
+    LocalService { key: String, action: shellmate_monitor::commands::ServiceAction, words: Command, done: &'static str },
     /// Run `line` on an exec channel and say how it went.
     Exec {
         /// The command line.

@@ -235,6 +235,7 @@ pub fn data(scenario: &str) -> MonitorData {
     };
     MonitorData {
         phase,
+        local_services: false,
         probe: Some(Arc::new(probe)),
         snapshot: Some(Arc::new(snapshot)),
         services,
@@ -246,6 +247,7 @@ pub fn data(scenario: &str) -> MonitorData {
 
 fn service(name: &str, description: &str, active: &str, sub: &str, enabled: bool, memory_mb: Option<u64>) -> Service {
     Service {
+        launchd: None,
         name: name.into(),
         description: description.into(),
         active: ActiveState::parse(active),

@@ -75,6 +75,7 @@ pub struct ForwardInfo {
 /// Everything the page knows about the server it shows.
 #[derive(Clone, Debug)]
 pub struct MonitorData {
+    pub local_services: bool,
     /// Where the monitor stands.
     pub phase: Phase,
     /// What the probe found out (once it has run).
@@ -95,7 +96,7 @@ impl MonitorData {
     pub fn local(&self) -> bool { self.probe.as_ref().is_some_and(|probe| probe.local_hardware.is_some()) }
     /// A monitor that has not said anything yet.
     pub fn empty() -> Self {
-        Self { phase: Phase::Idle, probe: None, snapshot: None, ports: None, services: None, docker: None, forwards: Arc::default() }
+        Self { local_services: false, phase: Phase::Idle, probe: None, snapshot: None, ports: None, services: None, docker: None, forwards: Arc::default() }
     }
 }
 
@@ -227,7 +228,7 @@ pub fn header(data: &MonitorData, page: Page, host: &str) -> HeaderView {
     let attention = attention_count(data);
     let tabs = Page::ALL
         .iter()
-        .filter(|page| **page != Page::Services || !data.local())
+        .filter(|page| **page != Page::Services || !data.local() || data.local_services)
         .filter(|page| **page != Page::Ports || data.ports.is_some())
         .map(|candidate| PageTab {
             page: *candidate,
@@ -237,6 +238,13 @@ pub fn header(data: &MonitorData, page: Page, host: &str) -> HeaderView {
                 Page::Overview => (attention > 0).then(|| (attention.to_string(), Tone::Err)),
                 Page::Processes => snapshot.map(|s| (s.processes.len().to_string(), Tone::Plain)),
                 Page::Ports => data.ports.as_ref().and_then(|list| list.rows.as_ref()).map(|rows| (rows.len().to_string(), Tone::Plain)),
+                Page::Services if data.local_services => data.services.as_ref().map(|list| {
+                    let visible = || list.services.iter().filter(|service| !service.apple());
+                    match visible().filter(|service| service.is_failed()).count() {
+                        0 => (visible().count().to_string(), Tone::Plain),
+                        failed => (format!("{failed} 失败"), Tone::Err),
+                    }
+                }),
                 Page::Services => probe.and_then(|probe| services_badge(probe, data.services.as_deref())),
                 Page::Docker => probe.and_then(|probe| docker_badge(probe, data.docker.as_deref())),
             },
@@ -557,14 +565,14 @@ pub struct AttentionItem {
 pub fn attention(data: &MonitorData) -> Vec<AttentionItem> {
     let mut items = Vec::new();
     if let Some(list) = data.services.as_deref() {
-        for service in list.services.iter().filter(|service| service.is_failed()) {
+        for service in list.services.iter().filter(|service| service.is_failed() && !service.apple()) {
             items.push(AttentionItem {
                 tag: "服务",
                 tone: Tone::Err,
                 title: format!("{} 启动失败", service.name),
                 detail: services::failure_text(service).unwrap_or_default(),
                 action_label: "查看服务",
-                action: AttentionAction::ShowService(service.name.clone()),
+                action: AttentionAction::ShowService(service.key().into()),
             });
         }
     }
@@ -1240,6 +1248,7 @@ mod tests {
     fn service(name: &str, active: &str, sub: &str) -> shellmate_monitor::services::Service {
         use shellmate_monitor::services::{ActiveState, Autostart, Service};
         Service {
+            launchd: None,
             name: name.into(),
             description: String::new(),
             active: ActiveState::parse(active),

@@ -17,7 +17,7 @@ impl TerminalBackend for Inert {
 impl Workspace {
     pub(crate) fn proto_scene(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (scene,_) = proto::request(scene);
-        if !proto::SCENES.contains(&scene) && !proto::monitor::PORT_SCENES.contains(&scene) {
+        if !proto::SCENES.contains(&scene) && !proto::monitor::PORT_SCENES.contains(&scene) && !proto::monitor::SERVICE_SCENES.contains(&scene) {
             log::warn!("unknown prototype scene");
             return;
         }
@@ -300,7 +300,7 @@ impl Workspace {
                 self.sessions[0].panel = Panel::Forward;
             }
             "mon-ov" | "mon-proc" | "mon-svc" | "mon-dk" => self.proto_monitor(scene, stress, window, cx),
-            local if matches!(local, "mon-local" | "mon-local-proc") || proto::monitor::PORT_SCENES.contains(&local) => {
+            local if matches!(local, "mon-local" | "mon-local-proc") || proto::monitor::PORT_SCENES.contains(&local) || proto::monitor::SERVICE_SCENES.contains(&local) => {
                 self.proto_local(window, cx);
                 self.proto_monitor(scene, false, window, cx);
             }
@@ -461,13 +461,15 @@ impl Workspace {
 impl Workspace {
     fn proto_monitor(&mut self, scene: &str, stress: bool, window: &mut Window, cx: &mut Context<Self>) {
         let ports = proto::monitor::PORT_SCENES.contains(&scene);
-        let local = ports || matches!(scene, "mon-local" | "mon-local-proc");
+        let services = proto::monitor::SERVICE_SCENES.contains(&scene);
+        let local = services || ports || matches!(scene, "mon-local" | "mon-local-proc");
         let ix = if local { self.active.expect("inert local fixture") } else { 0 };
-        let data = if ports { proto::monitor::local_ports(scene) } else if local { proto::monitor::local() } else if stress{proto::stress::monitor(scene,cx.is_dark())}else{crate::proto::monitor::data(scene, cx.is_dark())};
+        let data = if services { proto::monitor::local_services() } else if ports { proto::monitor::local_ports(scene) } else if local { proto::monitor::local() } else if stress{proto::stress::monitor(scene,cx.is_dark())}else{crate::proto::monitor::data(scene, cx.is_dark())};
         let panel =
             cx.new(|cx| crate::monitor::panel::MonitorPanel::new(if local { "本机" } else if stress{proto::stress::HOST}else{"prod-web-01"}, data, None, window, cx));
         let page = match scene {
             _ if ports => crate::monitor::model::Page::Ports,
+            _ if services => crate::monitor::model::Page::Services,
             "mon-proc" | "mon-local-proc" => crate::monitor::model::Page::Processes,
             "mon-svc" => crate::monitor::model::Page::Services,
             "mon-dk" => crate::monitor::model::Page::Docker,
@@ -475,6 +477,9 @@ impl Workspace {
         };
         panel.update(cx, |p, cx| {
             p.set_page(page, cx);
+            if scene == "mon-local-svc-sel" {
+                p.demo_services("", crate::monitor::services::ServiceFilter::All, Some("gui/501/homebrew.mxcl.redis"), window, cx);
+            }
             if scene == "mon-local-ports-sel" { p.demo_select_port(3000); }
             if matches!(scene, "mon-proc" | "mon-local-proc") {
                 p.show_process(if stress{4_194_304}else{2207}, window, cx);

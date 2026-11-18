@@ -2,6 +2,7 @@
 pub(crate) mod ports;
 mod processes;
 pub(crate) mod runner;
+pub(crate) mod services;
 mod system;
 
 use crate::{CpuCard, NetworkCard, Snapshot};

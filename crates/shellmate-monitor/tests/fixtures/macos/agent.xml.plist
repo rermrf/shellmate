@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>homebrew.mxcl.redis</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/redis-server</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>StandardErrorPath</key><string>/example/redis.err</string>
+  <key>StandardOutPath</key><string>/example/redis.log</string>
+</dict></plist>

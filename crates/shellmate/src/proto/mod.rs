@@ -222,7 +222,7 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
         }
     } else {
         match scene {
-            _ if monitor::PORT_SCENES.contains(&scene) => "local",
+            _ if monitor::PORT_SCENES.contains(&scene) || monitor::SERVICE_SCENES.contains(&scene) => "local",
             "rail-mid" | "rail-mid-expand" => "main",
             "set-cred-focus" | "set-cred-typed" => "set-cred-master",
             "set-ai-replace" => "set-ai",
