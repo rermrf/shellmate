@@ -65,7 +65,12 @@ impl FilesPanel {
     }
 
     fn render_breadcrumbs(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let crumbs=self.model.crumbs();
+        let mut crumbs=self.model.crumbs();
+        let home = self.local_home().and_then(std::path::Path::to_str)
+            .and_then(|home| crumbs.iter().position(|(_, dir)| dir == home).map(|index| (index, home.to_owned())));
+        let (root_label,root_dir) = if let Some((index,home)) = home {
+            crumbs.drain(..=index); ("~",home)
+        } else { ("/","/".to_owned()) };
         let full=self.model.cwd().to_string();
         let collapsed=full.chars().count()>38 || crumbs.len()>4;
         let piece=|index:usize,label:String,dir:String,strong:bool,cx:&mut Context<Self>| {
@@ -76,7 +81,7 @@ impl FilesPanel {
                 .child(div().truncate().child(label)).on_click(cx.listener(move |this,_,_,cx|this.go_to(&dir,cx)))
         };
         let mut path=div().flex().flex_1().min_w_0().items_center().gap(px(4.)).whitespace_nowrap().font_family(MONO_FONT).text_size(px(13.))
-            .child(piece(0,"/".into(),"/".into(),crumbs.is_empty(),cx));
+            .child(piece(0,root_label.into(),root_dir,crumbs.is_empty(),cx));
         if collapsed && !crumbs.is_empty() {
             let entries=crumbs.clone();let this=cx.entity().downgrade();
             path=path.child(Button::new("hidden-path").ghost().compact().label("…").tooltip(full)
@@ -102,7 +107,7 @@ impl FilesPanel {
     fn render_follow(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let on = self.model.follow();
         let panel = cx.entity();
-        let hint = (!self.model.osc7_seen()).then(|| {
+        let hint = (!self.is_local() && !self.model.osc7_seen()).then(|| {
             let panel_for_open = panel.clone();
             let (tx2, card2) = (p.tx2, p.card2);
             Popover::new("osc7-hint")
@@ -165,7 +170,7 @@ impl FilesPanel {
             .text_size(px(12.))
             .text_color(p.tx2)
             .children(hint)
-            .child("跟随终端目录 · OSC 7")
+            .child(if self.is_local() { "跟随终端目录" } else { "跟随终端目录 · OSC 7" })
             .child(
                 div()
                     .id("follow-switch")
@@ -192,7 +197,7 @@ impl FilesPanel {
 
     fn render_top_bar(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = self.model.ops_enabled() && !self.model.cwd().is_empty();
-        let offline = (!ready).then_some("连接就绪后可用");
+        let offline = (!ready).then_some(if self.is_local() { "目录就绪后可用" } else { "连接就绪后可用" });
         let no_selection = if ready { Some("先选中要下载的文件或目录") } else { offline };
         let can_download = self.model.download_path().is_some();
         div().w_full().min_w_0()
@@ -209,14 +214,14 @@ impl FilesPanel {
                 Self::tool("new-folder", "新建文件夹", false, offline, p)
                     .when(ready, |d| d.on_click(cx.listener(|this, _, _, cx| this.new_folder(cx)))),
             )
-            .child(
+            .when(!self.is_local(), |bar| bar.child(
                 Self::tool("download", "下载", false, if can_download { None } else { no_selection }, p)
                     .when(can_download, |d| d.on_click(cx.listener(|this, _, _, cx| this.begin_download(cx)))),
             )
             .child(
                 Self::tool("upload", "上传", true, offline, p)
                     .when(ready, |d| d.on_click(cx.listener(|this, _, _, cx| this.pick_upload(cx)))),
-            )
+            ))
             .when(!crate::layout::Responsive::at(self.width).files_inline_details,|d|d.child(Self::button("file-details-toggle","详情",false,p)
                 .on_click(cx.listener(|this,_,window,cx|{this.details_open = !this.details_open;window.focus(&this.focus,cx);cx.notify();}))))
             .child(
@@ -273,7 +278,7 @@ impl FilesPanel {
 
     fn render_row(&self, index: usize, p: &Palette, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let row = self.model.row(index)?;
-        let selected = self.model.selected_index() == Some(index);
+        let selected = self.model.row_selected(index);
         let (icon, name, note, size, time, perms) = match row {
             Row::Parent => (
                 crate::icons::folder(p).into_any_element(),
@@ -340,6 +345,20 @@ impl FilesPanel {
                     })),
             };
         let is_entry = matches!(row, Row::Entry(_));
+        let actions = match row {
+            Row::Entry(entry) if self.is_local() && selected && editing.is_none() => Some(div().flex().flex_none().gap(px(2.)).children([
+                ("row-finder", "在 Finder 中显示", Lucide::FolderOpen, MenuAction::Finder),
+                ("row-default", "用默认应用打开", Lucide::ExternalLink, MenuAction::DefaultApp),
+                ("row-copy", "拷贝路径", Lucide::Copy, MenuAction::CopyPath),
+            ].into_iter().map(|(id, label, icon, action)| {
+                let path = entry.path.clone();
+                div().id((id, index)).size(px(22.)).rounded(px(5.)).flex().items_center().justify_center().cursor_pointer()
+                    .hover(|style| style.bg(p.card2)).tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+                    .child(Icon::new(icon).size(px(14.)).text_color(p.tx2))
+                    .on_click(cx.listener(move |this, _, window, cx| { cx.stop_propagation(); this.path_action(action, &path, window, cx); }))
+            }))),
+            _ => None,
+        };
         Some(
             div()
                 .id(("file-row", index))
@@ -355,6 +374,7 @@ impl FilesPanel {
                 .when(selected, |d| d.bg(p.accs))
                 .when(!selected, |d| d.hover(|d| d.bg(p.card2)))
                 .child(name_cell)
+                .children(actions)
                 .child(div().w(px(84.)).flex_none().whitespace_nowrap().text_right().text_size(px(12.)).text_color(p.tx2).child(size))
                 .child(div().w(px(110.)).flex_none().whitespace_nowrap().text_size(px(12.)).text_color(p.tx2).child(time))
                 .child(
@@ -367,6 +387,13 @@ impl FilesPanel {
                         .child(perms),
                 )
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if this.is_local() && event.modifiers().platform {
+                        this.menu = None;
+                        this.model.toggle_row(index);
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                        return;
+                    }
                     this.select_row(index, window, cx);
                     if event.click_count() >= 2 {
                         this.open_row(index, cx);
@@ -376,7 +403,7 @@ impl FilesPanel {
                     row.on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.select_row(index, window, cx);
+                            if !this.model.row_selected(index) { this.select_row(index, window, cx); }
                             this.open_menu(index, event.position, cx);
                         }),
                     )
@@ -515,7 +542,7 @@ impl FilesPanel {
                     .text_size(px(14.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .shadow(card_shadow(p))
-                    .child(format!("松开即可上传到 {cwd}")),
+                    .child(format!("松开即可{}到 {cwd}", if self.is_local() { "拷贝" } else { "上传" })),
             );
         div()
             .id("files-card")
@@ -534,7 +561,7 @@ impl FilesPanel {
                 drag_surface.set(hot_surface);
                 style.bg(hot_bg).border_color(hot_border)
             })
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.upload(paths.paths().to_vec(), cx)))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.drop_paths(paths.paths().to_vec(), window, cx)))
             .shadow(card_shadow(p))
             .overflow_hidden()
             .child(self.render_top_bar(p, cx))
@@ -551,7 +578,7 @@ impl FilesPanel {
                     .text_color(p.tx2)
                     .border_t_1()
                     .border_color(p.line)
-                    .child("拖拽文件到此处上传 · 双击进入目录或编辑文件 · 右键更多操作"),
+                    .child(if self.is_local() { self.copy_status.clone().unwrap_or_else(|| format!("{} 项", self.model.entries().len())) } else { "拖拽文件到此处上传 · 双击进入目录或编辑文件 · 右键更多操作".into() }),
             )
     }
 
@@ -704,10 +731,11 @@ impl FilesPanel {
                         .hover(|d| d.opacity(0.88))
                         .on_click(cx.listener(move |this, _, _, cx| this.open_in_editor(path.clone(), cx)))
                 } else {
+                    let tip = if self.is_local() { "目录就绪后可用" } else { "连接就绪后可用" };
                     button
                         .opacity(0.45)
                         .cursor_not_allowed()
-                        .tooltip(|window, cx| Tooltip::new("连接就绪后可用").build(window, cx))
+                        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
                 }
             }));
         div().id("file-details")
@@ -783,11 +811,13 @@ impl FilesPanel {
                         .shadow(shadow)
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
                         .child(item("menu-open", open_label, MenuAction::Open, open_enabled, false, cx))
-                        .child(item("menu-download", "下载", MenuAction::Download, ops, false, cx))
+                        .when(!self.is_local(), |menu| menu.child(item("menu-download", "下载", MenuAction::Download, ops, false, cx)))
+                        .when(self.is_local(), |menu| menu.child(item("menu-finder", "在 Finder 中显示", MenuAction::Finder, ops, false, cx))
+                            .child(item("menu-default", "用默认应用打开", MenuAction::DefaultApp, ops, false, cx)))
                         .child(item("menu-rename", "重命名", MenuAction::Rename, ops, false, cx))
-                        .child(item("menu-copy", "复制路径", MenuAction::CopyPath, true, false, cx))
+                        .child(item("menu-copy", if self.is_local() { "拷贝路径" } else { "复制路径" }, MenuAction::CopyPath, true, false, cx))
                         .child(item("menu-perm", "修改权限", MenuAction::Permissions, grid, false, cx))
-                        .child(item("menu-delete", "删除", MenuAction::Delete, ops, true, cx)),
+                        .child(item("menu-delete", if self.is_local() { "移到废纸篓" } else { "删除" }, MenuAction::Delete, ops, true, cx)),
                 ),
             )
             .with_priority(2)

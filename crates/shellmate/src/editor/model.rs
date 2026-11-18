@@ -258,6 +258,17 @@ impl EditModel {
         }
     }
 
+    pub fn local_status(&self) -> (String, Tone) {
+        match &self.phase {
+            Phase::Clean => ("已与磁盘同步".into(), Tone::Muted),
+            Phase::Modified => ("● 已修改，未保存".into(), Tone::Warn),
+            Phase::Saving => ("正在保存…".into(), Tone::Accent),
+            Phase::Saved { at, .. } => (format!("✓ 已保存 · {at}"), Tone::Ok),
+            Phase::Conflict => ("磁盘文件已被修改".into(), Tone::Warn),
+            Phase::Failed(reason) => (format!("保存失败：{reason}"), Tone::Err),
+        }
+    }
+
     /// The footer's first part: `19 行 · UTF-8 · LF`, with `UTF-8 BOM` or `CRLF` where those apply.
     pub fn footer(&self, lines: usize) -> String {
         let encoding = if self.format.bom { "UTF-8 BOM" } else { "UTF-8" };

@@ -5,6 +5,7 @@ use crate::productivity::multi::{SessionRow, Split};
 #[derive(Default)]
 struct Available {
     session: bool,
+    files: bool,
     remote_panels: bool,
     duplicate: bool,
     split: bool,
@@ -21,7 +22,8 @@ impl Available {
         let protocol = main.filter(|row| !row.local).map(|row| row.protocol);
         Self {
             session: main.is_some(),
-            remote_panels: main.is_some() && Panel::Files.supported(protocol),
+            files: main.is_some() && Panel::Files.supported(protocol),
+            remote_panels: main.is_some() && Panel::Forward.supported(protocol),
             duplicate: main.is_some() && Session::duplicable(protocol),
             split: active.is_some_and(|(id, panel)| panel == Panel::Terminal &&
                 (split.other.is_some() || Split::candidate(id, rows, &[]).is_some())),
@@ -48,8 +50,10 @@ impl Available {
             bind(&ShowTerminal, |workspace, window, cx| workspace.show_panel(Panel::Terminal, window, cx));
         }
         bind(&ToggleSidebar, |workspace, window, cx| workspace.toggle_sidebar(&ToggleSidebar, window, cx));
-        if self.remote_panels {
+        if self.files {
             bind(&ShowFiles, |workspace, window, cx| workspace.show_panel(Panel::Files, window, cx));
+        }
+        if self.remote_panels {
             bind(&ShowForward, |workspace, window, cx| workspace.show_panel(Panel::Forward, window, cx));
             bind(&ShowMonitor, |workspace, window, cx| workspace.show_panel(Panel::Monitor, window, cx));
         }
@@ -150,7 +154,8 @@ mod tests {
             assert!(!registered.contains(LockVault.name()), "{scene}: the keychain cannot be locked");
             for (commands, flag) in [
                 (vec![CloseTab.name(), ShowTerminal.name()], flags[0]),
-                (vec![ShowFiles.name(), ShowForward.name(), ShowMonitor.name()], flags[1]),
+                (vec![ShowFiles.name()], flags[1] || scene.contains("local")),
+                (vec![ShowForward.name(), ShowMonitor.name()], flags[1]),
                 (vec![DuplicateSession.name()], flags[2]), (vec![ToggleSplit.name()], flags[3]),
                 (vec![ToggleRecording.name()], flags[4]), (vec![NextTab.name(), PreviousTab.name()], flags[5]),
             ] {

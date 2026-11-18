@@ -56,6 +56,9 @@ pub trait TerminalBackend: Send {
     /// into its sink.
     fn close(&mut self);
 
+    /// PID of the PTY child, distinct from the current foreground process group.
+    fn child_pid(&self) -> Option<u32> { None }
+
     /// Foreground process of the terminal; only meaningful for local PTYs.
     fn foreground_process(&self) -> Option<ProcessInfo> {
         None

@@ -58,6 +58,7 @@ fn count_lines(len: usize, rope_lines: usize, ends_with_newline: bool) -> usize 
 
 pub struct FileEditor {
     model: EditModel,
+    local: bool,
     /// The file's name, for the title and the dialogs.
     name: String,
     /// What the title shows after the name: `主机名:路径`.
@@ -101,10 +102,12 @@ impl FileEditor {
                 this.on_edited(cx);
             }
         });
+        let local = panel.upgrade().is_some_and(|panel| panel.read(cx).is_local());
         Self {
             model: EditModel::new(&file),
+            local,
             name,
-            place: format!("{host}:{}", file.path),
+            place: if local { file.path.clone() } else { format!("{host}:{}", file.path) },
             path: file.path,
             lang,
             editor,
@@ -236,7 +239,7 @@ impl FileEditor {
             });
         });
         self.dialog_open = true;
-        ConflictDialog::open(self.name.clone(), remote_time, snippet, info.remote_text.is_some(), answer, window, cx);
+        ConflictDialog::open(self.name.clone(), remote_time, snippet, info.remote_text.is_some(), self.local, answer, window, cx);
     }
 
     fn on_conflict_choice(&mut self, choice: ConflictChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -281,7 +284,7 @@ impl FileEditor {
             });
         });
         self.dialog_open = true;
-        UnsavedDialog::open(self.name.clone(), answer, window, cx);
+        UnsavedDialog::open(self.name.clone(), self.local, answer, window, cx);
     }
 
     fn on_unsaved_choice(&mut self, choice: UnsavedChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -465,7 +468,7 @@ impl FileEditor {
 impl Render for FileEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let (status, tone) = self.model.status();
+        let (status, tone) = if self.local { self.model.local_status() } else { self.model.status() };
         let saving = self.model.is_saving();
         let footer = self.model.footer(self.lines(cx));
         // The prototype's modal is 1200 × 800; a smaller window gets a smaller one.
@@ -565,7 +568,7 @@ impl Render for FileEditor {
                             .on_click(cx.listener(|this, _, window, cx| this.request_close(window, cx))),
                     )
                     .child(
-                        button("editor-save", "保存并上传 ⌘S", true)
+                        button("editor-save", if self.local { "保存 ⌘S" } else { "保存并上传 ⌘S" }, true)
                             .when(saving, |d| d.opacity(0.5).cursor_not_allowed())
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),

@@ -1,4 +1,5 @@
-//! The 文件 panel inside the workspace: one panel per SSH tab, all of a connection's panels on the
+//! The 文件 panel inside the workspace: an independent local browser per local tab, and one panel
+//! per SSH tab, with all of a connection's remote panels on the
 //! one SFTP session (and transfer queue) of its [`ConnGroup`](super::group::ConnGroup).
 //!
 //! The session is opened the first time a panel of the connection is shown. It follows the
@@ -358,6 +359,10 @@ impl Workspace {
             return;
         }
         self.sessions[ix].panel = panel;
+        self.sync_local_files_activity(cx);
+        if revisit && self.sessions[ix].host().is_none() && let Some(files) = &self.sessions[ix].files {
+            files.panel.update(cx, |panel, cx| panel.refresh_visible(cx));
+        }
         if panel == Panel::Files
             && let Some(group) = self.sessions[ix].ssh().map(|ssh| ssh.group)
         {
@@ -381,8 +386,14 @@ impl Workspace {
         let (session_id, terminal) = (self.sessions[ix].id, self.sessions[ix].terminal.clone());
         let panel = cx.new(|cx| FilesPanel::new(&terminal, runtime, window, cx));
         panel.update(cx,|p,cx|p.set_follow(self.preferences.get(shellmate_store::Preference::FollowDirectory),cx));
+        if self.sessions[ix].host().is_none() {
+            let Some(home) = self.local_files_home() else { return false };
+            panel.update(cx, |panel, _| panel.set_local(home));
+        }
         let subscription =
-            cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &FilesEvent, window, cx| match event {
+            cx.subscribe_in(&panel, window, move |this: &mut Self, _panel, event: &FilesEvent, window, cx| match event {
+                #[cfg(debug_assertions)]
+                FilesEvent::FixtureTrashReady => _panel.update(cx, |panel, cx| panel.ask_delete(window, cx)),
                 FilesEvent::RetrySession => this.retry_sftp(session_id, window, cx),
                 FilesEvent::SessionLost(session) => this.session_lost(session_id, session, cx),
                 FilesEvent::HandleClash(id) => this.handle_clash(session_id, *id, window, cx),
@@ -393,6 +404,23 @@ impl Workspace {
             });
         self.sessions[ix].files = Some(FilesTab { panel, _subscription: subscription });
         true
+    }
+
+    fn local_files_home(&self) -> Option<std::path::PathBuf> {
+        #[cfg(debug_assertions)]
+        if crate::prototype_fixture() {
+            return std::env::var_os("SHELLMATE_DATA_DIR").map(|dir| std::path::PathBuf::from(dir).join("files-local"));
+        }
+        std::env::home_dir()
+    }
+
+    pub(super) fn sync_local_files_activity(&self, cx: &mut Context<Self>) {
+        for (ix, session) in self.sessions.iter().enumerate() {
+            if session.host().is_none() && let Some(files) = &session.files {
+                let visible = Some(ix) == self.active && session.panel == Panel::Files;
+                files.panel.update(cx, |panel, cx| panel.set_local_visible(visible, cx));
+            }
+        }
     }
 
     /// A panel found its session unusable. The link reopens it if it is still the current one; either
@@ -418,10 +446,12 @@ impl Workspace {
             return;
         }
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else { return };
-        let (Some(files), Some(ssh)) = (session.files.as_ref(), session.ssh()) else { return };
-        let (panel, host, group_id) = (files.panel.downgrade(), ssh.host.name.clone(), ssh.group);
+        let Some(files) = session.files.as_ref() else { return };
+        let panel = files.panel.downgrade();
+        let host = session.ssh().map_or("本机", |ssh| ssh.host.name.as_str());
+        let group_id = session.ssh().map(|ssh| ssh.group);
         let began = std::time::Instant::now();
-        let editor = cx.new(|cx| FileEditor::new(file, &host, panel, window, cx));
+        let editor = cx.new(|cx| FileEditor::new(file, host, panel.clone(), window, cx));
         // How long until the modal is on screen: two frames after it is asked for.
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |_, _| log::info!("编辑器：打开到出现 {} ms", began.elapsed().as_millis()));
@@ -429,7 +459,7 @@ impl Workspace {
         let subscription =
             cx.subscribe_in(&editor, window, move |this: &mut Self, _, event: &EditorEvent, window, cx| match event {
                 // The upload changed the directory: every panel of the connection that shows it lists it again.
-                EditorEvent::Saved(dir) => this.remote_changed(group_id, dir, cx),
+                EditorEvent::Saved(dir) => if let Some(group_id) = group_id { this.remote_changed(group_id, dir, cx); } else { panel.update(cx, |panel, cx| panel.refresh_visible(cx)).ok(); },
                 EditorEvent::Closed => {
                     this.editor = None;
                     this._editor_subscription = None;
@@ -454,7 +484,10 @@ impl Workspace {
         let Some(panel) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.files.as_ref()) else {
             return;
         };
-        if offers_download(error) {
+        if panel.panel.read(cx).is_local() {
+            let reason = error.to_string();
+            window.push_notification(Notification::warning(reason.trim_end_matches("，请下载后查看").to_owned()).title(format!("无法用内置编辑器打开 {name}")), cx);
+        } else if offers_download(error) {
             let panel = panel.panel.downgrade();
             ConfirmDialog::open(
                 format!("无法用内置编辑器打开 {name}"),

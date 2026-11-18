@@ -20,6 +20,7 @@ pub struct ClashDialog {
     clash: Clash,
     answer: Answer,
     answered: bool,
+    local: bool,
 }
 
 /// The names to list: up to five, and ` 等` when there are more.
@@ -32,7 +33,13 @@ impl ClashDialog {
     /// Opens the dialog for item `id`.
     pub fn open(id: ItemId, clash: Clash, answer: Answer, window: &mut Window, cx: &mut App) {
         let title = clash.title();
-        let body = cx.new(|_| Self { id, clash, answer, answered: false });
+        let body = cx.new(|_| Self { id, clash, answer, answered: false, local: false });
+        super::open(window, cx, title, 480., body);
+    }
+
+    pub fn local(clash: Clash, answer: Answer, window: &mut Window, cx: &mut App) {
+        let title = clash.title();
+        let body = cx.new(|_| Self { id: ItemId(0), clash, answer, answered: false, local: true });
         super::open(window, cx, title, 480., body);
     }
 
@@ -78,7 +85,7 @@ impl Render for ClashDialog {
                     .on_click(cx.listener(|this, _, window, cx| this.choose(Choice::Skip, window, cx))),
                 button("clash-both", "保留两者", Tone::Plain, true)
                     .on_click(cx.listener(|this, _, window, cx| this.choose(Choice::KeepBoth, window, cx))),
-                button("clash-overwrite", "覆盖", Tone::Danger, true)
+                button("clash-overwrite", if self.local { "替换" } else { "覆盖" }, Tone::Danger, true)
                     .on_click(cx.listener(|this, _, window, cx| this.choose(Choice::Overwrite, window, cx))),
             ]))
     }

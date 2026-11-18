@@ -108,7 +108,7 @@ pub(crate) enum Panel {
 
 impl Panel {
     fn supported(self, protocol: Option<shellmate_core::Protocol>) -> bool {
-        self == Panel::Terminal || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
+        self == Panel::Terminal || (self == Panel::Files && protocol.is_none()) || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
     }
     const ALL: [Panel; 4] = [Panel::Terminal, Panel::Files, Panel::Forward, Panel::Monitor];
 
@@ -124,9 +124,8 @@ impl Panel {
     /// Why the panel is unavailable for a local session (prototype wording).
     fn local_hint(self) -> &'static str {
         match self {
-            Panel::Terminal => "",
-            Panel::Files => "本机文件请使用 Finder",
-            Panel::Forward => "本机会话不需要端口转发",
+            Panel::Terminal | Panel::Files => "",
+            Panel::Forward => "本机会话没有 SSH 连接，端口转发请在 SSH 会话中设置",
             Panel::Monitor => "本机状态请使用「活动监视器」",
         }
     }
@@ -148,7 +147,7 @@ struct Session {
     /// The local shell exited (SSH sessions track their state in [`ssh::SshSession`]).
     exited: bool,
     panel: Panel,
-    /// The file panel, made the first time the tab shows it (SSH tabs only).
+    /// The file panel, made the first time the tab shows it.
     files: Option<files::FilesTab>,
     /// The port forwarding panel, made the first time the tab shows it (SSH tabs only).
     forward: Option<forward::ForwardTab>,
@@ -499,6 +498,7 @@ impl Workspace {
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
+        self.sync_local_files_activity(cx);
         self.sync_ai_context(cx);
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
         self.touch_session(new_id);

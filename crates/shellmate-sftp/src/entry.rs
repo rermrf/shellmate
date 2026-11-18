@@ -47,7 +47,8 @@ pub struct Link {
 pub struct Revision {
     /// Size in bytes.
     pub size: u64,
-    /// Modification time, seconds since the Unix epoch.
+    /// Modification-time comparison token: epoch seconds on SFTP v3, epoch nanoseconds for
+    /// the local editor. Use entry metadata (in seconds) for display.
     pub mtime: Option<i64>,
 }
 

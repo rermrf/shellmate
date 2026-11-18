@@ -48,6 +48,7 @@ impl PtyOptions {
 }
 
 pub struct LocalPty {
+    pid: Option<u32>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -123,6 +124,7 @@ impl LocalPty {
             .spawn_command(cmd)
             .map_err(|_| anyhow::anyhow!("无法启动终端进程，请检查程序路径和权限"))?;
         drop(pair.slave);
+        let pid = child.process_id();
         let mut killer = child.clone_killer();
         let (read_done, drained) = std::sync::mpsc::channel();
         if let Err(e) = thread::Builder::new()
@@ -158,6 +160,7 @@ impl LocalPty {
             return Err(e.into());
         }
         Ok(Self {
+            pid,
             master: pair.master,
             writer,
             killer,
@@ -187,6 +190,8 @@ fn pty_size(dims: PtyDims) -> PtySize {
 }
 
 impl TerminalBackend for LocalPty {
+    fn child_pid(&self) -> Option<u32> { self.pid }
+
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.writer.write_all(bytes)?;
         self.writer.flush()
@@ -229,8 +234,6 @@ impl Drop for LocalPty {
 
 #[cfg(target_os = "macos")]
 fn process_info(pid: i32) -> Option<ProcessInfo> {
-    use std::ffi::CStr;
-    use std::mem::{MaybeUninit, size_of};
 
     let mut name_buf = [0u8; 256];
     // SAFETY: the buffer is valid for `len` bytes and proc_name NUL-terminates.
@@ -239,6 +242,14 @@ fn process_info(pid: i32) -> Option<ProcessInfo> {
         return None;
     }
     let name = String::from_utf8_lossy(&name_buf[..len as usize]).into_owned();
+    Some(ProcessInfo { pid, name, cwd: process_cwd(pid) })
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: i32) -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::mem::{MaybeUninit, size_of};
 
     let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
     let size = size_of::<libc::proc_vnodepathinfo>() as i32;
@@ -252,14 +263,12 @@ fn process_info(pid: i32) -> Option<ProcessInfo> {
             size,
         )
     };
-    let cwd = (got == size).then(|| {
+    (got == size).then(|| {
         // SAFETY: proc_pidinfo filled the struct; vip_path is NUL-terminated.
         let info = unsafe { info.assume_init() };
         let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
-        PathBuf::from(path.to_string_lossy().into_owned())
-    });
-
-    Some(ProcessInfo { pid, name, cwd })
+        PathBuf::from(OsStr::from_bytes(path.to_bytes()))
+    }).filter(|path| path.is_absolute())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -269,6 +278,19 @@ fn process_info(_pid: i32) -> Option<ProcessInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proc_pidinfo_reports_pty_shell_cwd_after_cd() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().canonicalize().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "cd -- \"$1\" && printf 'ready\\n' && sleep 2", "sh", target.to_str().unwrap()]);
+        let (send, received) = std::sync::mpsc::channel();
+        let child = LocalPty::spawn_builder(command, PtyDims::default(), move |_| { let _ = send.send(()); }, |_| {}).unwrap();
+        received.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert_eq!(process_cwd(child.child_pid().unwrap() as i32), Some(target));
+    }
     use super::*;
     use shellmate_core::{Program, Secret};
     use std::{

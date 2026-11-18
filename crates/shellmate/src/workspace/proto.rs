@@ -273,6 +273,7 @@ impl Workspace {
                 self.sidebar_motion = SidebarMotion::frozen_midpoint(open);
             }
             "local" => self.proto_local(window, cx),
+            "files-local" | "files-local-trash" => self.proto_local_files(scene == "files-local-trash", window, cx),
             "reconnect" => self.activate(3, window, cx),
             "files" | "editor" => self.proto_files(if stress {"stress-files"}else if scrolled {"files-scrolled"}else{scene}, window, cx),
             "fwd" | "fwd-new" => {
@@ -436,6 +437,21 @@ impl Workspace {
         self.next_id = 6;
         self.user_host = "chen@MacBook-Pro".into();
         self.activate(4, window, cx);
+    }
+
+    fn proto_local_files(&mut self, trash: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(data) = std::env::var_os("SHELLMATE_DATA_DIR") else { log::error!("files-local requires SHELLMATE_DATA_DIR"); return };
+        self.proto_local(window, cx);
+        let make = cx.background_spawn(async move { crate::files::local_fixture::prepare(std::path::Path::new(&data)) });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Err(err) = make.await { log::error!("files-local: {err}"); return; }
+            this.update_in(cx, |this, window, cx| {
+                this.show_panel(Panel::Files, window, cx);
+                if trash && let Some(files) = this.active.and_then(|ix| this.sessions[ix].files.as_ref()) {
+                    files.panel.update(cx, |panel, _| panel.fixture_trash_pair());
+                }
+            }).ok();
+        }).detach();
     }
 }
 impl Workspace {

@@ -23,6 +23,8 @@ use shellmate_term::{Terminal, TerminalEvent};
 use tokio::task::AbortHandle;
 
 use super::model::{Applied, DeleteRequest, FilesModel, LinkStatus, Request, Row};
+use super::local::LocalFs;
+use super::source::FileSource;
 use super::transfers::{Reveal, RowAction, TransferList, ensure_downloads_dir, reveal};
 use crate::dialogs::confirm::ConfirmDialog;
 use crate::editor::refusal::is_refusal;
@@ -30,6 +32,7 @@ use crate::editor::refusal::is_refusal;
 /// The key context of the panel: its shortcuts only work while the list has focus, so none of them
 /// can reach the terminal.
 pub const CONTEXT: &str = "FilesPanel";
+const CWD_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The keystrokes of the panel (each is bound to the action of the same row in [`init`]).
 pub const KEYS: [&str; 6] = ["up", "down", "enter", "cmd-up", "cmd-backspace", "escape"];
@@ -49,6 +52,8 @@ pub fn init(cx: &mut App) {
 
 /// What the panel asks of its owner.
 pub enum FilesEvent {
+    #[cfg(debug_assertions)]
+    FixtureTrashReady,
     /// The session could not be opened and the user asked again (刷新).
     RetrySession,
     /// An operation found this session unusable (the connection is gone, or the server stopped
@@ -85,6 +90,8 @@ pub struct RowMenu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuAction {
     Open,
+    Finder,
+    DefaultApp,
     Download,
     Rename,
     CopyPath,
@@ -102,6 +109,7 @@ pub(super) struct RenameInput {
 #[cfg(debug_assertions)]
 #[derive(Default)]
 struct Demo {
+    trash_pair: bool,
     /// The entry to select as soon as it is listed.
     select: Option<String>,
     /// The text the rename editor starts with (instead of the entry's name).
@@ -114,7 +122,12 @@ pub struct FilesPanel {
     pub(super) width: f32,
     pub(super) details_open: bool,
     pub(super) model: FilesModel,
-    session: Option<Arc<SftpSession>>,
+    session: Option<FileSource>,
+    terminal: Entity<Terminal>,
+    local_visible: bool,
+    cwd_timer: Option<gpui::Task<()>>,
+    pub(super) copying: bool,
+    pub(super) copy_status: Option<String>,
     runtime: SshRuntime,
     pub(super) focus: FocusHandle,
     /// The permission grid takes focus for 修改权限.
@@ -162,7 +175,10 @@ impl FilesPanel {
             model.on_terminal_cwd(dir);
         }
         let subscription = cx.subscribe_in(terminal, window, |this, _, event: &TerminalEvent, _, cx| {
-            if let TerminalEvent::CwdChanged(dir) = event {
+            if matches!(event, TerminalEvent::Output) && this.local_visible {
+                this.schedule_cwd(cx);
+            }
+            if let TerminalEvent::CwdChanged(dir) = event && (!this.is_local() || this.local_visible) {
                 let request = this.model.on_terminal_cwd(dir);
                 this.start(request, cx);
                 cx.notify();
@@ -172,6 +188,7 @@ impl FilesPanel {
             width:1144., details_open:false,
             model,
             session: None,
+            terminal: terminal.clone(), local_visible: false, cwd_timer: None, copying: false, copy_status: None,
             runtime,
             focus: cx.focus_handle(),
             perm_focus: cx.focus_handle(),
@@ -193,10 +210,76 @@ impl FilesPanel {
         }
     }
 
+    pub(crate) fn local_home(&self) -> Option<&std::path::Path> {
+        match &self.session { Some(FileSource::Local(fs)) => Some(&fs.home), _ => None }
+    }
+
+    pub fn is_local(&self) -> bool { self.local_home().is_some() }
+
+    pub fn set_local(&mut self, home: PathBuf) {
+        self.session = Some(FileSource::Local(Arc::new(LocalFs::new(home))));
+    }
+
+    pub fn set_local_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if !self.is_local() || self.local_visible == visible { return; }
+        self.local_visible = visible;
+        self.cwd_timer = None;
+        if visible {
+            if self.model.link() != &LinkStatus::Ready {
+                let terminal = self.terminal.read(cx);
+                let idle = terminal.last_output().is_none_or(|at| at.elapsed() >= CWD_IDLE);
+                if let Some(dir) = terminal.cwd() {
+                    self.model.navigate(dir, super::model::Cause::Initial);
+                }
+                let request = self.model.set_link(LinkStatus::Ready);
+                self.start(request, cx);
+                if !idle { self.schedule_cwd(cx); }
+                return;
+            }
+            if let Some(dir) = self.terminal.read(cx).cwd().map(str::to_owned) {
+                let request = self.model.on_terminal_cwd(&dir);
+                self.start(request, cx);
+            }
+            self.schedule_cwd(cx);
+        }
+    }
+
+    fn schedule_cwd(&mut self, cx: &mut Context<Self>) {
+        if !self.local_visible || !self.model.follow() || self.cwd_timer.is_some() { return; }
+        let terminal = self.terminal.read(cx);
+        let Some(pid) = terminal.child_pid() else { return };
+        let mut delay = CWD_IDLE.saturating_sub(terminal.last_output().map_or(std::time::Duration::ZERO, |time| time.elapsed()));
+        self.cwd_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(delay).await;
+                let Ok(Some(last)) = this.update(cx, |this, cx| {
+                    let terminal = this.terminal.read(cx);
+                    (this.local_visible && this.model.follow() && terminal.child_pid() == Some(pid)).then(|| terminal.last_output())
+                }) else { break };
+                delay = last.map_or(std::time::Duration::ZERO, |time| CWD_IDLE.saturating_sub(time.elapsed()));
+                if !delay.is_zero() { continue; }
+                let path = cx.background_spawn(async move { shellmate_term::process_cwd(pid) }).await;
+                let retry = this.update(cx, |this, cx| {
+                    let terminal = this.terminal.read(cx);
+                    if !this.local_visible || !this.model.follow() || terminal.child_pid() != Some(pid) { return false; }
+                    if terminal.last_output() != last { return true; }
+                    if let Some(dir) = path.as_deref().and_then(std::path::Path::to_str) {
+                        let request = this.model.on_terminal_cwd(dir);
+                        this.start(request, cx);
+                        cx.notify();
+                    }
+                    false
+                });
+                if !matches!(retry, Ok(true)) { break; }
+            }
+            this.update(cx, |this, _| this.cwd_timer = None).ok();
+        }));
+    }
+
     /// The state of the session behind the panel changed.
     pub fn set_link(&mut self, status: LinkStatus, session: Option<Arc<SftpSession>>, cx: &mut Context<Self>) {
         let session_changed = match (&self.session, &session) {
-            (Some(old), Some(new)) => !Arc::ptr_eq(old, new),
+            (Some(FileSource::Sftp(old)), Some(new)) => !Arc::ptr_eq(old, new),
             (None, None) => false,
             _ => true,
         };
@@ -206,7 +289,7 @@ impl FilesPanel {
         if session_changed && let Some(task) = self.listing_abort.take() {
             task.abort();
         }
-        self.session = session;
+        self.session = session.map(FileSource::Sftp);
         if !matches!(status, LinkStatus::Ready) {
             self.menu = None;
         }
@@ -273,7 +356,13 @@ impl FilesPanel {
             }
         }
         let used = session.clone();
-        let join = self.runtime.spawn(async move { session.listing(&request.dir).await });
+        let initial_pid = (self.local_visible && request.cause == super::model::Cause::Initial && request.dir == ".")
+            .then(|| self.terminal.read(cx)).filter(|term| term.last_output().is_none_or(|at| at.elapsed() >= CWD_IDLE))
+            .and_then(Terminal::child_pid);
+        let join = self.runtime.spawn(async move {
+            let dir = initial_pid.and_then(shellmate_term::process_cwd).and_then(|path| path.into_os_string().into_string().ok()).unwrap_or(request.dir);
+            session.listing(dir).await
+        });
         self.listing_abort = Some(join.abort_handle());
         cx.spawn(async move |this, cx| {
             let Ok(result) = join.await else { return };
@@ -284,10 +373,10 @@ impl FilesPanel {
                 let before = this.model.cwd().to_string();
                 let applying = Instant::now();
                 match this.model.apply_listed(id, (*result).clone()) {
-                    Applied::SessionLost => cx.emit(FilesEvent::SessionLost(used)),
+                    Applied::SessionLost => if let FileSource::Sftp(used) = used { cx.emit(FilesEvent::SessionLost(used)); },
                     Applied::Stale => return,
                     Applied::Shown => {
-                        if let Ok(entries) = &result.entries
+                        if let FileSource::Sftp(used) = used && let Ok(entries) = &result.entries
                             && entries.iter().any(|entry| entry.kind == shellmate_sftp::EntryKind::Symlink)
                         {
                             let job = this.runtime.spawn(async move { used.enrich(&result).await });
@@ -315,6 +404,15 @@ impl FilesPanel {
                     );
                 }
                 #[cfg(debug_assertions)]
+                if std::mem::take(&mut this.demo.trash_pair) {
+                    let [first, second] = super::local_fixture::SELECTION;
+                    this.model.select_name(first);
+                    if let Some(index) = this.model.entries().iter().position(|entry| entry.name == second) {
+                        this.model.toggle_row(index + usize::from(this.model.has_parent()));
+                        cx.emit(FilesEvent::FixtureTrashReady);
+                    }
+                }
+                #[cfg(debug_assertions)]
                 if let Some(name) = this.demo.select.take() {
                     this.model.select_name(&name);
                     if let Some(index) = this.model.selected_index() {
@@ -339,7 +437,7 @@ impl FilesPanel {
     /// panel waits for a new one.
     fn run_op<T, Fut>(
         &mut self,
-        job: impl FnOnce(Arc<SftpSession>) -> Fut,
+        job: impl FnOnce(FileSource) -> Fut,
         done: impl FnOnce(&mut Self, Result<T, SftpError>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) where
@@ -363,7 +461,7 @@ impl FilesPanel {
     /// outcome is "disconnected".
     fn run_job<T, Fut>(
         &mut self,
-        job: impl FnOnce(Arc<SftpSession>) -> Fut,
+        job: impl FnOnce(FileSource) -> Fut,
         done: impl FnOnce(&mut Self, Result<T, SftpError>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) where
@@ -383,7 +481,7 @@ impl FilesPanel {
             let result = join.await.unwrap_or_else(|err| Err(SftpError::Protocol(format!("任务异常终止：{err}"))));
             this.update(cx, |this, cx| {
                 this.ops.remove(&id);
-                if result.as_ref().is_err_and(SftpError::is_session_lost) {
+                if result.as_ref().is_err_and(SftpError::is_session_lost) && let FileSource::Sftp(used) = used {
                     this.lose_session(used, cx);
                 }
                 done(this, result, cx);
@@ -457,6 +555,7 @@ impl FilesPanel {
 
     pub(crate) fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
         let request = self.model.set_follow(on);
+        if on { self.schedule_cwd(cx); } else { self.cwd_timer = None; }
         self.start(request, cx);
         cx.notify();
     }
@@ -466,7 +565,7 @@ impl FilesPanel {
     pub(super) fn apply_chmod(&mut self, cx: &mut Context<Self>) {
         let Some((path, mode)) = self.model.chmod_request() else { return };
         self.run_op(
-            move |session| async move { session.chmod(&path, mode).await },
+            move |session| session.chmod(path, mode),
             |this, result, cx| {
                 let request = this.model.chmod_done(result);
                 this.start(request, cx);
@@ -485,7 +584,7 @@ impl FilesPanel {
         };
         let (from, to) = (request.from.clone(), request.to.clone());
         self.run_op(
-            move |session| async move { session.rename(&from, &to).await },
+            move |session| session.rename(from, to),
             move |this, result, cx| {
                 let request = this.model.rename_done(&request, result);
                 this.start(request, cx);
@@ -513,7 +612,7 @@ impl FilesPanel {
         }
         let dir = self.model.cwd().to_string();
         self.run_op(
-            move |session| async move { session.create_dir_unique(&dir, "新建文件夹").await },
+            move |session| session.create_dir_unique(dir, "新建文件夹"),
             |this, result, cx| match result {
                 Ok(path) => {
                     let request = this.model.new_folder_done(&path);
@@ -526,19 +625,22 @@ impl FilesPanel {
     }
 
     /// 删除 / ⌘⌫: asks first, and for a directory says that everything inside goes.
-    pub(super) fn ask_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn ask_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         let Some(request) = self.model.delete_request() else { return };
         let panel = cx.entity().downgrade();
         let confirmed = request.clone();
+        let local = self.is_local();
+        let paths = if local { self.model.selected_paths() } else { vec![request.path.clone()] };
+        let names = paths.iter().filter_map(|path| path::file_name(path)).collect::<Vec<_>>().join("、");
         ConfirmDialog::open(
-            request.title(),
-            request.body(),
-            "删除",
+            if local { format!("将 {} 项移到废纸篓？", paths.len()) } else { request.title() },
+            if local { format!("将 {names} 移到废纸篓。") } else { request.body() },
+            if local { "移到废纸篓" } else { "删除" },
             true,
             move |_, cx| {
                 let request = confirmed.clone();
-                panel.update(cx, |this, cx| this.begin_delete(request, cx)).ok();
+                panel.update(cx, |this, cx| this.begin_delete(request, paths.clone(), cx)).ok();
                 Ok(())
             },
             window,
@@ -546,10 +648,9 @@ impl FilesPanel {
         );
     }
 
-    fn begin_delete(&mut self, request: DeleteRequest, cx: &mut Context<Self>) {
-        let path = request.path.clone();
+    fn begin_delete(&mut self, request: DeleteRequest, paths: Vec<String>, cx: &mut Context<Self>) {
         self.run_op(
-            move |session| async move { session.remove(&path).await },
+            move |session| session.remove(paths),
             move |this, result, cx| {
                 let list = this.model.delete_done(&request, result);
                 this.start(list, cx);
@@ -572,7 +673,7 @@ impl FilesPanel {
         let (target, reported) = (path.clone(), path);
         let began = Instant::now();
         self.run_job(
-            move |session| async move { session.open_text(&target).await },
+            move |session| session.open_text(target),
             move |this, result, cx| match result {
                 Ok(file) => {
                     log::info!(
@@ -605,7 +706,7 @@ impl FilesPanel {
     ) -> async_channel::Receiver<Result<SaveOutcome, SftpError>> {
         let (answer, receiver) = async_channel::bounded(1);
         self.run_job(
-            move |session| async move { session.save_text(&path, &text, format, Some(expected)).await },
+            move |session| session.save_text(path, text, format, expected),
             move |_, result, _| {
                 let _ = answer.try_send(result);
             },
@@ -615,6 +716,47 @@ impl FilesPanel {
     }
 
     // ---- transfers -------------------------------------------------------------------------------------
+
+    pub(super) fn drop_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        use shellmate_sftp::transfer::Choice;
+        use super::local_copy::CopyPlan;
+        if !self.is_local() { return self.upload(paths, cx); }
+        if self.copying {
+            window.push_notification(Notification::warning("正在拷贝，请在完成后再拖入文件"), cx);
+            return;
+        }
+        if paths.is_empty() || self.model.cwd().is_empty() { return; }
+        self.copying = true;
+        self.copy_status = Some(format!("正在拷贝 {} 项…", paths.len()));
+        cx.notify();
+        let destination = self.model.cwd().to_owned();
+        let runtime = self.runtime.clone();
+        let dir = destination.clone();
+        let planning = runtime.spawn(super::source::blocking(move || CopyPlan::new(paths, dir)));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let plan = planning.await.map_err(|err| err.to_string())?.map_err(|err| err.to_string())?;
+                let choice = if plan.clash.count == 0 { Choice::Skip } else {
+                    let (send, recv) = async_channel::bounded(1);
+                    this.update_in(cx, |panel, window, cx| {
+                        if panel.local_visible {
+                            crate::dialogs::clash::ClashDialog::local(plan.clash.clone(), std::rc::Rc::new(move |_, answer, _, _| { let _ = send.try_send(answer); }), window, cx);
+                        }
+                    }).map_err(|err| err.to_string())?;
+                    let Some(choice) = recv.recv().await.ok().flatten() else { return Ok("已取消拷贝".to_owned()); };
+                    choice
+                };
+                runtime.spawn(super::source::blocking(move || plan.execute(choice))).await.map_err(|err| err.to_string())?
+                    .map(|count| format!("已拷贝 {count} 项")).map_err(|err| err.to_string())
+            }.await;
+            this.update_in(cx, |panel, _, cx| {
+                panel.copying = false;
+                panel.copy_status = Some(result.unwrap_or_else(|err| format!("拷贝失败：{err}")));
+                panel.on_remote_changed(&destination, cx);
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
 
     /// 下载 / the menu: the selected file or directory goes to the downloads folder.
     pub(super) fn begin_download(&mut self, cx: &mut Context<Self>) {
@@ -727,23 +869,34 @@ impl FilesPanel {
     /// An item of the row menu.
     pub(super) fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.menu.take() else { return };
-        self.model.select_name(&menu.name);
+        if action != MenuAction::Delete { self.model.select_name(&menu.name); }
         match action {
             MenuAction::Open if menu.opens_dir => self.go_to(&menu.path, cx),
             MenuAction::Open if menu.editable => self.open_in_editor(menu.path.clone(), cx),
             MenuAction::Open => {}
             MenuAction::Download => self.begin_download(cx),
+            MenuAction::Finder | MenuAction::DefaultApp | MenuAction::CopyPath => self.path_action(action, &menu.path, window, cx),
             MenuAction::Rename => {
                 self.model.start_rename();
-            }
-            MenuAction::CopyPath => {
-                cx.write_to_clipboard(ClipboardItem::new_string(menu.path.clone()));
-                window.push_notification(Notification::success(menu.path.clone()).title("已复制路径"), cx);
             }
             MenuAction::Permissions => {self.details_open=true;window.focus(&self.perm_focus,cx);cx.notify();},
             MenuAction::Delete => self.ask_delete(window, cx),
         }
         cx.notify();
+    }
+
+    pub(super) fn path_action(&self, action: MenuAction, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            MenuAction::Finder => if let Some(url) = objc2_foundation::NSURL::from_file_path(path) {
+                objc2_app_kit::NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&objc2_foundation::NSArray::from_retained_slice(&[url]));
+            },
+            MenuAction::DefaultApp => cx.open_with_system(path.as_ref()),
+            MenuAction::CopyPath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.to_owned()));
+                window.push_notification(Notification::success(path.to_owned()).title("已复制路径"), cx);
+            }
+            _ => unreachable!(),
+        }
     }
 
     // ---- the name editor ---------------------------------------------------------------------------------
@@ -844,6 +997,8 @@ impl FilesPanel {
         self.start(request, cx);
         cx.notify();
     }
+
+    pub fn fixture_trash_pair(&mut self) { self.demo.trash_pair = true; }
 
     /// Debug review hook: selects the entry called `name` once it is listed (now, or when it is).
     pub fn demo_select(&mut self, name: &str) {

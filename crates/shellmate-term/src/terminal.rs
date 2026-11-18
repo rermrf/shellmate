@@ -850,6 +850,12 @@ impl Terminal {
         self.agent.lock().last_output.is_some()
     }
 
+    pub fn child_pid(&self) -> Option<i32> {
+        self.backend.as_ref()?.child_pid()?.try_into().ok()
+    }
+
+    pub fn last_output(&self) -> Option<Instant> { self.agent.lock().last_output }
+
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
     }

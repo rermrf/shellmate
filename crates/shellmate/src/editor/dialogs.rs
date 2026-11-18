@@ -30,6 +30,7 @@ pub type ConflictAnswer = Rc<dyn Fn(ConflictChoice, &mut Window, &mut App)>;
 
 /// "远端文件已被修改": when, a few lines of what differs, and three ways out.
 pub struct ConflictDialog {
+    local: bool,
     file: String,
     /// When the server's copy changed (`HH:MM`), if it said.
     remote_time: Option<String>,
@@ -42,17 +43,19 @@ pub struct ConflictDialog {
 
 impl ConflictDialog {
     /// Opens the dialog.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         file: String,
         remote_time: Option<String>,
         snippet: Vec<DiffLine>,
         remote_is_text: bool,
+        local: bool,
         answer: ConflictAnswer,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let body = cx.new(|_| Self { file, remote_time, snippet, remote_is_text, answer, answered: false });
-        crate::dialogs::open(window, cx, "远端文件已被修改", 520., body);
+        let body = cx.new(|_| Self { file, remote_time, snippet, remote_is_text, local, answer, answered: false });
+        crate::dialogs::open(window, cx, if local { "磁盘文件已被修改" } else { "远端文件已被修改" }, 520., body);
     }
 
     fn choose(&mut self, choice: ConflictChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -109,30 +112,30 @@ impl Render for ConflictDialog {
                         .when(matches!(line, DiffLine::Hunk(_)), |d| d.font_weight(FontWeight::SEMIBOLD))
                         .child(line.text())
                 }));
-            let legend = div().text_size(px(11.5)).text_color(p.tx3).child("- 你的版本 · + 远端版本");
+            let legend = div().text_size(px(11.5)).text_color(p.tx3).child(if self.local { "- 你的版本 · + 磁盘版本" } else { "- 你的版本 · + 远端版本" });
             div().flex().flex_col().gap(px(6.)).child(legend).child(lines)
         });
         let note = if !self.remote_is_text {
             Some(
                 notice(
                     Notice::Warn,
-                    "远端文件现在不是可显示的文本（二进制、非 UTF-8 或超过 5 MB）：无法比较，也不能载入。",
+                    if self.local { "磁盘文件现在不是可显示的文本：无法比较，也不能载入。" } else { "远端文件现在不是可显示的文本（二进制、非 UTF-8 或超过 5 MB）：无法比较，也不能载入。" },
                     &p,
                 )
                 .into_any_element(),
             )
         } else if self.snippet.is_empty() {
-            Some(notice(Notice::Info, "两边的文本内容相同，只是远端的修改时间变了。", &p).into_any_element())
+            Some(notice(Notice::Info, if self.local { "文本内容相同，只是磁盘上的修改时间变了。" } else { "两边的文本内容相同，只是远端的修改时间变了。" }, &p).into_any_element())
         } else {
             None
         };
-        stack().child(hint(when, &p)).child(hint("直接上传会覆盖对方的改动。", &p)).children(diff).children(note).child(
+        stack().child(hint(when, &p)).child(hint(if self.local { "直接保存会覆盖磁盘上的改动。" } else { "直接上传会覆盖对方的改动。" }, &p)).children(diff).children(note).child(
             actions(vec![
                 button("conflict-cancel", "取消", Tone::Plain, true)
                     .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))),
-                button("conflict-load", "载入远端版本", Tone::Plain, self.remote_is_text)
+                button("conflict-load", if self.local { "载入磁盘版本" } else { "载入远端版本" }, Tone::Plain, self.remote_is_text)
                     .on_click(cx.listener(|this, _, window, cx| this.choose(ConflictChoice::LoadRemote, window, cx))),
-                button("conflict-overwrite", "覆盖远端", Tone::Danger, true)
+                button("conflict-overwrite", if self.local { "覆盖磁盘版本" } else { "覆盖远端" }, Tone::Danger, true)
                     .on_click(cx.listener(|this, _, window, cx| this.choose(ConflictChoice::Overwrite, window, cx))),
             ]),
         )
@@ -157,6 +160,7 @@ pub type UnsavedAnswer = Rc<dyn Fn(UnsavedChoice, &mut Window, &mut App)>;
 
 /// "有未上传的修改".
 pub struct UnsavedDialog {
+    local: bool,
     file: String,
     answer: UnsavedAnswer,
     answered: bool,
@@ -164,9 +168,9 @@ pub struct UnsavedDialog {
 
 impl UnsavedDialog {
     /// Opens the dialog.
-    pub fn open(file: String, answer: UnsavedAnswer, window: &mut Window, cx: &mut App) {
-        let body = cx.new(|_| Self { file, answer, answered: false });
-        crate::dialogs::open(window, cx, "有未上传的修改", 460., body);
+    pub fn open(file: String, local: bool, answer: UnsavedAnswer, window: &mut Window, cx: &mut App) {
+        let body = cx.new(|_| Self { file, local, answer, answered: false });
+        crate::dialogs::open(window, cx, if local { "有未保存的修改" } else { "有未上传的修改" }, 460., body);
     }
 
     fn choose(&mut self, choice: UnsavedChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -200,7 +204,7 @@ impl Render for UnsavedDialog {
                 .danger()
                 .outline()
                 .on_click(cx.listener(|this, _, window, cx| this.choose(UnsavedChoice::Discard, window, cx))),
-            button("unsaved-save", "上传并关闭", Tone::Primary, true)
+            button("unsaved-save", if self.local { "保存并关闭" } else { "上传并关闭" }, Tone::Primary, true)
                 .on_click(cx.listener(|this, _, window, cx| this.choose(UnsavedChoice::SaveAndClose, window, cx))),
         ]))
     }

@@ -7607,6 +7607,7 @@ dependencies = [
  "shellmate-term",
  "shellmate-vault",
  "similar",
+ "tempfile",
  "tokio",
  "zeroize",
 ]

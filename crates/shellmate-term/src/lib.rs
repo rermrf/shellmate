@@ -15,6 +15,8 @@ pub mod view;
 pub use colors::TerminalPalette;
 pub use element::TerminalStyle;
 pub use pty::{PtyOptions,LocalPty,nonzero_dims};
+#[cfg(target_os = "macos")]
+pub use pty::process_cwd;
 pub use shellmate_core::io::{OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 pub use terminal::{SessionEnd, Terminal, TerminalEvent, TerminalSize};
 pub use view::{TerminalView, init};

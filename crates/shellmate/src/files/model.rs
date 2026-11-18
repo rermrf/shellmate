@@ -219,6 +219,7 @@ pub struct FilesModel {
     dir_entry: Option<Entry>,
     view: View,
     selection: Option<Selection>,
+    additional: std::collections::BTreeSet<String>,
     follow: bool,
     /// The directory the terminal last reported with OSC 7.
     terminal_cwd: Option<String>,
@@ -258,6 +259,7 @@ impl FilesModel {
             dir_entry: None,
             view: View::Loading,
             selection: None,
+            additional: Default::default(),
             follow: true,
             terminal_cwd: None,
             banner: None,
@@ -519,6 +521,7 @@ impl FilesModel {
                 self.view = View::List;
                 self.banner = self.banner_after.take();
                 self.selection = previous.filter(|_| keep).filter(|sel| self.selection_exists(sel));
+                self.additional.retain(|name| keep && self.entries.iter().any(|entry| entry.name == *name));
                 if self.edit.as_ref().is_some_and(|edit| !self.entries.iter().any(|e| e.name == edit.name)) {
                     self.edit = None;
                 }
@@ -665,6 +668,7 @@ impl FilesModel {
     }
 
     fn set_selection(&mut self, selection: Option<Selection>) {
+        self.additional.clear();
         if self.selection != selection {
             self.selection = selection;
             // Selecting something else ends an edit of a name (unless it is being sent).
@@ -673,6 +677,25 @@ impl FilesModel {
             }
             self.reset_draft();
         }
+    }
+
+    pub fn row_selected(&self, index: usize) -> bool {
+        self.selected_index() == Some(index) || matches!(self.row(index), Some(Row::Entry(entry)) if self.additional.contains(&entry.name))
+    }
+
+    pub fn toggle_row(&mut self, index: usize) {
+        let Some(Row::Entry(entry)) = self.row(index) else { return self.select_row(index) };
+        let name = entry.name.clone();
+        let mut selected = std::mem::take(&mut self.additional);
+        if let Some(primary) = self.selected_entry() { selected.insert(primary.name.clone()); }
+        let primary = if selected.remove(&name) { selected.pop_first() } else { Some(name) };
+        self.set_selection(primary.map(Selection::Name));
+        self.additional = selected;
+    }
+
+    pub fn selected_paths(&self) -> Vec<String> {
+        self.entries.iter().filter(|entry| self.additional.contains(&entry.name) || matches!(&self.selection, Some(Selection::Name(name)) if *name == entry.name))
+            .map(|entry| entry.path.clone()).collect()
     }
 
     // ---- following the terminal -----------------------------------------------------------------------------
