@@ -159,7 +159,7 @@ async fn run(source: PortSource, protocol: Protocol) -> io::Result<ExecOutput> {
     match source {
         PortSource::Netstat => {
             let arg = if protocol == Protocol::Tcp { "tcp" } else { "udp" };
-            runner::output(Command::new("/usr/sbin/netstat").args(["-anv", "-p", arg]), TIMEOUT, LIMIT).await
+            runner::output_with_locale(Command::new("/usr/sbin/netstat").args(["-anv", "-p", arg]), TIMEOUT, LIMIT, runner::UTF8_LOCALE).await
         }
         PortSource::Lsof => {
             let mut cmd = Command::new("/usr/sbin/lsof");
@@ -168,7 +168,7 @@ async fn run(source: PortSource, protocol: Protocol) -> io::Result<ExecOutput> {
                 Protocol::Tcp => cmd.args(["-iTCP", "-sTCP:LISTEN"]),
                 Protocol::Udp => cmd.arg("-iUDP"),
             };
-            runner::output_with_locale(&mut cmd, TIMEOUT, LIMIT, "en_US.UTF-8").await
+            runner::output_with_locale(&mut cmd, TIMEOUT, LIMIT, runner::UTF8_LOCALE).await
         }
     }
 }
@@ -293,10 +293,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires permission to run netstat and lsof on a real Mac"]
     async fn real_machine_tcp_listeners() {
-        let baseline = runner::output(
+        let baseline = runner::output_with_locale(
             Command::new("/usr/sbin/lsof").args(["-nP", "-Fp", "-iTCP", "-sTCP:LISTEN"]),
             Duration::from_secs(4),
             16 << 20,
+            runner::UTF8_LOCALE,
         ).await.unwrap();
         assert!(!baseline.truncated);
         let pids = baseline.stdout_text().lines().filter(|line| line.starts_with('p')).count();

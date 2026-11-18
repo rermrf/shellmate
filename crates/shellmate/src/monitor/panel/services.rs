@@ -351,8 +351,8 @@ impl MonitorPanel {
                         .px(px(12.))
                         .py(px(9.))
                         .rounded(px(10.))
-                        .bg(p.errs)
-                        .text_color(p.err)
+                        .bg(bg)
+                        .text_color(fg)
                         .text_size(px(12.))
                         .line_height(px(18.))
                         .font_family(MONO_FONT)
@@ -503,7 +503,7 @@ impl MonitorPanel {
             shown.as_deref().and_then(|name| list.get(name)).map(|service| services::detail(service, uptime, probe));
 
         let list_card = div()
-            .flex_1().when(layout.services_stacked,|d|d.h(px(300.)).flex_none())
+            .flex_1().when(layout.services_stacked,|d|d.h(px(300.)).flex_none().overflow_hidden())
             .min_w_0()
             .min_h_0()
             .flex()

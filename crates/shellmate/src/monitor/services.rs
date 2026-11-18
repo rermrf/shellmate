@@ -73,6 +73,7 @@ pub fn state_tone(service: &Service) -> Tone {
     match service.active {
         ActiveState::Active | ActiveState::Reloading | ActiveState::Activating => Tone::Ok,
         ActiveState::Failed => Tone::Err,
+        ActiveState::LastRunFailed => Tone::Warn,
         _ => Tone::Off,
     }
 }
@@ -127,6 +128,7 @@ fn state_word(active: &ActiveState) -> String {
         ActiveState::Activating => "activating".into(),
         ActiveState::Deactivating => "deactivating".into(),
         ActiveState::Inactive => "inactive".into(),
+        ActiveState::LastRunFailed => "上次运行失败".into(),
         ActiveState::Failed => "failed".into(),
         ActiveState::Other(other) => other.clone(),
     }
@@ -236,6 +238,9 @@ pub struct Detail {
 /// What a failed unit says about its failure: the last error line of the journal when there was one, else
 /// the exit status and what systemd calls it (`退出码 1（exit-code）`).
 pub fn failure_text(service: &Service) -> Option<String> {
+    if service.active == ActiveState::LastRunFailed {
+        return service.exit_status.map(|code| format!("上次退出码 {code}"));
+    }
     if !service.is_failed() {
         return None;
     }

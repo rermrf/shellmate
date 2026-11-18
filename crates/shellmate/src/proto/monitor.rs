@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub const PORT_SCENES: [&str; 3] = ["mon-local-ports", "mon-local-ports-sel", "mon-local-ports-lsof"];
 pub const SERVICE_SCENES: [&str; 2] = ["mon-local-svc", "mon-local-svc-sel"];
 
-pub fn local_services() -> MonitorData {
+pub fn local_services(scene: &str) -> MonitorData {
     use shellmate_monitor::services::launchd::Job;
     let mut data = local();
     data.local_services = true;
@@ -19,20 +19,22 @@ pub fn local_services() -> MonitorData {
         ("gui/501", "homebrew.mxcl.mysql@8.4", "/opt/homebrew/opt/mysql@8.4/bin/mysqld_safe", "失败"),
         ("gui/501", "homebrew.mxcl.redis", "/opt/homebrew/opt/redis/bin/redis-server", "运行中"),
         ("gui/501", "org.example.sync", "/Applications/Sync.app/Contents/MacOS/Sync", "未运行"),
+        ("gui/501", "org.example.periodic-updater", "/Applications/Updater.app/Contents/MacOS/Updater", "上次运行失败"),
         ("system", "com.canonical.multipassd", "/Library/Application Support/com.canonical.multipass/bin/multipassd", "运行中"),
         ("system", "com.youqu.todesk.service", "/Applications/ToDesk.app/Contents/MacOS/ToDesk_Service", "未加载"),
         ("system", "com.apple.example", "/usr/libexec/example", "失败"),
     ] {
+        if state == "上次运行失败" && scene != "mon-local-svc" { continue; }
         let homebrew = label.starts_with("homebrew.mxcl.");
         let dir = if label.starts_with("com.apple.") { "/System/Library/LaunchDaemons" } else if domain == "system" { "/Library/LaunchDaemons" } else { "/Users/chen/Library/LaunchAgents" };
         let job = Job { target: format!("{domain}/{label}"), plist: Some(format!("{dir}/{label}.plist")),
             keep_alive: Some(homebrew), loaded: Some(state != "未加载"), log: homebrew.then(|| format!("/opt/homebrew/var/log/{label}.log")) };
         services.push(Service { name: job.formula().unwrap_or(label).into(), launchd: Some(job), description: program.into(),
-            active: match state { "失败" => ActiveState::Failed, "运行中" => ActiveState::Active, _ => ActiveState::Inactive }, sub: state.into(), load: String::new(),
+            active: match state { "失败" => ActiveState::Failed, "上次运行失败" => ActiveState::LastRunFailed, "运行中" => ActiveState::Active, _ => ActiveState::Inactive }, sub: state.into(), load: String::new(),
             autostart: if homebrew { Autostart::Enabled } else if state == "未加载" { Autostart::Disabled } else { Autostart::Manual },
             main_pid: (state == "运行中").then_some(if homebrew { 4200 } else { 4540 }), memory: (state == "运行中").then_some(32 << 20), cpu_nsec: None,
             since_monotonic_us: None, since_text: (state == "运行中").then(|| "2026-11-18 16:30:00".into()), result: None,
-            exit_status: (state == "失败").then_some(1), last_error: (state == "失败").then(|| if homebrew { "上次退出码 1\nStarting MySQL\nOpening data directory\nPermission denied\nInnoDB initialization failed\nAborting" } else { "上次退出码 1" }.into()),
+            exit_status: match state { "失败" => Some(1), "上次运行失败" => Some(78), _ => None }, last_error: (state == "失败").then(|| if homebrew { "上次退出码 1\nStarting MySQL\nOpening data directory\nPermission denied\nInnoDB initialization failed\nAborting" } else { "上次退出码 1" }.into()),
         });
     }
     data.services = Some(Arc::new(ServiceList { services }));
@@ -70,16 +72,23 @@ pub fn local_ports(scene: &str) -> MonitorData {
 fn launchd_scenes_filter_apple_keep_domains_distinct_and_confirm_keepalive() {
     use crate::monitor::{model, services};
     use shellmate_monitor::commands::ServiceAction;
-    let data = local_services();
+    let data = local_services("mon-local-svc");
     let list = data.services.as_deref().unwrap();
     let rows = services::rows(list, "", services::ServiceFilter::All);
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 6);
     assert_eq!((&*rows[0].name, &*rows[1].description), ("mysql@8.4（Homebrew）", "homebrew.mxcl.redis"));
     assert_eq!(rows[1].name, "redis（Homebrew）");
-    assert_eq!(services::filtered_rows(list, "", services::ServiceFilter::All, true).len(), 6);
+    assert_eq!(services::filtered_rows(list, "", services::ServiceFilter::All, true).len(), 7);
     let header = model::header(&data, model::Page::Services, "本机");
     assert_eq!(header.tabs.iter().find(|tab| tab.page == model::Page::Services).unwrap().badge, Some(("1 失败".into(), model::Tone::Err)));
-    assert_eq!(model::attention(&data).iter().filter(|item| item.tag == "服务").count(), 1);
+    let attention = model::attention(&data);
+    assert_eq!(attention.iter().filter(|item| item.tag == "服务").map(|item| &*item.title).collect::<Vec<_>>(),
+        ["mysql@8.4 已停止（退出码 1）"]);
+    let updater = list.get("gui/501/org.example.periodic-updater").unwrap();
+    let detail = services::detail(updater, None, data.probe.as_deref());
+    assert_eq!((detail.state.as_str(), detail.tone, detail.failure.as_deref()),
+        ("上次运行失败", model::Tone::Warn, Some("上次退出码 78")));
+    assert_eq!(services::rows(list, "", services::ServiceFilter::Failed).len(), 1);
     let redis = services::shown(list, &rows, Some("gui/501/homebrew.mxcl.redis")).unwrap();
     let detail = services::detail(redis, None, data.probe.as_deref());
     assert!(detail.buttons.iter().any(|button| button.enabled && button.label == "停止（本次登录内不再自动启动）"));
@@ -97,6 +106,29 @@ fn launchd_scenes_filter_apple_keep_domains_distinct_and_confirm_keepalive() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, system.key());
     assert!(services::detail(system, None, data.probe.as_deref()).log.is_none());
+}
+
+pub fn local_disks() -> MonitorData {
+    let mut data = local();
+    let snapshot = Arc::make_mut(data.snapshot.as_mut().unwrap());
+    snapshot.disks = [("/Volumes/Studio SSD", 42), ("/Volumes/客户数据平台 Production Backups", 96),
+        ("/", 88), ("/Volumes/Archive", 81), ("/Volumes/Production Media Library", 81)]
+        .into_iter().enumerate().map(|(index, (mount, percent))| shellmate_monitor::Disk {
+            filesystem: format!("/dev/disk{}s1", index + 3), mount: mount.into(), percent,
+            total: 100 << 30, used: u64::from(percent) << 30, available: u64::from(100 - percent) << 30,
+        }).collect();
+    data
+}
+
+#[test]
+fn disk_scene_prefers_root_then_fullest_then_name_and_alerts_for_hidden_mounts() {
+    use crate::monitor::model;
+    let data = local_disks();
+    let cards = model::cards(data.snapshot.as_deref());
+    assert_eq!(cards.hidden_disks, 2);
+    assert_eq!(cards.disks.iter().map(|disk| disk.mount.as_str()).collect::<Vec<_>>(),
+        ["/", "/Volumes/客户数据平台 Production Backups", "/Volumes/Archive"]);
+    assert!(model::attention(&data).iter().any(|item| item.title.contains("Production Media Library")));
 }
 
 pub fn local() -> MonitorData {

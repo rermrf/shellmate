@@ -32,7 +32,9 @@ fn word<'a>(rest: &mut &'a str) -> Option<&'a str> {
 fn row(bytes: &[u8], owner_column: usize, total: u64) -> Option<(Process, f64)> {
     let (exe, tail) = bytes.split_at_checked(owner_column)?;
     let exe = String::from_utf8_lossy(exe);
-    let name = exe.trim().rsplit('/').next()?.trim_matches(['(', ')']).to_owned();
+    let exe = exe.trim();
+    let exe = exe.strip_prefix('(').and_then(|wrapped| wrapped.strip_suffix(')')).unwrap_or(exe);
+    let name = exe.rsplit('/').next()?.to_owned();
     let tail = String::from_utf8_lossy(tail);
     let mut rest = tail.as_ref();
     let user = word(&mut rest)?.to_owned();
@@ -48,7 +50,7 @@ fn row(bytes: &[u8], owner_column: usize, total: u64) -> Option<(Process, f64)> 
     let mut birth: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::strptime(stamp.as_ptr(), c"%a %b %e %T %Y".as_ptr(), &mut birth) }.is_null() { return None; }
     let args = rest.trim_start();
-    let command = if args.is_empty() { &name } else { args }.chars().take(2048).collect();
+    let command = if args.is_empty() { exe } else { args }.to_owned();
     Some((
         Process {
             pid,
@@ -83,7 +85,8 @@ impl Processes {
         // Darwin sizes non-final comm to 16 bytes unless its heading asks for more.
         let exe_column = format!("comm={}", "X".repeat(libc::PATH_MAX as usize));
         let mut child = tokio::process::Command::new("/bin/ps")
-            .env("LC_ALL", "C")
+            .env("LC_ALL", super::runner::UTF8_LOCALE)
+            .env("LANG", super::runner::UTF8_LOCALE)
             .env("TZ", "UTC0")
             .args(["-axww", "-o", &exe_column, "-o", "user=OWNER", "-o", COLUMNS])
             .kill_on_drop(true)
@@ -153,7 +156,7 @@ mod tests {
         let args = format!("/Applications/My App --arg  has spaces {}", "x".repeat(5000));
         let (process, _) = sample(11, "0:12.34", "11:12:13", &args);
         assert_eq!(process.name, "My App");
-        assert_eq!(process.command, args[..2048]);
+        assert_eq!(process.command, args);
         assert_eq!((process.mem_percent, process.user.as_str()), (Some(50.), "chen"));
         let exe = format!("/Library/{}/Long Executable Name", "component/".repeat(60));
         let width = libc::PATH_MAX as usize;
@@ -161,6 +164,20 @@ mod tests {
         let (parsed, _) = row(line.as_bytes(), width + 1, 0).unwrap();
         assert_eq!(parsed.name, "Long Executable Name");
         assert_eq!(parsed.command, format!("{exe} --test"));
+    }
+
+    #[test]
+    fn utf8_comm_and_english_lstart_preserve_process_identity() {
+        for name in ["企业微信", "Microsoft Edge Helper (Renderer)", "WindowServer"] {
+            let exe = format!("/Applications/{name}.app/Contents/MacOS/{name}");
+            let args = format!("{exe} --profile 企业 微信");
+            let prefix = format!("{exe}{} ", " ".repeat(240 - exe.len()));
+            let line = format!("{prefix}chen 123 1 0 S 0 0:00.00 Tue Nov 10 14:06:29 2026 {args}");
+            let (process, _) = row(line.as_bytes(), 241, 0).unwrap();
+            assert_eq!(process.name, name);
+            assert_eq!(process.command, args);
+            assert_eq!(process.start_time, 1794319589);
+        }
     }
 
     #[test]

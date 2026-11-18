@@ -266,7 +266,13 @@ fn merge<'a>(
                 (_, _, true) => (ActiveState::Other("unknown".into()), "状态未知"),
                 (Some(false), _, _) => (ActiveState::Inactive, "未加载"),
                 (_, Some((1.., _)), _) => (ActiveState::Active, "运行中"),
-                (_, Some((0, Some(status))), _) if status != 0 => (ActiveState::Failed, "失败"),
+                (_, Some((0, Some(status))), _) if status != 0 => {
+                    if plist.is_some_and(|data| data.should_run) {
+                        (ActiveState::Failed, "失败")
+                    } else {
+                        (ActiveState::LastRunFailed, "上次运行失败")
+                    }
+                }
                 (_, Some((0, _)), _) => (ActiveState::Inactive, "未运行"),
                 _ => (ActiveState::Other("unknown".into()), "状态未知"),
             };

@@ -271,6 +271,8 @@ pub enum ActiveState {
     Deactivating,
     /// Not running.
     Inactive,
+    /// A stopped launchd job whose last invocation exited unsuccessfully.
+    LastRunFailed,
     /// It ended badly.
     Failed,
     /// Anything else systemd says.

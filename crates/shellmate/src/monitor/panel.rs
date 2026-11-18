@@ -319,17 +319,16 @@ impl MonitorPanel {
 
     // ---- drawing ---------------------------------------------------------------------------------
 
-    fn chip(&self, chip: &Chip, p: &Palette) -> AnyElement {
+    fn chip(&self, index: usize, chip: &Chip, p: &Palette) -> AnyElement {
         let (bg, fg) = tone_colors(p, chip.tone);
-        div()
+        ellipsis(("monitor-chip", index), chip.text.clone())
             .px(px(8.))
             .py(px(2.))
             .rounded(px(7.))
             .bg(bg)
             .text_color(fg)
-            .text_size(px(11.5)).whitespace_nowrap()
+            .text_size(px(11.5)).max_w_full()
             .font_weight(FontWeight::SEMIBOLD)
-            .child(chip.text.clone())
             .into_any_element()
     }
 
@@ -396,7 +395,7 @@ impl MonitorPanel {
                     .flex_1().min_w_0().when(stacked,|d|d.w_full().flex_none())
                     .flex().flex_col().gap(px(5.))
                     .child(facts)
-                    .child(div().flex().flex_wrap().gap(px(6.)).children(header.chips.iter().map(|chip| self.chip(chip, p)))),
+                    .child(div().flex().flex_wrap().gap(px(6.)).children(header.chips.iter().enumerate().map(|(index, chip)| self.chip(index, chip, p)))),
             )
             .child(
                 div()
@@ -495,8 +494,8 @@ impl MonitorPanel {
                     .justify_between()
                     .text_size(px(12.5))
                     .text_color(p.tx2)
-                    .child(cards.cpu.title.clone())
-                    .child(div().whitespace_nowrap().child(cards.cpu.load.clone())),
+                    .child(div().flex_none().child(cards.cpu.title.clone()))
+                    .child(ellipsis("cpu-load", cards.cpu.load.clone())),
             )
             .child(self.big_number(cards.cpu.percent.clone(), p))
             .child(div().h(px(64.)).w_full().child(sparkline(
@@ -536,7 +535,7 @@ impl MonitorPanel {
             .child(
                 div()
                     .flex()
-                    .gap(px(14.))
+                    .gap_x(px(14.)).gap_y(px(2.))
                     .text_size(px(11.5))
                     .text_color(p.tx2)
                     .flex_wrap().children(mem.legend.iter().map(|text| div().whitespace_nowrap().child(text.clone()))),
@@ -546,8 +545,11 @@ impl MonitorPanel {
             .card(p)
             .flex_1()
             .min_w_0()
-            .gap(px(10.))
-            .child(div().text_size(px(12.5)).line_height(px(19.)).text_color(p.tx2).child("磁盘"))
+            .gap(px(if cards.disks.len() == model::DISK_ROWS { 8. } else { 10. }))
+            .child(div().flex().flex_none().justify_between().text_size(px(12.5)).line_height(px(19.))
+                .text_color(p.tx2).child("磁盘").when(cards.hidden_disks > 0, |header| {
+                    header.child(div().text_color(p.tx3).child(format!("另 {} 个", cards.hidden_disks)))
+                }))
             .children(cards.disks.iter().map(|disk| {
                 let color = match disk.tone {
                     Tone::Err => p.err,
@@ -557,13 +559,14 @@ impl MonitorPanel {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_none()
                     .gap(px(4.))
                     .child(
                         div()
                             .flex()
                             .justify_between()
                             .gap(px(8.))
-                            .text_size(px(12.))
+                            .text_size(px(12.)).line_height(px(17.))
                             .child(
                                 ellipsis(gpui::SharedString::from(format!("mount-{}",disk.mount)),disk.mount.clone()).flex_1().font_family(MONO_FONT).font_weight(FontWeight::SEMIBOLD),
                             )
@@ -598,7 +601,7 @@ impl MonitorPanel {
                         .justify_between()
                         .text_size(px(12.5))
                         .text_color(p.tx2)
-                        .child(net.title.clone())
+                        .child(ellipsis("network-interface", net.title.clone()).flex_1())
                         .child(net.unit),
                 )
                 .child(
@@ -644,13 +647,13 @@ impl MonitorPanel {
         let layout=crate::layout::Responsive::at(self.width);
         let cell_width=layout.summary_width(self.width);
         div().w_full().min_w_0().flex().flex_wrap().flex_none().gap(px(10.))
-            .children([cpu,memory,disks,network].into_iter().map(|card|div().w(px(cell_width)).h(px(157.)).flex_none().min_w_0().flex().child(card)))
+            .children([cpu,memory,disks,network].into_iter().map(|card|div().w(px(cell_width)).h(px(157.)).flex_none().min_w_0().flex().child(card.overflow_hidden())))
             .into_any_element()
     }
 
     fn render_attention(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let items = model::attention(&self.data);
-        #[cfg(debug_assertions)] let items=if crate::proto::requested(){items.into_iter().map(|mut item|{if item.tag=="磁盘"{item.detail="按近 7 天增速约 11 天后写满 · 最大目录 /data/backups".into();}item}).collect::<Vec<_>>()}else{items};
+        #[cfg(debug_assertions)] let items=if crate::proto::requested() && !self.data.local(){items.into_iter().map(|mut item|{if item.tag=="磁盘"{item.detail="按近 7 天增速约 11 天后写满 · 最大目录 /data/backups".into();}item}).collect::<Vec<_>>()}else{items};
         let list = items.into_iter().enumerate().map(|(ix, item)| {
             let (bg, fg) = tone_colors(p, if item.tone == Tone::Err { Tone::Err } else { Tone::Warn });
             let action = item.action.clone();
@@ -758,7 +761,7 @@ impl MonitorPanel {
         // "cpu112-127" is longer than "cpu0": the names get one column as wide as the longest.
         let label_width =
             (bars.iter().map(|bar| bar.name.chars().count()).max().unwrap_or(0) as f32 * 7.8 + 4.).max(56.);
-        let top = model::top_processes(snapshot, 4);
+        let top = model::top_processes(snapshot, 4, self.data.local());
         let temperature = model::temperature_text(snapshot);
         self.card(p)
             .flex_1()
@@ -825,7 +828,7 @@ impl MonitorPanel {
                     .cursor_pointer()
                     .hover(|d| d.bg(p.card2))
                     .child(div().w(px(crate::layout::pid_width(pid,7.8))).flex_none().whitespace_nowrap().font_family(MONO_FONT).text_color(p.tx2).child(pid.to_string()))
-                    .child(ellipsis(("top-command",pid as usize),proc.command).flex_1().font_family(MONO_FONT))
+                    .child(ellipsis(("top-command",pid as usize),proc.label).flex_1().font_family(MONO_FONT))
                     .child(
                         div()
                             .min_w(px(72.)).flex_none().whitespace_nowrap()
@@ -931,7 +934,14 @@ impl MonitorPanel {
                         .font_family(MONO_FONT)
                         .pl(px(row.depth as f32 * 14.))
                         .child(div().flex_none().text_color(p.tx3).child(row.prefix))
-                        .child(ellipsis(("process-command",ix),row.command.clone()).flex_1()),
+                        .child(if self.data.local() && row.name != row.command {
+                            div().flex_1().min_w_0().flex().flex_col()
+                                .child(ellipsis(("process-name", ix), row.name.clone()))
+                                .child(ellipsis(("process-command", ix), row.command.clone()).text_color(p.tx2)
+                                    .text_size(px(11.)).line_height(px(14.))).into_any_element()
+                        } else {
+                            ellipsis(("process-command", ix), row.command.clone()).flex_1().into_any_element()
+                        }),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.select(key, cx)))
                 .into_any_element(),

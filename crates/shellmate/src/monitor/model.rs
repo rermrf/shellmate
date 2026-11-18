@@ -437,14 +437,15 @@ pub struct Cards {
     pub cpu: CpuView,
     /// Memory.
     pub memory: MemoryView,
-    /// Disks (at most five; the rest are in the attention list when they are full).
+    /// Visible mounts, with root first and the fullest remaining volumes next.
     pub disks: Vec<DiskView>,
+    pub hidden_disks: usize,
     /// Network (`None` when the server has no interface to speak of).
     pub network: Option<NetworkView>,
 }
 
 /// How many disks the card has room for.
-pub const DISK_ROWS: usize = 5;
+pub const DISK_ROWS: usize = 3;
 
 /// The cards for `snapshot`, with placeholders where there is nothing yet.
 pub fn cards(snapshot: Option<&Snapshot>) -> Cards {
@@ -478,20 +479,15 @@ pub fn cards(snapshot: Option<&Snapshot>) -> Cards {
         },
     };
 
-    let disks = snapshot
-        .map(|s| {
-            s.disks
-                .iter()
-                .take(DISK_ROWS)
-                .map(|disk| DiskView {
-                    mount: disk.mount.clone(),
-                    text: format::gb_pair(disk.used, disk.total, 10.0),
-                    fraction: f32::from(disk.percent.min(100)) / 100.0,
-                    tone: disk_tone(disk.percent),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut mounts: Vec<_> = snapshot.into_iter().flat_map(|snap| &snap.disks).collect();
+    mounts.sort_unstable_by_key(|disk| (disk.mount != "/", std::cmp::Reverse(disk.percent), &disk.mount));
+    let hidden_disks = mounts.len().saturating_sub(DISK_ROWS);
+    let disks = mounts.into_iter().take(DISK_ROWS).map(|disk| DiskView {
+        mount: disk.mount.clone(),
+        text: format::gb_pair(disk.used, disk.total, 10.0),
+        fraction: f32::from(disk.percent.min(100)) / 100.0,
+        tone: disk_tone(disk.percent),
+    }).collect();
 
     let network = match snapshot.and_then(|s| s.network.as_ref()) {
         Some(net) => {
@@ -510,7 +506,7 @@ pub fn cards(snapshot: Option<&Snapshot>) -> Cards {
         }
         None => None,
     };
-    Cards { cpu, memory, disks, network }
+    Cards { cpu, memory, disks, hidden_disks, network }
 }
 
 /// The color of a disk's bar.
@@ -569,7 +565,11 @@ pub fn attention(data: &MonitorData) -> Vec<AttentionItem> {
             items.push(AttentionItem {
                 tag: "服务",
                 tone: Tone::Err,
-                title: format!("{} 启动失败", service.name),
+                title: match (&service.launchd, service.exit_status) {
+                    (Some(_), Some(code)) => format!("{} 已停止（退出码 {code}）", service.name),
+                    (Some(_), None) => format!("{} 已停止", service.name),
+                    _ => format!("{} 启动失败", service.name),
+                },
                 detail: services::failure_text(service).unwrap_or_default(),
                 action_label: "查看服务",
                 action: AttentionAction::ShowService(service.key().into()),
@@ -704,21 +704,20 @@ pub fn temperature_text(snapshot: Option<&Snapshot>) -> Option<String> {
 pub struct TopProcess {
     /// Process id.
     pub pid: u32,
-    /// The command line.
-    pub command: String,
+    pub label: String,
     /// `13.8%`, or `—`.
     pub cpu: String,
 }
 
 /// The `n` processes that use the most CPU.
-pub fn top_processes(snapshot: Option<&Snapshot>, n: usize) -> Vec<TopProcess> {
+pub fn top_processes(snapshot: Option<&Snapshot>, n: usize, local: bool) -> Vec<TopProcess> {
     snapshot
         .map(|s| {
             s.top_by_cpu(n)
                 .into_iter()
                 .map(|p| TopProcess {
                     pid: p.pid,
-                    command: p.command.clone(),
+                    label: if local { &p.name } else { &p.command }.clone(),
                     cpu: p.cpu_percent.map_or_else(|| "—".into(), |v| format!("{v:.1}%")),
                 })
                 .collect()
@@ -1111,10 +1110,10 @@ mod tests {
         assert_eq!(cards.memory.legend, ["已用 10.0 GB", "缓存 3.0 GB", "Swap 128 MB"]);
         assert_eq!(
             cards.disks.iter().map(|d| (d.mount.as_str(), d.tone)).collect::<Vec<_>>(),
-            [("/", Tone::Plain), ("/data", Tone::Warn), ("/boot", Tone::Err)]
+            [("/", Tone::Plain), ("/boot", Tone::Err), ("/data", Tone::Warn)]
         );
-        assert_eq!(cards.disks[1].text, "164 / 200 GB");
-        assert!((cards.disks[1].fraction - 0.82).abs() < 1e-6);
+        assert_eq!(cards.disks[2].text, "164 / 200 GB");
+        assert!((cards.disks[2].fraction - 0.82).abs() < 1e-6);
         let net = cards.network.unwrap();
         assert_eq!((net.unit, net.down.as_str(), net.up.as_str()), ("MB/s", "0.4", "2.4"));
 
@@ -1226,11 +1225,13 @@ mod tests {
         let mut new = process(3000, 'S');
         new.cpu_percent = None;
         let snapshot = Snapshot { processes: vec![process(1, 'S'), busy, new], ..Snapshot::default() };
-        let top = top_processes(Some(&snapshot), 4);
+        let top = top_processes(Some(&snapshot), 4, false);
+        assert_eq!(top[0].label, "node /var/www/app/dist/server.js");
+        assert_eq!(top_processes(Some(&snapshot), 1, true)[0].label, "p2207");
         assert_eq!(top.iter().map(|t| t.pid).collect::<Vec<_>>(), [2207, 1, 3000], "a process without a rate is last");
         assert_eq!((top[0].cpu.as_str(), top[2].cpu.as_str()), ("11.5%", "—"));
-        assert_eq!(top_processes(Some(&snapshot), 1).len(), 1);
-        assert!(top_processes(None, 4).is_empty());
+        assert_eq!(top_processes(Some(&snapshot), 1, false).len(), 1);
+        assert!(top_processes(None, 4, false).is_empty());
     }
 
     fn ubuntu_with_everything() -> Probe {

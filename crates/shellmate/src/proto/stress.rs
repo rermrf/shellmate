@@ -42,6 +42,15 @@ pub fn monitor(scene: &str, dark: bool) -> MonitorData {
     snapshot.disks[1].mount = "/srv/production/客户数据平台/persistent-volumes/database-primary".into();
     snapshot.disks[1].total = 8 << 40;
     snapshot.disks[1].used = 7 << 40;
+    if scene == "mon-ov" {
+        snapshot.disks[1].available = 1 << 40;
+        snapshot.disks[1].percent = 88;
+        snapshot.disks.extend([("/var/lib/containers", 94), ("/srv/backups", 82), ("/opt", 35)]
+            .map(|(mount, percent)| shellmate_monitor::Disk {
+                filesystem: format!("/dev/mapper/vol-{percent}"), mount: mount.into(), percent,
+                total: 100 << 30, used: u64::from(percent) << 30, available: u64::from(100-percent) << 30,
+            }));
+    }
     for (i, p) in snapshot.processes.iter_mut().enumerate() {
         p.pid = 4_194_304 - i as u32;
         p.ppid = 1;
@@ -110,6 +119,9 @@ mod tests {
         let model = monitor("mon-ov", false);
         let snapshot = model.snapshot.unwrap();
         assert_eq!(snapshot.host.cores, 16);
+        let cards = crate::monitor::model::cards(Some(&snapshot));
+        assert_eq!((snapshot.disks.len(), cards.hidden_disks), (6, 3));
+        assert_eq!(cards.disks[1].mount, "/var/lib/containers");
         assert!(snapshot.process(4194304).is_some());
         assert!(snapshot.processes.iter().all(|p| p.pid >= 1_000_000 && p.command.len() > 200));
         assert!(model.services.unwrap().get(SERVICE).is_some());

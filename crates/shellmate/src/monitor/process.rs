@@ -60,6 +60,7 @@ pub struct Row {
     pub ppid: u32,
     /// Owner.
     pub user: String,
+    pub name: String,
     /// The command line.
     pub command: String,
     /// `13.0`, or `—`.
@@ -149,6 +150,7 @@ pub fn table(snapshot: &Snapshot, query: &str, sort: SortKey, tree: bool) -> Tab
             key: ProcKey::of(p),
             ppid: p.ppid,
             user: p.user.clone(),
+            name: p.name.clone(),
             command: p.command.clone(),
             cpu: format::percent_cell(p.cpu_percent),
             cpu_bar: p.cpu_percent.map_or(0.0, |v| (v / top).clamp(0.0, 1.0)),

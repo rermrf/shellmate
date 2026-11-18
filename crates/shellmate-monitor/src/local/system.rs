@@ -179,7 +179,7 @@ fn mount_label<'a>(mount: &'a str, kind: &str, flags: u32) -> Option<&'a str> {
     if matches!(mount, "/" | "/System/Volumes/Data") {
         return Some("/");
     }
-    if flags & libc::MNT_DONTBROWSE as u32 != 0 {
+    if flags & (libc::MNT_DONTBROWSE | libc::MNT_RDONLY) as u32 != 0 {
         return None;
     }
     let name = mount.strip_prefix("/Volumes/")?;
@@ -248,10 +248,14 @@ mod tests {
     #[test]
     fn only_user_visible_local_volumes_and_one_root() {
         let local = libc::MNT_LOCAL as u32;
+        let read_only = local | libc::MNT_RDONLY as u32;
+        assert_eq!(mount_label("/", "apfs", read_only), Some("/"));
         assert_eq!(mount_label("/", "apfs", local | libc::MNT_SNAPSHOT as u32), Some("/"));
         assert_eq!(mount_label("/System/Volumes/Data", "apfs", local), Some("/"));
         assert_eq!(mount_label("/Volumes/My SSD", "apfs", local), Some("/Volumes/My SSD"));
         for (mount, kind, flags) in [
+            ("/Volumes/Shellmate 0.1.4", "hfs", read_only),
+            ("/Volumes/Installer", "apfs", read_only),
             ("/System/Volumes/VM", "apfs", local),
             ("/Volumes/share", "smbfs", 0),
             ("/Volumes/test", "autofs", local),

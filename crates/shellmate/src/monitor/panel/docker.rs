@@ -493,12 +493,10 @@ impl MonitorPanel {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        div()
+                        ellipsis("docker-runtime-title", header.title.clone())
                             .font_weight(FontWeight::BOLD)
                             .text_size(px(14.))
-                            .line_height(px(17.))
-                            .child(header.title.clone())
-                            .whitespace_nowrap(),
+                            .line_height(px(17.)),
                     )
                     .child(
                         ellipsis("docker-subtitle", header.subtitle.clone())

@@ -67,6 +67,8 @@ async fn bounded(mut pipe: impl AsyncRead + Unpin, limit: usize) -> io::Result<(
     Ok((data, truncated))
 }
 
+pub(super) const UTF8_LOCALE: &str = "en_US.UTF-8";
+
 pub(crate) async fn output(cmd: &mut Command, timeout: Duration, limit: usize) -> io::Result<ExecOutput> {
     output_with_locale(cmd, timeout, limit, "C").await
 }
@@ -79,6 +81,7 @@ pub(super) async fn output_with_locale(
 ) -> io::Result<ExecOutput> {
     let mut child = cmd
         .env("LC_ALL", locale)
+        .env("LANG", locale)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -204,21 +207,18 @@ mod tests {
         let mut child = Command::new("/bin/sleep").arg("30").kill_on_drop(true).spawn().unwrap();
         let pid = child.id().unwrap();
         let words = kill(pid, Signal::Term).unwrap();
-        let denied = process_action(words.clone(), |_| async {
-            Ok(ExecOutput {
-                stdout: vec![],
-                stderr: b"Operation not permitted".into(),
-                status: ExecStatus::Code(1),
-                truncated: false,
+        for message in ["Operation not permitted", "企业微信 Helper: Permission denied"] {
+            let denied = process_action(words.clone(), |_| async {
+                Ok(ExecOutput {
+                    stdout: vec![],
+                    stderr: message.as_bytes().into(),
+                    status: ExecStatus::Code(1),
+                    truncated: false,
+                })
             })
-        })
-        .await;
-        assert_eq!(
-            denied,
-            ActionOutcome::Terminal(Plan::Terminal {
-                line: format!("sudo kill -TERM {pid}")
-            })
-        );
+            .await;
+            assert_eq!(denied, ActionOutcome::Terminal(Plan::Terminal { line: format!("sudo kill -TERM {pid}") }));
+        }
         let sent = process_action(words, |mut cmd| async move {
             output(&mut cmd, Duration::from_secs(3), 4096).await
         })

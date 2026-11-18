@@ -79,10 +79,64 @@ fn file(label: &str, keep_alive: bool, run_at_load: bool) -> Entry {
             program: Some("/example/program".into()),
             keep_alive,
             run_at_load,
+            should_run: keep_alive || run_at_load,
             stderr: None,
             stdout: None,
         }),
     }
+}
+
+#[test]
+fn only_expected_jobs_count_as_failed_after_exit() {
+    use serde_json::json;
+    for (fields, expected) in [
+        (json!({"KeepAlive": true, "StartInterval": 60}), true),
+        (json!({"KeepAlive": {"SuccessfulExit": false}}), true),
+        (json!({"RunAtLoad": true}), true),
+        (json!({"RunAtLoad": true, "StartOnMount": false}), true),
+        (json!({"KeepAlive": false}), false),
+        (json!({}), false),
+        (json!({"RunAtLoad": true, "StartInterval": 60}), false),
+        (json!({"RunAtLoad": true, "StartCalendarInterval": [{"Hour": 8}]}), false),
+        (json!({"RunAtLoad": true, "WatchPaths": ["/example"]}), false),
+        (json!({"RunAtLoad": true, "QueueDirectories": ["/example"]}), false),
+        (json!({"RunAtLoad": true, "StartOnMount": true}), false),
+        (json!({"RunAtLoad": true, "MachServices": {"example.ipc": true}}), false),
+        (json!({"RunAtLoad": true, "Sockets": {"Listeners": {}}}), false),
+        (json!({"RunAtLoad": true, "LaunchEvents": {"com.apple.notifyd.matching": {}}}), false),
+        (json!({"RunAtLoad": true, "OnDemand": true}), false),
+    ] {
+        let mut json = fields.clone();
+        json["Label"] = "example".into();
+        let mut entry = file("example", false, false);
+        entry.data = plists::parse(&json);
+        assert_eq!(entry.data.as_ref().unwrap().should_run, expected, "{fields}");
+        for (pid, exit, state) in [
+            ("-", 78, if expected { ActiveState::Failed } else { ActiveState::LastRunFailed }),
+            ("25", 78, ActiveState::Active), ("-", 0, ActiveState::Inactive),
+        ] {
+            let list = parse_list(&format!("PID Status Label\n{pid} {exit} example"));
+            let jobs = merge("gui/501", list, None, [&entry].into_iter(), None, None, &mut Tails::default());
+            assert_eq!(jobs[0].active, state, "{fields}");
+            assert_eq!(jobs[0].exit_status, Some(exit));
+        }
+    }
+}
+
+#[tokio::test]
+async fn plutil_reads_a_periodic_job_and_unicode_paths_in_c_locale() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("企业微信 Updater.plist");
+    fs::write(&path, r#"<plist version="1.0"><dict>
+        <key>Label</key><string>example.updater</string>
+        <key>Program</key><string>/Applications/企业微信 Helper</string>
+        <key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>
+        </dict></plist>"#).unwrap();
+    let entries = Cache::default().scan(vec![(false, dir.path().into())]).await;
+    assert_eq!(entries[0].path, path.to_str().unwrap());
+    let plist = entries[0].data.as_ref().unwrap();
+    assert_eq!(plist.program.as_deref(), Some("/Applications/企业微信 Helper"));
+    assert!(plist.run_at_load && !plist.should_run);
 }
 
 #[test]
@@ -94,7 +148,7 @@ fn maps_state_autostart_pid_since_and_failure_tail() {
         file("homebrew.mxcl.redis", true, false),
         file("org.example.agent", false, true),
         file("org.example.unloaded", false, true),
-        file("homebrew.mxcl.mysql@8.4", false, false),
+        file("homebrew.mxcl.mysql@8.4", true, false),
         file("malformed", false, false),
     ];
     files[3].data.as_mut().unwrap().stderr = Some(dir.path().join("missing").to_str().unwrap().into());
@@ -139,7 +193,7 @@ fn maps_state_autostart_pid_since_and_failure_tail() {
     let since = redis.since_text.as_deref().unwrap();
     assert!(since.starts_with("1970-01-0") && since.len() == 19 && !since.contains("UTC"), "{since}");
     let mysql = get("homebrew.mxcl.mysql@8.4");
-    assert_eq!((&*mysql.name, mysql.autostart), ("mysql@8.4", Autostart::Manual));
+    assert_eq!((&*mysql.name, mysql.autostart), ("mysql@8.4", Autostart::Enabled));
     assert_eq!(mysql.last_error.as_deref(), Some("上次退出码 78\na\nb\nc\nd\ne"));
     assert_eq!(get("org.example.agent").autostart, Autostart::Disabled);
     assert_eq!(get("org.example.unloaded").autostart, Autostart::Enabled);

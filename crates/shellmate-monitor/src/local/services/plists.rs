@@ -14,6 +14,7 @@ pub(super) struct Plist {
     pub program: Option<String>,
     pub keep_alive: bool,
     pub run_at_load: bool,
+    pub should_run: bool,
     pub stderr: Option<String>,
     pub stdout: Option<String>,
 }
@@ -21,6 +22,10 @@ pub(super) struct Plist {
 async fn read(path: &str) -> Option<Plist> {
     let text = read_cmd("/usr/bin/plutil", &["-convert", "json", "-o", "-", "--", path]).await?;
     let json: Value = serde_json::from_str(&text).ok()?;
+    parse(&json)
+}
+
+pub(super) fn parse(json: &Value) -> Option<Plist> {
     let dict = json.as_object()?;
     let label = dict.get("Label")?.as_str()?.to_owned();
     if !valid_label(&label) {
@@ -31,6 +36,10 @@ async fn read(path: &str) -> Option<Plist> {
         Some(Value::Object(_)) => true,
         _ => boolean("KeepAlive")?,
     };
+    let run_at_load = boolean("RunAtLoad")?;
+    let triggered = ["StartInterval", "StartCalendarInterval", "WatchPaths", "QueueDirectories",
+        "MachServices", "Sockets", "LaunchEvents"].iter().any(|key| dict.contains_key(*key))
+        || boolean("StartOnMount")? || boolean("OnDemand")?;
     let path = |key| {
         dict.get(key)?
             .as_str()
@@ -46,7 +55,8 @@ async fn read(path: &str) -> Option<Plist> {
         label,
         program,
         keep_alive,
-        run_at_load: boolean("RunAtLoad")?,
+        run_at_load,
+        should_run: keep_alive || (run_at_load && !triggered),
         stderr: path("StandardErrorPath"),
         stdout: path("StandardOutPath"),
     })
