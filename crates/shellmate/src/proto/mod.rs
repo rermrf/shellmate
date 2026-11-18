@@ -60,7 +60,7 @@ pub const PAGE_SCROLL_SCENES: &[(&str, (u32, u32))] = &[
 pub const SCENES: &[&str] = &[
     "mon-ov-scrolled", "mon-dk-scrolled", "mon-svc-scrolled", "fwd-scrolled",
     "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
-    "ai-agent", "ai-agent-run", "ai-agent-redline", "ai-agent-full",
+    "ai-agent", "ai-agent-run", "ai-new-confirm", "ai-agent-redline", "ai-agent-full",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
     "main", "prompt-plain", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
     "files",
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 67 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 68 + PAGE_SCROLL_SCENES.len());
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));

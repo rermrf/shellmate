@@ -42,9 +42,9 @@ impl Drawer {
         self.host.as_deref().unwrap_or("local")
     }
     pub(super) fn release_context(&mut self, cx: &mut Context<Self>) {
-        if !self.model.busy
-            && !self.pending
-            && self.continuation.is_none()
+        if !self.state.model.busy
+            && !self.state.pending
+            && self.state.continuation.is_none()
             && let Some(context) = self.next_context.take()
         {
             self.sync_context(context, cx);
@@ -53,44 +53,44 @@ impl Drawer {
 
     pub(super) fn agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Thinking => self.model.event(Event::Thinking),
-            AgentEvent::TextDelta(t) => self.model.event(Event::TextDelta(t)),
-            AgentEvent::Command(c) => self.model.event(Event::Command(c)),
+            AgentEvent::Thinking => self.state.model.event(Event::Thinking),
+            AgentEvent::TextDelta(t) => self.state.model.event(Event::TextDelta(t)),
+            AgentEvent::Command(c) => self.state.model.event(Event::Command(c)),
             AgentEvent::Done(u) => {
-                self.model.event(Event::Done(u));
-                self.run_config = None;
+                self.state.model.event(Event::Done(u));
+                self.state.run_config = None;
             }
             AgentEvent::Error(e) => {
-                self.model.event(Event::Error(e));
-                self.run_config = None;
+                self.state.model.event(Event::Error(e));
+                self.state.run_config = None;
             }
             // The bridge owns the pending card; separate channels can deliver this after Approval.
-            AgentEvent::StepProposed(_) => self.model.thinking = false,
+            AgentEvent::StepProposed(_) => self.state.model.thinking = false,
             AgentEvent::StepFinished { call, outcome } => {
-                if let Some(turn) = self.model.conversation.turns.last_mut() {
+                if let Some(turn) = self.state.model.conversation.turns.last_mut() {
                     let answer = turn.answer.get_or_insert_with(Answer::default);
                     let mut item = outcome.item(&call);
                     if let AnswerItem::Step { automatic, .. } = &mut item {
-                        *automatic = self.active_step.as_ref().is_some_and(|s| s.automatic);
+                        *automatic = self.state.active_step.as_ref().is_some_and(|s| s.automatic);
                     }
                     answer.items.push(item);
                 }
-                self.active_step = None;
+                self.state.active_step = None;
             }
             AgentEvent::StepLimit { steps, resume } => {
-                self.model.busy = false;
-                self.model.thinking = false;
-                self.continuation = Some(resume);
-                self.resume_steps = steps;
+                self.state.model.busy = false;
+                self.state.model.thinking = false;
+                self.state.continuation = Some(resume);
+                self.state.resume_steps = steps;
             }
         }
     }
     pub(super) fn resume(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.continuation.is_none() || self.model.busy {
+        if self.state.continuation.is_none() || self.state.model.busy {
             return;
         }
-        if let Some(config) = self.run_config.clone() {
-            self.model.busy = true;
+        if let Some(config) = self.state.run_config.clone() {
+            self.state.model.busy = true;
             self.start(config, w, cx);
         }
     }
@@ -167,8 +167,8 @@ impl Drawer {
                                     let mut step = ActiveStep::new(call);
                                     step.reply = Some(reply);
                                     step.redline = redline;
-                                    s.active_step = Some(step);
-                                    s.follow_bottom = true;
+                                    s.state.active_step = Some(step);
+                                    s.state.follow_bottom = true;
                                 }
                                 Ui::Running {
                                     call,
@@ -178,15 +178,15 @@ impl Drawer {
                                     let mut step = ActiveStep::new(call);
                                     step.started = Some(Instant::now());
                                     step.automatic = automatic;
-                                    s.active_step = Some(step);
+                                    s.state.active_step = Some(step);
                                     let _ = ready.send(());
                                 }
                                 Ui::CancelApproval(id)
-                                    if s.active_step.as_ref().is_some_and(|step| {
+                                    if s.state.active_step.as_ref().is_some_and(|step| {
                                         step.call.id == id && step.started.is_none()
                                     }) =>
                                 {
-                                    s.active_step = None;
+                                    s.state.active_step = None;
                                 }
                                 _ => {}
                             }
@@ -203,7 +203,7 @@ impl Drawer {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 if !this
                     .update_in(cx, |s, _, cx| {
-                        if s.epoch != epoch || !s.model.busy {
+                        if s.epoch != epoch || !s.state.model.busy {
                             return false;
                         }
                         cx.notify();
@@ -224,7 +224,7 @@ impl Drawer {
             .set_ai_permission(self.permission_key(), mode)
             .is_err()
         {
-            self.save_error = Some("无法保存审批设置，请重试".into());
+            self.state.save_error = Some("无法保存审批设置，请重试".into());
             cx.notify();
             return false;
         }
@@ -325,7 +325,7 @@ impl Drawer {
         chip.into_any_element()
     }
     fn approve(&mut self, deny: bool, cx: &mut Context<Self>) {
-        let Some(step) = &mut self.active_step else {
+        let Some(step) = &mut self.state.active_step else {
             return;
         };
         let command = step
@@ -357,7 +357,7 @@ impl Drawer {
     }
     pub(super) fn active_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = cx.palette().clone();
-        let step = self.active_step.as_ref().unwrap();
+        let step = self.state.active_step.as_ref().unwrap();
         let red = step
             .edit
             .as_ref()
@@ -401,7 +401,7 @@ impl Drawer {
         } else {
             card.child(command_block(
                 &step.call.command,
-                SharedString::from(format!("{}:active-command", self.id)),
+                SharedString::from(format!("{}:active-command", self.state.id)),
                 cx,
             ))
         };
@@ -432,7 +432,7 @@ impl Drawer {
                         .h(px(25.))
                         .text_size(px(11.))
                         .on_click(cx.listener(move |s, _, _, cx| {
-                            if let Some(step) = &mut s.active_step {
+                            if let Some(step) = &mut s.state.active_step {
                                 step.call.target = target;
                             }
                             cx.notify();
@@ -464,7 +464,7 @@ impl Drawer {
                         .child(
                             dialogs::button("ai-step-edit", "编辑", Tone::Plain, true).on_click(
                                 cx.listener(|s, _, w, cx| {
-                                    if let Some(step) = &mut s.active_step {
+                                    if let Some(step) = &mut s.state.active_step {
                                         let command = step.call.command.clone();
                                         let edit = cx.new(|cx| {
                                             // Approval must expose the entire edited command too.
@@ -484,7 +484,7 @@ impl Drawer {
                         .child(
                             dialogs::button("ai-step-deny", "拒绝", Tone::Plain, true).on_click(
                                 cx.listener(|s, _, w, cx| {
-                                    if let Some(step) = &mut s.active_step {
+                                    if let Some(step) = &mut s.state.active_step {
                                         step.reason = Some(cx.new(|cx| {
                                             InputState::new(w, cx).placeholder("拒绝原因（可选）")
                                         }));
@@ -563,8 +563,8 @@ impl Drawer {
         if !output.is_empty() || matches!(status, StepStatus::Completed | StepStatus::TimedOut) {
             let (stdout, stderr) = output_sections(output);
             let has_output = !stdout.is_empty() || !stderr.is_empty();
-            let expanded = self.expanded.contains(&key);
-            let overflowing = self.overflowing_output.contains(&key);
+            let expanded = self.state.expanded.contains(&key);
+            let overflowing = self.state.overflowing_output.contains(&key);
             let drawer = cx.entity().downgrade();
             let epoch = self.epoch;
             let content = div()
@@ -604,9 +604,9 @@ impl Drawer {
                                             return;
                                         }
                                         let changed = if over {
-                                            s.overflowing_output.insert(key)
+                                            s.state.overflowing_output.insert(key)
                                         } else {
-                                            s.overflowing_output.remove(&key)
+                                            s.state.overflowing_output.remove(&key)
                                         };
                                         if changed {
                                             cx.notify();
@@ -620,7 +620,7 @@ impl Drawer {
                 ScrollArea::new(
                     SharedString::from(format!(
                         "{}:ai-step-output-{}-{}-{expanded}",
-                        self.id, key.0, key.1
+                        self.state.id, key.0, key.1
                     )),
                     div()
                         .flex()
@@ -636,7 +636,7 @@ impl Drawer {
                 )
                 .height_limit(if expanded { 320. } else { 8. * 18. }, expanded),
             );
-            if has_output && !self.readonly {
+            if has_output && !self.state.readonly {
                 let copy = output.clone();
                 let mut actions = step_actions();
                 if overflowing {
@@ -647,8 +647,8 @@ impl Drawer {
                             cx,
                         )
                         .on_click(cx.listener(move |s, _, _, cx| {
-                            if !s.expanded.remove(&key) {
-                                s.expanded.insert(key);
+                            if !s.state.expanded.remove(&key) {
+                                s.state.expanded.insert(key);
                             }
                             cx.notify();
                         })),
@@ -669,11 +669,11 @@ impl Drawer {
 
     /// Only persisted/ended steps use this cap. Active approval always uses command_block.
     fn ended_command(&self, command: &str, key: (usize, usize), cx: &mut Context<Self>) -> Div {
-        let expanded = self.expanded_commands.contains(&key);
-        let overflowing = self.overflowing_commands.contains(&key);
+        let expanded = self.state.expanded_commands.contains(&key);
+        let overflowing = self.state.overflowing_commands.contains(&key);
         let drawer = cx.entity().downgrade();
         let epoch = self.epoch;
-        let conversation = self.id.clone();
+        let conversation = self.state.id.clone();
         // Measure all physical lines before applying the collapsed height cap.
         let measured = div()
             .flex_none()
@@ -688,13 +688,13 @@ impl Drawer {
                     cx.defer(move |cx| {
                         drawer
                             .update(cx, |s, cx| {
-                                if s.epoch != epoch || s.id != conversation {
+                                if s.epoch != epoch || s.state.id != conversation {
                                     return;
                                 }
                                 let changed = if over {
-                                    s.overflowing_commands.insert(key)
+                                    s.state.overflowing_commands.insert(key)
                                 } else {
-                                    s.overflowing_commands.remove(&key)
+                                    s.state.overflowing_commands.remove(&key)
                                 };
                                 if changed {
                                     cx.notify();
@@ -708,7 +708,7 @@ impl Drawer {
         let viewport = ScrollArea::new(
             SharedString::from(format!(
                 "{}:command:{}:{}:{expanded}",
-                self.id, key.0, key.1
+                self.state.id, key.0, key.1
             )),
             div()
                 .flex()
@@ -729,28 +729,28 @@ impl Drawer {
                 } else {
                     viewport.height_limit(3. * 18., false)
                 }));
-        if overflowing || !self.readonly {
+        if overflowing || !self.state.readonly {
             let mut actions = step_actions();
             if overflowing {
                 actions = actions.child(
                     step_action(
-                        markdown::element_id(&format!("{}:command-toggle", self.id), key.0, key.1),
+                        markdown::element_id(&format!("{}:command-toggle", self.state.id), key.0, key.1),
                         if expanded { "收起" } else { "展开" },
                         cx,
                     )
                     .on_click(cx.listener(move |s, _, _, cx| {
-                        if !s.expanded_commands.remove(&key) {
-                            s.expanded_commands.insert(key);
+                        if !s.state.expanded_commands.remove(&key) {
+                            s.state.expanded_commands.insert(key);
                         }
                         cx.notify();
                     })),
                 );
             }
-            if !self.readonly {
+            if !self.state.readonly {
                 let copy = command.to_owned();
                 actions = actions.child(
                     step_action(
-                        markdown::element_id(&format!("{}:command-copy", self.id), key.0, key.1),
+                        markdown::element_id(&format!("{}:command-copy", self.state.id), key.0, key.1),
                         "复制",
                         cx,
                     )
@@ -909,7 +909,7 @@ impl DialogBody for FullAccess {
                     .set_ai_permission(&key, PermissionMode::Full)
                     .is_err()
                 {
-                    s.save_error = Some("无法保存审批设置，请重试".into());
+                    s.state.save_error = Some("无法保存审批设置，请重试".into());
                     cx.notify();
                     return false;
                 }
@@ -940,13 +940,13 @@ impl Drawer {
         };
         self.label = "prod-web-01".into();
         self.protocol = "SSH".into();
-        self.readonly = false;
-        self.model.clear();
-        self.active_step = None;
-        self.expanded.clear();
-        self.overflowing_output.clear();
-        self.expanded_commands.clear();
-        self.overflowing_commands.clear();
+        self.state.readonly = false;
+        self.state.model.clear();
+        self.state.active_step = None;
+        self.state.expanded.clear();
+        self.state.overflowing_output.clear();
+        self.state.expanded_commands.clear();
+        self.state.overflowing_commands.clear();
         let redline = scene == "ai-agent-redline";
         *self.mode.lock().unwrap() = if redline {
             PermissionMode::Full
@@ -958,7 +958,7 @@ impl Drawer {
         } else {
             "docker logs --tail 50 nginx"
         };
-        self.model.start(
+        self.state.model.start(
             if redline {
                 "重启这台服务器"
             } else {
@@ -970,7 +970,7 @@ impl Drawer {
                 text: String::new(),
             },
         );
-        let answer = self
+        let answer = self.state
             .model
             .conversation
             .turns
@@ -985,9 +985,9 @@ impl Drawer {
         if scene == "ai-agent-run" {
             answer.items.push(AnswerItem::Step {automatic:false,command:command.into(),target:Target::Terminal,purpose:"检查入口服务日志".into(),class:Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:800,output:"标准输出：\n10.0.1.12 GET /health 200 0.002s\n10.0.1.15 GET /api/v1/status 200 0.015s\n10.0.1.12 GET /health 200 0.001s\n标准错误：\n".into()});
             answer.push_text(crate::proto::ai::AGENT_ANALYSIS);
-            self.model.busy = false;
+            self.state.model.busy = false;
         } else {
-            self.active_step = Some(ActiveStep::new(ToolCall {
+            self.state.active_step = Some(ActiveStep::new(ToolCall {
                 id: "fixture-step-2".into(),
                 command: command.into(),
                 purpose: if redline {

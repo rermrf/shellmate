@@ -1,15 +1,17 @@
 #[path = "agent_ui.rs"]
 pub(super) mod agent_ui;
 use super::markdown::{self, MarkdownCache};
-use super::model::{DrawerModel, SUGGESTIONS};
+use super::model::SUGGESTIONS;
+#[path = "panel_state.rs"]
+mod state;
 use crate::{
     theme::{ActivePalette, MONO_FONT},
     workspace::Workspace,
 };
-use agent_ui::ActiveStep;
 use futures::StreamExt;
 use gpui::{
     component::{
+        Disableable,
         button::Button,
         input::{Input, InputEvent, InputState},
     },
@@ -25,8 +27,9 @@ use shellmate_store::{
     CredentialStore, SharedStore,
     ai::{ConversationSummary, SavedConversation},
 };
+use state::{NewConversation, new_conversation_tooltip};
 use std::sync::Arc;
-use std::{collections::HashSet, sync::Mutex};
+use std::sync::Mutex;
 pub struct SessionContext {
     pub session: Option<usize>,
     pub host: Option<String>,
@@ -35,23 +38,19 @@ pub struct SessionContext {
     pub binding: Option<super::exec::Binding>,
 }
 pub struct Drawer {
-    pub model: DrawerModel,
+    state: state::ConversationState,
+    save_conversations: bool,
     workspace: WeakEntity<Workspace>,
     db: SharedStore,
     credentials: Arc<CredentialStore>,
     input: Entity<InputState>,
     _subscription: Subscription,
-    id: String,
-    created: i64,
     pub label: String,
     pub protocol: String,
     pub host: Option<String>,
     pub session: Option<usize>,
     provider: String,
     model_id: String,
-    save_error: Option<String>,
-    pending: bool,
-    queued: Option<UserTurn>,
     epoch: u64,
     abort: Option<tokio::task::AbortHandle>,
     pub history: bool,
@@ -59,21 +58,10 @@ pub struct Drawer {
     pub configured: bool,
     pub fixture: bool,
     scroll: ScrollHandle,
-    follow_bottom: bool,
     capabilities: Capabilities,
     mode: Arc<Mutex<PermissionMode>>,
     permission_menu: bool,
     binding: Option<super::exec::Binding>,
-    active_step: Option<ActiveStep>,
-    expanded: HashSet<(usize, usize)>,
-    overflowing_output: HashSet<(usize, usize)>,
-    expanded_commands: HashSet<(usize, usize)>,
-    overflowing_commands: HashSet<(usize, usize)>,
-    markdown: MarkdownCache,
-    readonly: bool,
-    continuation: Option<Box<agent::Resume>>,
-    resume_steps: usize,
-    run_config: Option<shellmate_ai::Config>,
     next_context: Option<SessionContext>,
 }
 impl Drawer {
@@ -97,24 +85,21 @@ impl Drawer {
             },
         );
         let configured = db.borrow().ai_settings().is_ok_and(|s| s.configured());
+        let save_conversations = saving_enabled(&db);
         Self {
-            model: Default::default(),
+            state: state::ConversationState::default(),
+            save_conversations,
             workspace,
             db,
             credentials,
             input,
             _subscription: subscription,
-            id: shellmate_core::HostId::generate().to_string(),
-            created: super::now(),
             label: "无会话".into(),
             protocol: String::new(),
             host: None,
             session: None,
             provider: String::new(),
             model_id: String::new(),
-            save_error: None,
-            pending: false,
-            queued: None,
             epoch: 0,
             abort: None,
             history: false,
@@ -122,29 +107,21 @@ impl Drawer {
             configured,
             fixture: false,
             scroll: ScrollHandle::new(),
-            follow_bottom: true,
             capabilities: Capabilities::default(),
             mode: Arc::new(Mutex::new(PermissionMode::Ask)),
             permission_menu: false,
             binding: None,
-            active_step: None,
-            expanded: HashSet::new(),
-            overflowing_output: HashSet::new(),
-            expanded_commands: HashSet::new(),
-            overflowing_commands: HashSet::new(),
-            markdown: MarkdownCache::default(),
-            readonly: false,
-            continuation: None,
-            resume_steps: 0,
-            run_config: None,
             next_context: None,
         }
     }
     pub fn sync_context(&mut self, context: SessionContext, cx: &mut Context<Self>) {
+        // Opening the drawer and saving settings both arrive here, even during a run.
+        self.save_conversations = saving_enabled(&self.db);
+        cx.notify();
         if self.fixture {
             return;
         }
-        if self.model.busy || self.pending || self.continuation.is_some() {
+        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() {
             self.next_context = Some(context);
             return;
         }
@@ -175,11 +152,11 @@ impl Drawer {
         }
     }
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
-        if self.pending || self.model.busy || question.trim().is_empty() {
+        if self.state.pending || self.state.model.busy || question.trim().is_empty() {
             return;
         }
-        self.continuation = None;
-        self.run_config = None;
+        self.state.continuation = None;
+        self.state.run_config = None;
         self.release_context(cx);
         let context = self
             .workspace
@@ -205,30 +182,30 @@ impl Drawer {
         self.begin(Some(user), w, cx);
     }
     fn begin(&mut self, user: Option<UserTurn>, w: &mut Window, cx: &mut Context<Self>) {
-        if self.model.busy || self.pending {
+        if self.state.model.busy || self.state.pending {
             return;
         }
         if let Some(user) = user {
-            self.queued = Some(user);
-            self.follow_bottom = true;
+            self.state.queued = Some(user);
+            self.state.follow_bottom = true;
         }
-        self.readonly = false;
-        self.continuation = None;
-        self.active_step = None;
-        self.pending = true;
+        self.state.readonly = false;
+        self.state.continuation = None;
+        self.state.active_step = None;
+        self.state.pending = true;
         self.history = false;
-        self.model.error = None;
+        self.state.model.error = None;
         cx.notify();
         let epoch = self.epoch;
         let this = cx.entity().downgrade();
         if self.fixture {
-            self.pending = false;
+            self.state.pending = false;
             if !self.configured {
-                self.model.error = Some(AiError::NotConfigured);
+                self.state.model.error = Some(AiError::NotConfigured);
                 cx.notify();
                 return;
             }
-            let queued = self.queued.take();
+            let queued = self.state.queued.take();
             self.start_fixture(queued, w, cx);
             return;
         }
@@ -242,7 +219,7 @@ impl Drawer {
                     if s.epoch != epoch {
                         return;
                     }
-                    s.pending = false;
+                    s.state.pending = false;
                     match result {
                         Ok(config) => {
                             if shellmate_store::SecretStore::is_locked(s.credentials.as_ref()) {
@@ -252,16 +229,20 @@ impl Drawer {
                             s.configured = true;
                             s.provider = config.provider.id().into();
                             s.model_id = config.model.clone();
-                            if let Some(user) = s.queued.take() {
-                                s.model.conversation.turns.push(Turn { user, answer: None });
-                                s.model.busy = true;
-                            } else if !s.model.retry() {
+                            if let Some(user) = s.state.queued.take() {
+                                s.state
+                                    .model
+                                    .conversation
+                                    .turns
+                                    .push(Turn { user, answer: None });
+                                s.state.model.busy = true;
+                            } else if !s.state.model.retry() {
                                 return;
                             }
                             s.start(config, w, cx);
                         }
                         Err(e) => {
-                            s.model.error = Some(e);
+                            s.state.model.error = Some(e);
                             if e == AiError::NotConfigured {
                                 s.configured = false;
                             }
@@ -275,7 +256,7 @@ impl Drawer {
     }
     fn start(&mut self, config: shellmate_ai::Config, w: &mut Window, cx: &mut Context<Self>) {
         self.epoch += 1;
-        if self.continuation.is_none() && !self.fixture {
+        if self.state.continuation.is_none() && !self.fixture {
             self.binding = self
                 .workspace
                 .update(cx, |s, cx| s.ai_binding(self.session, cx))
@@ -288,11 +269,11 @@ impl Drawer {
                 .unwrap_or_default();
         }
         let Some(runtime) = crate::runtime::get(cx) else {
-            self.model.event(Event::Error(AiError::Unavailable));
+            self.state.model.event(Event::Error(AiError::Unavailable));
             cx.notify();
             return;
         };
-        let mut conversation = self.model.conversation.clone();
+        let mut conversation = self.state.model.conversation.clone();
         let (tx, rx) = async_channel::bounded(64);
         let epoch = self.epoch;
         let (ui, messages) = async_channel::unbounded();
@@ -324,8 +305,8 @@ impl Drawer {
             resolved: Mutex::new(None),
         };
         self.bridge(messages, epoch, w, cx);
-        let continuation = self.continuation.take();
-        self.run_config = Some(config.clone());
+        let continuation = self.state.continuation.take();
+        self.state.run_config = Some(config.clone());
         let join = runtime.spawn(async move {
             let client = match RigClient::new(&config) {
                 Ok(client) => client,
@@ -374,16 +355,16 @@ impl Drawer {
                         }
                         match event {
                             Worker::Started(n) => {
-                                s.model.dropped = n;
+                                s.state.model.dropped = n;
                                 s.persist();
                             }
                             Worker::Event(event, ready) => {
                                 s.agent_event(event);
                                 let _ = ready.send(());
-                                if !s.model.busy {
+                                if !s.state.model.busy {
                                     s.abort = None;
                                     s.persist();
-                                    if s.continuation.is_none() {
+                                    if s.state.continuation.is_none() {
                                         s.binding = None;
                                         s.release_context(cx);
                                     }
@@ -405,53 +386,32 @@ impl Drawer {
         if self.fixture {
             return;
         }
-        let title = self
-            .model
-            .conversation
-            .turns
-            .first()
-            .map(|t| t.user.question.chars().take(48).collect::<String>())
-            .unwrap_or_default();
-        let saved = SavedConversation {
-            id: self.id.clone(),
-            host_id: self.host.clone(),
-            label: self
-                .model
-                .conversation
-                .turns
-                .last()
-                .map(|t| t.user.context.label.clone())
-                .unwrap_or_default(),
-            title,
-            provider: self.provider.clone(),
-            model: self.model_id.clone(),
-            created_at: self.created,
-            updated_at: super::now(),
-            conversation: self.model.conversation.clone(),
-        };
-        if self.db.borrow_mut().save_ai_conversation(&saved).is_err() {
-            self.save_error = Some("对话未能保存到本机，请检查主机库".into());
-        }
+        self.state.persist(
+            &mut self.db.borrow_mut(),
+            self.host.clone(),
+            &self.provider,
+            &self.model_id,
+        );
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
         if let Some(abort) = self.abort.take() {
             abort.abort();
         }
         self.epoch += 1;
-        self.continuation = None;
-        self.run_config = None;
-        if let Some(step) = self.active_step.take()
-            && let Some(turn) = self.model.conversation.turns.last_mut()
+        self.state.continuation = None;
+        self.state.run_config = None;
+        if let Some(step) = self.state.active_step.take()
+            && let Some(turn) = self.state.model.conversation.turns.last_mut()
         {
             turn.answer
                 .get_or_insert_with(Default::default)
                 .items
                 .push(shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call));
         }
-        self.pending = false;
+        self.state.pending = false;
         self.binding = None;
-        if self.model.busy {
-            self.model.event(Event::Error(AiError::Cancelled));
+        if self.state.model.busy {
+            self.state.model.event(Event::Error(AiError::Cancelled));
             self.persist();
         }
         self.release_context(cx);
@@ -459,21 +419,40 @@ impl Drawer {
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.stop(cx);
-        self.model.clear();
-        self.queued = None;
-        self.id = shellmate_core::HostId::generate().to_string();
-        self.created = super::now();
+        self.state.reset_conversation();
+        self.permission_menu = false;
         self.history_rows.clear();
         self.history = false;
-        self.save_error = None;
-        self.expanded.clear();
-        self.overflowing_output.clear();
-        self.expanded_commands.clear();
-        self.overflowing_commands.clear();
-        self.markdown = MarkdownCache::default();
-        self.follow_bottom = true;
         self.release_context(cx);
         cx.notify();
+    }
+    pub(crate) fn new_conversation(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        match self.state.new_conversation_action(self.history) {
+            NewConversation::Disabled => {}
+            NewConversation::Start => self.clear(cx),
+            NewConversation::Confirm => {
+                let drawer = cx.entity().downgrade();
+                let id = self.state.id.clone();
+                crate::dialogs::confirm::ConfirmDialog::open(
+                    "停止并开始新对话？",
+                    state::new_conversation_confirmation(self.save_conversations),
+                    "停止并新建",
+                    true,
+                    move |_, cx| {
+                        drawer
+                            .update(cx, |s, cx| {
+                                if s.state.id == id {
+                                    s.clear(cx);
+                                }
+                            })
+                            .ok();
+                        Ok(())
+                    },
+                    w,
+                    cx,
+                );
+            }
+        }
     }
     fn history(&mut self, cx: &mut Context<Self>) {
         self.history = !self.history;
@@ -487,39 +466,35 @@ impl Drawer {
         match loaded {
             Ok(Some(c)) => {
                 self.stop(cx);
-                self.id = c.id;
-                self.created = c.created_at;
+                self.state.reset_conversation();
+                self.state.id = c.id;
+                self.state.created = c.created_at;
                 self.provider = c.provider;
                 self.model_id = c.model;
-                self.queued = None;
-                self.model.conversation = c.conversation;
-                self.model.error = None;
+                self.state.model.conversation = c.conversation;
                 self.history = false;
-                self.readonly = true;
-                self.expanded.clear();
-                self.overflowing_output.clear();
-                self.expanded_commands.clear();
-                self.overflowing_commands.clear();
-                self.markdown = MarkdownCache::default();
-                self.follow_bottom = true;
+                self.state.readonly = true;
                 cx.notify();
             }
             _ => {
-                self.save_error = Some("无法打开这段对话".into());
+                self.state.save_error = Some("无法打开这段对话".into());
                 cx.notify();
             }
         }
     }
     fn delete(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.db.borrow_mut().delete_ai_conversation(id).is_err() {
-            self.save_error = Some("无法删除对话".into());
-        } else {
-            self.history_rows.retain(|r| r.id != id);
-            if self.id == id {
-                self.stop(cx);
-                self.model.clear();
-                self.id = shellmate_core::HostId::generate().to_string();
+        // Stop can persist the final partial answer; do it before deleting the row.
+        if self.state.id == id {
+            self.stop(cx);
+        }
+        match self.state.delete(&mut self.db.borrow_mut(), id) {
+            Ok(current) => {
+                self.history_rows.retain(|r| r.id != id);
+                if current {
+                    self.permission_menu = false;
+                }
             }
+            Err(_) => self.state.save_error = Some("无法删除对话".into()),
         }
         cx.notify();
     }
@@ -538,20 +513,21 @@ impl Drawer {
     }
     fn start_fixture(&mut self, user: Option<UserTurn>, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(user) = user {
-            self.model
+            self.state
+                .model
                 .conversation
                 .turns
                 .push(Turn { user, answer: None });
         } else {
-            self.model.retry();
+            self.state.model.retry();
         }
-        self.model.busy = true;
+        self.state.model.busy = true;
         let mut stream = FixtureProvider
-            .start(&self.model.conversation)
+            .start(&self.state.model.conversation)
             .expect("fixture provider");
         // The fixture stream is immediately ready; no timer, runtime or HTTP client.
         while let Some(event) = futures::executor::block_on(stream.next()) {
-            self.model.event(event);
+            self.state.model.event(event);
         }
 
         cx.notify();
@@ -559,27 +535,40 @@ impl Drawer {
     #[cfg(debug_assertions)]
     pub fn fixture_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for i in 0..8 {
-            self.model.start(&format!("第 {} 轮：检查服务状态", i + 1), ContextSnapshot::default());
-            self.model.event(Event::TextDelta(crate::proto::ai::CHAT_ANALYSIS.into()));
-            self.model.event(Event::Done(None));
+            self.state.model.start(
+                &format!("第 {} 轮：检查服务状态", i + 1),
+                ContextSnapshot::default(),
+            );
+            self.state
+                .model
+                .event(Event::TextDelta(crate::proto::ai::CHAT_ANALYSIS.into()));
+            self.state.model.event(Event::Done(None));
         }
-        self.follow_bottom = false;
-        crate::proto::scroll_after_layout(self.scroll.clone(), |handle| f32::from(handle.max_offset().y) / 2., window);
+        self.state.follow_bottom = false;
+        crate::proto::scroll_after_layout(
+            self.scroll.clone(),
+            |handle| f32::from(handle.max_offset().y) / 2.,
+            window,
+        );
         cx.notify();
     }
 
     #[cfg(debug_assertions)]
     pub fn scene(&mut self, scene: &str, cx: &mut Context<Self>) {
-        self.id = format!("fixture-{scene}");
-        self.markdown = MarkdownCache::default();
-        self.follow_bottom = true;
+        self.state.id = format!("fixture-{scene}");
+        self.state.markdown = MarkdownCache::default();
+        self.state.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
-        if scene.starts_with("ai-agent") {
+        if scene == "ai-new-confirm" {
+            self.agent_scene("ai-agent-run");
+            // Completed steps plus an answer still streaming; exercise the real button path.
+            self.state.model.busy = true;
+        } else if scene.starts_with("ai-agent") {
             self.agent_scene(scene);
         }
         if matches!(scene, "ai-chat" | "ai-error") {
-            self.model.start(
+            self.state.model.start(
                 "找出占用 3000 端口的进程\nTOKEN=fixture-sensitive",
                 ContextSnapshot {
                     label: "prod-web-01".into(),
@@ -588,27 +577,30 @@ impl Drawer {
                 },
             );
             if scene == "ai-error" {
-                self.model.event(Event::Error(AiError::RateLimited));
+                self.state.model.event(Event::Error(AiError::RateLimited));
             } else {
                 for e in fixture_events() {
-                    self.model.event(e);
+                    self.state.model.event(e);
                 }
-                self.model
+                self.state
+                    .model
                     .start("这个命令会修改系统吗？", ContextSnapshot::default());
-                self.model
+                self.state
+                    .model
                     .event(Event::TextDelta(crate::proto::ai::CHAT_ANALYSIS.into()));
-                self.model.event(Event::Done(None));
+                self.state.model.event(Event::Done(None));
             }
         }
         if scene == "ai-markdown" {
-            self.model.start(
+            self.state.model.start(
                 "帮我整理服务检查结果和后续检查步骤",
                 ContextSnapshot::default(),
             );
-            self.model
+            self.state
+                .model
                 .event(Event::TextDelta(crate::proto::ai::MARKDOWN.into()));
-            self.model.event(Event::Done(None));
-            self.follow_bottom = false;
+            self.state.model.event(Event::Done(None));
+            self.state.follow_bottom = false;
         }
         if scene == "ai-history" {
             self.history = true;
@@ -662,6 +654,14 @@ impl Drawer {
         }
         cx.notify();
     }
+}
+fn saving_enabled(db: &SharedStore) -> bool {
+    db.borrow()
+        .setting(shellmate_store::ai::SAVE_CONVERSATIONS)
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("0")
 }
 enum Worker {
     Started(usize),
@@ -765,13 +765,22 @@ impl Render for Drawer {
                             .on_click(cx.listener(|s, _, _, cx| s.history(cx))),
                     )
                     .child(
-                        Button::new("ai-clear")
-                            .label("清空")
+                        Button::new("ai-new")
+                            .icon(crate::icons::AppIcon::Plus.at(14.))
+                            .label("新对话")
                             .h(px(26.))
                             .px(px(8.))
                             .rounded(px(8.))
                             .text_size(px(12.))
-                            .on_click(cx.listener(|s, _, _, cx| s.clear(cx))),
+                            .disabled(
+                                self.state.new_conversation_action(self.history)
+                                    == NewConversation::Disabled,
+                            )
+                            .tooltip(new_conversation_tooltip(
+                                self.save_conversations,
+                                self.state.save_error.is_some(),
+                            ))
+                            .on_click(cx.listener(|s, _, w, cx| s.new_conversation(w, cx))),
                     )
                     .child(
                         Button::new("ai-close")
@@ -789,7 +798,7 @@ impl Render for Drawer {
             )
             .child(context);
         // GPUI applies this request during layout, using the new content height.
-        if self.follow_bottom && !self.history {
+        if self.state.follow_bottom && !self.history {
             self.scroll.scroll_to_bottom();
         }
         let mut body = div()
@@ -806,7 +815,7 @@ impl Render for Drawer {
                 cx.defer(move |cx| {
                     drawer
                         .update(cx, |s, cx| {
-                            s.follow_bottom =
+                            s.state.follow_bottom =
                                 s.scroll.offset().y + s.scroll.max_offset().y <= px(4.);
                             cx.notify();
                         })
@@ -871,12 +880,39 @@ impl Render for Drawer {
                         .label("去设置")
                         .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
                 );
-        } else if self.model.conversation.turns.is_empty() {
-            body=body.child(div().flex_none().pt(px(6.)).flex().flex_col().gap(px(8.)).child(div().text_size(px(13.)).line_height(px(20.8)).text_color(p.tx2).child("用自然语言描述想做的事，或让我解释终端里的报错。"))
-        .children(SUGGESTIONS.into_iter().enumerate().map(|(i,label)|div().id(("ai-suggestion",i)).py(px(10.)).px(px(12.)).rounded(px(12.)).bg(p.card2).cursor_pointer().hover(|d|d.bg(p.card3)).text_size(px(13.)).line_height(px(17.)).child(label).on_click(cx.listener(move|s,_,w,cx|s.ask(label.into(),w,cx))))));
+        } else if self.state.model.conversation.turns.is_empty() {
+            body = body.child(
+                div()
+                    .flex_none()
+                    .pt(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(20.8))
+                            .text_color(p.tx2)
+                            .child("用自然语言描述想做的事，或让我解释终端里的报错。"),
+                    )
+                    .children(SUGGESTIONS.into_iter().enumerate().map(|(i, label)| {
+                        div()
+                            .id(("ai-suggestion", i))
+                            .py(px(10.))
+                            .px(px(12.))
+                            .rounded(px(12.))
+                            .bg(p.card2)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(p.card3))
+                            .text_size(px(13.))
+                            .line_height(px(17.))
+                            .child(label)
+                            .on_click(cx.listener(move |s, _, w, cx| s.ask(label.into(), w, cx)))
+                    })),
+            );
         }
         if !self.history {
-            for (index, turn) in self.model.conversation.turns.iter().enumerate() {
+            for (index, turn) in self.state.model.conversation.turns.iter().enumerate() {
                 body = body.child(
                     div()
                         .flex_none()
@@ -936,10 +972,14 @@ impl Render for Drawer {
                             }
                             shellmate_ai::AnswerItem::Command(card) => card.clone(),
                             shellmate_ai::AnswerItem::Text(text) => {
-                                let text =
-                                    self.markdown.text(&self.id, (index, n), text, &commands);
+                                let text = self.state.markdown.text(
+                                    &self.state.id,
+                                    (index, n),
+                                    text,
+                                    &commands,
+                                );
                                 reply = reply.child(markdown::view(
-                                    markdown::element_id(&self.id, index, n),
+                                    markdown::element_id(&self.state.id, index, n),
                                     text,
                                     window,
                                     cx,
@@ -1030,21 +1070,22 @@ impl Render for Drawer {
                     body = body.child(reply);
                 }
             }
-            if self.continuation.is_some() {
+            if self.state.continuation.is_some() {
                 body = body.child(
                     crate::dialogs::button(
                         "ai-continue",
-                        format!("已执行 {} 步 · 继续", self.resume_steps),
+                        format!("已执行 {} 步 · 继续", self.state.resume_steps),
                         crate::dialogs::Tone::Primary,
                         true,
                     )
                     .on_click(cx.listener(|s, _, w, cx| s.resume(w, cx))),
                 );
             }
-            if self.pending
-                || (self.model.busy
-                    && self.active_step.is_none()
+            if self.state.pending
+                || (self.state.model.busy
+                    && self.state.active_step.is_none()
                     && self
+                        .state
                         .model
                         .conversation
                         .turns
@@ -1053,24 +1094,22 @@ impl Render for Drawer {
                         .is_none_or(|a| a.text().is_empty()))
             {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(
-                    if self.pending {
+                    if self.state.pending {
                         "正在准备请求…"
-                    } else if self.model.thinking {
+                    } else if self.state.model.thinking {
                         "正在思考…"
                     } else {
                         "正在分析当前会话输出…"
                     },
                 ));
             }
-            if self.model.dropped > 0 {
-                body = body.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(p.tx3)
-                        .child(format!("本次请求已省略最早 {} 轮对话", self.model.dropped)),
-                );
+            if self.state.model.dropped > 0 {
+                body = body.child(div().text_size(px(11.)).text_color(p.tx3).child(format!(
+                    "本次请求已省略最早 {} 轮对话",
+                    self.state.model.dropped
+                )));
             }
-            if let Some(error) = self.model.error {
+            if let Some(error) = self.state.model.error {
                 body = body.child(
                     div()
                         .flex_none()
@@ -1102,11 +1141,11 @@ impl Render for Drawer {
                 );
             }
         }
-        if let Some(e) = &self.save_error {
+        if let Some(e) = &self.state.save_error {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e.clone()));
         }
         // Keep the blocking card last so following the bottom reveals all its actions.
-        if !self.history && self.active_step.is_some() {
+        if !self.history && self.state.active_step.is_some() {
             body = body.child(self.active_card(cx));
         }
         let footer = div()
@@ -1142,7 +1181,7 @@ impl Render for Drawer {
                     .child(
                         crate::dialogs::button(
                             "ai-send",
-                            if self.model.busy || self.pending {
+                            if self.state.model.busy || self.state.pending {
                                 "停止"
                             } else {
                                 "发送"
@@ -1152,7 +1191,7 @@ impl Render for Drawer {
                         )
                         .h(px(30.))
                         .on_click(cx.listener(|s, _, w, cx| {
-                            if s.model.busy || s.pending {
+                            if s.state.model.busy || s.state.pending {
                                 s.stop(cx)
                             } else {
                                 s.send_input(w, cx)
@@ -1172,9 +1211,16 @@ impl Render for Drawer {
             .flex()
             .flex_col()
             .child(header)
-            .child(div().relative().flex_1().min_h_0().flex().flex_col()
-                .child(body)
-                .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(body)
+                    .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)),
+            )
             .child(footer)
     }
 }

@@ -53,7 +53,7 @@ pub enum AiError {
     RateLimited,
     #[error("余额不足，请检查服务商账户")]
     Quota,
-    #[error("上下文过长，请清空对话或缩短问题")]
+    #[error("上下文过长，请开始新对话或缩短问题")]
     ContextTooLong,
     #[error("请求超时，请稍后重试")]
     Timeout,

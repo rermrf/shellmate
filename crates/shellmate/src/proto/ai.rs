@@ -109,7 +109,8 @@ mod tests {
 
     #[test]
     fn ai_fixtures_have_both_themes_and_requested_sizes() {
-        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-markdown", "ai-markdown-wide"] {
+        assert_eq!(super::super::default_window_size("ai-new-confirm"), (1440, 900));
+        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-new-confirm", "ai-markdown", "ai-markdown-wide"] {
             assert!(super::super::SCENES.contains(&scene));
             for dark in [false, true] {
                 assert!(

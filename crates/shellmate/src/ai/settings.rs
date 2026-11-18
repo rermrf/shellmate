@@ -508,6 +508,7 @@ impl Render for AiSettings {
                                     .is_ok()
                                 {
                                     s.save = *v;
+                                    s.notify_configuration(cx);
                                 }
                                 cx.notify();
                             })),
