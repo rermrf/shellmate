@@ -7662,6 +7662,7 @@ dependencies = [
  "russh",
  "serde_json",
  "shellmate-core",
+ "shellmate-sftp",
  "shellmate-ssh",
  "tempfile",
  "thiserror 2.0.21",
