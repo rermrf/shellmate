@@ -182,7 +182,7 @@ impl Action {
             Self::Local => "⌘T",
             Self::Duplicate => "⇧⌘T",
             Self::Sidebar => "⌃⌘S",
-            Self::History => "⌃R",
+            Self::History => "⌘Y",
             _ => "",
         }
     }

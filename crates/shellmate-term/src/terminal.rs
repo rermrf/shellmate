@@ -135,7 +135,6 @@ pub enum TerminalEvent {
     CwdChanged(String),
     /// A command read from the primary screen, after privacy filtering.
     Command { command: String, cwd: Option<String>, time: i64 },
-    HistoryRequested,
     /// The user focused this terminal view.
     Focused,
     /// The painted content rectangle changed the PTY dimensions.

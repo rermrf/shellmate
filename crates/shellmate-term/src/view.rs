@@ -102,7 +102,6 @@ pub struct TerminalView {
     pub copy_on_select: bool,
     /// Right click pastes the clipboard (prototype default).
     pub right_click_paste: bool,
-    pub history_shortcut: bool,
     /// Keep the grid and backend at the last measured size while its container animates.
     pub hold_grid_size: bool,
     /// A frozen review frame has no previous layout; measure its grid at the simulated starting width.
@@ -139,7 +138,6 @@ impl TerminalView {
             search_icon: None,
             copy_on_select: true,
             right_click_paste: true,
-            history_shortcut: true,
             hold_grid_size: false,
             #[cfg(debug_assertions)]
             fixture_grid_width_offset: 0.,
@@ -320,11 +318,6 @@ impl TerminalView {
             return;
         }
         let keystroke = &event.keystroke;
-        if crate::behavior::history_shortcut(self.history_shortcut,keystroke) {
-            self.terminal.update(cx, |_, cx| cx.emit(TerminalEvent::HistoryRequested));
-            cx.stop_propagation();
-            return;
-        }
         if self.terminal.read(cx).is_exited() {
             if keystroke.key == "enter" && !keystroke.modifiers.modified() {
                 self.terminal.update(cx, |t, cx| t.restart(cx));

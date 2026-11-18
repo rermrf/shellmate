@@ -74,7 +74,6 @@ impl Workspace {
             s.view.update(cx, |v, cx| {
                 v.copy_on_select = self.preferences.get(P::CopySelection);
                 v.right_click_paste = self.preferences.get(P::RightPaste);
-                v.history_shortcut = self.preferences.get(P::HistoryShortcut);
                 cx.notify();
             });
             s.terminal.update(cx, |t, cx| {

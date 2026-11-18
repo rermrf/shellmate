@@ -87,6 +87,8 @@ pub(crate) fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(CONTEXT)),
         KeyBinding::new("cmd-ctrl-s", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("cmd-k", OpenPalette, Some(CONTEXT)),
+        // ⌃R stays with the shell's reverse search; the app's history has its own key.
+        KeyBinding::new("cmd-y", History, Some(CONTEXT)),
         KeyBinding::new("cmd-,", Settings, Some(CONTEXT)),
         KeyBinding::new("cmd-n", NewConnection, Some(CONTEXT)),
         KeyBinding::new("cmd-d", ToggleSplit, Some(CONTEXT)),
@@ -411,7 +413,6 @@ impl Workspace {
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
             view.top_radius = CARD_RADIUS;
-            view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view
         });
 
@@ -460,11 +461,6 @@ impl Workspace {
                 return;
             }
             if matches!(event, TerminalEvent::Focused) {this.note_terminal_focus(id,cx);return;}
-            if matches!(event, TerminalEvent::HistoryRequested) {
-                this.note_terminal_focus(id,cx);
-                this.open_history(window, cx);
-                return;
-            }
             let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
             match (&mut session.kind, event) {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
@@ -1085,7 +1081,7 @@ impl Workspace {
                         .on_click(cx.listener(|this,_,w,cx|this.toggle_recording(w,cx))))
                     .child(pill("logs", "记录", "会话记录与回放", true).on_click(cx.listener(|this,_,w,cx|this.open_records(None,false,w,cx))))
                     .child(
-                        pill("history", if focused.view.read(cx).history_shortcut { "历史 ⌃R" } else { "历史" }, "跨主机命令历史", true)
+                        pill("history", "历史 ⌘Y", "跨主机命令历史", true)
                             .on_click(cx.listener(|this, _, window, cx| this.open_history(window, cx))),
                     )
                     .child(pill("search", "搜索 ⌘F", "在输出中搜索", true).on_click(move |_, window, cx| {

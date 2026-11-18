@@ -317,7 +317,6 @@ impl Workspace {
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
             view.top_radius = CARD_RADIUS;
-            view.history_shortcut = self.store.borrow().history_shortcut().unwrap_or(true);
             view
         });
         let session_id = self.next_id;

@@ -150,7 +150,7 @@ pub fn paste_payload(text: &str, mode: &TermMode) -> String {
 mod tests {
     #[test]
     fn menubar_shortcuts_never_encode_shell_input() {
-        for key in ["cmd-n", "cmd-d", "cmd-,", "cmd-h", "alt-cmd-h", "cmd-m", "ctrl-cmd-f",
+        for key in ["cmd-n", "cmd-d", "cmd-y", "cmd-,", "cmd-h", "alt-cmd-h", "cmd-m", "ctrl-cmd-f",
             "alt-cmd-1", "alt-cmd-2", "alt-cmd-3", "alt-cmd-4"] {
             assert_eq!(esc(key), None, "{key}");
         }

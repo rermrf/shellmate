@@ -619,7 +619,6 @@ impl Render for SettingsWindow {
                     P::BracketedPaste,
                     P::PromptHighlight,
                     P::History,
-                    P::HistoryShortcut,
                     P::SessionLog,
                     P::AutoRecord,
                 ],
