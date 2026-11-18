@@ -28,6 +28,8 @@ impl Workspace {
     }
     pub(super) fn open_palette_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         let data = PaletteData {
+            monitor: self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(|s| s.supports_panel(Panel::Monitor)),
+            forward: self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(|s| s.supports_panel(Panel::Forward)),
             book: self.book.clone(),
             sessions: self
                 .sessions

@@ -373,7 +373,7 @@ impl Workspace {
         }
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);
-        self.sync_monitor_activity();
+        self.sync_monitor_activity(cx);
         cx.notify();
     }
 

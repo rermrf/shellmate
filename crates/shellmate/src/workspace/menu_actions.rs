@@ -7,6 +7,7 @@ struct Available {
     session: bool,
     files: bool,
     remote_panels: bool,
+    monitor: bool,
     duplicate: bool,
     split: bool,
     recording: bool,
@@ -24,6 +25,7 @@ impl Available {
             session: main.is_some(),
             files: main.is_some() && Panel::Files.supported(protocol),
             remote_panels: main.is_some() && Panel::Forward.supported(protocol),
+            monitor: main.is_some() && Panel::Monitor.supported(protocol),
             duplicate: main.is_some() && Session::duplicable(protocol),
             split: active.is_some_and(|(id, panel)| panel == Panel::Terminal &&
                 (split.other.is_some() || Split::candidate(id, rows, &[]).is_some())),
@@ -55,6 +57,8 @@ impl Available {
         }
         if self.remote_panels {
             bind(&ShowForward, |workspace, window, cx| workspace.show_panel(Panel::Forward, window, cx));
+        }
+        if self.monitor {
             bind(&ShowMonitor, |workspace, window, cx| workspace.show_panel(Panel::Monitor, window, cx));
         }
         bind(&ToggleTheme, |workspace, window, cx| workspace.toggle_theme(&ToggleTheme, window, cx));
@@ -155,7 +159,8 @@ mod tests {
             for (commands, flag) in [
                 (vec![CloseTab.name(), ShowTerminal.name()], flags[0]),
                 (vec![ShowFiles.name()], flags[1] || scene.contains("local")),
-                (vec![ShowForward.name(), ShowMonitor.name()], flags[1]),
+                (vec![ShowForward.name()], flags[1]),
+                (vec![ShowMonitor.name()], flags[1] || (cfg!(target_os = "macos") && scene.contains("local"))),
                 (vec![DuplicateSession.name()], flags[2]), (vec![ToggleSplit.name()], flags[3]),
                 (vec![ToggleRecording.name()], flags[4]), (vec![NextTab.name(), PreviousTab.name()], flags[5]),
             ] {

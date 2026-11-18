@@ -343,7 +343,17 @@ fn privilege_of(action: ProcessAction, process: &Process, probe: &Probe) -> Priv
 }
 
 /// How the command of `action` gets to run, and the line that will be run.
+pub(crate) fn local_command(action: ProcessAction, process: &Process) -> Result<Command, BuildError> {
+    let command = command_of(action, process)?;
+    match action {
+        ProcessAction::Nice => Command::new(command.argv().iter().filter(|arg| arg.as_str() != "-n").cloned()),
+        ProcessAction::Strace => Err(BuildError::Empty),
+        _ => Ok(command),
+    }
+}
+
 fn route(action: ProcessAction, process: &Process, probe: &Probe) -> Result<(Via, String, bool), BuildError> {
+    if probe.local_hardware.is_some() { return Ok((Via::Direct, local_command(action, process)?.line(), true)); }
     let command = command_of(action, process)?;
     let privilege = privilege_of(action, process, probe);
     if action == ProcessAction::Strace {
@@ -363,6 +373,7 @@ fn route(action: ProcessAction, process: &Process, probe: &Probe) -> Result<(Via
 pub fn buttons(process: &Process, probe: Option<&Probe>) -> Vec<ActionButton> {
     ProcessAction::ALL
         .iter()
+        .filter(|action| **action != ProcessAction::Strace || !probe.is_some_and(|p| p.local_hardware.is_some()))
         .map(|action| {
             let tone = match action {
                 ProcessAction::Strace => ButtonTone::Accent,

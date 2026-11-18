@@ -87,6 +87,7 @@ pub struct MonitorData {
 }
 
 impl MonitorData {
+    pub fn local(&self) -> bool { self.probe.as_ref().is_some_and(|probe| probe.local_hardware.is_some()) }
     /// A monitor that has not said anything yet.
     pub fn empty() -> Self {
         Self { phase: Phase::Idle, probe: None, snapshot: None, services: None, docker: None, forwards: Arc::default() }
@@ -208,15 +209,20 @@ pub fn header(data: &MonitorData, page: Page, host: &str) -> HeaderView {
 
     let mut chips = Vec::new();
     if let Some(probe) = probe.filter(|p| p.can_collect()) {
-        chips.push(sudo_chip(probe.sudo));
-        chips.push(docker_chip(probe));
-        chips.push(systemd_chip(probe));
-        chips.push(Chip { text: "独立 exec 通道 · 2s".into(), tone: Tone::Plain });
+        if let Some(hardware) = &probe.local_hardware {
+            if !hardware.is_empty() { chips.push(Chip { text: hardware.clone(), tone: Tone::Plain }); }
+        } else {
+            chips.push(sudo_chip(probe.sudo));
+            chips.push(docker_chip(probe));
+            chips.push(systemd_chip(probe));
+            chips.push(Chip { text: "独立 exec 通道 · 2s".into(), tone: Tone::Plain });
+        }
     }
 
     let attention = attention_count(data);
     let tabs = Page::ALL
         .iter()
+        .filter(|page| **page != Page::Services || !data.local())
         .map(|candidate| PageTab {
             page: *candidate,
             active: *candidate == page,
@@ -739,6 +745,9 @@ pub fn docker_page(probe: Option<&Probe>) -> Option<Placeholder> {
     };
     if probe.usable_container_runtime().is_some() {
         return None;
+    }
+    if probe.local_hardware.is_some() {
+        return Some(Placeholder { title: "未检测到 Docker".into(), detail: "没有可用的 Docker 引擎。".into() });
     }
     Some(match probe.containers.first() {
         None => Placeholder {

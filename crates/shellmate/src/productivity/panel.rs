@@ -46,6 +46,8 @@ pub enum Event {
 }
 
 pub struct PaletteData {
+    pub monitor: bool,
+    pub forward: bool,
     pub book: Rc<HostBook>,
     pub sessions: Vec<SessionItem>,
     pub active: Option<usize>,
@@ -135,6 +137,7 @@ impl Picker {
                     data.active,
                     &data.snippets,
                     model::PaletteFlags {
+                        monitor: data.monitor, forward: data.forward,
                         sidebar_open: data.sidebar_open,
                         split: data.split,
                         vault_lock: data.vault_lock,

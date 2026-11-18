@@ -81,6 +81,7 @@ pub struct MonitorPanel {
     service_log: Option<LogPane>,
     // the Docker page
     container_log: Option<(String, LogPane)>,
+    local_visible: bool,
     docker_scroll: ScrollHandle,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -161,6 +162,7 @@ impl MonitorPanel {
             service_scroll: UniformListScrollHandle::new(),
             service_log: None,
             container_log: None,
+            local_visible: true,
             docker_scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -205,12 +207,20 @@ impl MonitorPanel {
     /// Shows a sub-page. The logs follow what is in front: the journal of the selected service on the 服务
     /// page, the open container log on the Docker page, nothing elsewhere.
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page == Page::Services && self.data.local() { return; }
         if self.page != page {
             self.page = page;
             self.sync_service_log(cx);
             self.sync_container_log(cx);
             cx.emit(MonitorPanelEvent::PageChanged(page));
             cx.notify();
+        }
+    }
+
+    pub fn set_local_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.local_visible != visible {
+            self.local_visible = visible;
+            self.sync_container_log(cx);
         }
     }
 

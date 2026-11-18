@@ -89,6 +89,8 @@ pub enum JournalAccess {
 /// Everything the probe found out.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Probe {
+    /// Hardware description of a local macOS sampler; absent on SSH connections (even to Darwin).
+    pub local_hardware: Option<String>,
     /// `PRETTY_NAME` of `/etc/os-release`.
     pub os_name: Option<String>,
     /// `uname -sr`: `Linux 5.15.0-91-generic`.
@@ -128,6 +130,7 @@ impl Probe {
     /// A probe that knows nothing (the starting point of the parser; also handy in tests).
     pub fn unknown() -> Self {
         Self {
+            local_hardware: None,
             os_name: None,
             kernel: String::new(),
             is_linux: false,
@@ -146,7 +149,7 @@ impl Probe {
 
     /// Whether the collector can run here.
     pub fn can_collect(&self) -> bool {
-        self.is_linux
+        self.is_linux || self.local_hardware.is_some()
     }
 
     /// The container tool to use: the first one the login user can use (directly or with sudo), docker

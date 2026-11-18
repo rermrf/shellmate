@@ -214,6 +214,8 @@ pub struct SessionItem {
 /// Workspace state that changes which palette actions exist and how they read.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PaletteFlags {
+    pub monitor: bool,
+    pub forward: bool,
     pub sidebar_open: bool,
     pub split: bool,
     /// Credentials live in the master-password vault, the only store the app can lock.
@@ -228,7 +230,7 @@ pub fn palette(
     snippets: &[SnippetGroup],
     flags: PaletteFlags,
 ) -> Vec<Item> {
-    let PaletteFlags { sidebar_open, split, vault_lock } = flags;
+    let PaletteFlags { sidebar_open, split, vault_lock, monitor, forward } = flags;
     let empty = query.trim().is_empty();
     let mut items = Vec::new();
     if let Some(host) = quick_connect(query) {
@@ -289,6 +291,7 @@ pub fn palette(
         .into_iter()
         // Only the master-password vault can be locked.
         .filter(|a| vault_lock || *a != Action::LockVault)
+        .filter(|a| (*a != Action::Monitor || monitor) && (*a != Action::Forward || forward))
         .take(if empty { 5 } else { usize::MAX })
         .map(|a| Item {
             group: "操作",
@@ -461,7 +464,7 @@ mod tests {
     }
     #[test]
     fn palette_fuzzy_order_groups_and_cap() {
-        let flags = |vault_lock| PaletteFlags { sidebar_open: true, split: false, vault_lock };
+        let flags = |vault_lock| PaletteFlags { sidebar_open: true, split: false, vault_lock, monitor: true, forward: true };
         let mut hosts: Vec<_> = (0..20)
             .map(|i| Host::new(format!("prod-{i}"), "10.0.0.1"))
             .collect();

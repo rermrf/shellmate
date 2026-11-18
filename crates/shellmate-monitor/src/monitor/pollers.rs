@@ -149,6 +149,11 @@ impl Task {
     }
     /// Runs a line on the connection.
     async fn exec(&self, line: String) -> Result<ExecOutput, String> {
+        #[cfg(target_os = "macos")]
+        if self.local {
+            use crate::local::runner;
+            return runner::output(&mut runner::shell(&line), COMMAND_TIMEOUT, MAX_OUTPUT).await.map_err(|err| err.to_string());
+        }
         let connection = self.connection().ok_or_else(|| "没有可用的 SSH 连接".to_string())?;
         let result =
             connection.exec_with(&line, ExecOptions { timeout: COMMAND_TIMEOUT, max_output: MAX_OUTPUT }).await;
@@ -345,7 +350,7 @@ impl Task {
         want_usage: bool,
         oom: &mut std::collections::HashSet<String>,
     ) -> bool {
-        let tool = runtime.kind.command();
+        let tool = self.tool(runtime);
         let base = self.refresh_containers(runtime, oom);
         let usage = async {
             if !want_usage {
@@ -381,14 +386,9 @@ impl Task {
         runtime: &ContainerRuntime,
         oom: &mut std::collections::HashSet<String>,
     ) -> bool {
-        let (containers, error) = match self.exec(docker_script(runtime)).await {
-            Ok(output) if output.truncated => (None, Some("容器列表超过输出上限".into())),
-            Ok(output) if output.status.success() => {
-                let mut containers = parse_containers(&output.stdout_text());
-                remember_oom(&mut containers, oom);
-                (Some(containers), None)
-            }
-            Ok(output) => (None, Some(explain_failure(&output))),
+        let result = self.list_containers(runtime).await;
+        let (containers, error) = match result {
+            Ok(mut containers) => { remember_oom(&mut containers, oom); (Some(containers), None) }
             Err(why) => (None, Some(why)),
         };
         self.with(|inner, state| {
@@ -405,18 +405,42 @@ impl Task {
         .is_some()
     }
 
+    fn tool<'a>(&self, runtime: &'a ContainerRuntime) -> &'a str {
+        if self.local { &runtime.path } else { runtime.kind.command() }
+    }
+
+    async fn list_containers(&self, runtime: &ContainerRuntime) -> Result<Vec<Container>, String> {
+        let checked = |output: ExecOutput| {
+            if output.truncated { Err("容器列表超过输出上限".into()) }
+            else if !output.status.success() { Err(explain_failure(&output)) }
+            else { Ok(output.stdout_text()) }
+        };
+        if !self.local { return Ok(parse_containers(&checked(self.exec(docker_script(runtime)).await?)?)); }
+        let tool = self.tool(runtime);
+        let entries = docker::parse_ps(&checked(self.exec(docker::ps(tool).line()).await?)?);
+        let ids = entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+        let mut details = Vec::new();
+        for batch in ids.chunks(docker::INSPECT_BATCH) {
+            let command = docker::inspect(tool, batch).map_err(|err| err.to_string())?;
+            if let Ok(text) = checked(self.exec(command.line()).await?) { details.extend(docker::parse_inspect(&text)); }
+        }
+        Ok(docker::merge(&entries,&details))
+    }
+
+    async fn stream(&self, line: String) -> Option<PollStream> {
+        #[cfg(target_os = "macos")]
+        if self.local { return crate::local::runner::Stream::open(&line).ok().map(|stream| PollStream::Local(Box::new(stream))); }
+        self.connection()?.exec_stream(&crate::script::watched(&line)).await.ok().map(|stream| PollStream::Ssh(Box::new(stream)))
+    }
+
     /// The `events` stream: every container event asks for a new look.
     async fn watch_events(self, runtime: ContainerRuntime, wake: Arc<Notify>) {
         loop {
-            let line = crate::script::watched(&Self::docker_line(&runtime, docker::events(runtime.kind.command())));
-            if let Some(connection) = self.connection() {
-                let stream = connection.exec_stream(&line).await;
-                drop(connection);
-                if let Ok(mut stream) = stream {
-                    while let Some(line) = stream.next_line().await {
-                        if docker::is_container_event(&line) {
-                            wake.notify_one();
-                        }
+            let line = Self::docker_line(&runtime, docker::events(self.tool(&runtime)));
+            if let Some(mut stream) = self.stream(line).await {
+                while let Some(line) = stream.next_line().await {
+                    if docker::is_container_event(&line) {
+                        wake.notify_one();
                     }
                 }
             }
@@ -435,15 +459,8 @@ impl Task {
                     return;
                 }
             }
-            let line = crate::script::watched(&Self::docker_line(&runtime, docker::stats(runtime.kind.command())));
-            let stream = match self.connection() {
-                Some(connection) => {
-                    let stream = connection.exec_stream(&line).await;
-                    drop(connection);
-                    stream.ok()
-                }
-                None => None,
-            };
+            let line = Self::docker_line(&runtime, docker::stats(self.tool(&runtime)));
+            let stream = self.stream(line).await;
             if let Some(mut stream) = stream {
                 // `stats` writes all containers and then, a second later, moves the cursor home (`ESC [ H`) and writes
                 // them again: a batch ends where the next one begins (and every line ends with `ESC [ K`, which is
@@ -492,6 +509,22 @@ impl Task {
     }
 }
 
+enum PollStream {
+    Ssh(Box<shellmate_ssh::ExecStream>),
+    #[cfg(target_os = "macos")]
+    Local(Box<crate::local::runner::Stream>),
+}
+
+impl PollStream {
+    async fn next_line(&mut self) -> Option<String> {
+        match self {
+            Self::Ssh(stream) => stream.next_line().await,
+            #[cfg(target_os = "macos")]
+            Self::Local(stream) => stream.next_line().await,
+        }
+    }
+}
+
 /// Docker clears `OOMKilled` when the restart policy starts the container again, so a container that is killed
 /// for its memory again and again says so only half of the time. A container that was seen killed keeps the
 /// flag for as long as it is in the loop (and is forgotten when it is not, or gone).
@@ -530,7 +563,23 @@ pub(super) fn follow(inner: &Arc<Inner>, command: String) -> Follow {
     let (tx, rx) = async_channel::bounded(1024);
     let slot = inner.slot.clone();
     let closed = lock(&inner.state).closed;
+    #[cfg(target_os = "macos")]
+    let local = inner.local;
     let task = inner.runtime.spawn(async move {
+        #[cfg(target_os = "macos")]
+        if local && !closed {
+            let why = match crate::local::runner::Stream::open(&command) {
+                Ok(mut stream) => {
+                    while let Some(line) = stream.next_line().await {
+                        if tx.send(FollowEvent::Line(line)).await.is_err() { return; }
+                    }
+                    stream.finish().await
+                }
+                Err(err) => err.to_string(),
+            };
+            let _ = tx.send(FollowEvent::Ended(why)).await;
+            return;
+        }
         let connection = lock(&slot).as_ref().and_then(WeakConnection::upgrade).filter(|_| !closed);
         let Some(connection) = connection else {
             let _ = tx.send(FollowEvent::Ended("没有可用的 SSH 连接".into())).await;

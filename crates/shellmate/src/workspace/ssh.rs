@@ -849,6 +849,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(ix) = self.sessions.iter().position(|s| s.id == source && matches!(s.kind, super::SessionKind::Local)) {
+            if self.sessions[ix].exited { return; }
+            if enter {
+                self.open_local(window, cx);
+                if let Some(tab) = self.sessions.last_mut() {
+                    tab.title = format!("本机 · {label}").into();
+                    tab.typed = Some(TypedLine { text, enter });
+                    let id = tab.id;
+                    self.type_pending(id, window, cx);
+                }
+                return;
+            }
+            self.activate(ix, window, cx);
+            self.show_panel(Panel::Terminal, window, cx);
+            self.sessions[ix].terminal.update(cx, |terminal, _| terminal.paste(&text));
+            return;
+        }
         let Some((source_group, host_id)) =
             self.sessions.iter().find(|s| s.id == source).and_then(|s| s.ssh()).map(|ssh| (ssh.group, ssh.host.id.clone()))
         else {

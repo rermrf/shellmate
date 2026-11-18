@@ -1,10 +1,5 @@
-//! The 监控 panel inside the workspace: one panel per SSH tab, all the tabs of a connection on the one
-//! [`Monitor`] of that connection.
-//!
-//! Every connection ([`ConnGroup`]) has a monitor next to its forwarder and its SFTP link. It collects only
-//! while a tab of that connection is the one in front and shows the monitor page (switching between the
-//! sub-pages does not matter), and for 10 seconds after that; the collector's channel is the only thing the
-//! monitor holds on the connection, and it goes with the last tab.
+//! Each tab owns its panel; tabs share a monitor per SSH group or per local machine in the workspace.
+//! Only the active tab supplies focus. Its monitor continues sampling for 60 seconds after it leaves.
 
 use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
@@ -18,7 +13,7 @@ use shellmate_monitor::{
 use shellmate_ssh::Connection;
 
 use super::group::{GroupMonitor, PendingAction};
-use super::{Panel, Workspace};
+use super::{Panel, Session, SessionKind, Workspace};
 use crate::dialogs::confirm::ConfirmDialog;
 use crate::monitor::containers::{self, ForwardTarget};
 use crate::monitor::model::{ForwardInfo, MonitorData, Page};
@@ -38,23 +33,52 @@ pub struct MonitorTab {
 /// The title of the toasts of the monitor.
 const TOAST_TITLE: &str = "监控";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner { Local, Ssh(usize) }
+
+impl Session {
+    fn monitor_owner(&self) -> Option<Owner> {
+        match &self.kind { SessionKind::Local => Some(Owner::Local), SessionKind::Ssh(ssh) => Some(Owner::Ssh(ssh.group)), _ => None }
+    }
+}
+
 impl Workspace {
     // ---- the engine of a connection ------------------------------------------------------------
 
     /// Gives a new connection its monitor and starts following what it says.
     pub(super) fn attach_monitor(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.make_monitor(Owner::Ssh(group_id), window, cx);
+    }
+
+    fn backend(&self, owner: Owner) -> Option<&GroupMonitor> {
+        match owner { Owner::Local => self.local_monitor.as_ref(), Owner::Ssh(id) => self.group(id)?.monitor.as_ref() }
+    }
+
+    fn backend_mut(&mut self, owner: Owner) -> Option<&mut GroupMonitor> {
+        match owner { Owner::Local => self.local_monitor.as_mut(), Owner::Ssh(id) => self.group_mut(id)?.monitor.as_mut() }
+    }
+
+    fn make_monitor(&mut self, owner: Owner, window: &mut Window, cx: &mut Context<Self>) {
         let Some(runtime) = runtime::get(cx) else { return };
         let (events, changes) = async_channel::unbounded();
-        let monitor = Monitor::with_options(runtime.handle(), events, Options::default());
+        let monitor = match owner {
+            #[cfg(target_os = "macos")]
+            Owner::Local => Monitor::local(runtime.handle(), events),
+            #[cfg(not(target_os = "macos"))]
+            Owner::Local => return,
+            Owner::Ssh(_) => Monitor::with_options(runtime.handle(), events, Options::default()),
+        };
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = changes.recv().await {
-                if this.update_in(cx, |this, window, cx| this.on_monitor_event(group_id, event, window, cx)).is_err() {
+                if this.update_in(cx, |this, window, cx| this.on_monitor_event(owner, event, window, cx)).is_err() {
                     break;
                 }
             }
         });
-        if let Some(group) = self.group_mut(group_id) {
-            group.monitor = Some(GroupMonitor { monitor, pending: Default::default(), _task: Some(task) });
+        let backend = Some(GroupMonitor { monitor, pending: Default::default(), _task: Some(task) });
+        match owner {
+            Owner::Local => self.local_monitor = backend,
+            Owner::Ssh(id) => if let Some(group) = self.group_mut(id) { group.monitor = backend; },
         }
     }
 
@@ -76,17 +100,25 @@ impl Workspace {
 
     /// Tells every connection whether one of its tabs is showing the monitor page: only then it collects. The
     /// sub-page in front tells which numbers are wanted (container statistics, how often the lists are asked for).
-    pub(super) fn sync_monitor_activity(&mut self) {
+    pub(super) fn sync_monitor_activity(&mut self, cx: &mut Context<Self>) {
         let showing = self
             .active
             .and_then(|ix| self.sessions.get(ix))
             .filter(|session| session.panel == Panel::Monitor)
-            .and_then(|session| session.ssh().map(|ssh| (ssh.group, session.monitor.as_ref().map(|tab| tab.page))));
-        for group in &self.groups {
-            if let Some(monitor) = &group.monitor {
-                let here = showing.filter(|(id, _)| *id == group.id);
+            .and_then(|s| Some((s.monitor_owner()?, s.monitor.as_ref()?.page)));
+        if !self.sessions.iter().any(|s| s.monitor_owner() == Some(Owner::Local)) { self.local_monitor = None; }
+        for (ix,session) in self.sessions.iter().enumerate() {
+            if session.monitor_owner() == Some(Owner::Local) && let Some(tab) = &session.monitor {
+                let visible = Some(ix) == self.active && session.panel == Panel::Monitor;
+                tab.panel.update(cx, |panel,cx| panel.set_local_visible(visible,cx));
+            }
+        }
+        for owner in self.groups.iter().map(|g| Owner::Ssh(g.id)).chain([Owner::Local]) {
+            if let Some(monitor) = self.backend(owner) {
+                let here = showing.filter(|(id, _)| *id == owner);
                 monitor.monitor.set_active(here.is_some());
-                if let Some((_, Some(page))) = here {
+                if owner == Owner::Local && here.is_none() { monitor.monitor.set_focus(Focus::Overview); }
+                if let Some((_, page)) = here {
                     monitor.monitor.set_focus(match page {
                         Page::Overview => Focus::Overview,
                         Page::Processes => Focus::Processes,
@@ -135,16 +167,15 @@ impl Workspace {
     // ---- what the panels show ------------------------------------------------------------------
 
     /// What the monitor of connection `group_id` knows now.
-    fn monitor_data(&self, group_id: usize) -> MonitorData {
-        let Some(group) = self.group(group_id) else { return MonitorData::empty() };
-        match group.monitor.as_ref() {
+    fn monitor_data(&self, owner: Owner) -> MonitorData {
+        match self.backend(owner) {
             Some(monitor) => MonitorData {
                 phase: monitor.monitor.phase(),
-                probe: monitor.monitor.probe(),
+                probe: monitor.monitor.probe().or_else(|| (owner == Owner::Local).then(|| std::sync::Arc::new(Probe { local_hardware: Some(String::new()), ..Probe::unknown() }))),
                 snapshot: monitor.monitor.snapshot(),
                 services: monitor.monitor.services(),
                 docker: monitor.monitor.docker(),
-                forwards: self.forward_infos(group.key.host()),
+                forwards: match owner { Owner::Ssh(id) => self.group(id).map(|g| self.forward_infos(g.key.host())).unwrap_or_default(), Owner::Local => Default::default() },
             },
             None => MonitorData::empty(),
         }
@@ -152,14 +183,18 @@ impl Workspace {
 
     /// Hands what the monitor knows to every monitor panel of the connection's tabs.
     pub(super) fn sync_monitor_group(&mut self, group_id: usize, cx: &mut Context<Self>) {
+        self.sync_monitor_owner(Owner::Ssh(group_id), cx);
+    }
+
+    fn sync_monitor_owner(&mut self, owner: Owner, cx: &mut Context<Self>) {
         if self.monitor_frozen {
             return;
         }
-        let data = self.monitor_data(group_id);
+        let data = self.monitor_data(owner);
         let panels: Vec<_> = self
             .sessions
             .iter()
-            .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id))
+            .filter(|s| s.monitor_owner() == Some(owner))
             .filter_map(|s| s.monitor.as_ref().map(|tab| tab.panel.clone()))
             .collect();
         for panel in panels {
@@ -172,14 +207,13 @@ impl Workspace {
         if self.sessions[ix].monitor.is_some() {
             return true;
         }
-        let Some((session_id, host, group_id)) =
-            self.sessions[ix].ssh().map(|ssh| (self.sessions[ix].id, ssh.host.clone(), ssh.group))
-        else {
-            return false;
-        };
-        let data = self.monitor_data(group_id);
-        let monitor = self.group(group_id).and_then(|group| group.monitor.as_ref()).map(|m| m.monitor.clone());
-        let panel = cx.new(|cx| MonitorPanel::new(host.name.clone(), data, monitor, window, cx));
+        let Some(owner) = self.sessions[ix].monitor_owner() else { return false };
+        if owner == Owner::Local && self.local_monitor.is_none() && !self.monitor_frozen { self.make_monitor(owner, window, cx); }
+        let session_id = self.sessions[ix].id;
+        let host = self.sessions[ix].host().map_or("本机", |host| &host.name);
+        let data = self.monitor_data(owner);
+        let monitor = self.backend(owner).map(|m| m.monitor.clone());
+        let panel = cx.new(|cx| MonitorPanel::new(host.to_owned(), data, monitor, window, cx));
         let subscription =
             cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &MonitorPanelEvent, window, cx| {
                 this.on_monitor_panel_event(session_id, event, window, cx)
@@ -189,28 +223,26 @@ impl Workspace {
     }
 
     /// What the engine of connection `group_id` says.
-    fn on_monitor_event(&mut self, group_id: usize, event: MonitorEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_monitor_event(&mut self, owner: Owner, event: MonitorEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             MonitorEvent::Phase(phase) => log::debug!("监控 {phase:?}"),
             MonitorEvent::Probe(_)
             | MonitorEvent::Snapshot(_)
             | MonitorEvent::Services(_)
             | MonitorEvent::Docker(_) => {}
-            MonitorEvent::Action(report) => self.on_action_report(group_id, report, window, cx),
+            MonitorEvent::Action(report) => self.on_action_report(owner, report, window, cx),
         }
-        self.sync_monitor_group(group_id, cx);
+        self.sync_monitor_owner(owner, cx);
     }
 
     /// An action finished: the toast shows the command line and how it went.
-    fn on_action_report(&mut self, group_id: usize, report: ActionReport, window: &mut Window, cx: &mut Context<Self>) {
-        let pending = self
-            .group_mut(group_id)
-            .and_then(|group| group.monitor.as_mut())
+    fn on_action_report(&mut self, owner: Owner, report: ActionReport, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = self.backend_mut(owner)
             .and_then(|monitor| monitor.pending.remove(&report.id));
         // What the action changed is asked about again at once, whether it worked or not.
         if let (Some(topic), Some(monitor)) = (
             pending.as_ref().and_then(|action| action.topic),
-            self.group(group_id).and_then(|group| group.monitor.as_ref()),
+            self.backend(owner),
         ) {
             monitor.monitor.refresh(topic);
         }
@@ -225,6 +257,12 @@ impl Workspace {
                 Notification::error(format!("{line} · 失败{code}：{}", first_lines(message)))
             }
             ActionOutcome::Error(why) => Notification::error(format!("{line} · 没有执行：{why}")),
+            ActionOutcome::Terminal(plan) => {
+                if let (Some(action), shellmate_monitor::commands::Plan::Terminal { line }) = (pending, plan) {
+                    self.open_command_tab(action.session_id, "sudo", line.clone(), false, window, cx);
+                }
+                return;
+            }
         };
         window.push_notification(notification.title(TOAST_TITLE), cx);
     }
@@ -249,10 +287,8 @@ impl Workspace {
             },
             MonitorPanelEvent::Retry => {
                 if self.retry_mosh_panel(session_id,window,cx){return;}
-                let group =
-                    self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group);
-                if let Some(monitor) = group.and_then(|id| self.group(id)).and_then(|group| group.monitor.as_ref()) {
-                    monitor.monitor.restart();
+                if let Some((_, monitor)) = self.monitor_of(session_id) {
+                    monitor.restart();
                 }
             }
             MonitorPanelEvent::PageChanged(page) => {
@@ -261,7 +297,7 @@ impl Workspace {
                 {
                     tab.page = *page;
                 }
-                self.sync_monitor_activity();
+                self.sync_monitor_activity(cx);
             }
             MonitorPanelEvent::Service(action, unit) => self.run_service_action(session_id, *action, unit, window, cx),
             MonitorPanelEvent::Container(action, name) => {
@@ -276,10 +312,9 @@ impl Workspace {
     }
 
     /// The group and monitor of tab `session_id`, and the host it is on.
-    fn monitor_of(&self, session_id: usize) -> Option<(usize, Monitor, HostId)> {
-        let ssh = self.sessions.iter().find(|s| s.id == session_id)?.ssh()?;
-        let monitor = self.group(ssh.group)?.monitor.as_ref()?.monitor.clone();
-        Some((ssh.group, monitor, ssh.host.id.clone()))
+    fn monitor_of(&self, session_id: usize) -> Option<(Owner, Monitor)> {
+        let owner = self.sessions.iter().find(|s| s.id == session_id)?.monitor_owner()?;
+        Some((owner, self.backend(owner)?.monitor.clone()))
     }
 
     /// Asks the question of `planned` (if it has one) and then does it.
@@ -326,10 +361,10 @@ impl Workspace {
     ) {
         match run {
             Run::Exec { line, done } => {
-                let Some((group_id, monitor, _)) = self.monitor_of(session_id) else { return };
+                let Some((owner, monitor)) = self.monitor_of(session_id) else { return };
                 let id = monitor.run_action(line);
-                if let Some(group) = self.group_mut(group_id).and_then(|group| group.monitor.as_mut()) {
-                    group.pending.insert(id, PendingAction { done, topic });
+                if let Some(group) = self.backend_mut(owner) {
+                    group.pending.insert(id, PendingAction { done, topic, session_id });
                 }
             }
             Run::Terminal { line, enter, title } => self.open_command_tab(session_id, &title, line, enter, window, cx),
@@ -349,7 +384,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, monitor, _)) = self.monitor_of(session_id) else { return };
+        let Some((_, monitor)) = self.monitor_of(session_id) else { return };
         let (Some(list), Some(probe)) = (monitor.services(), monitor.probe()) else { return };
         let Some(service) = list.get(unit) else {
             return self.toast(Notification::warning(format!("服务 {unit} 已经不存在")), window, cx);
@@ -364,7 +399,7 @@ impl Workspace {
         session_id: usize,
         name: &str,
     ) -> Option<(Probe, ContainerRuntime, shellmate_monitor::docker::Container)> {
-        let (_, monitor, _) = self.monitor_of(session_id)?;
+        let (_, monitor) = self.monitor_of(session_id)?;
         let probe = monitor.probe()?;
         let runtime = probe.usable_container_runtime()?.clone();
         let container = monitor.docker()?.containers.iter().find(|c| c.name == name)?.clone();
@@ -400,7 +435,7 @@ impl Workspace {
 
     /// 清理: removes the dangling images after the question.
     fn run_prune(&mut self, session_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, monitor, _)) = self.monitor_of(session_id) else { return };
+        let Some((_, monitor)) = self.monitor_of(session_id) else { return };
         let (Some(probe), Some(view)) = (monitor.probe(), monitor.docker()) else { return };
         let Some(runtime) = probe.usable_container_runtime().cloned() else { return };
         match containers::prune_plan(&view, &runtime, &probe) {
@@ -422,7 +457,7 @@ impl Workspace {
             Ok(target) => target,
             Err(why) => return self.toast(Notification::warning(why), window, cx),
         };
-        let Some((_, _, host)) = self.monitor_of(session_id) else { return };
+        let Some(host) = self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.host.id.clone()) else { return };
         let forwards = self.forward_infos(&host);
         if let Some(rule) = containers::existing_forward(&forwards, &target) {
             return self.toast(Notification::info(containers::existing_text(rule)), window, cx);
@@ -458,15 +493,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(group_id) =
-            self.sessions.iter().find(|s| s.id == session_id).and_then(|s| s.ssh()).map(|ssh| ssh.group)
-        else {
-            return;
-        };
-        let Some(monitor) = self.group(group_id).and_then(|group| group.monitor.as_ref()).map(|m| m.monitor.clone())
-        else {
-            return;
-        };
+        let Some((owner, monitor)) = self.monitor_of(session_id) else { return };
         let (Some(snapshot), Some(probe)) = (monitor.snapshot(), monitor.probe()) else { return };
         let Some(process) = process::resolve(&snapshot, key) else {
             window.push_notification(
@@ -498,9 +525,13 @@ impl Workspace {
         }
         match planned.run {
             Run::Exec { line, done } => {
-                let id = monitor.run_action(line);
-                if let Some(group) = self.group_mut(group_id).and_then(|group| group.monitor.as_mut()) {
-                    group.pending.insert(id, PendingAction { done, topic: None });
+                let id = match owner {
+                    #[cfg(target_os = "macos")]
+                    Owner::Local => match process::local_command(action, process) { Ok(words) => monitor.run_local_process(words), Err(_) => return },
+                    _ => monitor.run_action(line),
+                };
+                if let Some(group) = self.backend_mut(owner) {
+                    group.pending.insert(id, PendingAction { done, topic: None, session_id });
                 }
             }
             Run::Terminal { line, enter, title } => self.open_command_tab(session_id, &title, line, enter, window, cx),
@@ -626,7 +657,7 @@ impl Workspace {
                 if now {
                     let planned = self
                         .monitor_of(session_id)
-                        .and_then(|(_, monitor, _)| Some((monitor.services()?, monitor.probe()?)))
+                        .and_then(|(_, monitor)| Some((monitor.services()?, monitor.probe()?)))
                         .and_then(|(list, probe)| services::plan(action, list.get(unit)?, &probe));
                     if let Some(planned) = planned {
                         self.execute_run(session_id, planned.run, Some(Topic::Services), window, cx);
@@ -641,7 +672,7 @@ impl Workspace {
                 match kind {
                     "exec" => self.open_container_terminal(session_id, name, window, cx),
                     "prune" if now => {
-                        let planned = self.monitor_of(session_id).and_then(|(_, monitor, _)| {
+                        let planned = self.monitor_of(session_id).and_then(|(_, monitor)| {
                             let probe = monitor.probe()?;
                             let runtime = probe.usable_container_runtime()?.clone();
                             containers::prune_plan(&*monitor.docker()?, &runtime, &probe)

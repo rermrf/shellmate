@@ -56,7 +56,7 @@ impl MonitorPanel {
             self.container_log = None;
             return;
         };
-        if self.page != Page::Docker {
+        if self.page != Page::Docker || !self.local_visible {
             // Not looking: the channel on the server is closed, and the lines are not kept.
             if pane.subject != CLOSED {
                 self.container_log = Some((name, LogPane::fixed(CLOSED.to_string(), LogKind::Docker, Vec::new())));
@@ -71,6 +71,7 @@ impl MonitorPanel {
 
     fn start_container_log(&mut self, container: &Container, cx: &mut Context<Self>) {
         let source = match self.runtime() {
+            Some(runtime) if self.data.local() => containers::log_with_tool(container, runtime, &runtime.path),
             Some(runtime) => containers::log_source(container, runtime),
             None => LogSource::Denied("这台主机没有可用的容器工具"),
         };
@@ -128,12 +129,11 @@ impl MonitorPanel {
             .font_family(MONO_FONT)
             .font_weight(FontWeight::SEMIBOLD)
             .whitespace_nowrap()
-            .cursor_pointer()
-            .hover(|d| d.opacity(0.85))
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .when(!self.data.local(), |button| button.cursor_pointer().hover(|d| d.opacity(0.85))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(MonitorPanelEvent::ForwardPort(target.clone())))))
             .flex_none()
             .child(chip.label.clone())
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(MonitorPanelEvent::ForwardPort(target.clone()))))
             .into_any_element()
     }
 

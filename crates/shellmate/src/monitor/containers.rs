@@ -417,7 +417,7 @@ pub fn plan(
     if action == ContainerAction::Remove && container.state.is_running() {
         return None;
     }
-    let command = commands::container(runtime.kind.command(), action, &container.name).ok()?;
+    let command = commands::container(tool_for(runtime,probe), action, &container.name).ok()?;
     let run = match commands::plan(&command, privilege(runtime), probe) {
         Plan::Exec { line } => Run::Exec { line, done: done_text(action) },
         Plan::Terminal { line } => {
@@ -445,7 +445,7 @@ pub fn exec_plan(container: &Container, runtime: &ContainerRuntime, probe: &Prob
     if container.state != ContainerState::Running {
         return None;
     }
-    let command = docker::exec_shell(runtime.kind.command(), &container.name).ok()?;
+    let command = docker::exec_shell(tool_for(runtime,probe), &container.name).ok()?;
     let line = commands::terminal_line(&command, privilege(runtime), probe);
     Some(Run::Terminal { line, enter: true, title: format!("{} · 容器", container.name) })
 }
@@ -455,7 +455,7 @@ pub fn prune_plan(view: &DockerView, runtime: &ContainerRuntime, probe: &Probe) 
     if view.dangling.count == 0 {
         return None;
     }
-    let command = commands::prune_dangling_images(runtime.kind.command()).ok()?;
+    let command = commands::prune_dangling_images(tool_for(runtime,probe)).ok()?;
     let run = match commands::plan(&command, privilege(runtime), probe) {
         Plan::Exec { line } => Run::Exec { line, done: "已清理" },
         Plan::Terminal { line } => Run::Terminal { line, enter: false, title: "image prune".into() },
@@ -476,8 +476,16 @@ pub fn prune_plan(view: &DockerView, runtime: &ContainerRuntime, probe: &Probe) 
 
 /// What the log of a container follows: `docker logs -f --tail 100 -t NAME` for one that runs, without `-f` for
 /// one that does not (it would never end).
+pub fn tool_for<'a>(runtime: &'a ContainerRuntime, probe: &Probe) -> &'a str {
+    if probe.local_hardware.is_some() { &runtime.path } else { runtime.kind.command() }
+}
+
 pub fn log_source(container: &Container, runtime: &ContainerRuntime) -> LogSource {
-    let Ok(command) = docker::logs(runtime.kind.command(), &container.name, container.state.is_running()) else {
+    log_with_tool(container,runtime,runtime.kind.command())
+}
+
+pub fn log_with_tool(container: &Container, runtime: &ContainerRuntime, tool: &str) -> LogSource {
+    let Ok(command) = docker::logs(tool, &container.name, container.state.is_running()) else {
         return LogSource::Denied("这个容器名不能用于查看日志");
     };
     LogSource::Follow(if runtime.access == ContainerAccess::Sudo {

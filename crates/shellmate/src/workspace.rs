@@ -108,7 +108,7 @@ pub(crate) enum Panel {
 
 impl Panel {
     fn supported(self, protocol: Option<shellmate_core::Protocol>) -> bool {
-        self == Panel::Terminal || (self == Panel::Files && protocol.is_none()) || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
+        self == Panel::Terminal || (protocol.is_none() && (self == Panel::Files || (cfg!(target_os = "macos") && self == Panel::Monitor))) || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
     }
     const ALL: [Panel; 4] = [Panel::Terminal, Panel::Files, Panel::Forward, Panel::Monitor];
 
@@ -126,7 +126,7 @@ impl Panel {
         match self {
             Panel::Terminal | Panel::Files => "",
             Panel::Forward => "本机会话没有 SSH 连接，端口转发请在 SSH 会话中设置",
-            Panel::Monitor => "本机状态请使用「活动监视器」",
+            Panel::Monitor => "此会话不支持监控",
         }
     }
 }
@@ -224,6 +224,7 @@ pub struct Workspace {
     forward_grants: shellmate_forward::GrantMemory,
     /// Debug review hook: the monitor panels show made-up data and ignore what the servers say.
     monitor_frozen: bool,
+    local_monitor: Option<group::GroupMonitor>,
     /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
     groups: Vec<group::ConnGroup>,
     active: Option<usize>,
@@ -304,6 +305,7 @@ impl Workspace {
             library_is_temporary: store_notice.is_some(),
             forward_grants: shellmate_forward::GrantMemory::new(),
             monitor_frozen: false,
+            local_monitor: None,
             groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,
@@ -506,7 +508,7 @@ impl Workspace {
         self.focus_active(window, cx);
         self.pump_active_clash(window, cx);
         self.sync_sidebar(cx);
-        self.sync_monitor_activity();
+        self.sync_monitor_activity(cx);
         cx.notify();
     }
 
@@ -544,7 +546,7 @@ impl Workspace {
             _ => {}
         }
         self.sync_sidebar(cx);
-        self.sync_monitor_activity();
+        self.sync_monitor_activity(cx);
         cx.notify();
     }
 

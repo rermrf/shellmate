@@ -14,6 +14,8 @@ pub mod commands;
 pub mod docker;
 pub mod engine;
 pub mod frame;
+#[cfg(target_os = "macos")]
+mod local;
 mod monitor;
 pub mod parse;
 pub mod probe;

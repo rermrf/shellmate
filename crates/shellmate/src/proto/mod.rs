@@ -95,6 +95,7 @@ pub const SCENES: &[&str] = &[
     "rail", "rail-mid", "rail-mid-expand",
     "local",
     "files-local", "files-local-trash",
+    "mon-local", "mon-local-proc",
     "qc",
     "tabmenu",
     "reconnect",
@@ -225,7 +226,7 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
             "set-cred-focus" | "set-cred-typed" => "set-cred-master",
             "set-ai-replace" => "set-ai",
             "host-new-focus" => "host-new",
-            "files-local" | "files-local-trash" => "local",
+            "files-local" | "files-local-trash" | "mon-local" | "mon-local-proc" => "local",
             _ => scene,
         }
     };
@@ -284,7 +285,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 76 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 78 + PAGE_SCROLL_SCENES.len());
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
@@ -298,7 +299,7 @@ mod tests {
                     "set-cred-focus" | "set-cred-typed" => "set-cred-master",
                     "set-ai-replace" => "set-ai",
                     "host-new-focus" => "host-new",
-                    "files-local" | "files-local-trash" => "local",
+                    "files-local" | "files-local-trash" | "mon-local" | "mon-local-proc" => "local",
                     _ => scene,
                 } };
                 assert_eq!(reading(scene, dark).scene, expected);

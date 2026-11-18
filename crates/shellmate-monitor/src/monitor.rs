@@ -7,6 +7,8 @@
 //! [`shutdown`](Monitor::shutdown) or after the last clone is dropped.
 
 mod pollers;
+#[cfg(target_os = "macos")]
+mod native;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -160,6 +162,8 @@ pub enum ActionOutcome {
     },
     /// The command could not be run: there is no connection, it took too long, the connection dropped.
     Error(String),
+    /// A local process action was denied. Offer the sudo line in the originating terminal.
+    Terminal(crate::commands::Plan),
 }
 
 /// The report of an action: what was run and how it went.
@@ -205,6 +209,7 @@ struct State {
 }
 
 struct Inner {
+    local: bool,
     runtime: Handle,
     events: async_channel::Sender<MonitorEvent>,
     options: Options,
@@ -253,7 +258,7 @@ impl Inner {
         if state.closed || !state.active || state.run_alive {
             return;
         }
-        if self.connection().is_none() {
+        if !self.local && self.connection().is_none() {
             self.set_phase(state, Phase::WaitingReconnect);
             return;
         }
@@ -270,6 +275,7 @@ impl Inner {
 
     fn task(self: &Arc<Self>, state: &State) -> Task {
         Task {
+            local: self.local,
             inner: Arc::downgrade(self),
             slot: self.slot.clone(),
             generation: state.generation,
@@ -294,6 +300,7 @@ impl Inner {
 /// The task of one run: probe if needed, then follow the collector until it ends.
 #[derive(Clone)]
 struct Task {
+    local: bool,
     inner: std::sync::Weak<Inner>,
     slot: Arc<Mutex<Option<WeakConnection>>>,
     generation: u64,
@@ -325,6 +332,8 @@ impl Task {
     }
 
     async fn run(self) {
+        #[cfg(target_os = "macos")]
+        if self.local { return self.run_local().await; }
         let mut failures = 0usize;
         // The tasks that ask about services and containers live as long as this run does.
         let mut watchers: Option<Vec<AbortOnDrop>> = None;
@@ -495,6 +504,16 @@ impl Monitor {
 
     /// Like [`new`](Self::new) with other settings.
     pub fn with_options(runtime: Handle, events: async_channel::Sender<MonitorEvent>, options: Options) -> Self {
+        Self::backend(runtime, events, options, false)
+    }
+
+    /// Creates a dormant macOS monitor; it never opens an SSH connection or prefetches local data.
+    #[cfg(target_os = "macos")]
+    pub fn local(runtime: Handle, events: async_channel::Sender<MonitorEvent>) -> Self {
+        Self::backend(runtime, events, Options::default(), true)
+    }
+
+    fn backend(runtime: Handle, events: async_channel::Sender<MonitorEvent>, options: Options, local: bool) -> Self {
         let state = State {
             closed: false,
             active: false,
@@ -514,6 +533,7 @@ impl Monitor {
         };
         Self {
             inner: Arc::new(Inner {
+                local,
                 runtime,
                 events,
                 options,
@@ -704,8 +724,38 @@ impl Monitor {
     /// Runs `command` (a line for the server's shell, built by [`crate::commands`]) on the connection and
     /// reports how it went as a [`MonitorEvent::Action`]. Works whether or not the collector runs.
     pub fn run_action(&self, command: impl Into<String>) -> ActionId {
-        let inner = &self.inner;
         let command = command.into();
+        let timeout = self.inner.options.action_timeout;
+        let slot = self.inner.slot.clone();
+        self.spawn_action(command.clone(), {
+            #[cfg(target_os = "macos")]
+            let local = self.inner.local;
+            async move {
+                #[cfg(target_os = "macos")]
+                if local {
+                    use crate::local::runner;
+                    return outcome(runner::output(&mut runner::shell(&command), timeout, 64 << 10).await.map_err(|err| err.to_string()));
+                }
+                let connection = lock(&slot).as_ref().and_then(WeakConnection::upgrade);
+                match connection {
+                    Some(connection) => outcome(connection.exec_with(&command, ExecOptions { timeout, max_output: 64 << 10 }).await.map_err(|err| explain(&err))),
+                    None => ActionOutcome::Error("没有可用的 SSH 连接".into()),
+                }
+            }
+        })
+    }
+
+    /// Runs validated process-action words directly on macOS (never via a shell).
+    #[cfg(target_os = "macos")]
+    pub fn run_local_process(&self, words: crate::commands::Command) -> ActionId {
+        let timeout = self.inner.options.action_timeout;
+        self.spawn_action(words.line(), crate::local::runner::process_action(words, move |mut cmd| async move {
+            crate::local::runner::output(&mut cmd, timeout, 64 << 10).await
+        }))
+    }
+
+    fn spawn_action(&self, command: String, action: impl Future<Output = ActionOutcome> + Send + 'static) -> ActionId {
+        let inner = &self.inner;
         let mut state = lock(&inner.state);
         state.next_action += 1;
         let id = ActionId(state.next_action);
@@ -713,29 +763,9 @@ impl Monitor {
             return id;
         }
         state.actions.retain(|task| !task.0.is_finished());
-        let (weak, slot, timeout) = (Arc::downgrade(inner), inner.slot.clone(), inner.options.action_timeout);
+        let weak = Arc::downgrade(inner);
         let task = inner.runtime.spawn(async move {
-            let connection = lock(&slot).as_ref().and_then(WeakConnection::upgrade);
-            let outcome = match connection {
-                None => ActionOutcome::Error("没有可用的 SSH 连接".into()),
-                Some(connection) => {
-                    let result = connection.exec_with(&command, ExecOptions { timeout, max_output: 64 << 10 }).await;
-                    drop(connection);
-                    match result {
-                        Ok(output) if output.status.success() => {
-                            ActionOutcome::Success { output: cut(&output.stdout_text()) }
-                        }
-                        Ok(output) => {
-                            let message = match output.stderr_text().trim() {
-                                "" => output.stdout_text(),
-                                stderr => stderr.to_string(),
-                            };
-                            ActionOutcome::Failure { code: output.status.code(), message: cut(&message) }
-                        }
-                        Err(err) => ActionOutcome::Error(explain(&err)),
-                    }
-                }
-            };
+            let outcome = action.await;
             if let Some(inner) = weak.upgrade() {
                 let state = lock(&inner.state);
                 inner.emit(&state, MonitorEvent::Action(ActionReport { id, command, outcome }));
@@ -743,6 +773,18 @@ impl Monitor {
         });
         state.actions.push(AbortOnDrop(task));
         id
+    }
+}
+
+pub(crate) fn outcome(result: Result<shellmate_ssh::ExecOutput, String>) -> ActionOutcome {
+    match result {
+        Ok(out) if out.status.success() => ActionOutcome::Success { output: cut(&out.stdout_text()) },
+        Ok(out) => {
+            let stderr = out.stderr_text();
+            let message = if stderr.trim().is_empty() { out.stdout_text() } else { stderr };
+            ActionOutcome::Failure { code: out.status.code(), message: cut(&message) }
+        }
+        Err(err) => ActionOutcome::Error(err),
     }
 }
 

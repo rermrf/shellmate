@@ -117,6 +117,7 @@ impl Drop for GroupForward {
 /// What is done when an action of the monitor reports back.
 #[derive(Clone, Debug)]
 pub struct PendingAction {
+    pub session_id: usize,
     /// What the toast says after the command line when it worked (`已发送`).
     pub done: &'static str,
     /// What to ask the monitor about again at once when the action is over (the list it changed).
