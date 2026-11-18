@@ -52,6 +52,7 @@ pub struct PaletteData {
     pub snippets: Vec<SnippetGroup>,
     pub sidebar_open: bool,
     pub split: bool,
+    pub vault_lock: bool,
 }
 enum Source {
     Palette(PaletteData),
@@ -133,8 +134,11 @@ impl Picker {
                     &data.sessions,
                     data.active,
                     &data.snippets,
-                    data.sidebar_open,
-                    data.split,
+                    model::PaletteFlags {
+                        sidebar_open: data.sidebar_open,
+                        split: data.split,
+                        vault_lock: data.vault_lock,
+                    },
                 )
             }
             Source::History { store, host, current } => match store.borrow().history(

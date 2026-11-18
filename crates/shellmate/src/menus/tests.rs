@@ -29,11 +29,11 @@ fn menu_tree_order_separators_and_shortcuts() {
         format!("{}: {entries}", menu.name)
     }).collect::<Vec<_>>();
     assert_eq!(tree, [
-        "Shellmate: 关于 Shellmate / | / 设置… ⌘, / 锁定凭据库 / | / 服务 / | / 隐藏 Shellmate ⌘H / 隐藏其他 ⌥⌘H / 全部显示 / | / 退出 Shellmate ⌘Q",
+        "Shellmate: 关于 Shellmate / | / 设置… ⌘, / | / 服务 / | / 隐藏 Shellmate ⌘H / 隐藏其他 ⌥⌘H / 全部显示 / | / 退出 Shellmate ⌘Q",
         "会话: 新建本机终端 ⌘T / 新建连接… ⌘N / 复制当前会话 ⇧⌘T / | / 分屏 ⌘D / 开始录制 / 广播输入 / | / 导入主机… / 导入配置包… / 导出配置包… / | / 关闭会话 ⌘W",
         "编辑: 撤销 ⌘Z / 重做 ⇧⌘Z / | / 剪切 ⌘X / 拷贝 ⌘C / 粘贴 ⌘V / 全选 ⌘A / | / 查找… ⌘F / 查找下一个 ⌘G / 查找上一个 ⇧⌘G",
         "显示: 显示侧边栏 ⌃⌘S / | / 终端 ⌥⌘1 / 文件 ⌥⌘2 / 端口转发 ⌥⌘3 / 监控 ⌥⌘4 / | / 深色外观 / | / 进入全屏幕 ⌃⌘F",
-        "工具: 命令面板… ⌘K / 命令历史… / 快捷命令 / | / AI 助手 / 解释报错 / | / 会话记录…",
+        "工具: 命令面板… ⌘K / 命令历史… / 快捷命令 / | / AI 助手 / | / 会话记录…",
         "窗口: 最小化 ⌘M / 缩放 / | / 上一个会话 ⇧⌘[ / 下一个会话 ⇧⌘]",
     ]);
 }
@@ -42,7 +42,7 @@ fn menu_tree_order_separators_and_shortcuts() {
 fn menu_labels_and_checks_follow_workspace_state() {
     for panel in [Panel::Terminal, Panel::Files, Panel::Forward, Panel::Monitor] {
         let state = MenuState { sidebar_open: true, panel: Some(panel), split: true, broadcast: true,
-            dark: true, recording: true, commands_open: panel == Panel::Terminal, ai_open: panel != Panel::Terminal };
+            dark: true, recording: true, commands_open: panel == Panel::Terminal, ai_open: panel != Panel::Terminal, vault_lock: false };
         let items = menus(&state).into_iter().flat_map(|menu| menu.items).filter_map(|item| match item {
             MenuItem::Action { name, checked, .. } => Some((name.to_string(), checked)), _ => None,
         }).collect::<std::collections::HashMap<_, _>>();

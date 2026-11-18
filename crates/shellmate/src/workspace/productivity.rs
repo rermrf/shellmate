@@ -43,6 +43,7 @@ impl Workspace {
             snippets: self.commands.read(cx).groups.clone(),
             sidebar_open: self.sidebar_open,
             split: self.split.other.is_some(),
+            vault_lock: self.vault_lock_available(),
         };
         let picker = cx.new(|cx| Picker::palette(data, query, window, cx));
         self.install_picker(picker, window, cx);

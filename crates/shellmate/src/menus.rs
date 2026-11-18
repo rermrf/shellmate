@@ -8,7 +8,7 @@ use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NextTab, Op
 actions!(shellmate, [About, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
     EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll, ShowTerminal, ShowFiles,
-    ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi, ExplainError,
+    ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi,
     Records, Minimize, Zoom]);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,18 +21,23 @@ pub(crate) struct MenuState {
     pub dark: bool,
     pub commands_open: bool,
     pub ai_open: bool,
+    /// Credentials live in the master-password vault, the only store the app can lock.
+    pub vault_lock: bool,
 }
 
 pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
     use MenuItem as Item;
     vec![
-        Menu::new("Shellmate").items([
-            Item::action("关于 Shellmate", About), Item::Separator,
-            Item::action("设置…", Settings), Item::action("锁定凭据库", LockVault), Item::Separator,
-            Item::os_submenu("服务", SystemMenuType::Services), Item::Separator,
-            Item::action("隐藏 Shellmate", HideApp), Item::action("隐藏其他", HideOthers),
-            Item::action("全部显示", ShowAll), Item::Separator, Item::action("退出 Shellmate", Quit),
-        ]),
+        Menu::new("Shellmate").items(
+            [Item::action("关于 Shellmate", About), Item::Separator, Item::action("设置…", Settings)]
+                .into_iter()
+                .chain(state.vault_lock.then(|| Item::action("锁定凭据库", LockVault)))
+                .chain([
+                    Item::Separator, Item::os_submenu("服务", SystemMenuType::Services), Item::Separator,
+                    Item::action("隐藏 Shellmate", HideApp), Item::action("隐藏其他", HideOthers),
+                    Item::action("全部显示", ShowAll), Item::Separator, Item::action("退出 Shellmate", Quit),
+                ]),
+        ),
         Menu::new("会话").items([
             Item::action("新建本机终端", NewLocalTerminal), Item::action("新建连接…", NewConnection),
             Item::action("复制当前会话", DuplicateSession), Item::Separator,
@@ -60,7 +65,7 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
         Menu::new("工具").items([
             Item::action("命令面板…", OpenPalette), Item::action("命令历史…", History),
             Item::action("快捷命令", ToggleCommands).checked(state.commands_open), Item::Separator,
-            Item::action("AI 助手", ToggleAi).checked(state.ai_open), Item::action("解释报错", ExplainError),
+            Item::action("AI 助手", ToggleAi).checked(state.ai_open),
             Item::Separator, Item::action("会话记录…", Records),
         ]),
         Menu::new("窗口").items([

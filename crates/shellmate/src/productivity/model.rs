@@ -211,15 +211,24 @@ pub struct SessionItem {
     pub host: Option<HostId>,
 }
 
+/// Workspace state that changes which palette actions exist and how they read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaletteFlags {
+    pub sidebar_open: bool,
+    pub split: bool,
+    /// Credentials live in the master-password vault, the only store the app can lock.
+    pub vault_lock: bool,
+}
+
 pub fn palette(
     query: &str,
     book: &HostBook,
     sessions: &[SessionItem],
     active: Option<usize>,
     snippets: &[SnippetGroup],
-    sidebar_open: bool,
-    split: bool,
+    flags: PaletteFlags,
 ) -> Vec<Item> {
+    let PaletteFlags { sidebar_open, split, vault_lock } = flags;
     let empty = query.trim().is_empty();
     let mut items = Vec::new();
     if let Some(host) = quick_connect(query) {
@@ -278,7 +287,9 @@ pub fn palette(
         .collect();
     let actions: Vec<_> = Action::ALL
         .into_iter()
-        .take(if empty { 5 } else { 13 })
+        // Only the master-password vault can be locked.
+        .filter(|a| vault_lock || *a != Action::LockVault)
+        .take(if empty { 5 } else { usize::MAX })
         .map(|a| Item {
             group: "操作",
             title: a.label(sidebar_open, split).into(),
@@ -450,6 +461,7 @@ mod tests {
     }
     #[test]
     fn palette_fuzzy_order_groups_and_cap() {
+        let flags = |vault_lock| PaletteFlags { sidebar_open: true, split: false, vault_lock };
         let mut hosts: Vec<_> = (0..20)
             .map(|i| Host::new(format!("prod-{i}"), "10.0.0.1"))
             .collect();
@@ -457,18 +469,28 @@ mod tests {
             h.last_connected_at = Some(i as i64);
         }
         let book = HostBook::new(vec![], hosts);
-        let rows = palette("", &book, &[], None, &samples(), true, false);
+        let rows = palette("", &book, &[], None, &samples(), flags(false));
         assert_eq!(rows[0].title, "prod-19");
         assert_eq!(rows.iter().filter(|i| i.group == "最近主机").count(), 4);
-        assert_eq!(palette("prd", &book, &[], None, &[], true, false).len(), 12);
+        assert_eq!(palette("prd", &book, &[], None, &[], flags(false)).len(), 12);
         assert_eq!(
-            palette("root@new:2222", &book, &[], None, &[], true, false)[0].group,
+            palette("root@new:2222", &book, &[], None, &[], flags(false))[0].group,
             "快速连接"
         );
         assert_eq!(
-            palette("upt", &book, &[], None, &samples(), true, false)[0].group,
+            palette("upt", &book, &[], None, &samples(), flags(false))[0].group,
             "快捷命令"
         );
+        let titles = |q: &str, lock: bool| {
+            palette(q, &book, &[], None, &[], flags(lock)).into_iter().map(|i| i.title).collect::<Vec<_>>()
+        };
+        assert!(!titles("锁定", false).contains(&"立即锁定凭据库".to_string()));
+        assert!(titles("锁定", true).contains(&"立即锁定凭据库".to_string()));
+        // Every action is reachable by search, including the ones added last.
+        for action in Action::ALL {
+            let label = action.label(true, false);
+            assert!(titles(label, true).iter().any(|t| t == label), "{label}");
+        }
         assert!(fuzzy("xx", "prod").is_none());
         assert!(fuzzy("prod", "prod").unwrap() < fuzzy("prod", "p-r-o-d").unwrap());
     }

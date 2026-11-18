@@ -10,6 +10,7 @@ struct Available {
     split: bool,
     recording: bool,
     cycle: bool,
+    vault_lock: bool,
 }
 
 type Handler = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
@@ -26,12 +27,13 @@ impl Available {
                 (split.other.is_some() || Split::candidate(id, rows, &[]).is_some())),
             recording: recording || rows.iter().any(|row| Some(row.id) == focused && row.connected()),
             cycle: rows.len() >= 2,
+            vault_lock: false,
         }
     }
 
     fn listeners(&self, mut bind: impl FnMut(&'static dyn gpui::Action, Handler)) {
         bind(&Settings, |workspace, window, cx| workspace.open_settings(0, window, cx));
-        bind(&LockVault, Workspace::lock_vault);
+        if self.vault_lock { bind(&LockVault, Workspace::lock_vault); }
         bind(&NewLocalTerminal, Workspace::open_local);
         bind(&NewConnection, Workspace::new_host);
         if self.duplicate { bind(&DuplicateSession, Workspace::duplicate_active); }
@@ -44,7 +46,6 @@ impl Available {
         if self.session {
             bind(&CloseTab, Workspace::close_tab);
             bind(&ShowTerminal, |workspace, window, cx| workspace.show_panel(Panel::Terminal, window, cx));
-            bind(&ExplainError, Workspace::explain_ai);
         }
         bind(&ToggleSidebar, |workspace, window, cx| workspace.toggle_sidebar(&ToggleSidebar, window, cx));
         if self.remote_panels {
@@ -66,6 +67,11 @@ impl Available {
 }
 
 impl Workspace {
+    /// Only the master-password vault can be locked; the system keychain unlocks with the login session.
+    pub(super) fn vault_lock_available(&self) -> bool {
+        self.secrets.backend() == shellmate_store::Backend::Master
+    }
+
     pub(super) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.secrets.lock();
         window.push_notification(Notification::info("凭据库已锁定"), cx);
@@ -95,6 +101,7 @@ impl Workspace {
             dark: cx.is_dark(),
             commands_open: self.commands_open,
             ai_open: self.ai_open,
+            vault_lock: self.vault_lock_available(),
         };
         if self.last_menu_state != Some(state) {
             self.last_menu_state = Some(state);
@@ -105,8 +112,9 @@ impl Workspace {
     pub(super) fn menu_listeners<E: InteractiveElement>(&self, mut root: E, cx: &Context<Self>) -> E {
         let session = self.active.and_then(|index| self.sessions.get(index));
         let focused_id = self.focused_session().map(|session| session.id);
-        let available = Available::for_sessions(&self.session_rows(cx), session.map(|s| (s.id, s.panel)), focused_id,
+        let mut available = Available::for_sessions(&self.session_rows(cx), session.map(|s| (s.id, s.panel)), focused_id,
             &self.split, focused_id.is_some_and(|id| self.running_recordings.contains_key(&id)));
+        available.vault_lock = self.vault_lock_available();
         available.listeners(|action, handler| {
             root.interactivity().on_boxed_action(action, cx.listener(move |workspace, _, window, cx| handler(workspace, window, cx)));
         });
@@ -139,8 +147,9 @@ mod tests {
             let available = Available::for_sessions(&rows, active.map(|id| (id, Panel::Terminal)), active, &Split::default(), false);
             let mut registered = std::collections::HashSet::new();
             available.listeners(|action, _| { assert!(registered.insert(action.name())); });
+            assert!(!registered.contains(LockVault.name()), "{scene}: the keychain cannot be locked");
             for (commands, flag) in [
-                (vec![CloseTab.name(), ShowTerminal.name(), ExplainError.name()], flags[0]),
+                (vec![CloseTab.name(), ShowTerminal.name()], flags[0]),
                 (vec![ShowFiles.name(), ShowForward.name(), ShowMonitor.name()], flags[1]),
                 (vec![DuplicateSession.name()], flags[2]), (vec![ToggleSplit.name()], flags[3]),
                 (vec![ToggleRecording.name()], flags[4]), (vec![NextTab.name(), PreviousTab.name()], flags[5]),
