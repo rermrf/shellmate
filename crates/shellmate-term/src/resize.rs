@@ -1,8 +1,12 @@
 //! Backend resize pacing; the local grid remains free to reflow every frame.
-use crate::PtyDims;
+use crate::{PtyDims, TerminalSize};
 use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_millis(100);
+
+pub(crate) fn layout_resize(current: TerminalSize, measured: TerminalSize, held: bool, pending: bool) -> Option<TerminalSize> {
+    (!held && (current != measured || pending)).then_some(measured)
+}
 
 #[derive(Default)]
 pub(crate) struct ResizeThrottle {
@@ -84,5 +88,25 @@ mod tests {
         throttle.set_dragging(false);
         assert_eq!(throttle.update(dims(90), at(101)), Some(dims(90)));
         assert_eq!(throttle.update(dims(80), at(102)), Some(dims(80)));
+    }
+
+    #[test]
+    fn held_layout_sends_only_the_final_measurement_even_after_reversal() {
+        let grid = |cols| TerminalSize { cols, ..Default::default() };
+        let mut current = grid(120);
+        let mut throttle = ResizeThrottle::default();
+        throttle.update(current.dims(), Duration::ZERO);
+        throttle.set_dragging(true);
+        throttle.set_dragging(false);
+        let mut sent = Vec::new();
+        for (frame, (held, cols)) in [(true, 118), (true, 111), (true, 116), (true, 125), (false, 130), (false, 130)].into_iter().enumerate() {
+            if let Some(next) = layout_resize(current, grid(cols), held, throttle.pending()) {
+                current = next;
+                sent.extend(throttle.update(next.dims(), Duration::from_millis(frame as u64 * 64)));
+            }
+            if held { assert_eq!(current, grid(120)); }
+        }
+        assert_eq!(sent, [grid(130).dims()]);
+        assert!(!throttle.pending());
     }
 }

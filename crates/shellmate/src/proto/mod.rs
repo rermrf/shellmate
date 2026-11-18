@@ -92,7 +92,7 @@ pub const SCENES: &[&str] = &[
     "set-local",
     "set-conn",
     "host-new", "host-new-focus",
-    "rail",
+    "rail", "rail-mid", "rail-mid-expand",
     "local",
     "qc",
     "tabmenu",
@@ -220,6 +220,7 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
         }
     } else {
         match scene {
+            "rail-mid" | "rail-mid-expand" => "main",
             "set-cred-focus" | "set-cred-typed" => "set-cred-master",
             "set-ai-replace" => "set-ai",
             "host-new-focus" => "host-new",
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 72 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 74 + PAGE_SCROLL_SCENES.len());
         assert_eq!(DATA["HOSTS"][0]["name"].s(), "prod-web-01");
         assert!(ansi(&DATA["S1"], true).contains("日志归档"));
         assert!(ansi(&DATA["S2"], false).contains("商品快照"));
@@ -291,6 +292,7 @@ mod tests {
                 let expected = if PAGE_SCROLL_SCENES.iter().any(|(name, _)| name == scene) {
                     if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
                 } else { match *scene {
+                    "rail-mid" | "rail-mid-expand" => "main",
                     "set-cred-focus" | "set-cred-typed" => "set-cred-master",
                     "set-ai-replace" => "set-ai",
                     "host-new-focus" => "host-new",

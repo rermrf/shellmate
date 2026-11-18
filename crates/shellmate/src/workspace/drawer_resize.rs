@@ -46,11 +46,7 @@ impl Workspace {
         clamp_width(
             self.ai_drawer_width,
             f32::from(window.viewport_size().width),
-            if self.sidebar_open {
-                SIDEBAR_WIDTH
-            } else {
-                RAIL_WIDTH
-            },
+            self.sidebar_motion.frame.width,
         )
     }
 
@@ -145,6 +141,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::{RAIL_WIDTH, SIDEBAR_WIDTH};
 
     #[test]
     fn drawer_width_minimum_and_window_maximum() {

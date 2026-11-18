@@ -240,20 +240,30 @@ impl Element for TerminalElement {
     ) -> Self::PrepaintState {
         let (cell_width, line_height) = self.cell_metrics(window);
         let replay=self.terminal.read(cx).is_replay();
-        let recorded=self.terminal.read(cx).size();
-        let grid = if replay { crate::replay::grid_size(recorded, cell_width) } else {TerminalSize::from_geometry(f32::from(bounds.size.width), f32::from(bounds.size.height), cell_width, line_height)};
+        let current = self.terminal.read(cx).size();
+        let width = f32::from(bounds.size.width);
+        #[cfg(debug_assertions)]
+        let width = width + self.view.read(cx).fixture_grid_width_offset;
+        let measured = if replay {
+            crate::replay::grid_size(current, cell_width)
+        } else {
+            TerminalSize::from_geometry(width, f32::from(bounds.size.height), cell_width, line_height)
+        };
+        let resize = crate::resize::layout_resize(
+            current, measured, self.view.read(cx).hold_grid_size, self.terminal.read(cx).resize_pending(),
+        );
+        let grid = resize.unwrap_or(current);
         let (cols, rows) = (grid.cols, grid.rows);
-        let size_changed = self.terminal.read(cx).size() != grid;
-        if size_changed || self.terminal.read(cx).resize_pending() {
+        if let Some(grid) = resize {
             self.terminal.update(cx, |t, cx| {
                 t.set_size(grid);
-                if size_changed {
+                if grid != current {
                     let terminal=cx.entity();
                     cx.defer(move |cx|terminal.update(cx,|_,cx|cx.emit(crate::TerminalEvent::SizeChanged)));
                 }
             });
+            if self.terminal.read(cx).resize_pending() { window.request_animation_frame(); }
         }
-        if self.terminal.read(cx).resize_pending() { window.request_animation_frame(); }
         self.view.update(cx, |v, _| v.geometry = Some(Geometry { origin: bounds.origin, size: grid }));
 
         let palette = &self.style.palette;

@@ -1,7 +1,9 @@
 //! Left column: host search, filter, grouped host list, local terminal entry; or, collapsed, the
 //! narrow rail of the same things ([`rail`]).
 
+mod motion;
 mod rail;
+pub(crate) use motion::{SidebarFrame, SidebarMotion};
 pub(crate) use rail::RAIL_WIDTH;
 
 use std::collections::{HashMap, HashSet};
@@ -103,6 +105,7 @@ pub struct Sidebar {
     local_summary: SharedString,
     /// Collapsed to the rail.
     rail: bool,
+    pub(crate) frame: SidebarFrame,
     /// A local terminal is running.
     local_alive: bool,
     active: Active,
@@ -133,6 +136,7 @@ impl Sidebar {
             session_count: 0,
             local_summary: "zsh · ~".into(),
             rail: false,
+            frame: SidebarFrame::endpoint(true),
             local_alive: false,
             active: Active::None,
             _subscriptions: subscriptions,
@@ -153,7 +157,9 @@ impl Sidebar {
     }
 
     pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.update(cx, |s, cx| s.focus(window, cx));
+        if !self.rail {
+            self.search.update(cx, |s, cx| s.focus(window, cx));
+        }
     }
 
     /// Updates live-session info shown in the list.
@@ -176,6 +182,10 @@ impl Sidebar {
             self.rail = collapsed;
             cx.notify();
         }
+    }
+
+    fn shared_footer(&self) -> bool {
+        self.frame != SidebarFrame::endpoint(!self.rail)
     }
 
     /// What the rail shows besides the hosts: whether a local terminal is running and which tab is on screen.
@@ -543,8 +553,7 @@ impl Sidebar {
             .pl(px(12.)).pr(px(10.))
             .mt(px(8.))
             .rounded(px(14.))
-            .bg(p.card)
-            .shadow(card_shadow(&p))
+            .when(!self.shared_footer(), |card| card.bg(p.card).shadow(card_shadow(&p)))
             .child(dot(if crate::prototype_fixture(){p.ok}else{p.tx3}, 8.))
             .child(div().flex_1().text_size(px(12.)).line_height(px(15.)).font_weight(FontWeight::NORMAL).text_color(p.tx2).child(if crate::prototype_fixture(){"已同步 · WebDAV · 2 分钟前"}else{SYNC_STATUS}))
             .child(
@@ -612,11 +621,8 @@ pub(crate) fn host_avatar(
         }))
 }
 
-impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.rail {
-            return self.render_rail(cx).into_any_element();
-        }
+impl Sidebar {
+    fn render_full(&self, cx: &mut Context<Self>) -> gpui::Div {
         let query = self.search.read(cx).value();
         let book = self.book.clone();
         let sections = sections(&book, self.filter, &query);
@@ -665,6 +671,35 @@ impl Render for Sidebar {
                     .children(list), &self.scroll, cx.palette().win, 8.),
             ))
             .child(self.render_footer(cx))
-            .into_any_element()
+    }
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.shared_footer() {
+            return if self.rail { self.render_rail(cx) } else { self.render_full(cx) };
+        }
+
+        let frame = self.frame;
+        let openness = frame.openness();
+        let palette = cx.palette().clone();
+        let mut viewport = div().absolute().inset_0().overflow_hidden();
+        if frame.content > 0. || !self.rail {
+            viewport = viewport.child(self.render_full(cx).absolute().top_0().left_0().opacity(frame.content.max(0.)));
+            if frame.content <= 0. {
+                // Mount search immediately on expansion, without invisible pointer targets.
+                viewport = viewport.child(div().absolute().inset_0().occlude());
+            }
+        }
+        if frame.content < 0. {
+            viewport = viewport.child(self.render_rail(cx).absolute().top_0().left_0().opacity(-frame.content));
+        }
+
+        let inset = px(18. - 6. * openness);
+        div().relative().flex_none().h_full().w(px(frame.width)).bg(palette.win)
+            .child(div().absolute().left(inset).right(inset).bottom(px(12.))
+                .h(px(40. + 8. * openness)).rounded(px(13. + openness))
+                .bg(palette.card).shadow(card_shadow(&palette)))
+            .child(viewport)
     }
 }

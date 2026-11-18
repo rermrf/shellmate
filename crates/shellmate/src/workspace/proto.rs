@@ -267,6 +267,11 @@ impl Workspace {
                 self.update_pane_radii(cx);
             }
             "rail" => self.set_sidebar_open(false, cx),
+            "rail-mid" | "rail-mid-expand" => {
+                let open = scene == "rail-mid-expand";
+                self.set_sidebar_open(open, cx);
+                self.sidebar_motion = SidebarMotion::frozen_midpoint(open);
+            }
             "local" => self.proto_local(window, cx),
             "reconnect" => self.activate(3, window, cx),
             "files" | "editor" => self.proto_files(if stress {"stress-files"}else if scrolled {"files-scrolled"}else{scene}, window, cx),

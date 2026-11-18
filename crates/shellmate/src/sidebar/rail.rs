@@ -79,7 +79,7 @@ impl Sidebar {
             }))
     }
 
-    pub(super) fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_rail(&self, cx: &mut Context<Self>) -> gpui::Div {
         let p = cx.palette().clone();
         let local_on = self.active == Active::Local;
         let local = key("rail-local", AppIcon::LocalTerminal, 17., local_on, "本机终端 ⌘T", &p)
@@ -149,8 +149,7 @@ impl Sidebar {
                     .justify_center()
                     .size(px(40.))
                     .rounded(px(13.))
-                    .bg(p.card)
-                    .shadow(card_shadow(&p))
+                    .when(!self.shared_footer(), |card| card.bg(p.card).shadow(card_shadow(&p)))
                     .cursor_pointer().on_click(cx.listener(|_,_,_,cx|cx.emit(SidebarEvent::Settings)))
                     .child(AppIcon::Settings.icon().text_color(p.tx2))
                     .child(

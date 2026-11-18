@@ -103,6 +103,11 @@ pub struct TerminalView {
     /// Right click pastes the clipboard (prototype default).
     pub right_click_paste: bool,
     pub history_shortcut: bool,
+    /// Keep the grid and backend at the last measured size while its container animates.
+    pub hold_grid_size: bool,
+    /// A frozen review frame has no previous layout; measure its grid at the simulated starting width.
+    #[cfg(debug_assertions)]
+    pub fixture_grid_width_offset: f32,
     /// Rounds the top corners so the view fits inside a rounded card.
     pub top_radius: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -135,6 +140,9 @@ impl TerminalView {
             copy_on_select: true,
             right_click_paste: true,
             history_shortcut: true,
+            hold_grid_size: false,
+            #[cfg(debug_assertions)]
+            fixture_grid_width_offset: 0.,
             top_radius: px(0.),
             _subscriptions: subscriptions,
         }

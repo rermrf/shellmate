@@ -24,7 +24,7 @@ use shellmate_term::{PtyOptions, Terminal, TerminalEvent, TerminalView};
 
 use crate::connect;
 use crate::editor::view::FileEditor;
-use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH, RAIL_WIDTH};
+use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent, SidebarMotion};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
@@ -229,6 +229,7 @@ pub struct Workspace {
     groups: Vec<group::ConnGroup>,
     active: Option<usize>,
     sidebar_open: bool,
+    sidebar_motion: SidebarMotion,
     next_id: usize,
     next_group: usize,
     user_host: SharedString,
@@ -307,6 +308,7 @@ impl Workspace {
             groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,
+            sidebar_motion: SidebarMotion::settled(!collapsed),
             next_id: 1,
             next_group: 1,
             user_host: user_at_host().into(),
@@ -610,6 +612,12 @@ impl Workspace {
             return;
         }
         self.sidebar_open = open;
+        #[cfg(target_os = "macos")]
+        gpui::base::apply_system_reduce_motion(cx);
+        let animate = !cx.reduce_motion();
+        #[cfg(debug_assertions)]
+        let animate = animate && std::env::var_os("SHELLMATE_DEMO").is_none();
+        self.sidebar_motion.retarget(open, cx.background_executor().now(), animate);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(!open, cx));
         if let Err(err) = self.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
             log::warn!("could not save the sidebar setting: {err}");
@@ -706,8 +714,7 @@ impl Workspace {
                 .iter()
                 .map(|(label, icon)| 24. + icon + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window))
                 .sum::<f32>();
-        let content_width =
-            f32::from(window.viewport_size().width) - if self.sidebar_open { SIDEBAR_WIDTH } else { RAIL_WIDTH } - 12.;
+        let content_width = f32::from(window.viewport_size().width) - self.sidebar_motion.frame.width - 12.;
         let available = (content_width - toolbar_width - 4. * 8.).max(0.);
         let overflow_label = format!("{} 个会话 ▾", self.sessions.len());
         let overflow_width = measure(&overflow_label, 12., FontWeight::NORMAL, window) + 16.;
@@ -718,7 +725,7 @@ impl Workspace {
         {
             // Ordinary prototype scenes use a count-based sliding window, even when another
             // tab physically fits. Real sessions and stress fixtures use only measured widths.
-            Some((if self.sidebar_open { 4 } else { 5 }) - usize::from(self.commands_open||self.ai_open))
+            Some((if self.sidebar_motion.frame.openness() >= 0.5 { 4 } else { 5 }) - usize::from(self.commands_open||self.ai_open))
         } else {
             cap
         };
@@ -1118,6 +1125,11 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sidebar_motion.advance(cx.background_executor().now(), cx.reduce_motion());
+        if self.sidebar_motion.running() {
+            _window.request_animation_frame();
+        }
+        self.sidebar.update(cx, |sidebar, _| sidebar.frame = self.sidebar_motion.frame);
         self.sync_menus(cx);
         let p = cx.palette().clone();
         let activity=self.secrets.clone();
@@ -1178,8 +1190,6 @@ impl Render for Workspace {
                     .flex_col()
                     .pr(px(12.))
                     .pb(px(12.))
-                    // Beside the sidebar there is a gap; beside the rail the tabs start right after it.
-                    .pl(px(0.))
                     .child(self.render_tab_bar(_window,cx))
                     .child(self.render_header(cx))
                     .child(

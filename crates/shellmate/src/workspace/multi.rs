@@ -306,6 +306,14 @@ impl Workspace {
         cx.notify();
     }
     pub(super) fn render_panes(&self, main: &Session, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let terminal_view = |session: &Session, cx: &mut Context<Self>| {
+            session.view.update(cx, |view, _| {
+                view.hold_grid_size = self.sidebar_motion.running();
+                #[cfg(debug_assertions)]
+                { view.fixture_grid_width_offset = self.sidebar_motion.fixture_grid_width_offset(self.sidebar_open); }
+            });
+            session.view.clone()
+        };
         let Some(other) = self
             .split
             .other
@@ -315,7 +323,7 @@ impl Workspace {
                 .flex_1()
                 .min_h_0().flex().flex_col()
                 .children(self.render_serial_toolbar(main,cx))
-                .child(div().flex_1().min_h_0().child(main.view.clone()))
+                .child(div().flex_1().min_h_0().child(terminal_view(main, cx)))
                 .into_any_element();
         };
         let p = cx.palette().clone();
@@ -397,7 +405,7 @@ impl Workspace {
                 )
                 .child(header)
                 .children(self.render_serial_toolbar(session,cx))
-                .child(div().flex_1().min_h_0().child(session.view.clone()))
+                .child(div().flex_1().min_h_0().child(terminal_view(session, cx)))
         };
         div()
             .rounded_t(CARD_RADIUS)
