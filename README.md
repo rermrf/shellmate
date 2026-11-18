@@ -1,6 +1,16 @@
-# Shellmate
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="crates/shellmate/assets/app-icon/dock-dark.png">
+    <img alt="Shellmate 图标" src="crates/shellmate/assets/app-icon/dock-light.png" width="128" height="128">
+  </picture>
+</p>
 
-一款为 macOS 打造的原生 SSH 客户端：终端、文件、端口转发、服务器监控和 AI 助手集中在一个窗口里，界面遵循 Flyme OS 12 的视觉风格。基于 Rust 与 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 编写，完全原生渲染，不依赖 WebView。
+<h1 align="center">Shellmate</h1>
+
+<p align="center">
+  一款为 macOS 打造的原生 SSH 客户端：终端、文件、端口转发、服务器监控和 AI 助手集中在一个窗口里。<br>
+  基于 Rust 与 <a href="https://github.com/zed-industries/zed/tree/main/crates/gpui">GPUI</a> 编写，完全原生渲染，不依赖 WebView。
+</p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.png">
