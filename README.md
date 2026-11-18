@@ -39,9 +39,9 @@
 
 ## 安装
 
-**系统要求**：macOS 13 及以上，Apple 芯片（arm64）。
+**系统要求**：macOS 13 及以上，Apple 芯片或 Intel 处理器。
 
-1. 打开 `Shellmate-<版本>-arm64.dmg`，把 Shellmate 拖进「应用程序」。
+1. 从 [Releases](https://github.com/rermrf/shellmate/releases) 下载 `Shellmate-<版本>-universal.dmg`，打开后把 Shellmate 拖进「应用程序」。
 2. 安装包目前是临时签名（ad-hoc），没有经过 Apple 公证。第一次打开时：
    - 在「应用程序」里**右键 Shellmate → 打开**，在弹出的对话框中再点「打开」；或
    - 在终端执行：
@@ -195,10 +195,17 @@
 # 调试运行
 cargo run -p shellmate
 
-# 生成 Shellmate.app 与 dmg（release）
+# 生成本机架构的 Shellmate.app 与 dmg
 scripts/bundle-macos.sh release
 # 输出：target/release/Shellmate.app、target/release/Shellmate-<版本>-arm64.dmg
+
+# Apple 芯片 + Intel 通用版（发布用）
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+scripts/bundle-macos.sh release --universal
+# 输出：target/release/Shellmate-<版本>-universal.dmg
 ```
+
+签名默认是临时签名；设置 `SIGN_IDENTITY` 为 Developer ID 证书名称时，会改用该证书签名并开启强化运行时。
 
 ## 开发
 
@@ -234,6 +241,20 @@ SHELLMATE_E2E_KEY=/path/to/key cargo test -p shellmate-sftp --test sftp e2e -- -
 ```
 
 `crates/shellmate-monitor/tests/latency` 提供了带人为延迟的首次打开耗时基准（同样默认忽略）。
+
+### 持续集成与发版
+
+- `.github/workflows/ci.yml`：推送到 `main` 和提交 PR 时，在 macOS 上运行 clippy（警告视为错误）与全部测试。
+- `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片 + Intel 通用版，生成 dmg 和 SHA-256，并创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。
+
+发版步骤：
+
+```sh
+# 1. 修改 Cargo.toml 的 workspace 版本号并提交
+# 2. 打标签并推送
+git tag v0.1.8
+git push origin main v0.1.8
+```
 
 ### 演示场景
 

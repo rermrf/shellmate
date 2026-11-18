@@ -1,20 +1,51 @@
 #!/bin/zsh
 # Build Shellmate.app with the app icon (scheme 1c).
 #
-#   scripts/bundle-macos.sh            # release build -> target/release/Shellmate.app
-#   scripts/bundle-macos.sh debug      # wrap the existing debug build -> target/debug/Shellmate.app
+#   scripts/bundle-macos.sh                       # release build for this Mac -> target/release/Shellmate.app + dmg
+#   scripts/bundle-macos.sh release --universal   # Apple silicon + Intel in one binary (what CI releases)
+#   scripts/bundle-macos.sh debug                 # wrap the existing debug build -> target/debug/Shellmate.app
 #
-# The bundle is ad-hoc signed. The Dock icon also follows the system dark
-# appearance at runtime (crates/shellmate/src/app_icon.rs).
+# Environment:
+#   SIGN_IDENTITY   codesign identity; defaults to "-" (ad-hoc). A Developer ID identity also turns on
+#                   the hardened runtime and a secure timestamp.
+#   MACOSX_DEPLOYMENT_TARGET   defaults to 13.0 for universal builds, matching LSMinimumSystemVersion.
+#
+# The Dock icon also follows the system dark appearance at runtime (crates/shellmate/src/app_icon.rs).
 set -euo pipefail
 cd "${0:A:h}/.."
 
-profile=${1:-release}
-case $profile in
-  release) cargo build --release -p shellmate ;;
-  debug) [[ -x target/debug/shellmate ]] || cargo build -p shellmate ;;
-  *) print -u2 "usage: $0 [release|debug]"; exit 2 ;;
-esac
+profile=release
+universal=0
+for arg in "$@"; do
+  case $arg in
+    release|debug) profile=$arg ;;
+    --universal) universal=1 ;;
+    *) print -u2 "usage: $0 [release|debug] [--universal]"; exit 2 ;;
+  esac
+done
+if (( universal )) && [[ $profile != release ]]; then
+  print -u2 "--universal only applies to release builds"; exit 2
+fi
+
+if (( universal )); then
+  export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-13.0}
+  for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo build --release -p shellmate --target $triple
+  done
+  binary=target/release/shellmate-universal
+  mkdir -p target/release
+  lipo -create -output $binary \
+    target/aarch64-apple-darwin/release/shellmate \
+    target/x86_64-apple-darwin/release/shellmate
+  arch=universal
+else
+  case $profile in
+    release) cargo build --release -p shellmate ;;
+    debug) [[ -x target/debug/shellmate ]] || cargo build -p shellmate ;;
+  esac
+  binary=target/$profile/shellmate
+  arch=$(uname -m)
+fi
 
 version=$(cargo metadata --no-deps --format-version 1 --offline \
   | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="shellmate"))')
@@ -22,7 +53,7 @@ app=target/$profile/Shellmate.app
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "target/$profile/shellmate" "$app/Contents/MacOS/Shellmate"
+cp "$binary" "$app/Contents/MacOS/Shellmate"
 cp crates/shellmate/assets/app-icon/Shellmate.icns "$app/Contents/Resources/Shellmate.icns"
 
 cat > "$app/Contents/Info.plist" <<PLIST
@@ -49,27 +80,37 @@ if [[ $profile == release ]]; then
   # Local symbols only matter for debugging; the linker's ad-hoc signature is replaced below.
   strip -x "$app/Contents/MacOS/Shellmate"
 fi
-codesign --force --sign - "$app" >/dev/null
-print "built $app ($version)"
+identity=${SIGN_IDENTITY:--}
+if [[ $identity == - ]]; then
+  codesign --force --sign - "$app" >/dev/null
+else
+  codesign --force --options runtime --timestamp --sign "$identity" "$app" >/dev/null
+fi
+print "built $app ($version, $arch)"
 
 [[ $profile == release ]] || exit 0
 
-# A drag-to-install disk image with first-launch notes for testers.
-arch=$(uname -m)
+if [[ $arch == universal ]]; then
+  supported="支持 Apple 芯片与 Intel 处理器的 Mac"
+else
+  supported="仅支持 Apple 芯片（M1 及以后）的 Mac"
+fi
+
+# A drag-to-install disk image with first-launch notes.
 dmg=target/release/Shellmate-$version-$arch.dmg
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
-cat > "$stage/首次打开说明.txt" <<'NOTE'
-Shellmate 体验版 · 安装与首次打开
+cat > "$stage/首次打开说明.txt" <<NOTE
+Shellmate · 安装与首次打开
 
 1. 把 Shellmate 拖到「应用程序」文件夹。
-2. 这个体验版没有 Apple 开发者签名，第一次打开时 macOS 会提示无法验证开发者：
+2. 这个版本没有 Apple 开发者签名，第一次打开时 macOS 会提示无法验证开发者：
    打开「系统设置 → 隐私与安全性」，在页面下方找到 Shellmate，点「仍要打开」，再确认一次即可。
    若提示「已损坏，无法打开」，在「终端」里执行下面这行后再打开：
      xattr -dr com.apple.quarantine /Applications/Shellmate.app
-3. 仅支持 Apple 芯片（M1 及以后）的 Mac，macOS 13 或更新版本。
+3. ${supported}，macOS 13 或更新版本。
 
 数据保存在本机：~/Library/Application Support/Shellmate
 密码默认存入 macOS 钥匙串；首次读取时系统会询问，选「始终允许」即可。

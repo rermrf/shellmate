@@ -1,0 +1,109 @@
+name: Release
+
+# Push a tag such as v0.1.8 (it must equal the version in Cargo.toml) to build a universal dmg and
+# create a draft release; review the notes on GitHub and publish it by hand.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, e.g. v0.1.8
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Universal dmg and draft release
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Tag must match the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="shellmate"))')
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match the Cargo.toml version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: universal-release
+
+      - name: Build Shellmate.app and the dmg
+        run: scripts/bundle-macos.sh release --universal
+
+      - name: Verify the bundle
+        run: |
+          app=target/release/Shellmate.app
+          lipo -info "$app/Contents/MacOS/Shellmate"
+          lipo "$app/Contents/MacOS/Shellmate" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict "$app"
+          hdiutil verify "target/release/Shellmate-$VERSION-universal.dmg"
+
+      - name: Checksum
+        working-directory: target/release
+        run: |
+          shasum -a 256 "Shellmate-$VERSION-universal.dmg" | tee "Shellmate-$VERSION-universal.dmg.sha256"
+
+      - name: Release notes
+        run: |
+          previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          sha=$(cut -d' ' -f1 "target/release/Shellmate-$VERSION-universal.dmg.sha256")
+          {
+            echo "## 更新内容"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --format='- %s' "$previous..$TAG" | grep -v '^- chore: 版本号' || true
+            else
+              echo "- 首个公开版本，功能介绍见 README。"
+            fi
+            echo
+            echo "## 安装"
+            echo
+            echo "下载 \`Shellmate-$VERSION-universal.dmg\`（支持 Apple 芯片与 Intel，macOS 13 及以上），把 Shellmate 拖进「应用程序」。"
+            echo
+            echo "这个版本没有 Apple 开发者签名。第一次打开时请在「应用程序」里右键 Shellmate → 打开；若提示「已损坏」，在终端执行："
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine /Applications/Shellmate.app'
+            echo '```'
+            echo
+            echo "SHA-256：\`$sha\`"
+          } > notes.md
+          cat notes.md
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=("target/release/Shellmate-$VERSION-universal.dmg" "target/release/Shellmate-$VERSION-universal.dmg.sha256")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag \
+              --title "Shellmate $VERSION" --notes-file notes.md
+          fi
