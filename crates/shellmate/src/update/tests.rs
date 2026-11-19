@@ -310,7 +310,7 @@ async fn download_with_checksum_file_progress_reuse_and_mismatch() {
     )
     .await
     .unwrap_err();
-    assert!(err.to_string().contains("SHA-256"));
+    assert!(err.to_string().contains("SHA-256"), "{err:#}");
     assert!(!dir.path().join(format!("{NAME}.part")).exists());
     server.await.unwrap();
 }

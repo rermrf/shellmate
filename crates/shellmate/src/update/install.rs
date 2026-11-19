@@ -229,7 +229,7 @@ pub(super) fn stage_mounted(
     verify(&source, &version, &requirement)?;
     let parent = bundle.parent().context("找不到应用目录")?;
     let directory_lock = fs::File::open(parent).context("无法打开应用目录")?;
-    directory_lock.try_lock().context("另一个更新正在安装")?;
+    lock_briefly(&directory_lock).context("另一个更新正在安装")?;
     let original = fs::File::open(&bundle).context("无法打开当前应用")?;
     let old_version = Version::parse(&plist(&bundle, "CFBundleShortVersionString")?)
         .context("当前应用版本无效")?;
@@ -274,6 +274,17 @@ impl Staged {
         verify(&self.partial, &self.version, &self.requirement)?;
         swap(&self.bundle, &self.partial, &self.old)
     }
+}
+
+/// Staging runs on a blocking thread, so waiting out a fork's brief hold on the lock is fine here.
+fn lock_briefly(file: &fs::File) -> Result<(), fs::TryLockError> {
+    for _ in 0..super::LOCK_ATTEMPTS {
+        match file.try_lock() {
+            Err(fs::TryLockError::WouldBlock) => std::thread::sleep(super::LOCK_PAUSE),
+            other => return other,
+        }
+    }
+    file.try_lock()
 }
 
 pub(super) fn swap(bundle: &Path, partial: &Path, old: &Path) -> Result<()> {

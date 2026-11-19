@@ -117,7 +117,17 @@ async fn transfer(
         .create(dir)
         .context("无法创建更新缓存目录")?;
     let lock = fs::File::open(dir).context("无法打开更新缓存目录")?;
-    lock.try_lock().context("更新缓存正在使用")?;
+    let mut attempts = 0;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if attempts < super::LOCK_ATTEMPTS => {
+                attempts += 1;
+                tokio::time::sleep(super::LOCK_PAUSE).await;
+            }
+            Err(e) => return Err(e).context("更新缓存正在使用"),
+        }
+    }
     let path = dir.join(&asset.name);
     let part = dir.join(format!("{}.part", asset.name));
     remove_if_present(&part).context("无法清理上次的下载")?;
