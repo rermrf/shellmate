@@ -58,6 +58,8 @@ pub const PAGE_SCROLL_SCENES: &[(&str, (u32, u32))] = &[
 ];
 
 pub const SCENES: &[&str] = &[
+    "update-available", "update-downloading", "update-ready", "update-uptodate",
+    "update-error", "update-fallback", "settings-update", "main-update-pill",
     "mon-ov-scrolled", "mon-dk-scrolled", "mon-svc-scrolled", "fwd-scrolled",
     "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
     "ai-agent", "ai-agent-run", "ai-new-confirm", "ai-agent-redline", "ai-agent-full",
@@ -224,6 +226,7 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
     } else {
         match scene {
             _ if monitor::PORT_SCENES.contains(&scene) || monitor::SERVICE_SCENES.contains(&scene) => "local",
+            s if s.starts_with("update-") || matches!(s, "settings-update" | "main-update-pill") => "main",
             "rail-mid" | "rail-mid-expand" => "main",
             "drawer-mid" => "ai",
             "drawer-swap-mid" => "cmds",
@@ -290,7 +293,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 82 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 90 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }
@@ -303,6 +306,7 @@ mod tests {
                 let expected = if PAGE_SCROLL_SCENES.iter().any(|(name, _)| name == scene) {
                     if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
                 } else { match *scene {
+                    s if s.starts_with("update-") || matches!(s, "settings-update" | "main-update-pill") => "main",
                     "rail-mid" | "rail-mid-expand" => "main",
                     "drawer-mid" => "ai",
                     "drawer-swap-mid" => "cmds",

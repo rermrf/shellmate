@@ -284,6 +284,7 @@ impl Workspace {
         let store=shellmate_store::SharedStore::new(store);
         let secrets=crate::security::coordinator(store.clone());
         let workspace=cx.entity().downgrade();
+        crate::updater::init(store.clone(), workspace.clone(), cx);
         let mut subscriptions=subscriptions;
         subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
@@ -675,6 +676,14 @@ impl Workspace {
 
     // ---- rendering -----------------------------------------------------
 
+    pub(crate) fn live_session_count(&self) -> usize {
+        self.sessions.iter().filter(|s| match &s.kind {
+            SessionKind::Local => !s.exited,
+            SessionKind::Stream(stream) => stream.connected(),
+            SessionKind::Ssh(ssh) => matches!(ssh.live(), Some(LiveStatus::Connecting | LiveStatus::Ok)),
+        }).count()
+    }
+
     fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         // Shape the same fonts/weights the strip renders; titles are capped, chips are not.
@@ -714,7 +723,11 @@ impl Workspace {
                 crate::tabs::tab_width(title, matches!(session.kind, SessionKind::Local), reconnect, broadcast)
             })
             .collect::<Vec<_>>();
-        let toolbar_width = 32.
+        let pill = cx.global::<crate::updater::Updater>().pill();
+        let pill_width = pill.as_ref().map_or(0., |label| {
+            8. + 24. + AppIcon::Shield.size() + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window)
+        });
+        let toolbar_width = 32. + pill_width
             + [("广播", 15.), ("AI", 14.), ("快捷命令", 14.)]
                 .iter()
                 .map(|(label, icon)| 24. + icon + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window))
@@ -890,6 +903,10 @@ impl Workspace {
                         )
                     }),
             )
+            .when_some(pill, |bar, label| bar.child(
+                toolbar_button("update-pill", AppIcon::Shield, Some(&label), "软件更新", true, cx)
+                    .bg(p.accs).text_color(p.acc).on_click(|_, w, cx| crate::updater::open(w, cx)),
+            ))
             .child(
                 toolbar_button("broadcast", AppIcon::Broadcast, Some("广播"), "向多个会话按行广播", true, cx)
                     .when(self.broadcast.enabled, |b| b.bg(p.warns).text_color(p.warn))

@@ -169,7 +169,7 @@ mod tests {
                 for item in menus(&MenuState::default()).into_iter().flat_map(|menu| menu.items) {
                     if let gpui::MenuItem::Action { action, .. } = item {
                         let name = action.name();
-                        let outside_workspace = [About.name(), HideApp.name(), HideOthers.name(), ShowAll.name(), Quit.name(),
+                        let outside_workspace = [About.name(), CheckUpdates.name(), HideApp.name(), HideOthers.name(), ShowAll.name(), Quit.name(),
                             EditUndo.name(), EditRedo.name(), EditCut.name(), EditCopy.name(), EditPaste.name(), EditSelectAll.name(),
                             Fullscreen.name(), Minimize.name(), Zoom.name(), ToggleSearch.name(),
                             shellmate_term::view::SearchUp.name(), shellmate_term::view::SearchDown.name()];

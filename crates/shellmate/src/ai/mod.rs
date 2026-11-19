@@ -1,6 +1,6 @@
 pub mod exec;
 pub mod host;
-mod markdown;
+pub(crate) mod markdown;
 mod scroll;
 pub mod model;
 pub mod panel;

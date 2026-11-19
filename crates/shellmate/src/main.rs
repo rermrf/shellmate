@@ -29,6 +29,8 @@ mod workspace;
 mod settings;
 mod records;
 mod menus;
+mod update;
+mod updater;
 
 use std::borrow::Cow;
 

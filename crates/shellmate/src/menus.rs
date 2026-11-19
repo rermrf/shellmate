@@ -5,7 +5,7 @@ use shellmate_term::view as terminal;
 use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NextTab, OpenPalette, Panel,
     PreviousTab, Quit, ToggleSidebar, ToggleTheme};
 
-actions!(shellmate, [About, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
+actions!(shellmate, [About, CheckUpdates, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
     EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll, ShowTerminal, ShowFiles,
     ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi,
@@ -29,7 +29,7 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
     use MenuItem as Item;
     vec![
         Menu::new("Shellmate").items(
-            [Item::action("关于 Shellmate", About), Item::Separator, Item::action("设置…", Settings)]
+            [Item::action("关于 Shellmate", About), Item::action("检查更新…", CheckUpdates), Item::Separator, Item::action("设置…", Settings)]
                 .into_iter()
                 .chain(state.vault_lock.then(|| Item::action("锁定凭据库", LockVault)))
                 .chain([
@@ -124,6 +124,7 @@ pub(crate) fn init(cx: &mut App) {
         .on_action(|_: &EditCopy, cx| forward_edit(cx, &input::Copy, Some(&terminal::Copy)))
         .on_action(|_: &EditPaste, cx| forward_edit(cx, &input::Paste, Some(&terminal::Paste)))
         .on_action(|_: &EditSelectAll, cx| forward_edit(cx, &input::SelectAll, Some(&terminal::SelectAll)))
+        .on_action(|_: &CheckUpdates, cx| with_active_window(cx, crate::updater::manual))
         .on_action(|_: &About, cx| with_active_window(cx, crate::dialogs::about::open))
         .on_action(|_: &HideApp, cx| cx.hide())
         .on_action(|_: &HideOthers, cx| cx.hide_other_apps())

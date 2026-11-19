@@ -350,6 +350,11 @@ impl Workspace {
                 }
             }
             "ai-explain"=>{self.sessions[0].terminal.update(cx,|t,cx|t.notice("[error] connect() failed: Connection refused",cx));},
+            s if s.starts_with("update-") || matches!(s, "settings-update" | "main-update-pill") => {
+                crate::updater::scene(s, cx);
+                if s == "settings-update" { self.open_settings(6, window, cx); }
+                if s.starts_with("update-") { crate::updater::open(window, cx); }
+            }
             "set-ai" | "set-ai-replace" => {
                 self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();
                 let view = settings(5, window, cx);

@@ -46,6 +46,7 @@
 | 会话记录 | 录制回放（asciicast v2，可导出 `.cast`）与纯文本会话日志 |
 | AI 助手 | OpenAI 兼容接口与 Anthropic；读取当前终端上下文、解释报错、按审批规则在终端或后台执行命令；敏感信息自动脱敏 |
 | 备份 | 加密配置包导出与导入（含导入前差异预览） |
+| 更新 | 应用内检查、下载并安装新版本；校验安装包的 SHA-256 与代码签名 |
 
 ## 安装
 
@@ -63,6 +64,7 @@
      ```
 
    dmg 里也附带了一份「首次打开说明」。
+3. 之后的版本可以在应用内更新：Shellmate 启动后和每天会自动检查一次（可在「设置 › 软件更新」关闭），也可以在菜单「Shellmate › 检查更新…」手动检查。有新版本时，标签栏右侧会出现提示，点开即可下载并重启更新。
 
 使用 Mosh 需要本机安装 `mosh-client`（例如 `brew install mosh`），远端安装 `mosh-server`。
 
@@ -198,6 +200,7 @@
 
 - 主机库中不保存任何明文凭据。
 - Shellmate 不收集遥测数据。只有你主动向 AI 助手提问时，才会把问题和（脱敏后的）终端上下文发送到你配置的 AI 服务。
+- 检查更新只访问 GitHub 的发布接口（`api.github.com`），请求中只带应用版本号；关闭「自动检查更新」后，只在你手动检查时访问。
 - 加密配置包可用于在设备之间迁移主机、分组、快捷命令、端口转发规则，以及（可选的）凭据；导入前会显示差异预览。
 
 ## 从源码构建
@@ -220,7 +223,7 @@ scripts/bundle-macos.sh release --arm64       # 仅 Apple 芯片，复用上一�
 # 输出：target/release/Shellmate-<版本>-arm64.dmg
 ```
 
-签名默认是临时签名；设置 `SIGN_IDENTITY` 为 Developer ID 证书名称时，会改用该证书签名并开启强化运行时。
+签名：钥匙串里有项目的自签名证书「Shellmate Code Signing」时自动用它签名，否则使用临时签名；也可以用 `SIGN_IDENTITY` 指定签名身份。证书的生成、备份、GitHub 配置与更换见 [`docs/signing.md`](docs/signing.md)。
 
 ## 开发
 
@@ -260,7 +263,7 @@ SHELLMATE_E2E_KEY=/path/to/key cargo test -p shellmate-sftp --test sftp e2e -- -
 ### 持续集成与发版
 
 - `.github/workflows/ci.yml`：推送到 `main` 和提交 PR 时，在 macOS 上运行 clippy（警告视为错误）与全部测试。
-- `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片版与 Apple 芯片 + Intel 通用版两个 dmg 及各自的 SHA-256，并创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。
+- `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片版与 Apple 芯片 + Intel 通用版两个 dmg 及各自的 SHA-256，用仓库 Secrets 中的证书签名并核对它在受信任清单里，然后创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。发布后，已安装的版本就能通过应用内更新收到它。
 
 发版步骤：
 

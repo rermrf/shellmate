@@ -184,7 +184,7 @@ pub fn segmented(
 pub fn toolbar_button(
     id: impl Into<ElementId>,
     icon: crate::icons::AppIcon,
-    label: Option<&'static str>,
+    label: Option<&str>,
     tooltip: impl Into<SharedString>,
     enabled: bool,
     cx: &App,
@@ -204,7 +204,7 @@ pub fn toolbar_button(
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.tx2)
         .child(icon.icon())
-        .children(label)
+        .children(label.map(str::to_owned))
         .when(enabled, |d| {
             d.cursor_pointer()
                 .hover(|d| d.bg(p.card3.opacity(0.6)).text_color(p.tx))

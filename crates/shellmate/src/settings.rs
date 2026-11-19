@@ -220,7 +220,7 @@ impl Render for SettingsWindow {
                 false
             }
         };
-        let names = ["凭据与安全", "同步与备份", "终端", "本地终端", "连接与保活", "AI 助手"];
+        let names = ["凭据与安全", "同步与备份", "终端", "本地终端", "连接与保活", "AI 助手", "软件更新"];
         let nav = div()
             .w(px(186.))
             .flex_none()
@@ -536,6 +536,8 @@ impl Render for SettingsWindow {
                 .child(div().flex().justify_end().child(
                     dialogs::button("sync-now", "立即同步", dialogs::Tone::Plain, false).h(px(36.)),
                 )));
+        } else if self.section == 6 {
+            content = content.child(crate::updater::settings(cx));
         } else if self.section==5 {
             content=content.child(self.ai.clone());
         } else {

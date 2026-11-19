@@ -24,9 +24,14 @@ impl Render for AboutDialog {
             .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child("Shellmate"))
             .child(super::hint(VERSION, palette))
             .child(div().text_size(px(14.)).child("macOS 上的 SSH 客户端"))
-            .child(super::button("about-close", "关闭", Tone::Primary, true)
-                .w(px(88.))
-                .on_click(cx.listener(|body, _, window, cx| body.dismiss(window, cx))))
+            .child(super::actions(vec![
+                super::button("about-updates", "检查更新", Tone::Plain, true)
+                    .w(px(88.))
+                    .on_click(|_, w, cx| crate::updater::manual(w, cx)),
+                super::button("about-close", "关闭", Tone::Primary, true)
+                    .w(px(88.))
+                    .on_click(cx.listener(|body, _, window, cx| body.dismiss(window, cx))),
+            ]))
     }
 }
 

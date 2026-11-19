@@ -15,7 +15,7 @@ use markdown::{ParseOptions, mdast::Node};
 use crate::theme::{ActivePalette, MONO_FONT};
 
 #[derive(Default)]
-pub(super) struct MarkdownCache {
+pub(crate) struct MarkdownCache {
     conversation: String,
     items: HashMap<(usize, usize), CachedText>,
 }
@@ -83,7 +83,7 @@ fn blocked_image() -> ImageSource {
     ImageSource::Custom(Arc::new(|_, _| None))
 }
 
-pub(super) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
+pub(crate) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
     let scope = format!("{id:?}");
     base_view(id, text, window, cx)
         .markdown_block_parser(blocks::parse)
