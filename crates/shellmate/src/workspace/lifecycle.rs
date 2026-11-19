@@ -47,20 +47,21 @@ impl MainWindow {
         }
     }
 
+    pub(super) fn with_restored_workspace(
+        cx: &mut App,
+        run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
+        Self::update(cx, move |s, window, cx| {
+            s.show_window(window, cx);
+            run(s, window, cx);
+        });
+    }
+
     pub(crate) fn with_restored_window(
         cx: &mut App,
         run: impl FnOnce(&mut Window, &mut App) + 'static,
     ) {
-        if let Some(main) = cx.try_global::<Self>().cloned() {
-            cx.defer(move |cx| {
-                main.handle
-                    .update(cx, |_, w, cx| {
-                        main.workspace.update(cx, |s, cx| s.show_window(w, cx)).ok();
-                        run(w, cx);
-                    })
-                    .ok();
-            });
-        }
+        Self::with_restored_workspace(cx, move |_, window, cx| run(window, cx));
     }
 
     pub(crate) fn reopen(cx: &mut App) {
@@ -88,16 +89,52 @@ fn native_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::N
 
 #[derive(Debug, PartialEq, Eq)]
 enum Close {
-    Hide,
+    HideInDock,
+    HideAsAccessory,
     Quit,
 }
 
 fn close_behavior(prefs: &Preferences) -> Close {
     if prefs.get(Preference::QuitOnWindowClose) {
         Close::Quit
+    } else if prefs.get(Preference::ShowStatusIcon) {
+        Close::HideAsAccessory
     } else {
-        Close::Hide
+        Close::HideInDock
     }
+}
+
+#[cfg(target_os = "macos")]
+fn set_policy(policy: gpui::ActivationPolicy, cx: &mut App) -> bool {
+    use gpui::ActivationPolicy;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    let app = NSApplication::sharedApplication(objc2::MainThreadMarker::new().expect("UI thread"));
+    let native = match policy {
+        ActivationPolicy::Regular => NSApplicationActivationPolicy::Regular,
+        ActivationPolicy::Accessory => NSApplicationActivationPolicy::Accessory,
+    };
+    if app.activationPolicy() == native {
+        return false;
+    }
+    // GPUI keeps its own policy for windowing requests and forwards the change to AppKit.
+    cx.set_activation_policy(policy);
+    if app.activationPolicy() == native {
+        log::info!("activation policy: {policy:?}");
+        true
+    } else {
+        log::warn!("AppKit declined activation policy {policy:?}");
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn has_shellmate_main_menu() -> bool {
+    use objc2_foundation::ns_string;
+    objc2_app_kit::NSApplication::sharedApplication(objc2::MainThreadMarker::new().expect("UI thread"))
+        .mainMenu()
+        .and_then(|menu| menu.itemWithTitle(ns_string!("会话")))
+        .and_then(|item| item.submenu())
+        .is_some_and(|menu| menu.itemWithTitle(ns_string!("新建本机终端")).is_some())
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -128,6 +165,16 @@ impl Activity {
 }
 
 impl Workspace {
+    #[cfg(target_os = "macos")]
+    pub(super) fn sync_hidden_activation_policy(&self, cx: &mut App) {
+        let policy = if close_behavior(&self.preferences) == Close::HideAsAccessory {
+            gpui::ActivationPolicy::Accessory
+        } else {
+            gpui::ActivationPolicy::Regular
+        };
+        set_policy(policy, cx);
+    }
+
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if close_behavior(&self.preferences) == Close::Quit {
             return self.request_quit(window, cx);
@@ -145,6 +192,7 @@ impl Workspace {
             self.set_window_hidden(true, cx);
             self.sync_menus(cx);
             native.orderOut(None);
+            self.sync_hidden_activation_policy(cx);
             log::info!("main window hidden");
         }
         #[cfg(not(target_os = "macos"))]
@@ -152,18 +200,36 @@ impl Workspace {
     }
 
     pub(crate) fn show_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.hidden {
-            return;
-        }
         #[cfg(target_os = "macos")]
         {
-            let Some(native) = native_window(window) else {
-                return;
-            };
+            let Some(native) = native_window(window) else { return };
+            let switched = set_policy(gpui::ActivationPolicy::Regular, cx);
+            cx.activate(true);
+            if native.isMiniaturized() { native.deminiaturize(None); }
             native.makeKeyAndOrderFront(None);
+            if switched {
+                // AppKit may still be transferring menu-bar ownership after setActivationPolicy.
+                // Wait for the next foreground turn, after sync_menus has installed the visible tree.
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(std::time::Duration::ZERO).await;
+                    this.update_in(cx, |s, _, cx| {
+                        if s.hidden { return; }
+                        if !has_shellmate_main_menu() && let Some((state, _)) = s.last_menu_state {
+                            cx.set_menus(crate::menus::menus(&state));
+                        }
+                        cx.activate(true);
+                        native.makeKeyAndOrderFront(None);
+                        if !has_shellmate_main_menu() {
+                            log::warn!("Shellmate main menu missing after restoring activation policy");
+                        }
+                    }).ok();
+                }).detach();
+            }
         }
-        self.set_window_hidden(false, cx);
+        #[cfg(not(target_os = "macos"))]
         cx.activate(true);
+        if !self.hidden { return; }
+        self.set_window_hidden(false, cx);
         self.sync_menus(cx);
         self.sync_sidebar(cx);
         self.sync_ai_context(cx);
@@ -264,7 +330,15 @@ impl Workspace {
 #[cfg(debug_assertions)]
 pub(crate) fn debug_hooks(cx: &mut App) {
     type Hook = (&'static str, fn(&mut App));
-    let hooks: [Hook; 3] = [
+    let hooks: &[Hook] = &[
+        #[cfg(target_os = "macos")]
+        ("SHELLMATE_DEBUG_STATUS_CLICK_AFTER", |cx| {
+            MainWindow::update(cx, |s, _, _| s.status_bar.debug_click())
+        }),
+        #[cfg(target_os = "macos")]
+        ("SHELLMATE_DEBUG_STATUS_MENU_AFTER", |cx| {
+            MainWindow::update(cx, |s, _, _| s.status_bar.debug_menu())
+        }),
         ("SHELLMATE_DEBUG_HIDE_AFTER", |cx| {
             MainWindow::update(cx, Workspace::close_window)
         }),
@@ -273,7 +347,7 @@ pub(crate) fn debug_hooks(cx: &mut App) {
             cx.dispatch_action(&super::Quit)
         }),
     ];
-    for (key, run) in hooks {
+    for &(key, run) in hooks {
         if let Some(seconds) = std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()) {
             let timer = cx
                 .background_executor()
@@ -294,8 +368,12 @@ mod tests {
     #[test]
     fn close_decision_uses_preference() {
         let mut prefs = Preferences::default();
-        assert_eq!(close_behavior(&prefs), Close::Hide);
+        assert_eq!(close_behavior(&prefs), Close::HideAsAccessory);
+        prefs.set(Preference::ShowStatusIcon, false);
+        assert_eq!(close_behavior(&prefs), Close::HideInDock);
         prefs.set(Preference::QuitOnWindowClose, true);
+        assert_eq!(close_behavior(&prefs), Close::Quit);
+        prefs.set(Preference::ShowStatusIcon, true);
         assert_eq!(close_behavior(&prefs), Close::Quit);
     }
 

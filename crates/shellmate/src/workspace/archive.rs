@@ -254,6 +254,14 @@ impl Workspace {
             .set_preference(key, value)
             .map_err(|e| e.to_string())?;
         self.preferences.set(key, value);
+        if key == P::ShowStatusIcon {
+            #[cfg(target_os = "macos")]
+            {
+                self.sync_status_item(cx);
+                if self.hidden { self.sync_hidden_activation_policy(cx); }
+            }
+            return Ok(());
+        }
         if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit) { return Ok(()); }
         if key == P::PreloadPanels && !value {
             for group in &mut self.groups {

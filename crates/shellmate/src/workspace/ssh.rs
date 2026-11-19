@@ -20,7 +20,7 @@ use shellmate_store::SecretKey;
 use shellmate_term::{Terminal, TerminalView};
 use tokio::task::JoinError;
 
-use super::group::{AbortOnDrop, Attempt, ConnGroup, PoolKey};
+use super::group::{AbortOnDrop, Attempt, ConnGroup, PoolKey, Prompt};
 use super::{Panel, Session, SessionKind, Workspace};
 use crate::connect::{self, AuthMemory, ConnectFailure, Connected, SaveReport, UiBridge, UiMsg};
 use crate::dialogs::auth::{ChallengeDialog, SecretDialog};
@@ -29,6 +29,15 @@ use crate::reconnect::{self, Failure, Input, MAX_ATTEMPTS, Output, Phase, Reconn
 use crate::runtime;
 use crate::sidebar::LiveStatus;
 use crate::theme::{ActivePalette, CARD_RADIUS};
+
+// A rejected key still needs attention on a first connection, including at a jump hop.
+fn cancelled_auth_prompt(error: &SshError) -> bool {
+    match error {
+        SshError::AuthCancelled => true,
+        SshError::Jump { source, .. } => cancelled_auth_prompt(source),
+        _ => false,
+    }
+}
 
 /// Where an SSH tab stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -447,7 +456,7 @@ impl Workspace {
             return self.release_group(group_id, window, cx);
         };
         let fail = |this: &mut Self, reason: String, window: &mut Window, cx: &mut Context<Self>| {
-            this.attempt_failed(group_id, Failure::Stop(reason), true, window, cx)
+            this.attempt_failed(group_id, Failure::Stop(reason), false, window, cx)
         };
         let Some(runtime) = runtime::get(cx) else {
             return fail(self, "SSH 运行时未能启动".into(), window, cx);
@@ -507,7 +516,7 @@ impl Workspace {
         let key = PoolKey::of(&chain, &connect::default_user());
         if let Some(group) = self.group_mut(group_id) {
             group.key = key;
-            group.prompting = false;
+            group.prompt = Prompt::None;
             group.attempt = Some(Attempt::new(abort, vec![pump, result]));
         }
         for session in &mut self.sessions {
@@ -572,7 +581,7 @@ impl Workspace {
     fn give_up(&mut self, group_id: usize, reason: &str, attempts: u32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = self.group_mut(group_id) else { return };
         let retried = group.machine.has_connected();
-        // Declining a question on a first connect is the user's choice, not a failure.
+        // Cancelling an authentication prompt on the first connect ends the tab.
         let ended = group.declined && !retried;
         group.stop();
         let text = reconnect::gave_up_text(reason, attempts, retried);
@@ -593,7 +602,7 @@ impl Workspace {
     fn attempt_failed(&mut self, group_id: usize, failure: Failure, declined: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group) = self.group_mut(group_id) {
             group.attempt = None;
-            group.prompting = false;
+            group.prompt = Prompt::None;
             group.declined = declined;
             group.last_failure = match &failure {
                 Failure::Retry(reason) | Failure::Stop(reason) => Some(reason.clone()),
@@ -611,10 +620,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let prompting = !matches!(msg, UiMsg::Event(_));
+        let prompt = match &msg {
+            UiMsg::Event(_) => Prompt::None,
+            UiMsg::HostKey { request, .. } if request.state == shellmate_core::FingerprintState::Changed => Prompt::ChangedKey,
+            UiMsg::Password { request, .. } if request.attempt > 0 => Prompt::RetryAuth,
+            UiMsg::Passphrase { request, .. } if request.attempt > 0 => Prompt::RetryAuth,
+            UiMsg::Challenge { request, .. } if request.attempt > 0 => Prompt::RetryAuth,
+            _ => Prompt::Waiting,
+        };
         let Some(group) = self.group_mut(group_id) else { return };
-        group.prompting = prompting;
-        if prompting {
+        if group.prompt != prompt {
+            group.prompt = prompt;
+            cx.notify();
+        }
+        if prompt != Prompt::None {
             // The question is about this connection: show the tab it belongs to.
             let on_group = |s: &Session| s.ssh().is_some_and(|ssh| ssh.group == group_id);
             let showing = self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(on_group);
@@ -647,7 +666,7 @@ impl Workspace {
             Ok(Ok(connected)) => self.on_connected(group_id, connected, window, cx),
             Ok(Err(ConnectFailure { error, saves })) => {
                 self.announce_saved(&saves, window, cx);
-                let declined = error.is_cancelled();
+                let declined = cancelled_auth_prompt(&error);
                 self.attempt_failed(group_id, reconnect::classify(&error), declined, window, cx);
             }
             Err(err) if err.is_cancelled() => {}
@@ -1067,6 +1086,15 @@ mod tests {
     use shellmate_core::AuthMethod;
 
     use super::*;
+
+    #[test]
+    fn only_cancelled_authentication_ends_a_first_connect_quietly() {
+        assert!(cancelled_auth_prompt(&SshError::AuthCancelled));
+        for error in [SshError::HostKeyChanged, SshError::HostKeyRejected, SshError::AuthRejected(AuthMethod::Password)] {
+            assert!(!cancelled_auth_prompt(&error));
+            assert!(!cancelled_auth_prompt(&SshError::Jump { host: "jump".into(), port: 22, source: Box::new(error) }));
+        }
+    }
 
     #[test]
     fn local_terminal_summary_counts_only_local_sessions() {

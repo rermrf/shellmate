@@ -147,6 +147,15 @@ pub fn forward_owner<'a>(groups: impl IntoIterator<Item = &'a ConnGroup>, host: 
     groups.into_iter().filter(|group| group.forward.is_some() && group.key.host() == host).map(|group| group.id).min()
 }
 
+/// Tracks prompts that block the group and distinguishes failures already waiting for input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Prompt {
+    None,
+    Waiting,
+    ChangedKey,
+    RetryAuth,
+}
+
 /// One connection and the tabs on it.
 pub struct ConnGroup {
     pub id: usize,
@@ -163,12 +172,12 @@ pub struct ConnGroup {
     pub memory: Arc<AuthMemory>,
     /// Why the last attempt failed, for the progress line before the next one.
     pub last_failure: Option<String>,
-    /// The last attempt ended because the user declined a question (not because anything broke).
+    /// The last attempt ended because the user cancelled authentication.
     pub declined: bool,
     /// The running attempt was started by the user (Enter, a click), not by the countdown.
     pub manual: bool,
     /// A dialog of the running attempt may be open.
-    pub prompting: bool,
+    pub(super) prompt: Prompt,
     /// The running attempt.
     pub attempt: Option<Attempt>,
     /// The countdown before the next attempt.
@@ -204,7 +213,7 @@ impl ConnGroup {
             last_failure: None,
             declined: false,
             manual: false,
-            prompting: false,
+            prompt: Prompt::None,
             attempt: None,
             timer: None,
             link: None,
@@ -229,14 +238,14 @@ impl ConnGroup {
 
     /// Whether a dialog of this group may be open.
     pub fn has_open_prompt(&self) -> bool {
-        (self.prompting && self.attempt.is_some()) || self.clash.open.is_some()
+        (self.prompt != Prompt::None && self.attempt.is_some()) || self.clash.open.is_some()
     }
 
     /// Stops whatever is running: the attempt (and with it its questions) and the countdown.
     pub fn stop(&mut self) {
         self.attempt = None;
         self.timer = None;
-        self.prompting = false;
+        self.prompt = Prompt::None;
         self.manual = false;
     }
 
@@ -302,7 +311,7 @@ mod tests {
         let task = tokio::spawn(async { std::future::pending::<()>().await });
         let mut group = ConnGroup::new(1, PoolKey::of(&[host("db")], "me"), Reconnect::initial(), AuthMemory::new());
         group.attempt = Some(Attempt::new(task.abort_handle(), Vec::new()));
-        group.prompting = true;
+        group.prompt = Prompt::Waiting;
         assert!(group.has_open_prompt());
         drop(group);
         assert!(task.await.unwrap_err().is_cancelled(), "closing the last tab cancels the connection task");
@@ -394,7 +403,7 @@ mod tests {
         let task = tokio::spawn(async { std::future::pending::<()>().await });
         let mut group = ConnGroup::new(1, PoolKey::of(&[host("db")], "me"), Reconnect::initial(), AuthMemory::new());
         group.attempt = Some(Attempt::new(task.abort_handle(), Vec::new()));
-        group.prompting = true;
+        group.prompt = Prompt::Waiting;
         group.stop();
         assert!(!group.has_open_prompt());
         assert!(task.await.unwrap_err().is_cancelled());

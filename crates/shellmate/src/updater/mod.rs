@@ -162,8 +162,12 @@ impl Updater {
         )
     }
 
+    pub(crate) fn available_version(&self) -> Option<String> {
+        self.release.as_ref().map(|release| release.version.to_string())
+    }
+
     pub fn pill(&self) -> Option<String> {
-        let version = self.release.as_ref()?.version.to_string();
+        let version = self.available_version()?;
         if self.prefs.skipped == version {
             return None;
         }

@@ -29,7 +29,11 @@ impl StreamSession {
         if let Some(state) = self.serial.as_ref().map(Control::state).or_else(|| self.snapshot.clone()) {
             return state.open || state.retrying;
         }
-        self.connected || (exited && self.attempt.is_some())
+        self.connected || (exited && self.retry_in_flight())
+    }
+
+    pub(super) fn retry_in_flight(&self) -> bool {
+        self.attempt.is_some()
     }
 
     pub fn connected(&self) -> bool {
@@ -135,6 +139,7 @@ impl Workspace {
             Ok::<_, String>((socket, password))
         });
         stream.attempt = Some(join.abort_handle());
+        cx.notify();
         stream.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             this.update_in(cx, |this, window, cx| {

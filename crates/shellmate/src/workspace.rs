@@ -42,6 +42,8 @@ mod proto;
 mod archive_demo;
 mod ssh;
 mod streams;
+#[cfg(target_os = "macos")]
+mod status_item;
 mod mosh;
 mod ai;
 mod drawer_resize;
@@ -188,6 +190,8 @@ impl Session {
 }
 
 pub struct Workspace {
+    #[cfg(target_os = "macos")]
+    status_bar: status_item::StatusBar,
     hidden: bool,
     quit_dialog: Option<gpui::WeakEntity<crate::dialogs::quit::QuitDialog>>,
     last_menu_state: Option<(crate::menus::MenuState, Option<menu_actions::Available>)>,
@@ -291,9 +295,15 @@ impl Workspace {
         crate::updater::init(store.clone(), workspace.clone(), cx);
         let mut subscriptions=subscriptions;
         // Background session changes can affect menu validation while AppKit has stopped drawing.
-        subscriptions.push(cx.observe_self(|s, cx| { if s.hidden { s.sync_menus(cx); } }));
+        subscriptions.push(cx.observe_self(|s, cx| {
+            #[cfg(target_os = "macos")]
+            s.sync_status_item(cx);
+            if s.hidden { s.sync_menus(cx); }
+        }));
         subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
+            #[cfg(target_os = "macos")]
+            status_bar: status_item::StatusBar::new(cx),
             hidden: false,
             quit_dialog: None,
             last_menu_state: None,
@@ -340,6 +350,8 @@ impl Workspace {
         this.reload_book(window, cx);
         let open_local=!crate::prototype_fixture();
         if open_local {this.open_local(window, cx);}
+        #[cfg(target_os = "macos")]
+        this.sync_status_item(cx);
         this.archive_timer(window,cx);
         this
     }

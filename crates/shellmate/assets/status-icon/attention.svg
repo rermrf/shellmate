@@ -1,0 +1,5 @@
+<!-- Shellmate menu bar icon, design 2c (docs/Shellmate 图标.html). A macOS template image: only black and alpha. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><defs>
+  <mask id="knock" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect x="0" y="10" width="22" height="22" rx="5.5" fill="#fff"/><path d="M6.5 17.5 L10.5 21.5 L6.5 25.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.5 25.5 H15.5" fill="none" stroke="#000" stroke-width="3" stroke-linecap="round"/></mask>
+  <mask id="dotgap" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect x="-4" y="-4" width="40" height="40" fill="#fff"/><circle cx="28" cy="4" r="6" fill="#000"/></mask>
+</defs><g mask="url(#dotgap)"><path d="M11.5 8 V5.5 A4 4 0 0 1 15.5 1.5 H26.5 A4 4 0 0 1 30.5 5.5 V16.5 A4 4 0 0 1 26.5 20.5 H24" fill="none" stroke="#000" stroke-width="3"/></g><circle cx="28" cy="4" r="4" fill="#000"/><rect x="0" y="10" width="22" height="22" rx="5.5" fill="#000" mask="url(#knock)"/></svg>

@@ -67,9 +67,10 @@ pub enum Preference {
     PreloadPanels,
     QuitOnWindowClose,
     ConfirmQuit,
+    ShowStatusIcon,
 }
 impl Preference {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -84,6 +85,7 @@ impl Preference {
         Self::PreloadPanels,
         Self::QuitOnWindowClose,
         Self::ConfirmQuit,
+        Self::ShowStatusIcon,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -101,6 +103,7 @@ impl Preference {
             Self::PreloadPanels => "preload_panels",
             Self::QuitOnWindowClose => "quit_on_window_close",
             Self::ConfirmQuit => "confirm_quit",
+            Self::ShowStatusIcon => "show_status_icon",
         }
     }
     pub fn label(self) -> &'static str {
@@ -119,6 +122,7 @@ impl Preference {
             Self::PreloadPanels => "连接后预加载文件与监控",
             Self::QuitOnWindowClose => "关闭窗口时",
             Self::ConfirmQuit => "退出前确认",
+            Self::ShowStatusIcon => "在菜单栏显示图标",
         }
     }
     pub fn description(self) -> &'static str {
@@ -129,6 +133,7 @@ impl Preference {
             Self::SessionLog => "纯文本，按主机与日期归档；包含屏幕上的输出，可能含敏感信息",
             Self::AutoRecord => "对新会话生效",
             Self::LoginShell => "加载 ~/.zprofile，PATH 与系统终端一致 · 对新会话生效",
+            Self::ShowStatusIcon => "关闭窗口后，Shellmate 只保留菜单栏图标；关掉此项则保留 Dock 图标。",
             Self::FollowDirectory => "通过 OSC 7 / shell 集成上报当前目录",
             Self::PreloadPanels => "SSH 连接后在后台打开文件列表、探测系统信息，打开文件、监控时无需等待",
             _ => "",
@@ -142,7 +147,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true],
         }
     }
 }
@@ -166,6 +171,8 @@ mod tests {
             let prefs = store.preferences().unwrap();
             assert_eq!(prefs.get(Preference::QuitOnWindowClose), quit);
             assert_eq!(prefs.get(Preference::ConfirmQuit), confirm);
+            assert_eq!(prefs.get(Preference::ShowStatusIcon), confirm);
+            store.set_preference(Preference::ShowStatusIcon, !confirm).unwrap();
             store.set_preference(Preference::QuitOnWindowClose, !quit).unwrap();
             store.set_preference(Preference::ConfirmQuit, !confirm).unwrap();
             drop(store);
