@@ -1,9 +1,9 @@
 mod dialogs;
 pub mod model;
 pub mod password;
-pub use dialogs::{
-    PasswordDialog, PreviewDialog, Purpose, ensure_unlocked, open_import, run_operation,
-};
+pub use dialogs::{PasswordDialog, Purpose, ensure_unlocked, open_import, run_operation};
+#[cfg(debug_assertions)]
+pub use dialogs::PreviewDialog;
 use shellmate_store::{CredentialStore, SharedStore};
 use std::sync::Arc;
 pub fn coordinator(db: SharedStore) -> Arc<CredentialStore> {

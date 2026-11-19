@@ -63,6 +63,7 @@ impl Frame {
         12. * (self.ai_share + self.commands_share)
     }
 
+    #[cfg(debug_assertions)]
     fn occupied(self, ai_width: f32) -> f32 {
         self.width(ai_width) + self.gap()
     }

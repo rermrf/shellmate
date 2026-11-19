@@ -21,12 +21,13 @@ use gpui::{
 use shellmate_ai::agent::{self, AgentEvent, Capabilities};
 use shellmate_ai::policy::PermissionMode;
 use shellmate_ai::{
-    AiError, CommandCard, ContextSnapshot, Event, ProviderClient, RigClient, Risk, Turn, UserTurn,
+    AiError, CommandCard, Event, ProviderClient, RigClient, Risk, Turn, UserTurn,
 };
-use shellmate_store::{
-    CredentialStore, SharedStore,
-    ai::{ConversationSummary, SavedConversation},
-};
+#[cfg(debug_assertions)]
+use shellmate_ai::ContextSnapshot;
+use shellmate_store::{CredentialStore, SharedStore, ai::ConversationSummary};
+#[cfg(debug_assertions)]
+use shellmate_store::ai::SavedConversation;
 use state::{NewConversation, new_conversation_tooltip};
 use std::sync::Arc;
 use std::sync::Mutex;

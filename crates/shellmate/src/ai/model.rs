@@ -1,7 +1,7 @@
 //! gpui-free policies for the drawer, disclosure, retries and settings.
-use shellmate_ai::{
-    AiError, Answer, AnswerItem, ContextSnapshot, Conversation, Event, Turn, UserTurn,
-};
+use shellmate_ai::{AiError, Answer, AnswerItem, Conversation, Event};
+#[cfg(any(test, debug_assertions))]
+use shellmate_ai::{ContextSnapshot, Turn, UserTurn};
 use shellmate_store::{SecretKey, SecretStore, ai::Settings};
 pub const SUGGESTIONS: [&str; 4] = [
     "解释最近的报错",
@@ -74,6 +74,7 @@ pub struct DrawerModel {
     pub dropped: usize,
 }
 impl DrawerModel {
+    #[cfg(any(test, debug_assertions))]
     pub fn start(&mut self, question: &str, context: ContextSnapshot) -> bool {
         if self.busy || question.trim().is_empty() {
             return false;
@@ -130,6 +131,7 @@ impl DrawerModel {
             }
         }
     }
+    #[cfg(any(test, debug_assertions))]
     pub fn clear(&mut self) {
         *self = Self::default();
     }
