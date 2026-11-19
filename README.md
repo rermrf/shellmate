@@ -54,9 +54,10 @@
 1. 从 [Releases](https://github.com/rermrf/shellmate/releases) 下载对应的安装包，打开后把 Shellmate 拖进「应用程序」：
    - Apple 芯片（M1 及以后）：`Shellmate-<版本>-arm64.dmg`，体积更小；
    - Intel 处理器：`Shellmate-<版本>-universal.dmg`，同时包含 Apple 芯片与 Intel 两种架构。
-2. 安装包目前是临时签名（ad-hoc），没有经过 Apple 公证。第一次打开时：
-   - 在「应用程序」里**右键 Shellmate → 打开**，在弹出的对话框中再点「打开」；或
-   - 在终端执行：
+2. 安装包目前是临时签名（ad-hoc），没有经过 Apple 公证，第一次打开时 macOS 会提示无法验证开发者：
+   - macOS 15 及以上：打开「系统设置 → 隐私与安全性」，在页面下方找到 Shellmate，点「仍要打开」并确认；
+   - macOS 13 / 14：在「应用程序」里**右键 Shellmate → 打开**，在弹出的对话框中再点「打开」；
+   - 若提示「已损坏，无法打开」，在终端执行下面这行后再打开：
      ```sh
      xattr -dr com.apple.quarantine /Applications/Shellmate.app
      ```
@@ -264,8 +265,8 @@ SHELLMATE_E2E_KEY=/path/to/key cargo test -p shellmate-sftp --test sftp e2e -- -
 发版步骤：
 
 ```sh
-# 1. 修改 Cargo.toml 的 workspace 版本号并提交
-# 2. 打标签并推送
+# 1. 修改 Cargo.toml 中 [workspace.package] 的 version 并提交（Cargo.lock 随之更新）
+# 2. 打标签并推送，标签必须是 v + 版本号，例如：
 git tag v0.1.8
 git push origin main v0.1.8
 ```

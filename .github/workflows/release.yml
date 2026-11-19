@@ -110,7 +110,11 @@ jobs:
             echo
             echo "两个版本都需要 macOS 13 及以上。打开 dmg，把 Shellmate 拖进「应用程序」。"
             echo
-            echo "这个版本没有 Apple 开发者签名。第一次打开时请在「应用程序」里右键 Shellmate → 打开；若提示「已损坏」，在终端执行："
+            echo "这个版本没有 Apple 开发者签名，第一次打开时 macOS 会提示无法验证开发者："
+            echo
+            echo "- macOS 15 及以上：打开「系统设置 → 隐私与安全性」，在页面下方找到 Shellmate，点「仍要打开」并确认；"
+            echo "- macOS 13 / 14：在「应用程序」里右键 Shellmate → 打开；"
+            echo "- 若提示「已损坏，无法打开」，在终端执行下面这行后再打开："
             echo
             echo '```sh'
             echo 'xattr -dr com.apple.quarantine /Applications/Shellmate.app'
