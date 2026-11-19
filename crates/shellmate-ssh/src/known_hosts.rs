@@ -373,7 +373,7 @@ mod tests {
         let (a, b, other_alg) =
             (key(Algorithm::Ed25519), key(Algorithm::Ed25519), key(Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 }));
         let hosts =
-            file(&dir, &format!("# comment\n{}\n[h2]:2222 {}\n", line("h1", &a).replace("h1", "H1"), "garbage"));
+            file(&dir, &format!("# comment\n{}\n[h2]:2222 {}\n", line("H1", &a), "garbage"));
         assert_eq!(hosts.lookup("h1", 22, &a).unwrap(), Lookup::Known);
         assert_eq!(hosts.lookup("h1", 22, &b).unwrap(), Lookup::Changed { recorded: vec![a.clone()] });
         assert_eq!(hosts.lookup("h1", 22, &other_alg).unwrap(), Lookup::New { other: vec![a.clone()] });
