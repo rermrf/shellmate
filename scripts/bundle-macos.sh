@@ -9,8 +9,9 @@
 #
 # Signing: SIGN_IDENTITY if set, otherwise the project's self-signed "Shellmate Code Signing" certificate
 # when a keychain has it (scripts/make-signing-cert.sh, docs/signing.md), otherwise ad-hoc ("-").
-# A certificate-signed app must match crates/shellmate/assets/signing/certificate.sha1, the certificate
-# the in-app updater trusts. A Developer ID identity also turns on the hardened runtime and a timestamp.
+# A certificate-signed app must be signed by a certificate in
+# crates/shellmate/assets/signing/trusted-certificates.txt, the list the in-app updater accepts.
+# A Developer ID identity also turns on the hardened runtime and a timestamp.
 #
 # Environment:
 #   SIGN_IDENTITY   codesign identity, or "-" to force ad-hoc signing.
@@ -115,11 +116,10 @@ case $identity in
   *) codesign --force $keychain --sign "$identity" "$app" >/dev/null ;;
 esac
 if [[ $identity != - ]]; then
-  pinned=$(tr -d ' \n' < crates/shellmate/assets/signing/certificate.sha1 | tr 'A-F' 'a-f')
-  if ! codesign --verify --deep --strict \
-      -R="identifier \"dev.shellmate.Shellmate\" and certificate leaf = H\"$pinned\"" "$app" 2>/dev/null; then
-    print -u2 "$app is signed by \"$identity\", but the updater only trusts the certificate in"
-    print -u2 "crates/shellmate/assets/signing/certificate.sha1 ($pinned); see docs/signing.md."
+  requirement=$(scripts/signing-requirement.sh)
+  if ! codesign --verify --deep --strict -R="$requirement" "$app" 2>/dev/null; then
+    print -u2 "$app is signed by \"$identity\", which is not in"
+    print -u2 "crates/shellmate/assets/signing/trusted-certificates.txt; see docs/signing.md."
     exit 1
   fi
 fi

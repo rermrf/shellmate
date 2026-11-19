@@ -1,0 +1,4 @@
+# Code-signing certificates the in-app updater accepts, one SHA-1 fingerprint per line; text after the
+# fingerprint and lines starting with # are ignored. Releases must be signed by one of them, and every
+# copy of Shellmate embeds this list when it is built. See docs/signing.md before adding or removing one.
+8725a95483477ea813f288b237718baebdf96fea  Shellmate Code Signing (created 2026-11-19, expires 2046-11-14)
