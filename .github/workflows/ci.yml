@@ -27,6 +27,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The Finder extension is Swift and outside the cargo workspace, so cargo never checks it.
+      # Compile both slices here so a broken change fails on push rather than at release time.
+      - name: Finder extension (Swift)
+        run: |
+          scripts/build-finder-extension.sh "$RUNNER_TEMP/ShellmateFinder" arm64 x86_64
+          lipo "$RUNNER_TEMP/ShellmateFinder" -verify_arch arm64 x86_64
+          plutil -lint macos/FinderExtension/Info.plist macos/FinderExtension/ShellmateFinder.entitlements
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

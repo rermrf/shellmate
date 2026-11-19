@@ -263,7 +263,7 @@ SHELLMATE_E2E_KEY=/path/to/key cargo test -p shellmate-sftp --test sftp e2e -- -
 
 ### 持续集成与发版
 
-- `.github/workflows/ci.yml`：推送到 `main` 和提交 PR 时，在 macOS 上运行 clippy（警告视为错误）与全部测试。
+- `.github/workflows/ci.yml`：推送到 `main` 和提交 PR 时，在 macOS 上运行 clippy（警告视为错误）与全部测试，并编译访达扩展（Swift，位于 `macos/FinderExtension`，不在 cargo 工作区内，由 `scripts/build-finder-extension.sh` 编译）。
 - `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片版与 Apple 芯片 + Intel 通用版两个 dmg 及各自的 SHA-256，用仓库 Secrets 中的证书签名并核对它在受信任清单里，然后创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。发布后，已安装的版本就能通过应用内更新收到它。
 
 发版步骤：

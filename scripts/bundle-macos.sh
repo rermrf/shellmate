@@ -86,17 +86,10 @@ mkdir -p "$appex/Contents/MacOS" "$appex/Contents/Resources"
 sed "s/@VERSION@/$version/g" "$finder_src/Info.plist" > "$appex/Contents/Info.plist"
 # The menu item shows the app icon (design 1c), light and dark, at 16 and 32 px.
 cp "$finder_src"/MenuIcon*.png "$appex/Contents/Resources/"
-compile_finder() {
-  swiftc -O -target "$1-apple-macos13.0" -application-extension -module-name ShellmateFinder \
-    -framework FinderSync -Xlinker -e -Xlinker _NSExtensionMain "$finder_src/ShellmateFinder.swift" -o "$2"
-}
 if [[ $arch == universal ]]; then
-  for slice in arm64 x86_64; do
-    compile_finder "$slice" "target/$profile/ShellmateFinder-$slice"
-  done
-  lipo -create target/$profile/ShellmateFinder-{arm64,x86_64} -output "$finder_bin"
+  scripts/build-finder-extension.sh "$finder_bin" arm64 x86_64
 else
-  compile_finder "$arch" "$finder_bin"
+  scripts/build-finder-extension.sh "$finder_bin" "$arch"
 fi
 
 cat > "$app/Contents/Info.plist" <<PLIST
