@@ -84,9 +84,8 @@ appex="$app/Contents/PlugIns/ShellmateFinder.appex"
 finder_bin="$appex/Contents/MacOS/ShellmateFinder"
 mkdir -p "$appex/Contents/MacOS" "$appex/Contents/Resources"
 sed "s/@VERSION@/$version/g" "$finder_src/Info.plist" > "$appex/Contents/Info.plist"
-for scale in '' '@2x'; do
-  cp "crates/shellmate/assets/status-icon/connected${scale}.png" "$appex/Contents/Resources/MenuIcon${scale}.png"
-done
+# The menu item shows the app icon (design 1c), light and dark, at 16 and 32 px.
+cp "$finder_src"/MenuIcon*.png "$appex/Contents/Resources/"
 compile_finder() {
   swiftc -O -target "$1-apple-macos13.0" -application-extension -module-name ShellmateFinder \
     -framework FinderSync -Xlinker -e -Xlinker _NSExtensionMain "$finder_src/ShellmateFinder.swift" -o "$2"

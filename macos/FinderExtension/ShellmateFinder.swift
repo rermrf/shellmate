@@ -3,11 +3,16 @@ import FinderSync
 
 @objc(ShellmateFinderSync)
 final class ShellmateFinderSync: FIFinderSync {
-    private let menuIcon: NSImage? = {
-        let image = Bundle(for: ShellmateFinderSync.self).image(forResource: "MenuIcon")
-        image?.size = NSSize(width: 16, height: 16)
-        image?.isTemplate = true
-        return image
+    // The app icon (design 1c) in colour; the dark variant is drawn whenever the menu is dark.
+    private let menuIcon: NSImage = {
+        let bundle = Bundle(for: ShellmateFinderSync.self)
+        let light = bundle.image(forResource: "MenuIcon")
+        let dark = bundle.image(forResource: "MenuIconDark")
+        return NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            let isDark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            (isDark ? dark : light)?.draw(in: rect)
+            return true
+        }
     }()
 
     override init() {
