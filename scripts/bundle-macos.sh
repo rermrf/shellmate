@@ -2,42 +2,55 @@
 # Build Shellmate.app with the app icon (scheme 1c).
 #
 #   scripts/bundle-macos.sh                       # release build for this Mac -> target/release/Shellmate.app + dmg
-#   scripts/bundle-macos.sh release --universal   # Apple silicon + Intel in one binary (what CI releases)
+#   scripts/bundle-macos.sh release --universal   # Apple silicon + Intel in one binary (released by CI)
+#   scripts/bundle-macos.sh release --arm64       # Apple silicon only, macOS 13+ (released by CI; reuses
+#                                                 # the arm64 half of a previous --universal build)
 #   scripts/bundle-macos.sh debug                 # wrap the existing debug build -> target/debug/Shellmate.app
 #
 # Environment:
 #   SIGN_IDENTITY   codesign identity; defaults to "-" (ad-hoc). A Developer ID identity also turns on
 #                   the hardened runtime and a secure timestamp.
-#   MACOSX_DEPLOYMENT_TARGET   defaults to 13.0 for universal builds, matching LSMinimumSystemVersion.
+#   MACOSX_DEPLOYMENT_TARGET   defaults to 13.0 for --universal and --arm64, matching LSMinimumSystemVersion.
 #
 # The Dock icon also follows the system dark appearance at runtime (crates/shellmate/src/app_icon.rs).
 set -euo pipefail
 cd "${0:A:h}/.."
 
 profile=release
-universal=0
+target=native
 for arg in "$@"; do
   case $arg in
     release|debug) profile=$arg ;;
-    --universal) universal=1 ;;
-    *) print -u2 "usage: $0 [release|debug] [--universal]"; exit 2 ;;
+    --universal) target=universal ;;
+    --arm64) target=arm64 ;;
+    *) print -u2 "usage: $0 [release|debug] [--universal|--arm64]"; exit 2 ;;
   esac
 done
-if (( universal )) && [[ $profile != release ]]; then
-  print -u2 "--universal only applies to release builds"; exit 2
+if [[ $target != native && $profile != release ]]; then
+  print -u2 "--$target only applies to release builds"; exit 2
 fi
 
-if (( universal )); then
+if [[ $target != native ]]; then
+  # Both release flavours build per-triple with the same deployment target, so the arm64 build is
+  # shared: --arm64 after --universal only re-bundles.
   export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-13.0}
-  for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+  triples=(aarch64-apple-darwin)
+  [[ $target == universal ]] && triples+=(x86_64-apple-darwin)
+  for triple in $triples; do
     cargo build --release -p shellmate --target $triple
   done
+fi
+
+if [[ $target == universal ]]; then
   binary=target/release/shellmate-universal
   mkdir -p target/release
   lipo -create -output $binary \
     target/aarch64-apple-darwin/release/shellmate \
     target/x86_64-apple-darwin/release/shellmate
   arch=universal
+elif [[ $target == arm64 ]]; then
+  binary=target/aarch64-apple-darwin/release/shellmate
+  arch=arm64
 else
   case $profile in
     release) cargo build --release -p shellmate ;;

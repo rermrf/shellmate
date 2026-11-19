@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag such as v0.1.8 (it must equal the version in Cargo.toml) to build a universal dmg and
-# create a draft release; review the notes on GitHub and publish it by hand.
+# Push a tag such as v0.1.8 (it must equal the version in Cargo.toml) to build an Apple silicon dmg and
+# a universal (Apple silicon + Intel) dmg and create a draft release; review the notes on GitHub and
+# publish it by hand.
 on:
   push:
     tags: ['v*']
@@ -23,7 +24,7 @@ env:
 
 jobs:
   release:
-    name: Universal dmg and draft release
+    name: Apple silicon and universal dmgs, draft release
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -52,10 +53,10 @@ jobs:
         with:
           key: universal-release
 
-      - name: Build Shellmate.app and the dmg
+      - name: Build the universal app and dmg
         run: scripts/bundle-macos.sh release --universal
 
-      - name: Verify the bundle
+      - name: Verify the universal bundle
         run: |
           app=target/release/Shellmate.app
           lipo -info "$app/Contents/MacOS/Shellmate"
@@ -63,15 +64,34 @@ jobs:
           codesign --verify --deep --strict "$app"
           hdiutil verify "target/release/Shellmate-$VERSION-universal.dmg"
 
-      - name: Checksum
+      # Re-bundles the arm64 half of the universal build; nothing is compiled again.
+      - name: Build the Apple silicon app and dmg
+        run: scripts/bundle-macos.sh release --arm64
+
+      - name: Verify the Apple silicon bundle
+        run: |
+          app=target/release/Shellmate.app
+          lipo -info "$app/Contents/MacOS/Shellmate"
+          if [ "$(lipo -archs "$app/Contents/MacOS/Shellmate")" != arm64 ]; then
+            echo "::error::The Apple silicon build must contain only arm64"
+            exit 1
+          fi
+          vtool -show-build "$app/Contents/MacOS/Shellmate" | grep -Eq 'minos 13\.0$'
+          codesign --verify --deep --strict "$app"
+          hdiutil verify "target/release/Shellmate-$VERSION-arm64.dmg"
+
+      - name: Checksums
         working-directory: target/release
         run: |
-          shasum -a 256 "Shellmate-$VERSION-universal.dmg" | tee "Shellmate-$VERSION-universal.dmg.sha256"
+          for arch in arm64 universal; do
+            shasum -a 256 "Shellmate-$VERSION-$arch.dmg" | tee "Shellmate-$VERSION-$arch.dmg.sha256"
+          done
 
       - name: Release notes
         run: |
           previous=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
-          sha=$(cut -d' ' -f1 "target/release/Shellmate-$VERSION-universal.dmg.sha256")
+          sha_arm64=$(cut -d' ' -f1 "target/release/Shellmate-$VERSION-arm64.dmg.sha256")
+          sha_universal=$(cut -d' ' -f1 "target/release/Shellmate-$VERSION-universal.dmg.sha256")
           {
             echo "## 更新内容"
             echo
@@ -81,9 +101,14 @@ jobs:
               echo "- 首个公开版本，功能介绍见 README。"
             fi
             echo
-            echo "## 安装"
+            echo "## 下载"
             echo
-            echo "下载 \`Shellmate-$VERSION-universal.dmg\`（支持 Apple 芯片与 Intel，macOS 13 及以上），把 Shellmate 拖进「应用程序」。"
+            echo "| 文件 | 适用于 |"
+            echo "|---|---|"
+            echo "| \`Shellmate-$VERSION-arm64.dmg\` | Apple 芯片（M1 及以后）的 Mac，推荐，体积更小 |"
+            echo "| \`Shellmate-$VERSION-universal.dmg\` | Intel 处理器的 Mac；也可在 Apple 芯片上使用 |"
+            echo
+            echo "两个版本都需要 macOS 13 及以上。打开 dmg，把 Shellmate 拖进「应用程序」。"
             echo
             echo "这个版本没有 Apple 开发者签名。第一次打开时请在「应用程序」里右键 Shellmate → 打开；若提示「已损坏」，在终端执行："
             echo
@@ -91,7 +116,10 @@ jobs:
             echo 'xattr -dr com.apple.quarantine /Applications/Shellmate.app'
             echo '```'
             echo
-            echo "SHA-256：\`$sha\`"
+            echo "SHA-256："
+            echo
+            echo "- \`Shellmate-$VERSION-arm64.dmg\`：\`$sha_arm64\`"
+            echo "- \`Shellmate-$VERSION-universal.dmg\`：\`$sha_universal\`"
           } > notes.md
           cat notes.md
 
@@ -99,7 +127,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=("target/release/Shellmate-$VERSION-universal.dmg" "target/release/Shellmate-$VERSION-universal.dmg.sha256")
+          files=()
+          for arch in arm64 universal; do
+            files+=("target/release/Shellmate-$VERSION-$arch.dmg" "target/release/Shellmate-$VERSION-$arch.dmg.sha256")
+          done
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" --notes-file notes.md

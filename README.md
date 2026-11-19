@@ -51,7 +51,9 @@
 
 **系统要求**：macOS 13 及以上，Apple 芯片或 Intel 处理器。
 
-1. 从 [Releases](https://github.com/rermrf/shellmate/releases) 下载 `Shellmate-<版本>-universal.dmg`，打开后把 Shellmate 拖进「应用程序」。
+1. 从 [Releases](https://github.com/rermrf/shellmate/releases) 下载对应的安装包，打开后把 Shellmate 拖进「应用程序」：
+   - Apple 芯片（M1 及以后）：`Shellmate-<版本>-arm64.dmg`，体积更小；
+   - Intel 处理器：`Shellmate-<版本>-universal.dmg`，同时包含 Apple 芯片与 Intel 两种架构。
 2. 安装包目前是临时签名（ad-hoc），没有经过 Apple 公证。第一次打开时：
    - 在「应用程序」里**右键 Shellmate → 打开**，在弹出的对话框中再点「打开」；或
    - 在终端执行：
@@ -209,10 +211,12 @@ cargo run -p shellmate
 scripts/bundle-macos.sh release
 # 输出：target/release/Shellmate.app、target/release/Shellmate-<版本>-arm64.dmg
 
-# Apple 芯片 + Intel 通用版（发布用）
+# 发布用的两个版本（最低 macOS 13）
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
-scripts/bundle-macos.sh release --universal
+scripts/bundle-macos.sh release --universal   # Apple 芯片 + Intel 通用版
 # 输出：target/release/Shellmate-<版本>-universal.dmg
+scripts/bundle-macos.sh release --arm64       # 仅 Apple 芯片，复用上一步编好的 arm64 部分
+# 输出：target/release/Shellmate-<版本>-arm64.dmg
 ```
 
 签名默认是临时签名；设置 `SIGN_IDENTITY` 为 Developer ID 证书名称时，会改用该证书签名并开启强化运行时。
@@ -255,7 +259,7 @@ SHELLMATE_E2E_KEY=/path/to/key cargo test -p shellmate-sftp --test sftp e2e -- -
 ### 持续集成与发版
 
 - `.github/workflows/ci.yml`：推送到 `main` 和提交 PR 时，在 macOS 上运行 clippy（警告视为错误）与全部测试。
-- `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片 + Intel 通用版，生成 dmg 和 SHA-256，并创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。
+- `.github/workflows/release.yml`：推送 `v*` 标签（必须与 `Cargo.toml` 中的版本一致）后，编译 Apple 芯片版与 Apple 芯片 + Intel 通用版两个 dmg 及各自的 SHA-256，并创建**草稿** Release；确认更新说明后在 GitHub 上手动发布。
 
 发版步骤：
 
