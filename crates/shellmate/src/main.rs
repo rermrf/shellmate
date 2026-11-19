@@ -11,6 +11,7 @@ mod connect;
 mod dialogs;
 mod editor;
 mod files;
+mod finder;
 mod forward;
 mod library;
 mod layout;
@@ -90,8 +91,16 @@ fn main() {
     #[cfg(target_os = "macos")]
     menus::configure_appkit();
     let app = gpui::application().with_assets(assets::AppAssets);
+    let (url_sender, url_receiver) = async_channel::unbounded();
+    #[cfg(debug_assertions)]
+    let debug_sender = url_sender.clone();
+    app.on_open_urls(move |urls| {
+        if let Err(err) = url_sender.try_send(urls) {
+            log::warn!("open url: workspace unavailable: {err}");
+        }
+    });
     app.on_reopen(workspace::lifecycle::MainWindow::reopen);
-    app.run(|cx: &mut App| {
+    app.run(move |cx: &mut App| {
         init_actions(cx);
         if let Err(err) = cx.text_system().add_fonts(FONTS.iter().map(|f| Cow::Borrowed(*f)).collect()) {
             log::error!("failed to load bundled fonts: {err:#}");
@@ -137,6 +146,9 @@ fn main() {
         })
         .expect("failed to open the main window");
         workspace::lifecycle::MainWindow::install(main_window, &workspace, cx);
+        workspace::open_urls::listen(url_receiver, cx);
+        #[cfg(debug_assertions)]
+        workspace::open_urls::debug_hook(debug_sender, cx);
         menus::init_hidden_shortcuts(cx);
         #[cfg(debug_assertions)]
         workspace::lifecycle::debug_hooks(cx);

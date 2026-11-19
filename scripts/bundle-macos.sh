@@ -35,6 +35,10 @@ done
 if [[ $target != native && $profile != release ]]; then
   print -u2 "--$target only applies to release builds"; exit 2
 fi
+if ! command -v swiftc >/dev/null; then
+  print -u2 "Building Shellmate's Finder extension requires swiftc (Xcode or Command Line Tools)."
+  exit 1
+fi
 
 if [[ $target != native ]]; then
   # Both release flavours build per-triple with the same deployment target, so the arm64 build is
@@ -75,6 +79,27 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/Shellmate"
 cp crates/shellmate/assets/app-icon/Shellmate.icns "$app/Contents/Resources/Shellmate.icns"
 
+finder_src=macos/FinderExtension
+appex="$app/Contents/PlugIns/ShellmateFinder.appex"
+finder_bin="$appex/Contents/MacOS/ShellmateFinder"
+mkdir -p "$appex/Contents/MacOS" "$appex/Contents/Resources"
+sed "s/@VERSION@/$version/g" "$finder_src/Info.plist" > "$appex/Contents/Info.plist"
+for scale in '' '@2x'; do
+  cp "crates/shellmate/assets/status-icon/connected${scale}.png" "$appex/Contents/Resources/MenuIcon${scale}.png"
+done
+compile_finder() {
+  swiftc -O -target "$1-apple-macos13.0" -application-extension -module-name ShellmateFinder \
+    -framework FinderSync -Xlinker -e -Xlinker _NSExtensionMain "$finder_src/ShellmateFinder.swift" -o "$2"
+}
+if [[ $arch == universal ]]; then
+  for slice in arm64 x86_64; do
+    compile_finder "$slice" "target/$profile/ShellmateFinder-$slice"
+  done
+  lipo -create target/$profile/ShellmateFinder-{arm64,x86_64} -output "$finder_bin"
+else
+  compile_finder "$arch" "$finder_bin"
+fi
+
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -90,6 +115,19 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>dev.shellmate.Shellmate.open</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>CFBundleURLSchemes</key><array><string>shellmate</string></array>
+  </dict></array>
+  <key>CFBundleDocumentTypes</key>
+  <array><dict>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>CFBundleTypeName</key><string>文件夹</string>
+  </dict></array>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
@@ -107,14 +145,16 @@ if [[ -z $identity ]]; then
     identity=-
   fi
 fi
-keychain=()
-[[ -n ${SIGN_KEYCHAIN:-} ]] && keychain=(--keychain "$SIGN_KEYCHAIN")
-case $identity in
-  -) codesign --force --sign - "$app" >/dev/null ;;
-  "Developer ID Application:"*)
-    codesign --force --options runtime --timestamp $keychain --sign "$identity" "$app" >/dev/null ;;
-  *) codesign --force $keychain --sign "$identity" "$app" >/dev/null ;;
-esac
+sign_args=(--force --sign "$identity")
+if [[ $identity != - && -n ${SIGN_KEYCHAIN:-} ]]; then
+  sign_args+=(--keychain "$SIGN_KEYCHAIN")
+fi
+if [[ $identity == "Developer ID Application:"* ]]; then
+  sign_args+=(--options runtime --timestamp)
+fi
+codesign $sign_args --entitlements "$finder_src/ShellmateFinder.entitlements" "$appex" >/dev/null
+codesign $sign_args "$app" >/dev/null
+codesign --verify --strict "$appex"
 if [[ $identity != - ]]; then
   requirement=$(scripts/signing-requirement.sh)
   if ! codesign --verify --deep --strict -R="$requirement" "$app" 2>/dev/null; then

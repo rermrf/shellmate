@@ -50,6 +50,7 @@ mod drawer_resize;
 mod drawer_motion;
 mod menu_actions;
 pub(crate) mod lifecycle;
+pub(crate) mod open_urls;
 
 actions!(
     shellmate,

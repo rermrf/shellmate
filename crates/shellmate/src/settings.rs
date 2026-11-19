@@ -20,12 +20,14 @@ use shellmate_store::{Backend, Preference as P, Preferences};
 
 // Re-enable the placeholder rows when remote sync is available.
 const SHOW_REMOTE_SYNC: bool = false;
+const LOCAL_TERMINAL: usize = 3;
 
 pub struct SettingsWindow {
     workspace: WeakEntity<Workspace>,
     preferences: Preferences,
     ai: Entity<crate::ai::settings::AiSettings>,
     section: usize,
+    finder_enabled: Option<bool>,
     scroll: gpui::ScrollHandle,
     error: Option<String>,
     credentials: std::sync::Arc<shellmate_store::CredentialStore>,
@@ -57,10 +59,17 @@ impl SettingsWindow {
             );
             let ai=cx.new(|cx|crate::ai::settings::AiSettings::new(workspace.clone(),db,credentials.clone(),window,cx));
             ai.update(cx,|a,cx|a.refresh_key(cx));
+            cx.observe_window_activation(window, |s: &mut Self, w, cx| {
+                if s.section == LOCAL_TERMINAL && w.is_window_active() {
+                    s.finder_enabled = crate::finder::enabled();
+                    cx.notify();
+                }
+            }).detach();
             Self {
                 ai, workspace,
                 preferences,
                 section,
+                finder_enabled: if section == LOCAL_TERMINAL { crate::finder::enabled() } else { None },
                 scroll: gpui::ScrollHandle::new(),
                 error: None,
                 selected_master: credentials.backend() == Backend::Master,
@@ -254,6 +263,9 @@ impl Render for SettingsWindow {
                     .child(name)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section = index;
+                        if index == LOCAL_TERMINAL {
+                            this.finder_enabled = crate::finder::enabled();
+                        }
                         this.scroll.set_offset(gpui::point(px(0.), px(0.)));
                         cx.notify();
                     }))
@@ -624,7 +636,7 @@ impl Render for SettingsWindow {
                     P::SessionLog,
                     P::AutoRecord,
                 ],
-                3 => &[P::LoginShell],
+                LOCAL_TERMINAL => &[P::LoginShell],
                 _ if crate::prototype_fixture() => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory],
                 _ => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory, P::PreloadPanels],
             };
@@ -636,35 +648,37 @@ impl Render for SettingsWindow {
                 .py(px(4.))
                 .flex()
                 .flex_col();
-            for key in keys {
-                let key = *key;
+            let preference_row = |label: &'static str, description: &'static str| {
+                div()
+                    .min_h(px(56.))
+                    .flex_none()
+                    .py(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_height(px(16.))
+                            .child(label)
+                            .when(!description.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .mt(px(4.))
+                                        .text_size(px(12.))
+                                        .text_color(p.tx2)
+                                        .child(description),
+                                )
+                            }),
+                    )
+            };
+            for &key in keys {
                 rows = rows.child(
-                    div()
-                        .min_h(px(56.))
-                        .flex_none()
-                        .py(px(12.))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .whitespace_normal()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .line_height(px(16.))
-                                .child(key.label())
-                                .when(!key.description().is_empty(), |d| {
-                                    d.child(
-                                        div()
-                                            .mt(px(4.))
-                                            .text_size(px(12.))
-                                            .text_color(p.tx2)
-                                            .child(key.description()),
-                                    )
-                                }),
-                        )
+                    preference_row(key.label(), key.description())
                         .when(key == P::History, |d| {
                             d.child(
                                 Button::new("clear-history")
@@ -705,6 +719,19 @@ impl Render for SettingsWindow {
                                     this.toggle(key, *value, w, cx)
                                 })),
                         )),
+                );
+            }
+            if self.section == LOCAL_TERMINAL {
+                let status = match self.finder_enabled {
+                    Some(true) => "已启用",
+                    Some(false) => "未启用",
+                    None => "开发版不可用",
+                };
+                rows = rows.child(
+                    preference_row("访达右键菜单", "在访达的文件夹或空白处右键，选择「进入 Shellmate」，即可在该目录打开本机终端。")
+                        .child(div().flex_none().text_size(px(12.)).text_color(p.tx2).child(status))
+                        .child(dialogs::button("finder-settings", "在系统设置中打开", dialogs::Tone::Plain, true)
+                            .on_click(|_, _, _| crate::finder::show_settings())),
                 );
             }
             content = content.child(rows);
