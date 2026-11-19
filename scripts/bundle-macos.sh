@@ -7,9 +7,14 @@
 #                                                 # the arm64 half of a previous --universal build)
 #   scripts/bundle-macos.sh debug                 # wrap the existing debug build -> target/debug/Shellmate.app
 #
+# Signing: SIGN_IDENTITY if set, otherwise the project's self-signed "Shellmate Code Signing" certificate
+# when a keychain has it (scripts/make-signing-cert.sh, docs/signing.md), otherwise ad-hoc ("-").
+# A certificate-signed app must match crates/shellmate/assets/signing/certificate.sha1, the certificate
+# the in-app updater trusts. A Developer ID identity also turns on the hardened runtime and a timestamp.
+#
 # Environment:
-#   SIGN_IDENTITY   codesign identity; defaults to "-" (ad-hoc). A Developer ID identity also turns on
-#                   the hardened runtime and a secure timestamp.
+#   SIGN_IDENTITY   codesign identity, or "-" to force ad-hoc signing.
+#   SIGN_KEYCHAIN   keychain file holding the identity (CI uses a temporary one).
 #   MACOSX_DEPLOYMENT_TARGET   defaults to 13.0 for --universal and --arm64, matching LSMinimumSystemVersion.
 #
 # The Dock icon also follows the system dark appearance at runtime (crates/shellmate/src/app_icon.rs).
@@ -93,13 +98,32 @@ if [[ $profile == release ]]; then
   # Local symbols only matter for debugging; the linker's ad-hoc signature is replaced below.
   strip -x "$app/Contents/MacOS/Shellmate"
 fi
-identity=${SIGN_IDENTITY:--}
-if [[ $identity == - ]]; then
-  codesign --force --sign - "$app" >/dev/null
-else
-  codesign --force --options runtime --timestamp --sign "$identity" "$app" >/dev/null
+identity=${SIGN_IDENTITY:-}
+if [[ -z $identity ]]; then
+  if security find-identity -p codesigning 2>/dev/null | grep -q '"Shellmate Code Signing"'; then
+    identity="Shellmate Code Signing"
+  else
+    identity=-
+  fi
 fi
-print "built $app ($version, $arch)"
+keychain=()
+[[ -n ${SIGN_KEYCHAIN:-} ]] && keychain=(--keychain "$SIGN_KEYCHAIN")
+case $identity in
+  -) codesign --force --sign - "$app" >/dev/null ;;
+  "Developer ID Application:"*)
+    codesign --force --options runtime --timestamp $keychain --sign "$identity" "$app" >/dev/null ;;
+  *) codesign --force $keychain --sign "$identity" "$app" >/dev/null ;;
+esac
+if [[ $identity != - ]]; then
+  pinned=$(tr -d ' \n' < crates/shellmate/assets/signing/certificate.sha1 | tr 'A-F' 'a-f')
+  if ! codesign --verify --deep --strict \
+      -R="identifier \"dev.shellmate.Shellmate\" and certificate leaf = H\"$pinned\"" "$app" 2>/dev/null; then
+    print -u2 "$app is signed by \"$identity\", but the updater only trusts the certificate in"
+    print -u2 "crates/shellmate/assets/signing/certificate.sha1 ($pinned); see docs/signing.md."
+    exit 1
+  fi
+fi
+print "built $app ($version, $arch, signed by ${${identity:#-}:-ad-hoc})"
 
 [[ $profile == release ]] || exit 0
 

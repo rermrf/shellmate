@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# Signing secrets must never be committed (docs/signing.md)
+*.p12

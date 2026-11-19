@@ -53,6 +53,38 @@ jobs:
         with:
           key: universal-release
 
+      # Releases are signed with the project's self-signed certificate so that keychain access and the
+      # in-app updater keep trusting new versions (docs/signing.md).
+      - name: Import the signing certificate
+        env:
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_CERT_P12" ] || [ -z "$SIGNING_CERT_PASSWORD" ]; then
+            echo "::error::Add the SIGNING_CERT_P12 and SIGNING_CERT_PASSWORD repository secrets (docs/signing.md)"
+            exit 1
+          fi
+          pinned=$(tr -d ' \n' < crates/shellmate/assets/signing/certificate.sha1 | tr 'A-F' 'a-f')
+          if ! echo "$pinned" | grep -Eq '^[0-9a-f]{40}$' || [ "$pinned" = 0000000000000000000000000000000000000000 ]; then
+            echo "::error::crates/shellmate/assets/signing/certificate.sha1 must hold the certificate's SHA-1 (docs/signing.md)"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          printf '%s' "$SIGNING_CERT_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$SIGNING_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | xargs)
+          {
+            echo "SIGN_IDENTITY=Shellmate Code Signing"
+            echo "SIGN_KEYCHAIN=$keychain"
+            echo "SIGN_REQUIREMENT=identifier \"dev.shellmate.Shellmate\" and certificate leaf = H\"$pinned\""
+          } >> "$GITHUB_ENV"
+
       - name: Build the universal app and dmg
         run: scripts/bundle-macos.sh release --universal
 
@@ -61,7 +93,7 @@ jobs:
           app=target/release/Shellmate.app
           lipo -info "$app/Contents/MacOS/Shellmate"
           lipo "$app/Contents/MacOS/Shellmate" -verify_arch arm64 x86_64
-          codesign --verify --deep --strict "$app"
+          codesign --verify --deep --strict -R="$SIGN_REQUIREMENT" "$app"
           hdiutil verify "target/release/Shellmate-$VERSION-universal.dmg"
 
       # Re-bundles the arm64 half of the universal build; nothing is compiled again.
@@ -77,7 +109,7 @@ jobs:
             exit 1
           fi
           vtool -show-build "$app/Contents/MacOS/Shellmate" | grep -Eq 'minos 13\.0$'
-          codesign --verify --deep --strict "$app"
+          codesign --verify --deep --strict -R="$SIGN_REQUIREMENT" "$app"
           hdiutil verify "target/release/Shellmate-$VERSION-arm64.dmg"
 
       - name: Checksums
@@ -142,3 +174,8 @@ jobs:
             gh release create "$TAG" "${files[@]}" --draft --verify-tag \
               --title "Shellmate $VERSION" --notes-file notes.md
           fi
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGN_KEYCHAIN:-}" ]; then security delete-keychain "$SIGN_KEYCHAIN" || true; fi
