@@ -380,7 +380,8 @@ impl Workspace {
                 settings(2, window, cx).update(cx, |s, cx| s.fixture_scroll(120., cx));
             }
             "set-local" => self.open_settings(3, window, cx),
-            "set-conn" => self.open_settings(4, window, cx),
+            "quit-confirm" => self.confirm_quit(super::lifecycle::Activity { sessions: 3, transfers: 1, forwards: 2 }, window, cx),
+            "set-conn" | "settings-window" => self.open_settings(4, window, cx),
             _ => {}
         }
         self.sync_sidebar(cx);

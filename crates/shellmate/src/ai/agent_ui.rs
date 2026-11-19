@@ -202,11 +202,11 @@ impl Drawer {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 if !this
-                    .update_in(cx, |s, _, cx| {
+                    .update_in(cx, |s, window, cx| {
                         if s.epoch != epoch || !s.state.model.busy {
                             return false;
                         }
-                        cx.notify();
+                        if window.is_visible() { cx.notify(); }
                         true
                     })
                     .unwrap_or(false)

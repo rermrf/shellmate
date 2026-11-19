@@ -194,6 +194,7 @@ struct State {
     closed: bool,
     /// Somebody is looking at the monitor page.
     active: bool,
+    window_hidden: bool,
     /// The collecting task is running (it ends by itself when it gives up or the connection is gone).
     run_alive: bool,
     run: Option<AbortOnDrop>,
@@ -232,7 +233,7 @@ struct Inner {
     wake_docker: Arc<Notify>,
     /// The next look at the containers also asks for the disk usage (somebody pressed a button).
     docker_full: Arc<AtomicBool>,
-    disconnect: watch::Sender<()>,
+    cancel_prefetch: watch::Sender<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -279,6 +280,7 @@ impl Inner {
             // Whatever time passed since the last sample is not a rate.
             engine.reset_baselines();
         }
+        log::info!("monitor sampling started or resumed");
         self.set_phase(state, Phase::Starting);
         let task = self.task(state);
         state.run = Some(AbortOnDrop(self.runtime.spawn(task.run())));
@@ -528,6 +530,7 @@ impl Monitor {
         let state = State {
             closed: false,
             active: false,
+            window_hidden: false,
             run_alive: false,
             run: None,
             grace: None,
@@ -555,7 +558,7 @@ impl Monitor {
                 options,
                 slot: Arc::new(Mutex::new(None)),
                 state: Mutex::new(state),
-                disconnect: watch::channel(()).0,
+                cancel_prefetch: watch::channel(()).0,
                 focus: watch::channel(Focus::Overview).0,
                 wake_services: Arc::new(Notify::new()),
                 #[cfg(target_os = "macos")]
@@ -575,6 +578,7 @@ impl Monitor {
         if state.closed {
             return;
         }
+        let active = active && !state.window_hidden;
         let was_active = std::mem::replace(&mut state.active, active);
         #[cfg(target_os = "macos")]
         if inner.local { inner.sync_native(&mut state); }
@@ -603,6 +607,27 @@ impl Monitor {
         }
     }
 
+    /// Stop sampling immediately when the window is ordered out, including a run in its
+    /// tab-switch grace period. Keep its connection, cached samples and user actions.
+    pub fn set_window_hidden(&self, hidden: bool) {
+        let inner = &self.inner;
+        let mut state = lock(&inner.state);
+        if state.closed || state.window_hidden == hidden { return; }
+        state.window_hidden = hidden;
+        if !hidden { return; }
+        inner.cancel_prefetch.send_replace(());
+        state.active = false;
+        #[cfg(target_os = "macos")]
+        if inner.local { inner.sync_native(&mut state); }
+        state.grace = None;
+        if state.run.take().is_some() {
+            state.generation += 1;
+            state.run_alive = false;
+            inner.set_phase(&mut state, Phase::Idle);
+            log::info!("monitor sampling paused while the window is hidden");
+        }
+    }
+
     /// There is a connection (the first one, or a new one after a loss). Collecting starts (again) if
     /// somebody is looking.
     pub fn connection_restored(&self, connection: &Connection) {
@@ -625,7 +650,7 @@ impl Monitor {
         *lock(&inner.slot) = None;
         state.generation += 1;
         state.probe_cell = Arc::default();
-        inner.disconnect.send_replace(());
+        inner.cancel_prefetch.send_replace(());
         state.run = None;
         state.run_alive = false;
         state.actions.clear();
@@ -650,7 +675,7 @@ impl Monitor {
         state.closed = true;
         #[cfg(target_os = "macos")]
         { state.ports_task = None; state.services_task = None; }
-        self.inner.disconnect.send_replace(());
+        self.inner.cancel_prefetch.send_replace(());
         *lock(&self.inner.slot) = None;
         // Dropped here, under the lock, so no task can start or report in between.
         let (run, grace, actions) = (state.run.take(), state.grace.take(), std::mem::take(&mut state.actions));
@@ -661,13 +686,13 @@ impl Monitor {
 
     /// Warm the inactive monitor once, without starting a collector, events or stats streams.
     pub async fn prefetch(&self) {
-        let (task, connection, mut disconnect) = {
+        let (task, connection, mut cancelled) = {
             let state = lock(&self.inner.state);
-            if state.closed || state.run_alive || state.active {
+            if state.closed || state.window_hidden || state.run_alive || state.active {
                 return;
             }
             let Some(connection) = self.inner.connection() else { return };
-            (self.inner.task(&state), connection, self.inner.disconnect.subscribe())
+            (self.inner.task(&state), connection, self.inner.cancel_prefetch.subscribe())
         };
         let warm = async {
             let probe = match task.with(|_, state| state.probe.clone()) {
@@ -691,7 +716,7 @@ impl Monitor {
                 task.prefetch_pages(&probe).await;
             }
         };
-        tokio::select! { biased; _ = disconnect.changed() => {}, () = warm => {} }
+        tokio::select! { biased; _ = cancelled.changed() => {}, () = warm => {} }
     }
 
     /// The newest numbers, if any frame came in yet.

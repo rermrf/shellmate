@@ -117,7 +117,7 @@ impl TerminalView {
         let subscriptions = vec![
             cx.observe(&terminal, |_, _, cx| cx.notify()),
             cx.subscribe(&terminal, |this: &mut Self, _, event: &TerminalEvent, cx| {
-                if matches!(event, TerminalEvent::Output) && this.search.is_some() {
+                if matches!(event, TerminalEvent::Output) && this.search.is_some() && !this.terminal.read(cx).display_paused {
                     this.refresh_search(false, cx);
                 }
             }),
@@ -143,6 +143,16 @@ impl TerminalView {
             fixture_grid_width_offset: 0.,
             top_radius: px(0.),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// Keep consuming output while the owning window is ordered out. Refresh any open
+    /// search against the accumulated grid when that window returns.
+    pub fn set_display_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |t, _| t.display_paused = paused);
+        if !paused {
+            self.refresh_search(false, cx);
+            cx.notify();
         }
     }
 

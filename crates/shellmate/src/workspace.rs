@@ -47,6 +47,7 @@ mod ai;
 mod drawer_resize;
 mod drawer_motion;
 mod menu_actions;
+pub(crate) mod lifecycle;
 
 actions!(
     shellmate,
@@ -187,7 +188,10 @@ impl Session {
 }
 
 pub struct Workspace {
-    last_menu_state: Option<crate::menus::MenuState>,
+    hidden: bool,
+    quit_dialog: Option<gpui::WeakEntity<crate::dialogs::quit::QuitDialog>>,
+    last_menu_state: Option<(crate::menus::MenuState, Option<menu_actions::Available>)>,
+    hidden_focus_actions: Vec<&'static str>,
     store: shellmate_store::SharedStore,
     /// Saved passwords and key passphrases (the macOS keychain).
     secrets: Arc<shellmate_store::CredentialStore>,
@@ -286,9 +290,14 @@ impl Workspace {
         let workspace=cx.entity().downgrade();
         crate::updater::init(store.clone(), workspace.clone(), cx);
         let mut subscriptions=subscriptions;
+        // Background session changes can affect menu validation while AppKit has stopped drawing.
+        subscriptions.push(cx.observe_self(|s, cx| { if s.hidden { s.sync_menus(cx); } }));
         subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
+            hidden: false,
+            quit_dialog: None,
             last_menu_state: None,
+            hidden_focus_actions: Vec::new(),
             preferences,
             data_root:shellmate_term::archive::data_root(),log_root:shellmate_term::archive::log_root(),
             running_recordings:HashMap::new(),archive_task:None,records_window:None,
@@ -459,6 +468,7 @@ impl Workspace {
         cx.subscribe_in(terminal, window, move |this: &mut Self, _, event: &TerminalEvent, window, cx| {
             if matches!(event, TerminalEvent::Output) {
                 this.preload_on_output(id, cx);
+                if this.hidden { return; }
             }
             if let TerminalEvent::Command { command, cwd, time } = event {
                 this.save_command_history(id, command, cwd.clone(), *time, cx);
@@ -1153,11 +1163,11 @@ impl Render for Workspace {
         if self.drawer_motion.changing_target(target) { crate::motion::refresh_preference(cx); }
         self.drawer_motion.update(target, now, crate::motion::enabled(cx) && !self.ai_drawer_drag.active());
         let ai_width = self.drawer_width(_window);
-        if self.sidebar_motion.running() || self.drawer_motion.running() {
+        if !self.hidden && _window.is_visible() && (self.sidebar_motion.running() || self.drawer_motion.running()) {
             _window.request_animation_frame();
         }
         self.sidebar.update(cx, |sidebar, _| sidebar.frame = self.sidebar_motion.frame);
-        self.sync_menus(cx);
+        if !self.hidden { self.sync_menus(cx); }
         let p = cx.palette().clone();
         let activity=self.secrets.clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {

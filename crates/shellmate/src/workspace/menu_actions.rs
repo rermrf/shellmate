@@ -2,8 +2,8 @@ use super::*;
 use crate::menus::*;
 use crate::productivity::multi::{SessionRow, Split};
 
-#[derive(Default)]
-struct Available {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Available {
     session: bool,
     files: bool,
     remote_panels: bool,
@@ -33,6 +33,14 @@ impl Available {
             cycle: rows.len() >= 2,
             vault_lock: false,
         }
+    }
+
+    fn handler(&self, name: &str) -> Option<Handler> {
+        let mut handler = None;
+        self.listeners(|action, run| {
+            if action.name() == name { handler = Some(run); }
+        });
+        handler
     }
 
     fn listeners(&self, mut bind: impl FnMut(&'static dyn gpui::Action, Handler)) {
@@ -74,6 +82,19 @@ impl Available {
     }
 }
 
+/// Focus-sensitive commands use the native window's responder chain while visible.
+fn hidden_menus(state: &MenuState, available: Available, focused: &[&str]) -> Vec<gpui::Menu> {
+    let mut tree = menus(state);
+    for item in tree.iter_mut().flat_map(|menu| &mut menu.items) {
+        let gpui::MenuItem::Action { action, os_action, .. } = item else { continue };
+        if available.handler(action.name()).is_some() || focused.contains(&action.name()) || os_action.is_some() {
+            *os_action = None;
+            *action = Box::new(ReopenForMenu(action.name()));
+        }
+    }
+    tree
+}
+
 impl Workspace {
     /// Only the master-password vault can be locked; the system keychain unlocks with the login session.
     pub(super) fn vault_lock_available(&self) -> bool {
@@ -110,19 +131,44 @@ impl Workspace {
             ai_open: self.ai_open,
             vault_lock: self.vault_lock_available(),
         };
-        if self.last_menu_state != Some(state) {
-            self.last_menu_state = Some(state);
-            cx.defer(move |cx| cx.set_menus(menus(&state)));
+        let hidden = self.hidden.then(|| self.menu_availability(cx));
+        if self.last_menu_state != Some((state, hidden)) {
+            self.last_menu_state = Some((state, hidden));
+            let tree = match hidden {
+                Some(available) => hidden_menus(&state, available, &self.hidden_focus_actions),
+                None => menus(&state),
+            };
+            cx.defer(move |cx| cx.set_menus(tree));
         }
     }
 
-    pub(super) fn menu_listeners<E: InteractiveElement>(&self, mut root: E, cx: &Context<Self>) -> E {
+    fn menu_availability(&self, cx: &App) -> Available {
         let session = self.active.and_then(|index| self.sessions.get(index));
         let focused_id = self.focused_session().map(|session| session.id);
         let mut available = Available::for_sessions(&self.session_rows(cx), session.map(|s| (s.id, s.panel)), focused_id,
             &self.split, focused_id.is_some_and(|id| self.running_recordings.contains_key(&id)));
         available.vault_lock = self.vault_lock_available();
-        available.listeners(|action, handler| {
+        available
+    }
+
+    pub(super) fn remember_focus_actions(&mut self, window: &Window, cx: &App) {
+        use shellmate_term::view::{SearchDown, SearchUp};
+        let actions: [&dyn gpui::Action; 3] = [&ToggleSearch, &SearchUp, &SearchDown];
+        self.hidden_focus_actions = actions.into_iter().filter(|action| window.is_action_available(*action, cx))
+            .map(|action| action.name()).collect();
+    }
+
+    pub(crate) fn perform_hidden_menu(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_window(window, cx);
+        if let Some(run) = self.menu_availability(cx).handler(name) {
+            run(self, window, cx);
+        } else if let Ok(action) = cx.build_action(name, None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    pub(super) fn menu_listeners<E: InteractiveElement>(&self, mut root: E, cx: &Context<Self>) -> E {
+        self.menu_availability(cx).listeners(|action, handler| {
             root.interactivity().on_boxed_action(action, cx.listener(move |workspace, _, window, cx| handler(workspace, window, cx)));
         });
         root
@@ -135,6 +181,22 @@ mod tests {
     use gpui::Action as _;
     use shellmate_core::Protocol;
     use crate::productivity::multi::Status;
+
+    #[test]
+    fn hidden_menu_routes_available_workspace_commands_without_a_key_window() {
+        let tree = hidden_menus(&MenuState::default(), Available::default(), &[ToggleSearch.name()]);
+        let restored: Vec<_> = tree.iter().flat_map(|menu| &menu.items).filter_map(|item| {
+            let gpui::MenuItem::Action { action, .. } = item else { return None };
+            action.as_any().downcast_ref::<ReopenForMenu>().map(|a| a.0)
+        }).collect();
+        for name in [Settings.name(), NewLocalTerminal.name(), NewConnection.name(), ToggleSidebar.name(),
+            ToggleTheme.name(), OpenPalette.name(), Records.name(), ToggleSearch.name(), EditPaste.name()] {
+            assert!(restored.contains(&name), "{name}");
+        }
+        for name in [CloseTab.name(), ShowForward.name(), HideApp.name(), Quit.name()] {
+            assert!(!restored.contains(&name), "{name}");
+        }
+    }
 
     #[test]
     fn workspace_handlers_for_main_local_empty_and_serial() {
@@ -169,7 +231,7 @@ mod tests {
                 for item in menus(&MenuState::default()).into_iter().flat_map(|menu| menu.items) {
                     if let gpui::MenuItem::Action { action, .. } = item {
                         let name = action.name();
-                        let outside_workspace = [About.name(), CheckUpdates.name(), HideApp.name(), HideOthers.name(), ShowAll.name(), Quit.name(),
+                        let outside_workspace = [CloseWindow.name(), About.name(), CheckUpdates.name(), HideApp.name(), HideOthers.name(), ShowAll.name(), Quit.name(),
                             EditUndo.name(), EditRedo.name(), EditCut.name(), EditCopy.name(), EditPaste.name(), EditSelectAll.name(),
                             Fullscreen.name(), Minimize.name(), Zoom.name(), ToggleSearch.name(),
                             shellmate_term::view::SearchUp.name(), shellmate_term::view::SearchDown.name()];

@@ -105,7 +105,7 @@ impl<const N: usize> Blocks<N> {
                 remember: clock.animate,
             }
         });
-        if region.flight.is_some() {
+        if window.is_visible() && region.flight.is_some() {
             window.request_animation_frame();
         }
         region

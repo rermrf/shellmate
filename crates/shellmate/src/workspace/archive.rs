@@ -238,7 +238,7 @@ impl Workspace {
             let active = self.running_recordings.values().map(|r| r.row.id).collect();
             panel.update(cx, |p, cx| p.sync_recordings(active, self.preferences.get(P::PromptHighlight), cx));
         }
-        if !self.running_recordings.is_empty() {
+        if !self.hidden && !self.running_recordings.is_empty() {
             cx.notify();
         }
     }
@@ -254,6 +254,7 @@ impl Workspace {
             .set_preference(key, value)
             .map_err(|e| e.to_string())?;
         self.preferences.set(key, value);
+        if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit) { return Ok(()); }
         if key == P::PreloadPanels && !value {
             for group in &mut self.groups {
                 group.preload = None;

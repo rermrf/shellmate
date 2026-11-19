@@ -65,9 +65,11 @@ pub enum Preference {
     PromptHighlight,
     ReplayTimestamps,
     PreloadPanels,
+    QuitOnWindowClose,
+    ConfirmQuit,
 }
 impl Preference {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -80,6 +82,8 @@ impl Preference {
         Self::PromptHighlight,
         Self::ReplayTimestamps,
         Self::PreloadPanels,
+        Self::QuitOnWindowClose,
+        Self::ConfirmQuit,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -95,6 +99,8 @@ impl Preference {
             Self::PromptHighlight => "prompt_highlight",
             Self::ReplayTimestamps => "replay_timestamps",
             Self::PreloadPanels => "preload_panels",
+            Self::QuitOnWindowClose => "quit_on_window_close",
+            Self::ConfirmQuit => "confirm_quit",
         }
     }
     pub fn label(self) -> &'static str {
@@ -111,6 +117,8 @@ impl Preference {
             Self::PromptHighlight => "提示符高亮",
             Self::ReplayTimestamps => "回放时间",
             Self::PreloadPanels => "连接后预加载文件与监控",
+            Self::QuitOnWindowClose => "关闭窗口时",
+            Self::ConfirmQuit => "退出前确认",
         }
     }
     pub fn description(self) -> &'static str {
@@ -129,12 +137,12 @@ impl Preference {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
-    values: [bool; 12],
+    values: [bool; Preference::ALL.len()],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            values: [true, true, true, true, true, false, false, true, true, true, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true],
         }
     }
 }
@@ -149,6 +157,22 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn window_preferences_persist_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.db");
+        let mut store = HostStore::open(&path).unwrap();
+        for (quit, confirm) in [(false, true), (true, false), (false, true)] {
+            let prefs = store.preferences().unwrap();
+            assert_eq!(prefs.get(Preference::QuitOnWindowClose), quit);
+            assert_eq!(prefs.get(Preference::ConfirmQuit), confirm);
+            store.set_preference(Preference::QuitOnWindowClose, !quit).unwrap();
+            store.set_preference(Preference::ConfirmQuit, !confirm).unwrap();
+            drop(store);
+            store = HostStore::open(&path).unwrap();
+        }
+    }
+
     #[test]
     fn replay_timestamps_default_on_and_persist_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -186,7 +210,7 @@ mod tests {
         for key in Preference::ALL {
             assert_eq!(
                 p.get(key),
-                !matches!(key, Preference::SessionLog | Preference::AutoRecord)
+                !matches!(key, Preference::SessionLog | Preference::AutoRecord | Preference::QuitOnWindowClose)
             );
             s.set_preference(key, !p.get(key)).unwrap();
             assert_eq!(s.preferences().unwrap().get(key), !p.get(key));

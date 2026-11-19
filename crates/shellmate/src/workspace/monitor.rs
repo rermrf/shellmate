@@ -71,6 +71,7 @@ impl Workspace {
             Owner::Local => return,
             Owner::Ssh(_) => Monitor::with_options(runtime.handle(), events, Options::default()),
         };
+        monitor.set_window_hidden(self.hidden);
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = changes.recv().await {
                 if this.update_in(cx, |this, window, cx| this.on_monitor_event(owner, event, window, cx)).is_err() {
@@ -118,6 +119,8 @@ impl Workspace {
         }
         for owner in self.groups.iter().map(|g| Owner::Ssh(g.id)).chain([Owner::Local]) {
             if let Some(monitor) = self.backend(owner) {
+                monitor.monitor.set_window_hidden(self.hidden);
+                if self.hidden { continue; }
                 let here = showing.filter(|(id, _)| *id == owner);
                 if here.is_none() { monitor.monitor.set_active(false); }
                 if owner == Owner::Local && here.is_none() { monitor.monitor.set_focus(Focus::Overview); }

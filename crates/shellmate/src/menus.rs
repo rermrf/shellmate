@@ -1,11 +1,13 @@
-use gpui::{Action, App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
+use gpui::{Action, App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
 use gpui::component::input;
 use shellmate_term::view as terminal;
 
 use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NextTab, OpenPalette, Panel,
     PreviousTab, Quit, ToggleSidebar, ToggleTheme};
 
-actions!(shellmate, [About, CheckUpdates, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
+use crate::workspace::{Workspace, lifecycle::MainWindow};
+
+actions!(shellmate, [CloseWindow, About, CheckUpdates, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
     EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll, ShowTerminal, ShowFiles,
     ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi,
@@ -46,6 +48,7 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
             Item::action("广播输入", ToggleBroadcast).checked(state.broadcast), Item::Separator,
             Item::action("导入主机…", ImportHosts), Item::action("导入配置包…", ImportBundle),
             Item::action("导出配置包…", ExportBundle), Item::Separator, Item::action("关闭会话", CloseTab),
+            Item::action("关闭窗口", CloseWindow),
         ]),
         Menu::new("编辑").items([
             Item::os_action("撤销", EditUndo, OsAction::Undo), Item::os_action("重做", EditRedo, OsAction::Redo),
@@ -86,14 +89,33 @@ fn edit_target(input_available: bool, terminal_available: bool) -> Option<Target
     }
 }
 
-fn with_active_window(cx: &mut App, run: impl FnOnce(&mut Window, &mut App) + 'static) {
-    if let Some(handle) = cx.active_window() {
-        cx.defer(move |cx| { handle.update(cx, |_, window, cx| run(window, cx)).ok(); });
+/// AppKit has no responder window for an ordered-out workspace. Only its hidden menu
+/// uses this app-level action. Visible menus retain GPUI's focus-sensitive validation.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = shellmate, no_json)]
+pub(crate) struct ReopenForMenu(pub &'static str);
+
+/// Give the hidden menu the same native key equivalents without binding extra keys in
+/// any visible view. AppKit reads the binding by action when constructing its NSMenu.
+pub(crate) fn init_hidden_shortcuts(cx: &mut App) {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let mut shortcuts = Vec::new();
+    for item in menus(&MenuState::default()).into_iter().flat_map(|menu| menu.items) {
+        let MenuItem::Action { action, .. } = item else { continue };
+        let Some(binding) = keymap.bindings_for_action(action.as_ref()).next() else { continue };
+        let [key] = binding.keystrokes() else { continue };
+        let scope = gpui::KeyBindingContextPredicate::parse("HiddenWorkspaceMenu").expect("menu context");
+        shortcuts.push(KeyBinding::load(&key.unparse(cx.platform_info().os),
+            Box::new(ReopenForMenu(action.name())), Some(scope.into()), false, None, cx)
+            .expect("existing menu shortcut"));
     }
+    drop(keymap);
+    cx.bind_keys(shortcuts);
 }
 
 fn forward_edit(cx: &mut App, input: &'static dyn Action, terminal: Option<&'static dyn Action>) {
-    with_active_window(cx, move |window, cx| {
+    MainWindow::with_restored_window(cx, move |window, cx| {
         let target = edit_target(window.is_action_available(input, cx),
             terminal.is_some_and(|action| window.is_action_available(action, cx)));
         let action = match target {
@@ -112,7 +134,7 @@ pub(crate) fn global_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-v", EditPaste, None), KeyBinding::new("cmd-a", EditSelectAll, None),
         KeyBinding::new("cmd-h", HideApp, None), KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None), KeyBinding::new("ctrl-cmd-f", Fullscreen, None),
-        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-shift-w", CloseWindow, None),
     ]
 }
 
@@ -124,15 +146,20 @@ pub(crate) fn init(cx: &mut App) {
         .on_action(|_: &EditCopy, cx| forward_edit(cx, &input::Copy, Some(&terminal::Copy)))
         .on_action(|_: &EditPaste, cx| forward_edit(cx, &input::Paste, Some(&terminal::Paste)))
         .on_action(|_: &EditSelectAll, cx| forward_edit(cx, &input::SelectAll, Some(&terminal::SelectAll)))
-        .on_action(|_: &CheckUpdates, cx| with_active_window(cx, crate::updater::manual))
-        .on_action(|_: &About, cx| with_active_window(cx, crate::dialogs::about::open))
+        .on_action(|_: &CheckUpdates, cx| MainWindow::with_restored_window(cx, crate::updater::manual))
+        .on_action(|_: &About, cx| MainWindow::with_restored_window(cx, crate::dialogs::about::open))
         .on_action(|_: &HideApp, cx| cx.hide())
         .on_action(|_: &HideOthers, cx| cx.hide_other_apps())
         .on_action(|_: &ShowAll, cx| cx.unhide_other_apps())
-        .on_action(|_: &Minimize, cx| with_active_window(cx, |window, _| window.minimize_window()))
-        .on_action(|_: &Zoom, cx| with_active_window(cx, |window, _| window.zoom_window()))
-        .on_action(|_: &Fullscreen, cx| with_active_window(cx, |window, _| window.toggle_fullscreen()))
-        .on_action(|_: &Quit, cx| cx.quit());
+        .on_action(|_: &Minimize, cx| MainWindow::with_restored_window(cx, |window, _| window.minimize_window()))
+        .on_action(|_: &Zoom, cx| MainWindow::with_restored_window(cx, |window, _| window.zoom_window()))
+        .on_action(|_: &Fullscreen, cx| MainWindow::with_restored_window(cx, |window, _| window.toggle_fullscreen()))
+        .on_action(|_: &CloseWindow, cx| MainWindow::update(cx, Workspace::close_window))
+        .on_action(|_: &Quit, cx| MainWindow::update(cx, Workspace::request_quit))
+        .on_action(|action: &ReopenForMenu, cx| {
+            let name = action.0;
+            MainWindow::update(cx, move |s, w, cx| s.perform_hidden_menu(name, w, cx));
+        });
 }
 
 #[cfg(target_os = "macos")]

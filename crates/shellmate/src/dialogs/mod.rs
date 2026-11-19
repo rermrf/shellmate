@@ -9,6 +9,7 @@ pub mod auth;
 pub(crate) mod about;
 pub mod clash;
 pub mod confirm;
+pub(crate) mod quit;
 pub mod host_editor;
 pub mod hostkey;
 pub mod import;

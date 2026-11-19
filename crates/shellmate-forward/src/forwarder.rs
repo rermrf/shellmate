@@ -462,6 +462,12 @@ impl Forwarder {
         lock(&self.inner.state).rules.iter().filter(|entry| entry.state.is_running()).count()
     }
 
+    /// Bound local/dynamic listeners survive SSH loss. Remote listeners exist only after
+    /// the server grants the forward on a live connection.
+    pub fn listening_rules(&self) -> usize {
+        lock(&self.inner.state).rules.iter().filter(|entry| entry.bound.is_some() || entry.state.is_running()).count()
+    }
+
     /// How many forwarded connections are open across all rules (what closing would cut).
     pub fn active_connections(&self) -> u32 {
         lock(&self.inner.state).rules.iter().map(|entry| entry.stats.snapshot().active).sum()

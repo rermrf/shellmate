@@ -50,13 +50,22 @@ impl PasswordInput {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        cx.on_focus(&focus, window, |this, _, cx| this.start_blink(BLINK, cx))
+        cx.on_focus(&focus, window, |this, w, cx| {
+            if w.is_window_active() { this.start_blink(BLINK, cx); }
+        })
             .detach();
         cx.on_blur(&focus, window, |this, _, cx| {
             this.blink = None;
             cx.notify();
         })
         .detach();
+        cx.observe_window_activation(window, |this, w, cx| {
+            if w.is_window_active() && this.focus.is_focused(w) {
+                this.start_blink(BLINK, cx);
+            } else {
+                this.blink = None;
+            }
+        }).detach();
         Self {
             value: Zeroizing::new(String::new()),
             focus,

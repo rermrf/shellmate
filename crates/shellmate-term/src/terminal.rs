@@ -265,6 +265,7 @@ pub struct Terminal {
     tx: async_channel::Sender<Msg>,
     output_pending: Arc<AtomicBool>,
     foreground: Option<(Instant, Option<ProcessInfo>)>,
+    pub(crate) display_paused: bool,
     bracketed_paste: bool,
     replay: bool,
     pub(crate) replay_times: crate::replay::timestamps::LineTimes,
@@ -330,6 +331,7 @@ impl Terminal {
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
             foreground: None,
+            display_paused: false,
             bracketed_paste: true,
             replay: false,
             replay_times: Default::default(),
@@ -475,7 +477,7 @@ impl Terminal {
         self.foreground = None;
         self.schedule_prompt_learning(cx);
         cx.emit(TerminalEvent::Output);
-        cx.notify();
+        if !self.display_paused { cx.notify(); }
     }
 
     fn schedule_prompt_learning(&mut self, cx: &mut Context<Self>) {
@@ -492,7 +494,7 @@ impl Terminal {
                     if last_output.is_some_and(|at| now.saturating_duration_since(at) < crate::prompt::QUIET) {
                         return true;
                     }
-                    if this.prompt_highlighter.learn(&*term, last_output, now) { cx.notify(); }
+                    if this.prompt_highlighter.learn(&*term, last_output, now) && !this.display_paused { cx.notify(); }
                     false
                 });
                 if !matches!(retry, Ok(true)) { break; }

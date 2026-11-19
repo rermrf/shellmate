@@ -625,8 +625,8 @@ impl Render for SettingsWindow {
                     P::AutoRecord,
                 ],
                 3 => &[P::LoginShell],
-                _ if crate::prototype_fixture() => &[P::FollowDirectory],
-                _ => &[P::FollowDirectory, P::PreloadPanels],
+                _ if crate::prototype_fixture() => &[P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory],
+                _ => &[P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory, P::PreloadPanels],
             };
             let mut rows = div()
                 .flex_none()
@@ -688,14 +688,23 @@ impl Render for SettingsWindow {
                                     })),
                             )
                         })
-                        .child(
+                        .when_else(key == P::QuitOnWindowClose, |d| {
+                            let quit = self.preferences.get(key);
+                            let this = cx.weak_entity();
+                            d.child(crate::ui::segmented(key.key(), vec![
+                                crate::ui::SegmentItem::new("保持运行", !quit),
+                                crate::ui::SegmentItem::new("退出 Shellmate", quit),
+                            ], move |index, w, cx| {
+                                this.update(cx, |s, cx| s.toggle(key, index == 1, w, cx)).ok();
+                            }, cx))
+                        }, |d| d.child(
                             Switch::new(key.key())
                                 .checked(self.preferences.get(key))
                                 .color(p.ok)
                                 .on_click(cx.listener(move |this, value: &bool, w, cx| {
                                     this.toggle(key, *value, w, cx)
                                 })),
-                        ),
+                        )),
                 );
             }
             content = content.child(rows);

@@ -127,7 +127,7 @@ impl Clock {
         let generation = window.use_keyed_state(id, cx, |_, _| Generation::default());
         let (_, progress) = generation.update(cx, |state, cx| state.visible_sample(key, self, cx));
         progress.map_or(1., |progress| {
-            window.request_animation_frame();
+            if window.is_visible() { window.request_animation_frame(); }
             mix(0.4, 1., progress)
         })
     }

@@ -89,7 +89,9 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     menus::configure_appkit();
-    gpui::application().with_assets(assets::AppAssets).run(|cx: &mut App| {
+    let app = gpui::application().with_assets(assets::AppAssets);
+    app.on_reopen(workspace::lifecycle::MainWindow::reopen);
+    app.run(|cx: &mut App| {
         init_actions(cx);
         if let Err(err) = cx.text_system().add_fonts(FONTS.iter().map(|f| Cow::Borrowed(*f)).collect()) {
             log::error!("failed to load bundled fonts: {err:#}");
@@ -105,8 +107,6 @@ fn main() {
             _ => dark,
         };
         theme::apply(dark, cx);
-
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         #[cfg(debug_assertions)]
@@ -126,7 +126,7 @@ fn main() {
             ..Default::default()
         };
         let (store, store_notice) = open_store();
-        let (_window, _workspace) = gpui::open_window(options, cx, move |window, cx| {
+        let (main_window, workspace) = gpui::open_window(options, cx, move |window, cx| {
             // The Dock icon follows the system appearance, like macOS's own dark icons.
             window
                 .observe_window_appearance(|window, _| {
@@ -136,14 +136,18 @@ fn main() {
             cx.new(|cx| Workspace::new(store, store_notice, window, cx))
         })
         .expect("failed to open the main window");
+        workspace::lifecycle::MainWindow::install(main_window, &workspace, cx);
+        menus::init_hidden_shortcuts(cx);
+        #[cfg(debug_assertions)]
+        workspace::lifecycle::debug_hooks(cx);
         #[cfg(debug_assertions)]
         if let Ok(name) = std::env::var("SHELLMATE_DEMO") {
-            _window.update(cx, |_, window, cx| demo::run(&name, &_workspace, window, cx)).ok();
+            main_window.update(cx, |_, window, cx| demo::run(&name, &workspace, window, cx)).ok();
         }
         cx.activate(true);
         #[cfg(debug_assertions)]
         if let Some(path) = std::env::var_os("SHELLMATE_MENU_DUMP") {
-            _window.update(cx, |_, window, _| menus::dump::after_frame(path.into(), window)).ok();
+            main_window.update(cx, |_, window, _| menus::dump::after_frame(path.into(), window)).ok();
         }
     });
 }

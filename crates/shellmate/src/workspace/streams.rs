@@ -25,6 +25,13 @@ impl StreamSession {
             task: None,
         }
     }
+    pub(super) fn connected_or_reconnecting(&self, exited: bool) -> bool {
+        if let Some(state) = self.serial.as_ref().map(Control::state).or_else(|| self.snapshot.clone()) {
+            return state.open || state.retrying;
+        }
+        self.connected || (exited && self.attempt.is_some())
+    }
+
     pub fn connected(&self) -> bool {
         self.snapshot.as_ref().map_or(self.connected, |s| s.open)
     }

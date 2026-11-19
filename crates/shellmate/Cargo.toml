@@ -33,7 +33,9 @@ env_logger.workspace = true
 libc.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSWorkspace"] }
+objc2-app-kit = { workspace = true, features = ["NSWorkspace", "NSView", "NSWindow"] }
+# GPUI already uses this locked crate for its Window handle.
+raw-window-handle = "0.6.2"
 similar.workspace = true
 tempfile.workspace = true
 # Already used by gpui-component; reuse the locked parser for safe Markdown preprocessing.

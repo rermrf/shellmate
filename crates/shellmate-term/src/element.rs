@@ -262,7 +262,7 @@ impl Element for TerminalElement {
                     cx.defer(move |cx|terminal.update(cx,|_,cx|cx.emit(crate::TerminalEvent::SizeChanged)));
                 }
             });
-            if self.terminal.read(cx).resize_pending() { window.request_animation_frame(); }
+            if window.is_visible() && self.terminal.read(cx).resize_pending() { window.request_animation_frame(); }
         }
         self.view.update(cx, |v, _| v.geometry = Some(Geometry { origin: bounds.origin, size: grid }));
 

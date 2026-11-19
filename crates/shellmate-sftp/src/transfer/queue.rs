@@ -402,6 +402,11 @@ impl TransferQueue {
         }
     }
 
+    /// How many transfers are actively moving files.
+    pub fn running_count(&self) -> usize {
+        self.inner.lock().items.iter().filter(|item| item.state == TransferState::Running).count()
+    }
+
     /// Every item, oldest first.
     pub fn snapshot(&self) -> Vec<TransferView> {
         let now = Instant::now();

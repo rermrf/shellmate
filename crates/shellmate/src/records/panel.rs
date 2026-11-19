@@ -103,7 +103,7 @@ pub struct RecordsWindow {
     rename: Option<Entity<InputState>>,
     progress: Rc<Cell<Option<Bounds<Pixels>>>>,
     _subscriptions: Vec<Subscription>,
-    _timer: Task<()>,
+    timer: Option<Task<()>>,
     #[cfg(debug_assertions)]
     demo_end: Option<bool>,
 }
@@ -155,16 +155,6 @@ impl RecordsWindow {
                     this.filter(cx);
                 }
             });
-            let timer = cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(33))
-                        .await;
-                    if this.update(cx, |s, cx| s.tick(cx)).is_err() {
-                        break;
-                    }
-                }
-            });
             let mut this = Self {
                 store,
                 log_root,
@@ -194,10 +184,11 @@ impl RecordsWindow {
                 rename: None,
                 progress: Rc::new(Cell::new(None)),
                 _subscriptions: vec![subscription],
-                _timer: timer,
+                timer: None,
                 #[cfg(debug_assertions)]
                 demo_end: None,
             };
+            this.set_window_visible(true, cx);
             this.load(cx);
             this.refresh_durations(cx);
             this
@@ -418,6 +409,16 @@ impl RecordsWindow {
         self.last_tick = Instant::now();
         cx.notify();
     }
+    pub(crate) fn set_window_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.last_tick = Instant::now();
+        self.timer = visible.then(|| cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                if this.update(cx, |s, cx| s.tick(cx)).is_err() { break; }
+            }
+        }));
+    }
+
     fn tick(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick).as_secs_f64();

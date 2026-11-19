@@ -238,6 +238,27 @@ mod tests {
     use crate::ports::PortSource;
     use tokio::sync::oneshot;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordering_out_cancels_grace_and_reopening_starts_a_fresh_run() {
+        // No yields: the executor never polls a system sampler or launches a process.
+        let (events, _) = async_channel::unbounded();
+        let monitor = Monitor::local(Handle::current(), events);
+        monitor.set_active(true);
+        let old_run = monitor.inner.task(&lock(&monitor.inner.state));
+        monitor.set_active(false);
+        assert!(lock(&monitor.inner.state).grace.is_some());
+        monitor.set_window_hidden(true);
+        assert_eq!(monitor.phase(), Phase::Idle);
+        assert!(old_run.with(|_, _| ()).is_none());
+        monitor.set_active(true);
+        assert!(!lock(&monitor.inner.state).run_alive);
+        monitor.set_window_hidden(false);
+        monitor.set_active(true);
+        assert_eq!(monitor.phase(), Phase::Starting);
+        assert!(lock(&monitor.inner.state).run_alive);
+        monitor.shutdown();
+    }
+
     #[tokio::test]
     async fn service_polling_wakes_for_actions_and_cancels_when_hidden() {
         tokio::time::timeout(Duration::from_secs(3), async {
