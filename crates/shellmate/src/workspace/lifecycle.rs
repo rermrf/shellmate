@@ -369,6 +369,7 @@ impl Workspace {
 
 #[cfg(debug_assertions)]
 pub(crate) fn debug_hooks(cx: &mut App) {
+    super::tab_drag::debug::install(cx);
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
         ("SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER", |cx| Hub::update(cx, Workspace::move_session_to_new_window)),

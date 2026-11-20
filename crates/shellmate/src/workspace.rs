@@ -32,6 +32,7 @@ use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_b
 mod files;
 mod hub;
 mod transfer;
+mod tab_drag;
 pub(crate) use hub::Hub;
 use hub::{Services, Route};
 mod forward;
@@ -220,6 +221,7 @@ pub struct Workspace {
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
     session_menu: Option<multi::OpenSessionMenu>,
+    tab_strip: tab_drag::TabStrip,
     #[cfg(debug_assertions)]
     demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
     #[cfg(debug_assertions)]
@@ -309,6 +311,7 @@ impl Workspace {
             ai_drawer_width, ai_drawer_drag: Default::default(),
             drawer_motion: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
+            tab_strip: Default::default(),
             #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -708,6 +711,89 @@ impl Workspace {
         }).count()
     }
 
+    fn tab_face(&self, ix: usize, width: gpui::Pixels, preview: bool, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let s = &self.sessions[ix];
+        let active = Some(ix) == self.active;
+        let p = cx.palette().clone();
+        div()
+            .id(("tab", s.id))
+            .w(width)
+            .min_w_0()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .h(px(36.))
+            .pl(px(12.))
+            .pr(px(6.))
+            .rounded(px(12.))
+            .cursor_pointer()
+            .text_size(px(13.))
+            .line_height(px(16.))
+            .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
+            .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
+            .when(matches!(s.kind, SessionKind::Local), |d| {
+                d.child(AppIcon::Laptop.icon().text_color(session_dot(s, &p)))
+            })
+            .when(!matches!(s.kind, SessionKind::Local), |d| d.child(dot(session_dot(s, &p), 7.)))
+            .child(crate::ui::ellipsis(("tab-title", s.id), s.title.clone()).flex_1().max_w(px(crate::tabs::TITLE_MAX)))
+            .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded(px(4.))
+                        .bg(p.warns)
+                        .text_color(p.warn)
+                        .text_size(px(10.))
+                        .child("广播"),
+                )
+            })
+            .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
+                let failed = status == ssh::SshStatus::Failed;
+                let color = if failed { p.err } else { p.warn };
+                let id = s.id;
+                div()
+                    .id(("tab-badge", id))
+                    .flex_none()
+                    .h(px(16.))
+                    .px(px(5.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .bg(color.opacity(0.14))
+                    .text_color(color)
+                    .text_size(px(10.))
+                    .line_height(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(badge)
+                    .when(!preview, |d| d.tooltip(|window, cx| Tooltip::new("点击或按回车立即重试").build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.retry_tab(id, window, cx);
+                    })))
+            }))
+            .child(
+                div()
+                    .id(("close-tab", s.id))
+                    .flex_none()
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .hover(|d| d.bg(p.card3))
+                    .text_size(px(15.))
+                    .line_height(px(15.))
+                    .text_color(p.tx3)
+                    .child("×")
+                    .when(!preview, |d| d.on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close(ix, window, cx);
+                    }))),
+            )
+    }
+
     fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         // Shape the same fonts/weights the strip renders; titles are capped, chips are not.
@@ -777,87 +863,17 @@ impl Workspace {
             + crate::tabs::TAB_GAP * visible.len().saturating_sub(1) as f32;
         let has_tabs = !visible.is_empty();
         let source = self.handle;
+        let indices = visible.clone();
+        let tab_owner = cx.weak_entity();
+        let strip_owner = tab_owner.clone();
         let tabs = visible.into_iter().map(|ix| {
-            let s = &self.sessions[ix];
-            let active = Some(ix) == self.active;
-            let id = s.id;
-            div()
-                .id(("tab", s.id))
-                .w(px(widths[ix].min(fit.single_tab_max)))
-                .min_w_0()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(8.))
-                .h(px(36.))
-                .pl(px(12.))
-                .pr(px(6.))
-                .rounded(px(12.))
-                .cursor_pointer()
-                .text_size(px(13.))
-                .line_height(px(16.))
-                .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
-                .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
-                .when(matches!(s.kind, SessionKind::Local), |d| {
-                    d.child(AppIcon::Laptop.icon().text_color(session_dot(s, &p)))
+            let id = self.sessions[ix].id;
+            let width = px(widths[ix].min(fit.single_tab_max));
+            self.tab_face(ix, width, false, cx)
+                .on_mouse_down(MouseButton::Left, tab_drag::press)
+                .on_drag(tab_drag::DraggedTab::new(source, id), move |tab, offset, window, cx| {
+                    tab.begin(offset, width, window, cx)
                 })
-                .when(!matches!(s.kind, SessionKind::Local), |d| d.child(dot(session_dot(s, &p), 7.)))
-                .child(crate::ui::ellipsis(("tab-title", s.id), s.title.clone()).flex_1().max_w(px(crate::tabs::TITLE_MAX)))
-                .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id), |d| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .px(px(5.))
-                            .rounded(px(4.))
-                            .bg(p.warns)
-                            .text_color(p.warn)
-                            .text_size(px(10.))
-                            .child("广播"),
-                    )
-                })
-                .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
-                    let failed = status == ssh::SshStatus::Failed;
-                    let color = if failed { p.err } else { p.warn };
-                    let id = s.id;
-                    div()
-                        .id(("tab-badge", id))
-                        .flex_none()
-                        .h(px(16.))
-                        .px(px(5.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(5.))
-                        .bg(color.opacity(0.14))
-                        .text_color(color)
-                        .text_size(px(10.))
-                        .line_height(px(12.))
-                        .font_weight(FontWeight::BOLD)
-                        .child(badge)
-                        .tooltip(|window, cx| Tooltip::new("点击或按回车立即重试").build(window, cx))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.retry_tab(id, window, cx);
-                        }))
-                }))
-                .child(
-                    div()
-                        .id(("close-tab", s.id))
-                        .flex_none()
-                        .size(px(22.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.))
-                        .hover(|d| d.bg(p.card3))
-                        .text_size(px(15.))
-                        .line_height(px(15.))
-                        .text_color(p.tx3)
-                        .child("×")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close(ix, window, cx);
-                        })),
-                )
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
                 .context_menu(move |menu, window, cx| {
                     transfer::tab_context_menu(menu, source, id, window, cx)
@@ -880,6 +896,9 @@ impl Workspace {
 
         let theme_icon = if cx.is_dark() { AppIcon::Sun } else { AppIcon::Moon };
         div()
+            .on_children_prepainted(move |bounds, _, cx| {
+                let _ = strip_owner.update(cx, |this, _| this.tab_strip.bounds = bounds.first().copied());
+            })
             .h(px(58.))
             .flex_none()
             .pt(px(4.))
@@ -902,7 +921,10 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap(px(crate::tabs::TAB_GAP))
-                            .children(tabs),
+                            .children(tabs)
+                            .on_children_prepainted(move |bounds, _, cx| {
+                                let _ = tab_owner.update(cx, |this, _| this.tab_strip.record_tabs(&indices, bounds));
+                            }),
                     )
                     .child(div().flex_none().when(has_tabs, |d| d.ml(px(crate::tabs::TAB_GAP))).child(new_tab))
                     .child(window_drag_area(div().id("tabbar-drag")).flex_1().min_w_0().h_full())
@@ -1232,6 +1254,7 @@ impl Render for Workspace {
             .id("workspace")
             .relative()
             .key_context(CONTEXT)
+            .on_drag_move::<tab_drag::DraggedTab>(tab_drag::moved)
             .track_focus(&self.focus_handle)
             .map(|root| self.menu_listeners(root, cx))
             .on_action(cx.listener(Self::focus_host_search))
@@ -1268,6 +1291,7 @@ impl Render for Workspace {
             })
             .children(palette)
             .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
+                tab_drag::paint_and_listen(window, cx);
                 if let Some(owner) = drag_owner.upgrade() {
                     let moved = owner.clone();
                     window.on_mouse_event::<gpui::MouseMoveEvent>(move |e, phase, w, cx| {

@@ -113,6 +113,7 @@ impl Route {
 pub(crate) struct Hub {
     pub(super) services: Rc<Services>,
     windows: Vec<Entry>,
+    pub(super) tab_drag: tab_drag::TabDrag,
     window_ids: Ids,
     _timer: gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -137,9 +138,15 @@ impl Hub {
         let secrets = crate::security::coordinator(store.clone());
         crate::updater::init(store.clone(), cx);
         let activity = secrets.clone();
-        let keys = cx.intercept_keystrokes(move |_, _, _| activity.activity());
+        let keys = cx.intercept_keystrokes(move |event, window, cx| {
+            activity.activity();
+            if event.keystroke.key == "escape" {
+                tab_drag::escape(window, cx);
+            }
+        });
         let closed = cx.on_window_closed(|cx, id| {
             crate::dialogs::modal::forget_window(id, cx);
+            tab_drag::window_closed(id, cx);
             let windows = &mut cx.global_mut::<Self>().windows;
             if let Some(ix) = windows.iter().position(|e| e.handle.window_id() == id) {
                 windows.remove(ix);
@@ -195,6 +202,7 @@ impl Hub {
                 status_bar,
             }),
             windows: Vec::new(),
+            tab_drag: Default::default(),
             window_ids: Ids::default(),
             _timer: timer,
             _subscriptions: vec![closed, keys],

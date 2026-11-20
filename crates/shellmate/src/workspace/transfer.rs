@@ -34,8 +34,14 @@ fn remove_tab(
 }
 
 impl Workspace {
-    pub(super) fn detach_session(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) -> Option<DetachedSession> {
+    pub(super) fn detach_session(&mut self, id: usize, destination: AnyWindowHandle, window: &mut Window, cx: &mut Context<Self>) -> Option<DetachedSession> {
         let ix = self.sessions.iter().position(|s| s.id == id)?;
+        if destination == self.handle {
+            // Reordering keeps focus, subscriptions, split and broadcast in this window.
+            return Some(DetachedSession {
+                session: self.sessions.remove(ix), source: self.handle, resume_typing: false, question: None,
+            });
+        }
         let question = self.take_connection_prompt(id, window, cx);
         self.detach_clash_dialog(id, window, cx);
         let main = self.main_id();
@@ -87,6 +93,10 @@ impl Workspace {
             resume_typing,
             question,
         } = detached;
+        if source == self.handle {
+            self.sessions.insert(index, session);
+            return;
+        }
         let id = session.id;
         session.ai_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         session
@@ -213,9 +223,9 @@ impl Workspace {
 }
 
 #[derive(Clone, Copy)]
-enum Destination {
+pub(super) enum Destination {
     New(Placement),
-    Existing(AnyWindowHandle),
+    Existing(AnyWindowHandle, usize),
 }
 
 fn move_to_new(source: AnyWindowHandle, id: usize, window: &Window, cx: &mut App) {
@@ -223,7 +233,7 @@ fn move_to_new(source: AnyWindowHandle, id: usize, window: &Window, cx: &mut App
     cx.defer(move |cx| move_sessions(source, destination, vec![id], cx));
 }
 
-fn move_sessions(handle: AnyWindowHandle, target: Destination, ids: Vec<usize>, cx: &mut App) {
+pub(super) fn move_sessions(handle: AnyWindowHandle, target: Destination, ids: Vec<usize>, cx: &mut App) {
     let Some(source) = Hub::entry(handle, cx) else { return };
     let Some(owner) = source.workspace.upgrade() else { return };
     let workspace = owner.read(cx);
@@ -239,12 +249,12 @@ fn move_sessions(handle: AnyWindowHandle, target: Destination, ids: Vec<usize>, 
         }).ok();
         return;
     }
-    let destination = match target {
-        Destination::New(placement) => open_secondary(placement, cx),
-        Destination::Existing(handle) => Hub::entry(handle, cx),
+    let (destination, index) = match target {
+        Destination::New(placement) => (open_secondary(placement, cx), 0),
+        Destination::Existing(handle, index) => (Hub::entry(handle, cx), index),
     };
     if let Some(destination) = destination
-        && !move_tabs(&source, &destination, &ids, usize::MAX, cx)
+        && !move_tabs(&source, &destination, &ids, index, cx)
         && matches!(target, Destination::New(_))
     {
         destination.update(cx, |_, window, _| window.remove_window());
@@ -265,7 +275,7 @@ fn move_tabs(
     let moved = destination.update(cx, |target, window, cx| {
         let Some(tabs) = source.update(cx, |workspace, source_window, cx| {
             ids.iter()
-                .filter_map(|id| workspace.detach_session(*id, source_window, cx))
+                .filter_map(|id| workspace.detach_session(*id, destination.handle, source_window, cx))
                 .collect::<Vec<_>>()
         }) else {
             return false;
@@ -301,14 +311,14 @@ fn move_all(source: &hub::Entry, destination: &hub::Entry, cx: &mut App) {
         if ids.is_empty() {
             source.update(cx, |workspace, window, cx| workspace.close_empty_window_if_needed(window, cx));
         } else {
-            move_sessions(source.handle, Destination::Existing(destination.handle), ids, cx);
+            move_sessions(source.handle, Destination::Existing(destination.handle, usize::MAX), ids, cx);
         }
     }
 }
 
 pub(super) fn move_to_recent_window(source: AnyWindowHandle, tabs: Vec<usize>, cx: &mut App) {
     if let Some(destination) = Hub::most_recent_other(source, cx) {
-        move_sessions(source, Destination::Existing(destination.handle), tabs, cx);
+        move_sessions(source, Destination::Existing(destination.handle, usize::MAX), tabs, cx);
     }
 }
 
@@ -338,7 +348,7 @@ pub(super) fn tab_context_menu(
             let destination = *destination;
             submenu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _, cx| {
                 cx.defer(move |cx| {
-                    move_sessions(source, Destination::Existing(destination), vec![id], cx);
+                    move_sessions(source, Destination::Existing(destination, usize::MAX), vec![id], cx);
                 });
             }))
         })
