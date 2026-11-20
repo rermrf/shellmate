@@ -1,0 +1,272 @@
+# P9 多窗口：标签拆分与合并
+
+目标：像 VS Code / Chrome 一样，任何会话标签都可以拖出成为独立窗口，也可以拖回或拖进其他窗口合并。移动过程中，SSH 连接、终端内容和面板状态全部保留。
+
+本文是完整的实施方案，可以按步骤直接交给 Codex 实现。每一步完成后都按第 7 节的清单验收。
+
+---
+
+## 0. 已确定的决策
+
+| 问题 | 决定 |
+|---|---|
+| 关闭「不是最后一个」的窗口，而窗口里还有会话时 | **每次弹窗询问**：取消 / 移到其他窗口 / 断开并关闭 |
+| 最后一个窗口的关闭行为 | 沿用现有逻辑：「关闭窗口时 = 保持运行」时收到菜单栏，否则走退出流程 |
+| 新窗口是否带侧边栏（主机列表） | **带**。每个窗口都有自己的侧边栏，展开或收起各自独立，主机数据共享 |
+| AI 抽屉、快捷命令抽屉、广播、分屏 | **按窗口独立**。广播和分屏只作用于同一窗口里的会话 |
+| 实施顺序 | 1a 架构 → 1b 多窗口功能（不含拖拽）→ 2 标签拖拽 → 3 跟随鼠标的浮动预览 |
+
+## 1. 技术验证结论（2026-11-20，已通过）
+
+用一个独立的 gpui 测试程序（两个窗口，标签里有每秒自增的计数器和可输入的文字），在本机实测了以下各项：
+
+| 验证项 | 结果 |
+|---|---|
+| 窗口内拖动标签调整顺序 | ✅ |
+| 拖到所有窗口之外松手：在松手位置新开窗口 | ✅ 松手约 30 ms 后新窗口出现 |
+| 拖到另一个窗口的标签栏：插入到指定位置 | ✅ 目标窗口能同步画出插入竖线 |
+| 拖出窗口时，有一个跟随鼠标的浮动预览窗口 | ✅ 流畅 |
+| 移动后实体状态（计数器、已输入文字、焦点）保留 | ✅ |
+
+### 关键技术点（实现时必须遵守）
+
+1. **标签拖动不能带动窗口**：窗口要用 `app_owns_titlebar_drag: true`（Shellmate 已经设置），并且标签元素不能放在 `window_drag_area` 里。否则在标题栏区域拖标签，系统会把整个窗口拖走。验证时第一次就踩了这个坑。
+2. **拖出窗口后仍能收到事件**：macOS 会把鼠标拖动和松开事件持续发给发起拖拽的那个窗口，即使鼠标已经在窗口外。
+   - **移动**：用 `div().on_drag_move::<DraggedTab>(…)`，它在捕获阶段触发，不需要鼠标悬停在元素上。
+   - **松开**：在根元素的 `canvas` 里注册 `window.on_mouse_event(|e: &MouseUpEvent, phase, window, cx| …)`，只处理 `DispatchPhase::Capture`。
+3. **屏幕坐标**：屏幕坐标 = `window.bounds().origin + event.position`。gpui 的坐标原点在左上角，是跨显示器的全局坐标。窗口的标题栏是透明的（`appears_transparent: true`），所以内容区域的原点就是窗口原点。
+4. **命中判断**：遍历所有窗口的 `bounds()`，找出鼠标所在的窗口；再看是否落在标签栏高度内，以及按横坐标落在第几个插入位置。
+   - 窗口重叠时，必须取**最靠前**的那个窗口。验证程序按登记顺序判断，重叠时会出错。正式实现要用 `NSApp.orderedWindows`（从前往后）决定。
+5. **新窗口位置**：`WindowOptions.window_bounds = WindowBounds::Windowed(Bounds::new(松手点 - 抓取偏移, 尺寸))`。
+6. **浮动预览窗口**：
+   - 选项：`WindowKind::PopUp`、`titlebar: None`、`focus: false`、`is_movable: false`；
+   - gpui 没有移动窗口的接口，要通过原生窗口句柄拿到 `NSWindow` 后调用 `setFrameOrigin`；
+   - 坐标转换：AppKit 的原点在主屏幕左下角，`y_appkit = 主屏高度 - (y_gpui + 预览高度)`。
+
+验证程序的核心代码片段：
+
+```rust
+// 拖动中（发起窗口的根元素上）
+.on_drag_move::<DraggedTab>(move |e: &DragMoveEvent<DraggedTab>, window, cx| {
+    let screen = window.bounds().origin + e.event.position;
+    let over = over_at(cx, screen);          // Strip(窗口, 插入位置) / Window(窗口) / Outside
+    // 位置变化时：通知目标窗口画插入线；进入 Outside 时打开浮动预览，离开时关闭
+    if over == Over::Outside { move_ghost(cx, screen); }
+})
+// 松开（根元素内的 canvas，paint 阶段注册）
+.child(canvas(|_, _, _| (), move |_, _, window, _| {
+    window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+        if phase != DispatchPhase::Capture { return; }
+        let screen = window.bounds().origin + e.position;
+        // 按 over_at(screen) 决定：本窗口排序 / 移入其他窗口 / 新开窗口
+    });
+}).absolute().size_0())
+
+// 移动浮动预览窗口
+let view = unsafe { h.ns_view.cast::<objc2_app_kit::NSView>().as_ref() };
+if let Some(ns) = view.window() {
+    let screen_h = NSScreen::screens(mtm).firstObject().map(|s| s.frame().size.height).unwrap_or(0.);
+    ns.setFrameOrigin(NSPoint::new(x as f64 + 12., screen_h - (y as f64 + 12. + 32.)));
+}
+```
+
+---
+
+## 2. 第 1a 步：Workspace 按窗口拆分（已实现，待验收）
+
+**状态**：已由 Codex 实现，提交在 `p7-wip` 分支（`refactor: Workspace 按窗口拆分…`），**还没有合并到 `feat/p7-more` / `main`**。
+
+已经验证的部分：本机完整测试 1507 个通过；`cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo clippy --release -p shellmate -- -D warnings` 都没有警告。
+
+还没做的验收见第 7 节，包括 101 个演示场景逐像素对比、原有调试开关回归、跨窗口移动会话的实测。
+
+### 架构（实现结果）
+
+- **`Workspace`（每个窗口一个）**：本窗口的 `sessions`（标签）、`active`、侧边栏和侧边栏动画、分屏、广播勾选、两个抽屉、picker、编辑器、`hidden`、菜单状态、焦点，以及和窗口绑定的订阅。见 `crates/shellmate/src/workspace.rs`。
+- **`Hub`（应用级 Global）**：见 `crates/shellmate/src/workspace/hub.rs`。
+  - **共享服务**：存储、凭据、主机列表、偏好设置、数据和日志目录、临时主机、待填表单、录制和录制窗口、端口转发授权、本机监控、退出对话框、状态栏图标。
+  - **共享的 SSH 连接组**：`ConnGroup`。
+  - **全局唯一 ID**：会话 ID 和连接组 ID 的分配器。
+  - **窗口清单**：按最近激活排序；`Hub::install` 负责登记窗口，`Hub::activated` 把窗口提到最前。
+  - **路由**：`Route`。异步完成的回调（SSH、SFTP、转发、监控、Mosh、重连）通过 `Route::deliver` 找到会话当前所在的窗口。连接组的状态则通过 `Workspace::project` 推送到所有显示该连接组的窗口。
+- **会话移动**（`crates/shellmate/src/workspace/transfer.rs`）：
+  - **`detach_session(id) -> DetachedSession`**：从本窗口移除标签，结束分屏配对，清掉广播勾选，丢弃所有和窗口绑定的订阅。终端、滚动缓冲、面板实体和状态、所属连接组都原样保留。
+  - **`attach_session(detached, index, window, cx)`**：在目标窗口重建终端订阅、终端视图的窗口绑定和搜索框、文件 / 转发 / 监控面板的绑定，恢复 AI 状态和焦点，并继续输入未完成的命令。
+- **调试开关**（只在调试版有效）：
+  - `SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER=<秒>`：开第二个窗口，把当前会话移过去；
+  - `SHELLMATE_DEBUG_MERGE_BACK_AFTER=<秒>`：把最新窗口的会话全部并回第一个窗口，并关闭空窗口。
+
+### 1a 留给后续步骤的风险（Codex 报告）
+
+1. 让窗口成为活动窗口的界面操作，都必须调用 `Hub::activated`，否则「最近激活」的顺序会不对。
+2. 拖拽实现必须用 `detach_session` / `attach_session`（或 `move_tab`），**绝不能复制** `ConnGroup` 或终端实体。
+3. 对话框归窗口所有。如果移动会话时，它的主机指纹或密码对话框正开着，必须先关闭，再在目标窗口重新弹出。
+
+---
+
+## 3. 第 1b 步：多窗口功能（不含拖拽）
+
+### 3.1 新建窗口
+
+- 在「会话」菜单「新建本机终端」下面，加一项「新建窗口」，快捷键 ⇧⌘N。
+- 新窗口是一个空的 Workspace：显示空状态界面，带侧边栏。
+- 窗口位置：相对当前活动窗口向右下错开 28 pt，尺寸相同。如果超出屏幕，就回到屏幕左上角。
+- 窗口标题设为「<当前标签名> — Shellmate」，没有标签时为「Shellmate」。macOS 会在「窗口」菜单里自动列出各个窗口，供用户切换。
+
+### 3.2 移动会话的菜单入口
+
+- **标签右键菜单**（已有，演示场景 `tabmenu`）加两项：
+  - 「移到新窗口」：新窗口错开放置，会话移过去并成为活动标签；
+  - 「移到窗口 ›」：子菜单列出其他窗口，名称为「窗口 N · <该窗口当前标签名>」。只有一个窗口时，这一项灰掉。
+- **「窗口」菜单**加一项「将会话移到新窗口」，作用于当前标签。
+- 如果被移走的是源窗口的最后一个标签，按 3.3 节的「空窗口」规则处理。
+
+### 3.3 关闭窗口的规则
+
+先判断是不是最后一个窗口：
+
+1. **最后一个窗口**：完全沿用现有逻辑，不弹 3.3 节的对话框：
+   - 「关闭窗口时 = 保持运行」且「在菜单栏显示图标」开着：隐藏窗口，切换成附属应用，只留菜单栏图标；
+   - 「保持运行」但菜单栏图标关着：隐藏窗口，Dock 图标保留；
+   - 「关闭窗口时 = 退出 Shellmate」：走退出流程。
+2. **不是最后一个窗口，并且里面还有会话**：弹出对话框，样式参照 `dialogs/quit.rs`：
+   - 标题「关闭窗口」；
+   - 正文「这个窗口里有 N 个会话，其中 M 个正在连接。」，M 为 0 时省略后半句；
+   - 按钮：
+     - 「取消」（普通）；
+     - 「移到其他窗口」（主按钮，回车触发）：把全部会话按顺序追加到最近激活的其他窗口，然后关闭本窗口；
+     - 「断开并关闭」（危险按钮）：逐个按现有关闭标签的逻辑关闭会话，然后关闭窗口；
+   - Esc 等于取消。
+   - 连接组如果还有其他窗口的会话在用，就**不能**断开连接。现有的连接组引用计数逻辑要保证这一点。
+3. **不是最后一个窗口，并且已经没有会话**：直接关闭，不弹窗。
+4. **空窗口**：不是最后一个窗口的窗口，在最后一个标签被关掉或移走后，**自动关闭**（和 Chrome 一样）。最后一个窗口变空时保留，显示空状态。
+
+### 3.4 应用级功能适配多窗口
+
+- **状态栏菜单**：会话列表覆盖所有窗口。点某个会话，就显示它所在的窗口并切到这个标签。「打开 Shellmate」显示最近激活的窗口；如果窗口是隐藏状态，就恢复它。
+- **退出确认**：统计所有窗口的会话、传输和转发（1a 已实现）。
+- **应用内更新**：「重启会断开 N 个会话」统计所有窗口（1a 已实现）。
+- **访达「进入 Shellmate」和拖文件夹到 Dock 图标**：在最近激活的窗口打开（1a 已实现）。
+- **Dock 点击和重新打开应用**：恢复隐藏的窗口。按 3.3 节的规则，同一时间最多只有一个隐藏窗口。
+- **菜单状态**：菜单栏的勾选和灰显，以当前活动窗口为准。用 `observe_window_activation` 在窗口被激活时调用 `Hub::activated`，并同步菜单。
+- **设置**：在当前活动窗口里打开；修改偏好后，所有窗口都要收到通知。
+- **录制窗口**：全局只有一个，不变。
+
+### 3.5 按窗口独立的功能
+
+- **侧边栏**：每个窗口一个 `Sidebar` 实体，读同一份主机数据；主机增删改后所有窗口都要刷新。
+- **AI 抽屉**：每个窗口一个；AI 的上下文取本窗口的当前会话。
+- **快捷命令抽屉**：每个窗口一个。
+- **广播**：只能勾选本窗口的会话；会话被移走时，自动取消勾选（1a 已实现）。
+- **分屏**：两个分屏必须在同一个窗口里；其中一个会话被移走时，分屏结束（1a 已实现）。
+
+### 3.6 演示场景与测试
+
+- **新增演示场景**：
+  - `close-window-dialog`：3 个会话、其中 2 个正在连接的关闭窗口对话框；
+  - `tabmenu-move`：标签右键菜单，展开「移到窗口 ›」子菜单，里面有 2 个其他窗口。
+- **新增调试开关**：`SHELLMATE_DEBUG_NEW_WINDOW_AFTER`，作用等同于 ⇧⌘N。
+- **单元测试**：
+  - 关闭窗口的判断：最后一个窗口、有会话、没有会话；
+  - 「移到其他窗口」时目标窗口的选择；
+  - 窗口命名；
+  - 空窗口自动关闭。
+
+---
+
+## 4. 第二期：标签拖拽
+
+### 4.1 交互
+
+- **拖动开始**：在标签上按下并移动超过 4 pt 才开始拖拽，普通点击切换标签不受影响。拖拽时标签栏里显示的预览，沿用现有标签的样式。
+- **在本窗口标签栏内**：显示蓝色竖线提示插入位置，用主题强调色，宽 2 pt；松手后调整顺序。
+- **在另一个窗口的标签栏上方**：竖线画在**目标窗口**里，松手后插入到对应位置，目标窗口被激活。
+- **在另一个窗口的非标签栏区域上方**：松手后追加到目标窗口末尾。
+- **在所有窗口之外**：松手后在松手位置新开窗口，会话移进去：
+  - 新窗口原点 = 松手点 − 鼠标在标签内的抓取偏移；
+  - 新窗口尺寸 = 源窗口尺寸。
+- **Esc**：取消拖拽，什么都不改。
+- **特殊情况**：
+  - 源窗口只有这一个标签，并且松手在所有窗口之外：不做任何改变。新开窗口再关掉旧窗口等于什么都没变。
+  - 拖进另一个窗口：源窗口变空后按 3.3 节第 4 条自动关闭。
+- **分屏中的会话被拖走**：分屏结束。
+- **窗口重叠**：以最靠前的窗口为准，通过 `NSApp.orderedWindows` 判断。
+- **多显示器**：gpui 的坐标是全局坐标，可以直接使用；浮动预览的坐标转换见第 5 节。
+
+### 4.2 实现要点
+
+- **拖拽值**：`DraggedTab { session_id, source: AnyWindowHandle, grab_offset }`，挂在标签元素上：`.on_drag(DraggedTab…, |…| 预览实体)`。
+- **拖拽状态**：放在 `Hub` 里，内容是：`Option<{ session_id, source, over: Over, ghost: Option<AnyWindowHandle> }>`。
+- **拖动中**：每个 Workspace 的根元素都挂 `on_drag_move::<DraggedTab>`，但只有发起窗口会收到事件。按 1. 节第 3、4 点算出位置：
+  - `over` 变化时，给相关窗口设置或清除 `drop_marker: Option<usize>` 并 `notify`；
+  - 用户可见的效果只有插入竖线。
+- **松开**：每个 Workspace 的根元素用 canvas 注册 `MouseUpEvent` 的捕获阶段监听。只有存在拖拽状态时才处理，按 `over` 执行：
+  - 本窗口：调整顺序；
+  - 其他窗口：`detach_session`，再对目标窗口 `attach_session`；
+  - 窗口之外：新开窗口，再 `attach_session`。
+
+  处理完清除拖拽状态和所有插入竖线。
+- **标签栏布局**：每个窗口每帧记录自己的标签栏范围和每个标签的横向位置（在 prepaint 时记录到 Workspace 或 Hub），插入位置按标签中点计算。不能像验证程序那样假定固定宽度，因为真实标签宽度不一样，还有溢出菜单「N 个会话 ▾」。
+- **事件冲突**：确认标签栏空白处的 `window_drag_area` 不会吃掉标签上的拖动，并且双击标题栏缩放等原有行为不受影响。
+- **调试开关**：`SHELLMATE_DEBUG_DRAG=<会话序号>:<目标>`，目标可以是 `self:<位置>`、`window:<n>:<位置>` 或 `outside:<x>,<y>`。它直接调用松开时的处理逻辑，不用真的拖动鼠标就能验证三种结果。
+
+---
+
+## 5. 第三期：跟随鼠标的浮动预览（可选）
+
+- 鼠标离开所有窗口时，打开一个无边框小窗口，显示被拖动的标签：
+  - 样式和标签一致：标题、状态点、圆角、阴影，使用当前主题的配色；
+  - 窗口选项：`WindowKind::PopUp`、`titlebar: None`、`focus: false`、`is_movable: false`；
+  - 尺寸为标签的实际尺寸。
+- 每次拖动事件都移动它，方法和坐标转换见 1. 节第 6 点，位置是「鼠标 − 抓取偏移」。
+- 鼠标回到任意窗口内时关闭它，因为窗口内会画 gpui 自己的拖拽预览；拖拽结束时也关闭。
+- 它不能抢焦点，也不能出现在「窗口」菜单里。验证时确认这两点。
+
+---
+
+## 6. 交给 Codex 的提示模板
+
+每一步单独交给 Codex，命令为：`codex:codex-rescue`，`--write --model gpt-6.2-astra --effort xhigh --cwd /Users/emoji/Documents/demo/rust/gpui/shellmate-agent`。提示词如下，把方括号部分替换掉：
+
+```text
+在 /Users/emoji/Documents/demo/rust/gpui/shellmate-agent（分支 p7-wip）实现 docs/plans/p9-multi-window.md 的「[第 1b 步 / 第二期 / 第三期]」。先完整阅读该文档的第 0、1、2 节和你要做的那一节，严格按文档的交互和实现要点做。
+
+硬性要求：
+- 不要提交（不要 git commit）。
+- 不要修改 docs/、README.md、scripts/、.github/、macos/、crates/shellmate/assets/。
+- 离线构建（cargo --offline），不新增 crate（可以打开已锁定 crate 的 feature）。
+- 测试不得访问外网、/Applications、真实的 ~/Library/Application Support/Shellmate 和钥匙串；本机回环（127.0.0.1）可以用。
+- 不要对整个工作区运行 cargo fmt，只格式化你新建的文件。
+- 以下两条必须零警告：cargo clippy --workspace --all-targets --offline -- -D warnings；cargo clippy --release -p shellmate --offline -- -D warnings。
+- cargo test --workspace --offline 必须通过（沙盒拒绝的回环、窗口类测试可以跳过，但要在报告里列出）。
+- 现有的所有 SHELLMATE_DEMO=proto:* 演示场景，单窗口画面必须保持逐像素不变；新界面严格沿用现有组件和配色（dialogs/mod.rs 里的组件、ui::Toggle、cx.palette()）。
+
+完成后把报告写到 /private/tmp/<随便一个目录>/p9-[步骤]-report.md，内容包括：设计、改动的文件（带行号）、新增的调试开关和用法、没能验证的部分。
+```
+
+---
+
+## 7. 验收清单（每一步完成后由 Claude 审查）
+
+1. **代码审查**：
+   - 重点看会话移动是否只通过 `detach_session` / `attach_session`；
+   - 有没有复制连接组或终端实体；
+   - 对话框的归属；
+   - `Hub::activated` 有没有调用。
+2. **测试**：在本机（沙盒外）运行 `cargo test --workspace --locked --no-fail-fast`，以及两条 clippy 命令。
+3. **截图对比**：
+   - 用改动前的调试版程序和改动后的程序，分别把 `crates/shellmate/src/proto/mod.rs` 里 `SCENES` 列出的全部场景截一遍（浅色主题），逐张对比；
+   - 截图规则：每个场景启动后等 6 秒；**只截在屏幕上且最宽的那个窗口**，因为进程还有不在屏幕上的 1080 宽辅助窗口；
+   - 基准噪声（同一程序拍两遍）：101 个场景里 98 个完全一致，`host-serial`、`host-telnet`、`set-ai-anthropic` 各约 0.04%（输入框光标）。除这三个以外，任何差异都要查明原因。
+4. **原有调试开关回归**：`SHELLMATE_DEBUG_HIDE_AFTER`、`_REOPEN_AFTER`、`_QUIT_AFTER`、`_STATUS_CLICK_AFTER`、`_STATUS_MENU_AFTER`、`_OPEN_URLS` 的行为都和以前一样。注意这些计时是从窗口建好后开始算的，调试版启动大约要 4 秒。
+5. **本步新功能**：
+   - 用调试开关走一遍：移动会话、合并、关闭窗口对话框、拖拽的三种结果；
+   - 检查移动后终端里的 shell 是不是同一个进程（`lsof -a -d cwd -p <pid>`），滚动内容和面板状态是否都在。
+6. **需要用户实际操作的部分**：真实的鼠标拖拽、右键菜单、关闭按钮、Dock 点击，由用户在本机试，Claude 读日志判断。
+
+### 1a 的待办验收（下次第一件事）
+
+- [ ] 101 个场景截图对比。基准截图在 `/private/tmp/claude-501/-Users-emoji-Documents-demo-rust-gpui-shellmate/867c80f1-3c88-49de-a72e-43489677b9fa/scratchpad/p19/before`，临时目录重启后可能已经没了，没了就从 1a 之前的提交重新编译、重新拍。
+- [ ] 原有调试开关回归。
+- [ ] `SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER` 和 `_MERGE_BACK_AFTER` 实测：用本机终端会话，确认移动前后 shell 进程相同、内容还在。
+- [ ] 通过后，把 1a 合并到 `feat/p7-more` 和 `main`。
