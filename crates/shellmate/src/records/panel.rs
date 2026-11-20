@@ -77,6 +77,18 @@ fn recording_menu(
     menu
 }
 
+pub(crate) struct OpenRecords {
+    pub(crate) owner: gpui::AnyWindowHandle,
+    view: gpui::WeakEntity<RecordsWindow>,
+    modal: dialogs::modal::Handle,
+}
+
+impl OpenRecords {
+    pub(crate) fn panel(&self) -> Option<Entity<RecordsWindow>> {
+        self.view.upgrade().filter(|_| self.modal.is_open())
+    }
+}
+
 pub struct RecordsWindow {
     store: shellmate_store::SharedStore,
     log_root: PathBuf,
@@ -116,7 +128,7 @@ impl RecordsWindow {
         active: HashSet<i64>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Entity<Self> {
+    ) -> OpenRecords {
         let body = cx.new(|cx| {
             let recordings = store.borrow().recordings().unwrap_or_default();
             let index = selected
@@ -193,15 +205,27 @@ impl RecordsWindow {
             this.refresh_durations(cx);
             this
         });
-        dialogs::open(
+        let modal = dialogs::open_tracked(
             window,
             cx,
             "会话记录",
             1140_f32.min(f32::from(window.viewport_size().width) - 40.),
             body.clone(),
         );
-        body
+        OpenRecords { owner: window.window_handle(), view: body.downgrade(), modal }
     }
+
+    pub(crate) fn reveal(&mut self, row: Option<i64>, logs: bool, cx: &mut Context<Self>) {
+        if logs || row.is_some() {
+            if self.logs_tab != logs {
+                self.switch(logs, cx);
+            }
+            if let Some(ix) = row.and_then(|id| self.recordings.iter().position(|r| r.id == id)) {
+                self.select(ix, cx);
+            }
+        }
+    }
+
     /// Older catalog rows contain wall time. Repair them from the immutable event stream,
     /// off the UI thread, without loading all recordings into memory.
     fn refresh_durations(&mut self, cx: &mut Context<Self>) {

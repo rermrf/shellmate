@@ -57,6 +57,12 @@ impl SettingsWindow {
                     PasswordEvent::Submit => s.master_password(w, cx),
                 },
             );
+            if let Some(workspace) = workspace.upgrade() {
+                cx.subscribe(&workspace, |settings: &mut Self, _, change: &crate::workspace::PreferenceChanged, cx| {
+                    settings.preferences.set(change.0, change.1);
+                    cx.notify();
+                }).detach();
+            }
             let ai=cx.new(|cx|crate::ai::settings::AiSettings::new(workspace.clone(),db,credentials.clone(),window,cx));
             ai.update(cx,|a,cx|a.refresh_key(cx));
             cx.observe_window_activation(window, |s: &mut Self, w, cx| {

@@ -8,6 +8,8 @@
 //! where they run. When the owner goes away the next connection takes the rules over. The rules of a
 //! host that is not saved (deleted while it is open, or a temporary library) only exist in memory.
 
+use std::collections::HashSet;
+
 use gpui::component::WindowExt as _;
 use gpui::component::notification::Notification;
 use gpui::{AppContext as _, Context, Entity, Subscription, Window};
@@ -26,6 +28,13 @@ use crate::runtime;
 pub struct ForwardTab {
     pub panel: Entity<ForwardPanel>,
     pub(super) _subscription: Option<Subscription>,
+}
+
+/// Effects of destroying the forwarding engines owned by a set of closing tabs.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ForwardImpact {
+    pub rules: usize,
+    pub connections: u32,
 }
 
 impl Workspace {
@@ -419,6 +428,20 @@ impl Workspace {
     /// Closes the tab at `ix`. The last tab of a connection that has forwards running asks first:
     /// the forwards stop with it.
     pub(super) fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.sessions.get(ix).map(|s| s.id) else { return };
+        if let Some((_, editor)) = self.editor.as_ref().filter(|(owner, _)| *owner == id) {
+            let source = self.handle;
+            editor.update(cx, |editor, cx| editor.close_then(window, cx, move |cx| {
+                if let Some(entry) = super::Hub::entry(source, cx) {
+                    entry.update(cx, |workspace, w, cx| {
+                        if let Some(ix) = workspace.sessions.iter().position(|s| s.id == id) {
+                            workspace.close(ix, w, cx);
+                        }
+                    });
+                }
+            }));
+            return;
+        }
         match self.close_question(ix, cx) {
             Some((session_id, title, text)) => {
                 let workspace = cx.entity().downgrade();
@@ -450,24 +473,50 @@ impl Workspace {
     fn close_question(&self, ix: usize, cx: &gpui::App) -> Option<(usize, String, String)> {
         let session = self.sessions.get(ix)?;
         let ssh = session.ssh()?;
-        let group = self.group(ssh.group)?;
-        let others_on_connection =
-            self.sessions.iter().filter(|s| s.ssh().is_some_and(|other| other.group == ssh.group)).count() - 1;
-        if others_on_connection > 0 || !self.peers(super::Route::Group(ssh.group), cx).is_empty() || self.forward_owner(&ssh.host.id) != Some(group.id) {
+        let impact = self.forward_impact(|tab| tab.id == session.id, cx);
+        if impact == ForwardImpact::default() {
             return None;
         }
-        // Another connection to the host takes the rules over: they go on running.
-        let adopter = self.hub
-            .groups.borrow()
-            .iter()
-            .any(|other| other.id != group.id && other.key.host() == &ssh.host.id && other.live_connection().is_some());
-        let forward = group.forward.as_ref()?;
-        let running = forward.forwarder.running_rules();
-        if adopter || running == 0 {
-            return None;
-        }
-        let (title, text) = model::close_confirmation(&ssh.host.name, running, forward.forwarder.active_connections());
+        let (title, text) = model::close_confirmation(&ssh.host.name, impact.rules, impact.connections);
         Some((session.id, title, text))
+    }
+
+    /// Count a shared group once, and only if its last tab will actually disappear.
+    pub(super) fn forward_impact(&self, closing: impl Fn(&super::Session) -> bool, cx: &gpui::App) -> ForwardImpact {
+        let mut removed = HashSet::new();
+        let mut remaining = HashSet::new();
+        for session in &self.sessions {
+            if let Some(ssh) = session.ssh() {
+                if closing(session) {
+                    removed.insert(ssh.group);
+                } else {
+                    remaining.insert(ssh.group);
+                }
+            }
+        }
+        if removed.is_empty() {
+            return ForwardImpact::default();
+        }
+        for entry in self.peers(super::Route::All, cx) {
+            if let Some(peer) = entry.workspace.upgrade() {
+                remaining.extend(peer.read(cx).sessions.iter().filter_map(|s| Some(s.ssh()?.group)));
+            }
+        }
+        let groups = self.hub.groups.borrow();
+        let mut loss = ForwardImpact::default();
+        for group in groups.iter().filter(|g| removed.contains(&g.id) && !remaining.contains(&g.id)) {
+            let Some(forward) = &group.forward else { continue };
+            // Handoff can restart listeners on the surviving owner. Existing
+            // connections still belong to the engine being shut down.
+            let successor = groups.iter()
+                .filter(|g| g.key.host() == group.key.host() && g.forward.is_some() && remaining.contains(&g.id))
+                .min_by_key(|g| g.id);
+            if successor.is_none_or(|g| g.live_connection().is_none()) {
+                loss.rules += forward.forwarder.listening_rules();
+            }
+            loss.connections = loss.connections.saturating_add(forward.forwarder.active_connections());
+        }
+        loss
     }
 
     // ---- review hooks ------------------------------------------------------------------------
@@ -569,7 +618,7 @@ impl Workspace {
                 }
             }
             // Closes the question that is open (as 取消 would).
-            "dismiss" => window.close_all_dialogs(cx),
+            "dismiss" => crate::dialogs::modal::close_all(window, cx),
             // The tab closed for good, without asking.
             "close-now" => self.close_session(session_id, window, cx),
             // Logs how the rules stand (and how many connections the engine has).

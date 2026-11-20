@@ -237,7 +237,23 @@ impl Workspace {
                 workspace.update(cx, |this, cx| this.on_clash_answer(group_id, id, choice, window, cx)).ok();
             });
         });
-        ClashDialog::open(id, clash, answer, window, cx);
+        let modal = ClashDialog::open(id, clash, answer, window, cx);
+        if let Some(owner) = self.main_id() {
+            self.clash_dialogs.insert(owner, (group_id, id, modal));
+        }
+    }
+
+    /// Release the view's claim so the destination can present the same queued upload.
+    pub(super) fn detach_clash_dialog(&mut self, session: usize, window: &mut Window, cx: &mut gpui::App) {
+        let Some((group, item, modal)) = self.clash_dialogs.remove(&session) else { return };
+        if modal.is_open() {
+            modal.close(window, cx);
+            if let Some(mut group) = self.group_mut(group)
+                && group.clash.open == Some(item)
+            {
+                group.clash.open = None;
+            }
+        }
     }
 
     /// The dialog was answered (`Some`) or closed with Esc (`None`: the item keeps waiting).
@@ -249,6 +265,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clash_dialogs.retain(|_, (group, item, _)| (*group, *item) != (group_id, id));
         if let Some(mut group) = self.group_mut(group_id) {
             group.clash.open = None;
             match choice {
@@ -455,7 +472,7 @@ impl Workspace {
     // ---- the editor ---------------------------------------------------------------------------------
 
     /// Opens the editor modal on `file`, read by the panel of tab `session_id` (one editor at a time).
-    fn open_editor(&mut self, session_id: usize, file: TextFile, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_editor(&mut self, session_id: usize, file: TextFile, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             return;
         }
@@ -477,10 +494,12 @@ impl Workspace {
                 EditorEvent::Closed => {
                     this.editor = None;
                     this._editor_subscription = None;
-                    this.focus_active(window, cx);
+                    if !window.has_active_dialog(cx) {
+                        this.focus_active(window, cx);
+                    }
                 }
             });
-        self.editor = Some(editor.clone());
+        self.editor = Some((session_id, editor.clone()));
         self._editor_subscription = Some(subscription);
         FileEditor::open(editor, window, cx);
     }
@@ -591,7 +610,6 @@ impl Workspace {
     pub(crate) fn demo_queue_step(&mut self, step: u8, window: &mut Window, cx: &mut Context<Self>) {
         use std::path::PathBuf;
 
-        use gpui::component::WindowExt as _;
         let Some(panel) = self.demo_panel() else { return };
         let Some(uploads) = std::env::var_os("SHELLMATE_DEMO_UPLOADS").map(PathBuf::from) else {
             return log::error!("set SHELLMATE_DEMO_UPLOADS to a scratch directory with the files to send");
@@ -638,7 +656,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                window.close_all_dialogs(cx);
+                crate::dialogs::modal::close_all(window, cx);
                 self.on_clash_answer(group_id, id, None, window, cx);
             }
             5 => panel.update(cx, |panel, cx| {
@@ -661,7 +679,7 @@ impl Workspace {
                 }
             }
             other => {
-                let Some(editor) = self.editor.clone() else { return log::warn!("no editor open for step {other:?}") };
+                let Some((_, editor)) = self.editor.clone() else { return log::warn!("no editor open for step {other:?}") };
                 editor.update(cx, |editor, cx| match other {
                     "type" => editor.demo_type("\n# 由演示脚本在编辑器里加的一行\n", window, cx),
                     "save" => editor.demo_save(window, cx),

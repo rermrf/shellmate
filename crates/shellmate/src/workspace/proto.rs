@@ -241,6 +241,9 @@ impl Workspace {
                 self.hub.secrets.clone(), section, self.hub.store.clone(), window, cx)
         };
         match scene {
+            "close-window-dialog" | "tabmenu-move" => {
+                self.demo_multi_window(scene == "close-window-dialog", window, cx);
+            }
             "cmds" | "bc" | "qc" | "tabmenu" => {
                 self.commands_open = true;
                 if scene == "bc" {
@@ -327,8 +330,10 @@ impl Workspace {
                     window,
                     cx,
                 );
-                panel.update(cx, |r, cx| r.proto_scene(scene, cx));
-                *self.hub.records_window.borrow_mut() = Some(panel.downgrade());
+                if let Some(view) = panel.panel() {
+                    view.update(cx, |r, cx| r.proto_scene(scene, cx));
+                }
+                *self.hub.records_window.borrow_mut() = Some(panel);
             }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
@@ -559,9 +564,7 @@ impl Workspace {
                 bom: false,
                 mode: Some(0o644),
             };
-            let editor = cx.new(|cx| FileEditor::new(file, "prod-web-01", panel.downgrade(), window, cx));
-            FileEditor::open(editor.clone(), window, cx);
-            self.editor = Some(editor);
+            self.open_editor(self.sessions[0].id, file, window, cx);
         }
     }
     pub(super) fn proto_reconnect_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -588,38 +591,39 @@ impl Workspace {
         self.sidebar.update(cx, |s, cx| {
             s.select(Some(if changed { "h5" } else { "h9" }.into()), cx)
         });
-        let (request, rx) = tokio::sync::oneshot::channel();
-        drop(rx);
+        let Some(session) = self.main_id() else { return };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        cx.spawn(async move |_, _| {
+            if let Ok(decision) = answer.await {
+                log::info!("prototype host key decision: {decision:?}");
+            }
+        }).detach();
         let info = |value: &str| shellmate_ssh::HostKeyInfo {
             algorithm: "ssh-ed25519".into(),
             fingerprint: value.into(),
         };
-        crate::dialogs::hostkey::HostKeyDialog::open(
-            shellmate_ssh::HostKeyRequest {
-                host: if changed { "staging-api" } else { "homelab-nas" }.into(),
-                port: 22,
-                state: if changed {
-                    shellmate_core::FingerprintState::Changed
-                } else {
-                    shellmate_core::FingerprintState::New
-                },
-                key: info(if changed {
-                    "SHA256:k9Fq1Zp0sW3yR7tBn2Mv6cXe8LjD4hUa5oGi0QwE1rT"
-                } else {
-                    "SHA256:7mJ2kQ9Lx0vT3bRk1nWc4ePZa8uYf6HsD5gVq0iN2oE"
-                }),
-                recorded: if changed {
-                    vec![shellmate_ssh::HostKeyInfo {
-                        algorithm: "ecdsa-sha2-nistp256".into(),
-                        fingerprint: "SHA256:Xb4tN0q2mR8sVw1LcK7yHd3eJf9aPz5uQg6iO2nTr4E".into(),
-                    }]
-                } else {
-                    vec![]
-                },
+        let request = shellmate_ssh::HostKeyRequest {
+            host: if changed { "staging-api" } else { "homelab-nas" }.into(),
+            port: 22,
+            state: if changed {
+                shellmate_core::FingerprintState::Changed
+            } else {
+                shellmate_core::FingerprintState::New
             },
-            request,
-            window,
-            cx,
-        );
+            key: info(if changed {
+                "SHA256:k9Fq1Zp0sW3yR7tBn2Mv6cXe8LjD4hUa5oGi0QwE1rT"
+            } else {
+                "SHA256:7mJ2kQ9Lx0vT3bRk1nWc4ePZa8uYf6HsD5gVq0iN2oE"
+            }),
+            recorded: if changed {
+                vec![shellmate_ssh::HostKeyInfo {
+                    algorithm: "ecdsa-sha2-nistp256".into(),
+                    fingerprint: "SHA256:Xb4tN0q2mR8sVw1LcK7yHd3eJf9aPz5uQg6iO2nTr4E".into(),
+                }]
+            } else {
+                vec![]
+            },
+        };
+        self.open_connection_prompt(session, connect::UiMsg::HostKey { request, reply }, window, cx);
     }
 }

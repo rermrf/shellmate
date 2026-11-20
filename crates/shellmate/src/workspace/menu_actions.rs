@@ -47,6 +47,7 @@ impl Available {
         bind(&Settings, |workspace, window, cx| workspace.open_settings(0, window, cx));
         if self.vault_lock { bind(&LockVault, Workspace::lock_vault); }
         bind(&NewLocalTerminal, Workspace::open_local);
+        bind(&NewWindow, Workspace::new_window);
         bind(&NewConnection, Workspace::new_host);
         if self.duplicate { bind(&DuplicateSession, Workspace::duplicate_active); }
         if self.split { bind(&ToggleSplit, Workspace::toggle_split); }
@@ -56,6 +57,7 @@ impl Available {
         bind(&ImportBundle, Workspace::import_bundle);
         bind(&ExportBundle, Workspace::export_bundle);
         if self.session {
+            bind(&MoveSessionToNewWindow, Workspace::move_session_to_new_window);
             bind(&CloseTab, Workspace::close_tab);
             bind(&ShowTerminal, |workspace, window, cx| workspace.show_panel(Panel::Terminal, window, cx));
         }
@@ -140,7 +142,7 @@ impl Workspace {
                 None => menus(&state),
             };
             let handle = self.handle;
-            cx.defer(move |cx| { if Hub::windows(cx).first().is_some_and(|e| e.handle == handle) { cx.set_menus(tree); } });
+            cx.defer(move |cx| { if Hub::windows(cx).first().is_some_and(|e| e.handle == handle) { install(tree, cx); } });
         }
     }
 
@@ -191,7 +193,7 @@ mod tests {
             let gpui::MenuItem::Action { action, .. } = item else { return None };
             action.as_any().downcast_ref::<ReopenForMenu>().map(|a| a.0)
         }).collect();
-        for name in [Settings.name(), NewLocalTerminal.name(), NewConnection.name(), ToggleSidebar.name(),
+        for name in [Settings.name(), NewLocalTerminal.name(), NewWindow.name(), NewConnection.name(), ToggleSidebar.name(),
             ToggleTheme.name(), OpenPalette.name(), Records.name(), ToggleSearch.name(), EditPaste.name()] {
             assert!(restored.contains(&name), "{name}");
         }
@@ -220,7 +222,7 @@ mod tests {
             available.listeners(|action, _| { assert!(registered.insert(action.name())); });
             assert!(!registered.contains(LockVault.name()), "{scene}: the keychain cannot be locked");
             for (commands, flag) in [
-                (vec![CloseTab.name(), ShowTerminal.name()], flags[0]),
+                (vec![CloseTab.name(), ShowTerminal.name(), MoveSessionToNewWindow.name()], flags[0]),
                 (vec![ShowFiles.name()], flags[1] || scene.contains("local")),
                 (vec![ShowForward.name()], flags[1]),
                 (vec![ShowMonitor.name()], flags[1] || (cfg!(target_os = "macos") && scene.contains("local"))),

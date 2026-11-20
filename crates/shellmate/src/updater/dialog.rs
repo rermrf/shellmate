@@ -197,7 +197,7 @@ impl Render for UpdateDialog {
                         } else {
                             s.release = None;
                             s.phase = Phase::Idle;
-                            w.close_dialog(cx);
+                            crate::dialogs::modal::close(w, cx);
                         }
                         cx.refresh_windows();
                     },
@@ -257,7 +257,7 @@ impl Render for UpdateDialog {
                 buttons.push(
                     action("update-on-quit", "退出时安装", Tone::Plain).on_click(|_, w, cx| {
                         cx.global_mut::<Updater>().at_quit = true;
-                        w.close_dialog(cx);
+                        crate::dialogs::modal::close(w, cx);
                         cx.refresh_windows();
                     }),
                 );

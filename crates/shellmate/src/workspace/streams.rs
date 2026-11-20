@@ -80,8 +80,20 @@ impl Workspace {
         if crate::prototype_fixture() {
             return;
         }
-        if self.hub.secrets.is_locked() && self.sessions.iter().any(|s|s.id==id&&s.host().is_some_and(|h|h.protocol==Protocol::Telnet)) {
-            let this=cx.entity().downgrade();crate::security::ensure_unlocked(self.hub.secrets.clone(),"连接 Telnet",window,cx,move|ok,w,cx|{if ok{this.update(cx,|s,cx|s.start_stream(id,w,cx)).ok();}});return;
+        if self.connection_prompts.get(&id).is_some_and(|prompt| prompt.is_open()) {
+            return;
+        }
+        if self.hub.secrets.is_locked()
+            && self.sessions.iter().any(|s| s.id == id && s.host().is_some_and(|h| h.protocol == Protocol::Telnet))
+        {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.open_connection_prompt(id, connect::UiMsg::VaultUnlock { reason: "连接 Telnet", reply }, window, cx);
+            cx.spawn(async move |_, cx| {
+                if answer.await == Ok(true) {
+                    Route::Session(id).deliver(cx, |owner, window, cx| owner.start_stream(id, window, cx));
+                }
+            }).detach();
+            return;
         }
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
             return;

@@ -223,7 +223,7 @@ impl Workspace {
         for id in stopped {
             let _ = self.stop_recording(id, cx);
         }
-        if !crate::prototype_fixture() && let Some(panel) = self.hub.records_window.borrow().as_ref().and_then(|p| p.upgrade()) {
+        if !crate::prototype_fixture() && let Some(panel) = self.hub.records_window.borrow().as_ref().filter(|r| r.owner == self.handle).and_then(|r| r.panel()) {
             let active = self.hub.running_recordings.borrow().values().map(|r| r.row.id).collect();
             panel.update(cx, |p, cx| p.sync_recordings(active, self.hub.preferences.borrow().get(P::PromptHighlight), cx));
         }
@@ -250,6 +250,7 @@ impl Workspace {
         Ok(())
     }
     fn apply_preference(&mut self, key: P, value: bool, window: &mut Window,cx: &mut Context<Self>) {
+        cx.emit(super::PreferenceChanged(key, value));
         if key == P::ShowStatusIcon {
             #[cfg(target_os = "macos")]
             {
@@ -326,6 +327,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let existing = self.hub.records_window.borrow().as_ref()
+            .and_then(|records| Some((records.owner, records.panel()?)));
+        if let Some((owner, panel)) = existing {
+            panel.update(cx, |records, cx| records.reveal(selected, logs, cx));
+            if owner != self.handle {
+                cx.defer(move |cx| {
+                    if let Some(entry) = Hub::entry(owner, cx) {
+                        entry.update(cx, Workspace::show_window);
+                    }
+                });
+            }
+            return;
+        }
         let active = self.hub.running_recordings.borrow().values().map(|r| r.row.id).collect();
         let view = crate::records::panel::RecordsWindow::open(
             self.hub.store.clone(),
@@ -336,6 +350,6 @@ impl Workspace {
             window,
             cx,
         );
-        *self.hub.records_window.borrow_mut() = Some(view.downgrade());
+        *self.hub.records_window.borrow_mut() = Some(view);
     }
 }

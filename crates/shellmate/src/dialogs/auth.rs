@@ -38,10 +38,10 @@ impl SecretDialog {
         reply: oneshot::Sender<Option<Answer>>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> (super::modal::Handle, gpui::WeakEntity<Self>) {
         let title = format!("连接 {}", request.host);
         let kind = SecretKind::Password { user: request.user, host: request.host, port: request.port };
-        Self::open(kind, request.attempt, "输入密码", title, reply, window, cx);
+        Self::open(kind, request.attempt, "输入密码", title, reply, window, cx)
     }
 
     /// Opens the passphrase dialog for `request`.
@@ -50,7 +50,7 @@ impl SecretDialog {
         reply: oneshot::Sender<Option<Answer>>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> (super::modal::Handle, gpui::WeakEntity<Self>) {
         let title = "解锁私钥".to_string();
         Self::open(
             SecretKind::Passphrase { key: request.key_path },
@@ -60,7 +60,7 @@ impl SecretDialog {
             reply,
             window,
             cx,
-        );
+        )
     }
 
     fn open(
@@ -71,7 +71,7 @@ impl SecretDialog {
         reply: oneshot::Sender<Option<Answer>>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> (super::modal::Handle, gpui::WeakEntity<Self>) {
         let body = cx.new(|cx| {
             let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
             let subscription = cx.subscribe_in(&input, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
@@ -81,7 +81,28 @@ impl SecretDialog {
             });
             Self { kind, attempt, input, save: true, error: None, reply: Some(reply), _subscription: subscription }
         });
-        super::open(window, cx, title, 440., body);
+        let weak = body.downgrade();
+        (super::open_tracked(window, cx, title, 440., body), weak)
+    }
+
+    pub(crate) fn take_question(&mut self) -> Option<crate::connect::UiMsg> {
+        use crate::connect::UiMsg;
+        let reply = self.reply.take()?;
+        Some(match &self.kind {
+            SecretKind::Password { user, host, port } => UiMsg::Password {
+                request: PasswordRequest {
+                    user: user.clone(),
+                    host: host.clone(),
+                    port: *port,
+                    attempt: self.attempt,
+                },
+                reply,
+            },
+            SecretKind::Passphrase { key } => UiMsg::Passphrase {
+                request: PassphraseRequest { key_path: key.clone(), attempt: self.attempt },
+                reply,
+            },
+        })
     }
 
     fn finish(&mut self, answer: Option<Answer>) {
@@ -174,7 +195,7 @@ impl ChallengeDialog {
         reply: oneshot::Sender<Option<Vec<Secret>>>,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> (super::modal::Handle, gpui::WeakEntity<Self>) {
         let otp = matches!(request.prompts.as_slice(), [only] if looks_like_otp(&only.text));
         let title = if otp {
             "两步验证".to_string()
@@ -215,7 +236,12 @@ impl ChallengeDialog {
             };
             Self { request, mode, error: None, reply: Some(reply), _subscriptions: subscriptions }
         });
-        super::open(window, cx, title, 440., body);
+        let weak = body.downgrade();
+        (super::open_tracked(window, cx, title, 440., body), weak)
+    }
+
+    pub(crate) fn take_question(&mut self) -> Option<crate::connect::UiMsg> {
+        Some(crate::connect::UiMsg::Challenge { request: self.request.clone(), reply: self.reply.take()? })
     }
 
     fn finish(&mut self, answers: Option<Vec<Secret>>) {

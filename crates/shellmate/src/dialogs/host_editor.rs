@@ -7,7 +7,7 @@ use gpui::assets::IconName as Lucide;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::input::{InputEvent, InputState};
 use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui::component::{Icon, WindowExt as _};
+use gpui::component::Icon;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, Focusable as _, FontWeight, IntoElement, PathPromptOptions, Render, SharedString,
@@ -541,16 +541,16 @@ impl HostEditor {
                     .update_in(cx, |_, window, cx| match message {
                         UiMsg::VaultUnlock { reason, reply } => {if let Some(manager)=&credentials{crate::security::ensure_unlocked(manager.clone(),reason,window,cx,move|ok,_,_|{let _=reply.send(ok);});}},
                         UiMsg::HostKey { request, reply } => {
-                            super::hostkey::HostKeyDialog::open(request, reply, window, cx)
+                            super::hostkey::HostKeyDialog::open(request, reply, window, cx);
                         }
                         UiMsg::Password { request, reply } => {
-                            super::auth::SecretDialog::open_password(request, reply, window, cx)
+                            super::auth::SecretDialog::open_password(request, reply, window, cx);
                         }
                         UiMsg::Passphrase { request, reply } => {
-                            super::auth::SecretDialog::open_passphrase(request, reply, window, cx)
+                            super::auth::SecretDialog::open_passphrase(request, reply, window, cx);
                         }
                         UiMsg::Challenge { request, reply } => {
-                            super::auth::ChallengeDialog::open(request, reply, window, cx)
+                            super::auth::ChallengeDialog::open(request, reply, window, cx);
                         }
                         UiMsg::Event(_) => {}
                     })
@@ -934,7 +934,7 @@ impl Render for HostEditor {
                             .text_size(px(12.5))
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.invalidate_test();
-                                w.close_dialog(cx);
+                                crate::dialogs::modal::close(w, cx);
                                 this.workspace.update(cx, |workspace, cx| workspace.open_import(w, cx)).ok();
                             })),
                     )

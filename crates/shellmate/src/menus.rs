@@ -2,7 +2,7 @@ use gpui::{Action, App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, ac
 use gpui::component::input;
 use shellmate_term::view as terminal;
 
-use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NextTab, OpenPalette, Panel,
+use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NewWindow, NextTab, OpenPalette, Panel,
     PreviousTab, Quit, ToggleSidebar, ToggleTheme};
 
 use crate::workspace::{Workspace, Hub};
@@ -11,7 +11,7 @@ actions!(shellmate, [CloseWindow, About, CheckUpdates, Settings, LockVault, Hide
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
     EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll, ShowTerminal, ShowFiles,
     ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi,
-    Records, Minimize, Zoom]);
+    Records, Minimize, Zoom, MoveSessionToNewWindow]);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MenuState {
@@ -41,7 +41,8 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
                 ]),
         ),
         Menu::new("会话").items([
-            Item::action("新建本机终端", NewLocalTerminal), Item::action("新建连接…", NewConnection),
+            Item::action("新建本机终端", NewLocalTerminal), Item::action("新建窗口", NewWindow),
+            Item::action("新建连接…", NewConnection),
             Item::action("复制当前会话", DuplicateSession), Item::Separator,
             Item::action("分屏", ToggleSplit).checked(state.split),
             Item::action(if state.recording { "停止录制" } else { "开始录制" }, ToggleRecording),
@@ -73,9 +74,32 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
         ]),
         Menu::new("窗口").items([
             Item::action("最小化", Minimize), Item::action("缩放", Zoom), Item::Separator,
+            Item::action("将会话移到新窗口", MoveSessionToNewWindow), Item::Separator,
             Item::action("上一个会话", PreviousTab), Item::action("下一个会话", NextTab),
         ]),
     ]
+}
+
+pub(crate) fn install(tree: Vec<Menu>, cx: &mut App) {
+    cx.set_menus(tree);
+    #[cfg(target_os = "macos")]
+    {
+        // GPUI recognizes "Window" by its English name. Register the localized menu with AppKit.
+        use objc2_app_kit::NSApplication;
+        use objc2_foundation::ns_string;
+        let app = NSApplication::sharedApplication(objc2::MainThreadMarker::new().expect("UI thread"));
+        let menu = app.mainMenu()
+            .and_then(|menu| menu.itemWithTitle(ns_string!("窗口")))
+            .and_then(|item| item.submenu());
+        app.setWindowsMenu(menu.as_deref());
+        for entry in Hub::windows(cx).to_vec() {
+            entry.handle.update(cx, |_, window, _| {
+                if let Some(native) = crate::workspace::lifecycle::native_window(window) {
+                    app.addWindowsItem_title_filename(&native, &native.title(), false);
+                }
+            }).ok();
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

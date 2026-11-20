@@ -101,7 +101,7 @@ impl Workspace {
         .unwrap();
         log.flush().unwrap();
         self.open_records(None, scenario == "logs", window, cx);
-        if let Some(view) = self.hub.records_window.borrow().as_ref().and_then(|v| v.upgrade()) {
+        if let Some(view) = self.hub.records_window.borrow().as_ref().and_then(|r| r.panel()) {
             view.update(cx, |r, cx| {
                 if scenario == "logs" {
                     r.demo_query("nginx", window, cx);
@@ -202,7 +202,7 @@ impl Workspace {
                     match w.stop_recording(id, cx) {
                         Ok(row) => {
                             w.open_records(row, false, window, cx);
-                            if let Some(view) = w.hub.records_window.borrow().as_ref().and_then(|v| v.upgrade()) {
+                            if let Some(view) = w.hub.records_window.borrow().as_ref().and_then(|r| r.panel()) {
                                 view.update(cx, |r, cx| r.demo_position(true, cx));
                             }
                         }

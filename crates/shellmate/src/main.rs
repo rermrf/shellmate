@@ -119,7 +119,7 @@ fn main() {
 
         let (store, store_notice) = open_store();
         workspace::Hub::init(store, store_notice.is_some(), cx);
-        let (main_window, workspace) = open_workspace(true, store_notice, cx).expect("failed to open the main window");
+        let (main_window, workspace) = open_workspace(store_notice, cx).expect("failed to open the main window");
         #[cfg(not(debug_assertions))]
         let _ = (main_window, workspace);
         workspace::open_urls::listen(url_receiver, cx);
@@ -140,15 +140,28 @@ fn main() {
     });
 }
 
-fn open_workspace(first: bool, store_notice: Option<String>, cx: &mut App) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
+fn open_workspace(store_notice: Option<String>, cx: &mut App) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     #[cfg(debug_assertions)]
     let bounds = if proto::requested() {
         let (width, height) = proto::window_size();
         Bounds::new(point(px(60.), px(60.)), size(px(width as f32), px(height as f32)))
     } else { bounds };
+    open_workspace_at(true, store_notice, bounds, None, true, cx)
+}
+
+fn open_workspace_at(
+    first: bool,
+    store_notice: Option<String>,
+    bounds: Bounds<gpui::Pixels>,
+    display_id: Option<gpui::DisplayId>,
+    focus: bool,
+    cx: &mut App,
+) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id,
+        focus,
         titlebar: Some(TitlebarOptions {
             title: Some("Shellmate".into()),
             appears_transparent: true,
@@ -168,6 +181,6 @@ fn open_workspace(first: bool, store_notice: Option<String>, cx: &mut App) -> an
         cx.new(|cx| Workspace::new(store_notice, first, window, cx))
     })
     ?;
-    workspace::Hub::install(main_window, &workspace, cx);
+    workspace::Hub::install(main_window, &workspace, focus, cx);
     Ok((main_window, workspace))
 }

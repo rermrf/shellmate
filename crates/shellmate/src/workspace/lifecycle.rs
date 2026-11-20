@@ -1,11 +1,11 @@
 //! Workspace visibility and application-wide quit coordination.
-use super::{Hub, SessionKind, Workspace, ssh::SshStatus};
-use crate::dialogs::quit::QuitDialog;
+use super::{Hub, SessionKind, Workspace, forward::ForwardImpact, ssh::SshStatus};
+use crate::dialogs::{quit::QuitDialog, window::{Choice, WindowCloseDialog}};
 use gpui::{App, Context, WeakEntity, Window};
 use shellmate_store::{Preference, Preferences};
 
 #[cfg(target_os = "macos")]
-fn native_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+pub(crate) fn native_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
@@ -30,6 +30,64 @@ fn close_behavior(prefs: &Preferences) -> Close {
         Close::HideAsAccessory
     } else {
         Close::HideInDock
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowClose {
+    Last,
+    Confirm,
+    Remove,
+}
+
+fn window_close(windows: usize, sessions: usize) -> WindowClose {
+    match (windows, sessions) {
+        (0 | 1, _) => WindowClose::Last,
+        (_, 0) => WindowClose::Remove,
+        _ => WindowClose::Confirm,
+    }
+}
+
+/// The tabs and forwarding impact the user actually saw in the close dialog.
+struct CloseScope {
+    tabs: Vec<usize>,
+    forwards: ForwardImpact,
+}
+
+impl CloseScope {
+    fn confirm(self, handle: gpui::AnyWindowHandle, choice: Choice, cx: &mut App) {
+        let Some(entry) = Hub::entry(handle, cx) else { return };
+        // A close of a secondary window cannot authorize quitting the application.
+        if Hub::windows(cx).len() < 2 {
+            return;
+        }
+        let move_tabs = entry.update(cx, |workspace, window, cx| {
+            let same_tabs = workspace.sessions.iter().map(|s| s.id).eq(self.tabs.iter().copied());
+            let increased_impact = choice == Choice::Disconnect && {
+                let current = workspace.forward_impact(|_| true, cx);
+                current.rules > self.forwards.rules || current.connections > self.forwards.connections
+            };
+            if !same_tabs || increased_impact {
+                workspace.close_window(window, cx);
+                return None;
+            }
+            if let Some((_, editor)) = &workspace.editor {
+                editor.update(cx, |editor, cx| editor.close_then(window, cx, move |cx| {
+                    self.confirm(handle, choice, cx);
+                }));
+                return None;
+            }
+            if choice == Choice::Move {
+                return Some(self.tabs);
+            }
+            for id in self.tabs {
+                workspace.close_session(id, window, cx);
+            }
+            None
+        });
+        if let Some(tabs) = move_tabs.flatten() {
+            super::transfer::move_to_recent_window(handle, tabs, cx);
+        }
     }
 }
 
@@ -108,6 +166,38 @@ impl Workspace {
     }
 
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match window_close(Hub::windows(cx).len(), self.sessions.len()) {
+            WindowClose::Remove => return window.remove_window(),
+            WindowClose::Confirm => {
+                if self.close_dialog.as_ref().is_none_or(|dialog| !dialog.is_open()) {
+                    let connecting = self.sessions.iter().filter(|session| match &session.kind {
+                        SessionKind::Ssh(ssh) => matches!(ssh.status, SshStatus::Connecting | SshStatus::Reconnecting(_)),
+                        SessionKind::Stream(stream) => stream.retry_in_flight()
+                            || stream.snapshot.as_ref().is_some_and(|state| state.retrying),
+                        SessionKind::Local => false,
+                    }).count();
+                    let scope = CloseScope {
+                        tabs: self.sessions.iter().map(|s| s.id).collect(),
+                        forwards: self.forward_impact(|_| true, cx),
+                    };
+                    let impact = scope.forwards;
+                    let warning = match (impact.rules, impact.connections) {
+                        (0, 0) => None,
+                        (0, n) => Some(format!("选择「断开并关闭」会断开 {n} 个转发连接。")),
+                        (n, 0) => Some(format!("选择「断开并关闭」会停止 {n} 条端口转发。")),
+                        (rules, connections) => Some(format!("选择「断开并关闭」会停止 {rules} 条端口转发，并断开 {connections} 个转发连接。")),
+                    };
+                    let handle = self.handle;
+                    self.close_dialog = Some(WindowCloseDialog::open(
+                        scope.tabs.len(), connecting, warning,
+                        move |choice, cx| cx.defer(move |cx| scope.confirm(handle, choice, cx)),
+                        window, cx,
+                    ));
+                }
+                return;
+            }
+            WindowClose::Last => {}
+        }
         if close_behavior(&self.hub.preferences.borrow()) == Close::Quit {
             return self.request_quit(window, cx);
         }
@@ -131,7 +221,17 @@ impl Workspace {
         window.minimize_window();
     }
 
+    pub(super) fn close_empty_window_if_needed(&self, window: &mut Window, cx: &App) -> bool {
+        let close = window_close(Hub::windows(cx).len(), self.sessions.len()) == WindowClose::Remove;
+        if close {
+            window.remove_window();
+        }
+        close
+    }
+
     pub(crate) fn show_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Hub::activated(self.handle, cx);
+        self.last_menu_state = None;
         #[cfg(target_os = "macos")]
         {
             let Some(native) = native_window(window) else { return };
@@ -145,9 +245,9 @@ impl Workspace {
                 cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(std::time::Duration::ZERO).await;
                     this.update_in(cx, |s, _, cx| {
-                        if s.hidden { return; }
+                        if s.hidden || Hub::windows(cx).first().is_none_or(|entry| entry.handle != s.handle) { return; }
                         if !has_shellmate_main_menu() && let Some((state, _)) = s.last_menu_state {
-                            cx.set_menus(crate::menus::menus(&state));
+                            cx.defer(move |cx| crate::menus::install(crate::menus::menus(&state), cx));
                         }
                         cx.activate(true);
                         native.makeKeyAndOrderFront(None);
@@ -159,8 +259,11 @@ impl Workspace {
             }
         }
         #[cfg(not(target_os = "macos"))]
-        cx.activate(true);
-        if !self.hidden { return; }
+        window.activate_window();
+        if !self.hidden {
+            self.sync_menus(cx);
+            return;
+        }
         self.set_window_hidden(false, cx);
         self.sync_menus(cx);
         self.sync_sidebar(cx);
@@ -183,7 +286,7 @@ impl Workspace {
                 .view
                 .update(cx, |view, cx| view.set_display_paused(hidden, cx));
         }
-        if let Some(records) = self.hub.records_window.borrow().as_ref().and_then(WeakEntity::upgrade) {
+        if let Some(records) = self.hub.records_window.borrow().as_ref().filter(|r| r.owner == self.handle).and_then(|r| r.panel()) {
             records.update(cx, |panel, cx| panel.set_window_visible(!hidden, cx));
         }
         self.sync_monitor_activity(cx);
@@ -268,7 +371,8 @@ impl Workspace {
 pub(crate) fn debug_hooks(cx: &mut App) {
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
-        ("SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER", super::transfer::move_to_new_window),
+        ("SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER", |cx| Hub::update(cx, Workspace::move_session_to_new_window)),
+        ("SHELLMATE_DEBUG_NEW_WINDOW_AFTER", |cx| Hub::update(cx, Workspace::new_window)),
         ("SHELLMATE_DEBUG_MERGE_BACK_AFTER", super::transfer::merge_back),
         #[cfg(target_os = "macos")]
         ("SHELLMATE_DEBUG_STATUS_CLICK_AFTER", |cx| {
@@ -303,6 +407,18 @@ pub(crate) fn debug_hooks(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinal_windows_confirm_only_when_they_have_tabs() {
+        assert_eq!(window_close(1, 3), WindowClose::Last);
+        assert_eq!(window_close(2, 3), WindowClose::Confirm);
+    }
+
+    #[test]
+    fn losing_the_last_tab_closes_only_a_nonfinal_window() {
+        assert_eq!(window_close(2, 0), WindowClose::Remove);
+        assert_eq!(window_close(1, 0), WindowClose::Last);
+    }
 
     #[test]
     fn close_decision_uses_preference() {

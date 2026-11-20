@@ -237,6 +237,7 @@ impl ConnGroup {
     }
 
     /// Whether a dialog of this group may be open.
+    #[cfg(test)]
     pub fn has_open_prompt(&self) -> bool {
         (self.prompt != Prompt::None && self.attempt.is_some()) || self.clash.open.is_some()
     }

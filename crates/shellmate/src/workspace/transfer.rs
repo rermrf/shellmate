@@ -1,5 +1,7 @@
 //! Tab ownership changes are synchronous on GPUI's foreground thread.
 use super::*;
+use gpui::{AnyWindowHandle, Bounds, DisplayId, Pixels, point};
+use gpui::component::menu::{PopupMenu, PopupMenuItem};
 use crate::productivity::multi::{Broadcast, Split};
 
 #[must_use]
@@ -7,6 +9,7 @@ pub(super) struct DetachedSession {
     session: Session,
     source: gpui::AnyWindowHandle,
     resume_typing: bool,
+    question: Option<connect::UiMsg>,
 }
 
 fn remove_tab(
@@ -31,8 +34,10 @@ fn remove_tab(
 }
 
 impl Workspace {
-    pub(super) fn detach_session(&mut self, id: usize) -> Option<DetachedSession> {
+    pub(super) fn detach_session(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) -> Option<DetachedSession> {
         let ix = self.sessions.iter().position(|s| s.id == id)?;
+        let question = self.take_connection_prompt(id, window, cx);
+        self.detach_clash_dialog(id, window, cx);
         let main = self.main_id();
         let mut session = self.sessions.remove(ix);
         self.active = remove_tab(
@@ -65,6 +70,7 @@ impl Workspace {
             session,
             source: self.handle,
             resume_typing,
+            question,
         })
     }
 
@@ -79,6 +85,7 @@ impl Workspace {
             mut session,
             source,
             resume_typing,
+            question,
         } = detached;
         let id = session.id;
         session.ai_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -116,13 +123,11 @@ impl Workspace {
         if resume_typing {
             self.type_pending(id, window, cx);
         }
-        if let Some(entry) = Hub::windows(cx)
-            .iter()
-            .find(|e| e.handle == source)
-            .cloned()
-        {
+        if let Some(question) = question {
             cx.defer(move |cx| {
-                entry.update(cx, Self::refresh_after_detach);
+                if let Some(entry) = Route::Session(id).target(cx) {
+                    entry.update(cx, |workspace, window, cx| workspace.open_connection_prompt(id, question, window, cx));
+                }
             });
         }
         log::info!(
@@ -133,6 +138,7 @@ impl Workspace {
     }
 
     fn refresh_after_detach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_window_title(window);
         self.update_pane_radii(cx);
         self.sync_ai_context(cx);
         let selected = self.active.and_then(|ix| self.sessions.get(ix)).map(|s| {
@@ -140,10 +146,12 @@ impl Workspace {
                 .map_or_else(|| "local".into(), |h| h.id.to_string())
         });
         self.sidebar.update(cx, |s, cx| s.select(selected, cx));
-        if self.active.is_some() {
-            self.focus_active(window, cx);
-        } else {
-            window.focus(&self.focus_handle, cx);
+        if !window.has_active_dialog(cx) {
+            if self.active.is_some() {
+                self.focus_active(window, cx);
+            } else {
+                window.focus(&self.focus_handle, cx);
+            }
         }
         self.sync_sidebar(cx);
         self.sync_local_files_activity(cx);
@@ -152,85 +160,287 @@ impl Workspace {
     }
 }
 
-/// Acquire the destination window before relinquishing source ownership.
-#[cfg_attr(not(debug_assertions), allow(dead_code))] // Entry point for the next phase's tab UI.
-fn move_tab(
+pub(super) fn window_title(tab: Option<&str>) -> String {
+    tab.map_or_else(|| "Shellmate".to_owned(), |name| format!("{name} — Shellmate"))
+}
+
+type Placement = (Bounds<Pixels>, Option<DisplayId>);
+
+fn cascade(current: Bounds<Pixels>, screen: Bounds<Pixels>) -> Bounds<Pixels> {
+    let shifted = Bounds::new(current.origin + point(px(28.), px(28.)), current.size);
+    if shifted.left() < screen.left() || shifted.top() < screen.top()
+        || shifted.right() > screen.right() || shifted.bottom() > screen.bottom()
+    {
+        Bounds::new(screen.origin, current.size)
+    } else {
+        shifted
+    }
+}
+
+fn new_window_placement(window: &Window, cx: &App) -> Placement {
+    let current = window.bounds();
+    window.display(cx).or_else(|| cx.primary_display()).map_or(
+        (Bounds::new(current.origin + point(px(28.), px(28.)), current.size), None),
+        |display| (cascade(current, display.visible_bounds()), Some(display.id())),
+    )
+}
+
+fn open_secondary((bounds, display_id): Placement, cx: &mut App) -> Option<hub::Entry> {
+    match crate::open_workspace_at(false, None, bounds, display_id, false, cx) {
+        Ok((handle, _)) => Hub::entry(handle, cx),
+        Err(error) => {
+            log::error!("could not open workspace window: {error:#}");
+            None
+        }
+    }
+}
+
+impl Workspace {
+    pub(super) fn new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placement = new_window_placement(window, cx);
+        cx.defer(move |cx| {
+            if let Some(entry) = open_secondary(placement, cx) {
+                entry.update(cx, Self::show_window);
+            }
+        });
+    }
+
+    pub(super) fn move_session_to_new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.main_id() {
+            move_to_new(self.handle, id, window, cx);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Destination {
+    New(Placement),
+    Existing(AnyWindowHandle),
+}
+
+fn move_to_new(source: AnyWindowHandle, id: usize, window: &Window, cx: &mut App) {
+    let destination = Destination::New(new_window_placement(window, cx));
+    cx.defer(move |cx| move_sessions(source, destination, vec![id], cx));
+}
+
+fn move_sessions(handle: AnyWindowHandle, target: Destination, ids: Vec<usize>, cx: &mut App) {
+    let Some(source) = Hub::entry(handle, cx) else { return };
+    let Some(owner) = source.workspace.upgrade() else { return };
+    let workspace = owner.read(cx);
+    if ids.is_empty() || !ids.iter().all(|id| workspace.sessions.iter().any(|tab| tab.id == *id)) {
+        return;
+    }
+    if let Some((_, editor)) = workspace.editor.as_ref().filter(|(id, _)| ids.contains(id)) {
+        let editor = editor.clone();
+        source.handle.update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.close_then(window, cx, move |cx| {
+                move_sessions(handle, target, ids, cx);
+            }));
+        }).ok();
+        return;
+    }
+    let destination = match target {
+        Destination::New(placement) => open_secondary(placement, cx),
+        Destination::Existing(handle) => Hub::entry(handle, cx),
+    };
+    if let Some(destination) = destination
+        && !move_tabs(&source, &destination, &ids, usize::MAX, cx)
+        && matches!(target, Destination::New(_))
+    {
+        destination.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+/// Open the destination's update scope before relinquishing source ownership.
+fn move_tabs(
     source: &hub::Entry,
     destination: &hub::Entry,
-    id: usize,
+    ids: &[usize],
     index: usize,
     cx: &mut App,
 ) -> bool {
-    if source.handle == destination.handle {
+    if source.handle == destination.handle || ids.is_empty() {
         return false;
     }
-    destination
-        .update(cx, |w, window, cx| {
-            let Some(source) = source.workspace.upgrade() else {
-                return false;
-            };
-            let Some(tab) = source.update(cx, |s, _| s.detach_session(id)) else {
-                return false;
-            };
-            w.attach_session(tab, index, window, cx);
-            true
-        })
-        .unwrap_or(false)
+    let moved = destination.update(cx, |target, window, cx| {
+        let Some(tabs) = source.update(cx, |workspace, source_window, cx| {
+            ids.iter()
+                .filter_map(|id| workspace.detach_session(*id, source_window, cx))
+                .collect::<Vec<_>>()
+        }) else {
+            return false;
+        };
+        if tabs.is_empty() {
+            return false;
+        }
+        target.show_window(window, cx);
+        let index = index.min(target.sessions.len());
+        let dialog_focus = window.has_active_dialog(cx).then(|| window.focused(cx)).flatten();
+        for (offset, tab) in tabs.into_iter().enumerate() {
+            target.attach_session(tab, index + offset, window, cx);
+        }
+        if let Some(focus) = dialog_focus {
+            window.focus(&focus, cx);
+        }
+        true
+    }).unwrap_or(false);
+    if moved {
+        source.update(cx, |workspace, window, cx| {
+            if !workspace.close_empty_window_if_needed(window, cx) {
+                workspace.refresh_after_detach(window, cx);
+            }
+        });
+    }
+    moved
 }
 
 #[cfg(debug_assertions)]
-pub(super) fn move_to_new_window(cx: &mut App) {
-    let Some(source) = Hub::windows(cx).first().cloned() else {
-        return;
-    };
-    let Some(id) = source
-        .workspace
-        .upgrade()
-        .and_then(|w| w.read(cx).main_id())
-    else {
-        return;
-    };
-    match crate::open_workspace(false, None, cx) {
-        Ok((handle, workspace)) => {
-            let destination = hub::Entry {
-                handle,
-                workspace: workspace.downgrade(),
-            };
-            if !move_tab(&source, &destination, id, 0, cx) {
-                destination.update(cx, |_, w, _| w.remove_window());
-            }
+fn move_all(source: &hub::Entry, destination: &hub::Entry, cx: &mut App) {
+    if let Some(workspace) = source.workspace.upgrade() {
+        let ids: Vec<_> = workspace.read(cx).sessions.iter().map(|session| session.id).collect();
+        if ids.is_empty() {
+            source.update(cx, |workspace, window, cx| workspace.close_empty_window_if_needed(window, cx));
+        } else {
+            move_sessions(source.handle, Destination::Existing(destination.handle), ids, cx);
         }
-        Err(e) => log::error!("could not open workspace window: {e:#}"),
     }
+}
+
+pub(super) fn move_to_recent_window(source: AnyWindowHandle, tabs: Vec<usize>, cx: &mut App) {
+    if let Some(destination) = Hub::most_recent_other(source, cx) {
+        move_sessions(source, Destination::Existing(destination.handle), tabs, cx);
+    }
+}
+
+pub(super) fn tab_context_menu(
+    menu: PopupMenu,
+    source: AnyWindowHandle,
+    id: usize,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let destinations: Vec<_> = Hub::windows(cx).iter()
+        .filter(|entry| entry.handle != source)
+        .filter_map(|entry| {
+            let workspace = entry.workspace.upgrade()?;
+            let title = workspace.read(cx).active_tab_title().unwrap_or("Shellmate");
+            Some((entry.handle, format!("窗口 {} · {title}", entry.number)))
+        })
+        .collect();
+    let menu = menu.item(PopupMenuItem::new("移到新窗口").on_click(move |_, window, cx| {
+        move_to_new(source, id, window, cx);
+    }));
+    if destinations.is_empty() {
+        return menu.item(PopupMenuItem::new("移到窗口 ›").disabled(true));
+    }
+    menu.submenu("移到窗口", window, cx, move |submenu, _, _| {
+        destinations.iter().fold(submenu, |submenu, (destination, label)| {
+            let destination = *destination;
+            submenu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _, cx| {
+                cx.defer(move |cx| {
+                    move_sessions(source, Destination::Existing(destination), vec![id], cx);
+                });
+            }))
+        })
+    })
 }
 
 #[cfg(debug_assertions)]
 pub(super) fn merge_back(cx: &mut App) {
-    // Creation order is independent of key-window changes.
-    let mut windows = Hub::windows(cx).to_vec();
-    windows.sort_by_key(|e| e.workspace.entity_id());
-    let (Some(first), Some(newest)) = (windows.first(), windows.last()) else {
-        return;
-    };
-    if first.handle == newest.handle {
-        return;
-    }
-    let Some(source) = newest.workspace.upgrade() else {
-        return;
-    };
-    let ids: Vec<_> = source.read(cx).sessions.iter().map(|s| s.id).collect();
-    for id in ids {
-        move_tab(newest, first, id, usize::MAX, cx);
-    }
-    if source.read(cx).sessions.is_empty() {
-        newest.update(cx, |_, w, _| w.remove_window());
+    let windows = Hub::windows(cx);
+    let first = windows.iter().min_by_key(|entry| entry.number).cloned();
+    let newest = windows.iter().max_by_key(|entry| entry.number).cloned();
+    if let (Some(first), Some(newest)) = (first, newest)
+        && first.handle != newest.handle
+    {
+        move_all(&newest, &first, cx);
         first.update(cx, Workspace::show_window);
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Workspace {
+    pub(super) fn demo_multi_window(&mut self, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.handle;
+        let current = window.bounds();
+        let display = window.display(cx).map(|display| display.id());
+        let count = if close { 1 } else { 2 };
+        // Move fixture tabs to background windows using the production path.
+        let ids: Vec<_> = self.sessions.iter()
+            .filter(|session| !close || matches!(session.kind, SessionKind::Stream(_)))
+            .rev().take(count).map(|session| session.id).collect();
+        if close {
+            for session in self.sessions.iter_mut().take(2) {
+                if let SessionKind::Ssh(ssh) = &mut session.kind {
+                    ssh.status = ssh::SshStatus::Connecting;
+                }
+            }
+            if let Some(SessionKind::Ssh(ssh)) = self.sessions.last_mut().map(|session| &mut session.kind) {
+                ssh.status = ssh::SshStatus::Failed;
+            }
+            self.sync_sidebar(cx);
+        }
+        cx.defer(move |cx| {
+            let Some(source) = Hub::entry(source, cx) else { return };
+            for (offset, id) in ids.into_iter().enumerate() {
+                let inset = px(50. + 28. * offset as f32);
+                let bounds = Bounds::new(current.origin + point(inset, inset), gpui::size(px(980.), px(620.)));
+                if let Some(destination) = open_secondary((bounds, display), cx) {
+                    move_tabs(&source, &destination, &[id], 0, cx);
+                }
+            }
+            source.update(cx, |workspace, window, cx| {
+                workspace.show_window(window, cx);
+                if close {
+                    workspace.close_window(window, cx);
+                } else {
+                    workspace.open_demo_tab_menu(window, cx);
+                }
+            });
+        });
+    }
+
+    fn open_demo_tab_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.main_id() else { return };
+        let source = self.handle;
+        let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+            tab_context_menu(menu, source, id, window, cx)
+        });
+        let subscription = cx.subscribe_in(&menu, window, |workspace, _, _: &gpui::DismissEvent, window, cx| {
+            workspace.demo_tab_menu = None;
+            workspace.focus_active(window, cx);
+            cx.notify();
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        self.demo_tab_menu = Some((menu, subscription));
+        cx.notify();
+        window.on_next_frame(|window, _| window.on_next_frame(|window, cx| {
+            for key in ["down", "down", "right"] {
+                window.dispatch_keystroke(gpui::Keystroke::parse(key).expect("popup key"), cx);
+            }
+        }));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_titles_follow_the_active_tab() {
+        assert_eq!(window_title(None), "Shellmate");
+        assert_eq!(window_title(Some("本机")), "本机 — Shellmate");
+    }
+
+    #[test]
+    fn window_placement_offsets_or_wraps_with_the_same_size() {
+        let size = gpui::size(px(1000.), px(700.));
+        let screen = Bounds::new(point(px(0.), px(25.)), gpui::size(px(1500.), px(950.)));
+        let current = Bounds::new(point(px(60.), px(60.)), size);
+        assert_eq!(cascade(current, screen), Bounds::new(point(px(88.), px(88.)), size));
+        let at_edge = Bounds::new(point(px(500.), px(60.)), size);
+        assert_eq!(cascade(at_edge, screen), Bounds::new(screen.origin, size));
+    }
 
     #[test]
     fn removing_a_pane_ends_the_split_and_forgets_its_broadcast_target() {

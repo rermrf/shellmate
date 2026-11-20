@@ -3,7 +3,6 @@
 
 use std::rc::Rc;
 
-use gpui::component::WindowExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::prelude::*;
 use gpui::{App, Context, FontWeight, IntoElement, Render, Window, div, px};
@@ -61,7 +60,7 @@ impl ConflictDialog {
     fn choose(&mut self, choice: ConflictChoice, window: &mut Window, cx: &mut Context<Self>) {
         self.answered = true;
         // Closed first: what the answer sets going (a save, say) may open another dialog.
-        window.close_dialog(cx);
+        crate::dialogs::modal::close(window, cx);
         (self.answer)(choice, window, cx);
     }
 }
@@ -175,7 +174,7 @@ impl UnsavedDialog {
 
     fn choose(&mut self, choice: UnsavedChoice, window: &mut Window, cx: &mut Context<Self>) {
         self.answered = true;
-        window.close_dialog(cx);
+        crate::dialogs::modal::close(window, cx);
         (self.answer)(choice, window, cx);
     }
 }

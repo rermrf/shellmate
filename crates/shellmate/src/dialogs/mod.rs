@@ -10,6 +10,8 @@ pub(crate) mod about;
 pub mod clash;
 pub mod confirm;
 pub(crate) mod quit;
+pub(crate) mod window;
+pub(crate) mod modal;
 pub mod host_editor;
 pub mod hostkey;
 pub mod import;
@@ -18,7 +20,7 @@ pub use crate::ui::scroll::scroll_body;
 use std::cell::Cell;
 
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::{Disableable as _, WindowExt as _};
+use gpui::component::Disableable as _;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, FontWeight, Hsla, IntoElement, Render, SharedString, Window, div, px};
 
@@ -40,7 +42,7 @@ pub trait DialogBody: Render + Sized + 'static {
     /// The primary button or Enter was used: confirms and closes if allowed.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.confirm(window, cx) {
-            window.close_dialog(cx);
+            modal::close(window, cx);
             window.refresh();
         }
     }
@@ -49,7 +51,7 @@ pub trait DialogBody: Render + Sized + 'static {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_cancel() { return; }
         self.cancel(window, cx);
-        window.close_dialog(cx);
+        modal::close(window, cx);
         window.refresh();
     }
 }
@@ -61,12 +63,8 @@ pub fn open_modal(
     window: &mut Window,
     cx: &mut App,
     build: impl Fn(gpui::component::dialog::Dialog, &mut Window, &mut App) -> gpui::component::dialog::Dialog + 'static,
-) {
-    window.refresh();
-    let nested = window.has_active_dialog(cx);
-    window.open_dialog(cx, move |dialog, window, cx| {
-        build(dialog.overlay(nested), window, cx).on_close(|_, window, _| window.refresh())
-    });
+) -> modal::Handle {
+    modal::open(window, cx, build)
 }
 
 /// Height of a self-contained modal shell, leaving both measured edge margins.
@@ -135,6 +133,16 @@ pub fn open<V: DialogBody>(
     width: f32,
     body: Entity<V>,
 ) {
+    open_tracked(window, cx, title, width, body);
+}
+
+pub(crate) fn open_tracked<V: DialogBody>(
+    window: &mut Window,
+    cx: &mut App,
+    title: impl Into<SharedString>,
+    width: f32,
+    body: Entity<V>,
+) -> modal::Handle {
     let title: SharedString = title.into();
     let first_build = Cell::new(true);
     open_modal(window, cx, move |dialog, window, cx| {
@@ -181,7 +189,7 @@ pub fn open<V: DialogBody>(
                 on_cancel.update(cx, |body, cx| { if !body.can_cancel() { return false; } body.cancel(window, cx); true })
             })
             .map(|d| if records || settings { fixed_shell(d, body.clone(), custom_height) } else { d.child(body.clone()) })
-    });
+    })
 }
 
 /// Visual weight of a dialog button.

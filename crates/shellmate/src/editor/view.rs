@@ -4,7 +4,6 @@
 
 use std::cell::Cell;
 
-use gpui::component::WindowExt as _;
 use gpui::component::input::{Editor, EditorState, Escape, InputEvent, RopeExt as _};
 use gpui::prelude::*;
 use gpui::{
@@ -56,7 +55,11 @@ fn count_lines(len: usize, rope_lines: usize, ends_with_newline: bool) -> usize 
     }
 }
 
+type AfterClose = Box<dyn FnOnce(&mut App)>;
+
 pub struct FileEditor {
+    modal: Option<crate::dialogs::modal::Handle>,
+    after_close: Option<AfterClose>,
     model: EditModel,
     local: bool,
     /// The file's name, for the title and the dialogs.
@@ -104,6 +107,8 @@ impl FileEditor {
         });
         let local = panel.upgrade().is_some_and(|panel| panel.read(cx).is_local());
         Self {
+            modal: None,
+            after_close: None,
             model: EditModel::new(&file),
             local,
             name,
@@ -122,7 +127,8 @@ impl FileEditor {
     /// Opens `editor` as a modal over the window (one at a time: the modal sees to that).
     pub fn open(editor: Entity<Self>, window: &mut Window, cx: &mut App) {
         let first_build = Cell::new(true);
-        crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
+        let body = editor.clone();
+        let modal = crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
             if first_build.replace(false) {
                 editor.update(cx, |editor, cx| editor.focus(window, cx));
             }
@@ -144,6 +150,7 @@ impl FileEditor {
                 })
                 .map(|d| crate::dialogs::fixed_shell(d, editor.clone(), px(crate::dialogs::shell_height(f32::from(window.viewport_size().height), 800., 50.))))
         });
+        body.update(cx, |body, _| body.modal = Some(modal));
     }
 
     fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -211,13 +218,21 @@ impl FileEditor {
             SaveEnd::Saved { close } => {
                 self.saving_text = None;
                 cx.emit(EditorEvent::Saved(self.dir()));
-                if close {
+                if close || (self.after_close.is_some() && !self.model.close_needs_confirmation()) {
                     self.close(window, cx);
+                } else {
+                    self.after_close = None;
                 }
             }
-            SaveEnd::Conflict => self.ask_about_conflict(window, cx),
+            SaveEnd::Conflict => {
+                self.after_close = None;
+                self.ask_about_conflict(window, cx);
+            }
             // The panel has been told about a lost session already; the status line has the reason.
-            SaveEnd::Failed { .. } => self.saving_text = None,
+            SaveEnd::Failed { .. } => {
+                self.after_close = None;
+                self.saving_text = None;
+            }
             SaveEnd::Ignored => {}
         }
         cx.notify();
@@ -263,6 +278,17 @@ impl FileEditor {
 
     // ---- closing -----------------------------------------------------------------------------------
 
+    /// Resume a window operation only after this editor actually closes.
+    pub(crate) fn close_then(&mut self, window: &mut Window, cx: &mut Context<Self>, resume: impl FnOnce(&mut App) + 'static) {
+        if self.dialog_open || self.after_close.is_some() {
+            return;
+        }
+        self.after_close = Some(Box::new(resume));
+        if !self.model.is_saving() {
+            self.request_close(window, cx);
+        }
+    }
+
     /// 关闭 / Esc: asks first when something is not uploaded.
     pub fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog_open {
@@ -290,7 +316,10 @@ impl FileEditor {
     fn on_unsaved_choice(&mut self, choice: UnsavedChoice, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog_open = false;
         match choice {
-            UnsavedChoice::Cancel => self.focus(window, cx),
+            UnsavedChoice::Cancel => {
+                self.after_close = None;
+                self.focus(window, cx);
+            }
             UnsavedChoice::Discard => self.close(window, cx),
             // Closes when the upload works; a conflict or a failure keeps the editor open.
             UnsavedChoice::SaveAndClose => match self.model.begin_save_and_close() {
@@ -303,8 +332,13 @@ impl FileEditor {
 
     /// Closes the modal.
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.close_dialog(cx);
+        if let Some(modal) = self.modal.take() {
+            modal.close(window, cx);
+        }
         cx.emit(EditorEvent::Closed);
+        if let Some(resume) = self.after_close.take() {
+            cx.defer(resume);
+        }
     }
 
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
@@ -330,7 +364,7 @@ impl FileEditor {
     /// `unsaved-save`, `unsaved-discard`, `unsaved-cancel` for the question about closing.
     #[cfg(debug_assertions)]
     pub fn demo_choose(&mut self, choice: &str, window: &mut Window, cx: &mut Context<Self>) {
-        window.close_dialog(cx);
+        crate::dialogs::modal::close(window, cx);
         match choice {
             "load" => self.on_conflict_choice(ConflictChoice::LoadRemote, window, cx),
             "overwrite" => self.on_conflict_choice(ConflictChoice::Overwrite, window, cx),

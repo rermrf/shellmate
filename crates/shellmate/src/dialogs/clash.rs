@@ -2,7 +2,6 @@
 
 use std::rc::Rc;
 
-use gpui::component::WindowExt as _;
 use gpui::prelude::*;
 use gpui::{App, Context, IntoElement, Render, Window, div, px};
 use shellmate_sftp::transfer::{Choice, Clash, ItemId};
@@ -31,10 +30,10 @@ pub fn names_line(clash: &Clash) -> String {
 
 impl ClashDialog {
     /// Opens the dialog for item `id`.
-    pub fn open(id: ItemId, clash: Clash, answer: Answer, window: &mut Window, cx: &mut App) {
+    pub fn open(id: ItemId, clash: Clash, answer: Answer, window: &mut Window, cx: &mut App) -> super::modal::Handle {
         let title = clash.title();
         let body = cx.new(|_| Self { id, clash, answer, answered: false, local: false });
-        super::open(window, cx, title, 480., body);
+        super::open_tracked(window, cx, title, 480., body)
     }
 
     pub fn local(clash: Clash, answer: Answer, window: &mut Window, cx: &mut App) {
@@ -46,7 +45,7 @@ impl ClashDialog {
     fn choose(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
         self.answered = true;
         (self.answer)(self.id, Some(choice), window, cx);
-        window.close_dialog(cx);
+        crate::dialogs::modal::close(window, cx);
     }
 }
 

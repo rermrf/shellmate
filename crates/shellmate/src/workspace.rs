@@ -8,6 +8,7 @@ use std::sync::Arc;
 use gpui::assets::IconName as Lucide;
 use crate::icons::AppIcon;
 use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::menu::ContextMenuExt as _;
 use gpui::component::notification::Notification;
 use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, WindowExt as _};
@@ -60,6 +61,7 @@ actions!(
     shellmate,
     [
         NewLocalTerminal,
+        NewWindow,
         DuplicateSession,
         CloseTab,
         NextTab,
@@ -88,6 +90,7 @@ pub(crate) fn bindings() -> Vec<KeyBinding> {
     use crate::menus::*;
     vec![
         KeyBinding::new("cmd-t", NewLocalTerminal, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", NewWindow, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-t", DuplicateSession, Some(CONTEXT)),
         KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
@@ -199,10 +202,13 @@ pub struct Workspace {
     hub: Rc<Services>,
     handle: gpui::AnyWindowHandle,
     hidden: bool,
+    close_dialog: Option<crate::dialogs::modal::Handle>,
     last_menu_state: Option<(crate::menus::MenuState, Option<menu_actions::Available>)>,
     hidden_focus_actions: Vec<&'static str>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
+    connection_prompts: HashMap<usize, ssh::OpenConnectionPrompt>,
+    clash_dialogs: HashMap<usize, (usize, shellmate_sftp::transfer::ItemId, crate::dialogs::modal::Handle)>,
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
     ai_drawer: Option<Entity<crate::ai::panel::Drawer>>,
@@ -215,6 +221,8 @@ pub struct Workspace {
     split: crate::productivity::multi::Split,
     session_menu: Option<multi::OpenSessionMenu>,
     #[cfg(debug_assertions)]
+    demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
+    #[cfg(debug_assertions)]
     review_confirmation: Option<gpui::WeakEntity<crate::productivity::panel::Confirmation>>,
     #[cfg(debug_assertions)]
     live_review: bool,
@@ -226,10 +234,14 @@ pub struct Workspace {
     sidebar_motion: SidebarMotion,
     focus_handle: FocusHandle,
     /// The editor modal, if one is open (one at a time per window).
-    editor: Option<Entity<FileEditor>>,
+    editor: Option<(usize, Entity<FileEditor>)>,
     _editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
+
+pub(crate) struct PreferenceChanged(pub shellmate_store::Preference, pub bool);
+
+impl gpui::EventEmitter<PreferenceChanged> for Workspace {}
 
 /// Shows a notification once the window's root view exists: notifications cannot be pushed
 /// while the root view is still being built (`Workspace::new`).
@@ -285,15 +297,19 @@ impl Workspace {
             hub,
             handle: window.window_handle(),
             hidden: false,
+            close_dialog: None,
             last_menu_state: None,
             hidden_focus_actions: Vec::new(),
             sidebar,
             sessions: Vec::new(),
+            connection_prompts: HashMap::new(),
+            clash_dialogs: HashMap::new(),
             commands,
             commands_open: false, ai_drawer:None,ai_open:false,
             ai_drawer_width, ai_drawer_drag: Default::default(),
             drawer_motion: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
+            #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
             picker: None,
@@ -311,6 +327,7 @@ impl Workspace {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
         if first { this.reload_book(window, cx); }
+        else { window.focus(&this.focus_handle, cx); }
         let open_local=first && !crate::prototype_fixture();
         if open_local {this.open_local(window, cx);}
         #[cfg(target_os = "macos")]
@@ -484,6 +501,7 @@ impl Workspace {
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
+        self.update_window_title(window);
         self.sync_local_files_activity(cx);
         self.sync_ai_context(cx);
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
@@ -496,6 +514,14 @@ impl Workspace {
         cx.notify();
     }
 
+    fn active_tab_title(&self) -> Option<&str> {
+        self.active.and_then(|ix| self.sessions.get(ix)).map(|session| session.title.as_ref())
+    }
+
+    fn update_window_title(&self, window: &mut Window) {
+        window.set_window_title(&transfer::window_title(self.active_tab_title()));
+    }
+
     /// Closes the tab at `ix` right away (see [`Workspace::close`] for the confirmation).
     fn close_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.sessions.len() {
@@ -505,6 +531,16 @@ impl Workspace {
         // connection that is still being made is cancelled together with the dialog it asked.
         let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
         let closed=self.sessions[ix].id;
+        self.detach_clash_dialog(closed, window, cx);
+        if let Some(question) = self.take_connection_prompt(closed, window, cx)
+            && let Some(group) = group
+        {
+            cx.defer(move |cx| {
+                if let Some(entry) = Route::Group(group).target(cx) {
+                    entry.update(cx, |workspace, window, cx| workspace.show_group_question(group, question, window, cx));
+                }
+            });
+        }
         if let Some(mut group) = group.and_then(|id| self.group_mut(id)) && group.preload.as_ref().is_some_and(|(owner, _)| *owner == closed) { group.preload = None; }
         let was_recording=self.hub.running_recordings.borrow().contains_key(&closed);
         if let Some(error)=self.finalize_archives(closed,cx){window.push_notification(Notification::error(error),cx);}
@@ -517,11 +553,12 @@ impl Workspace {
         self.sessions.remove(ix);
         self.update_pane_radii(cx);
         if let Some(group) = group {
-            self.release_group(group, window, cx);
+            self.release_group(group, cx);
         }
         match self.active {
             _ if self.sessions.is_empty() => {
                 self.active = None;
+                self.update_window_title(window);
                 self.sync_ai_context(cx);
                 window.focus(&self.focus_handle, cx);
                 self.sidebar.update(cx, |s, cx| s.select(None, cx));
@@ -532,6 +569,7 @@ impl Workspace {
         self.sync_sidebar(cx);
         self.sync_monitor_activity(cx);
         cx.notify();
+        self.close_empty_window_if_needed(window, cx);
     }
 
     fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -629,10 +667,12 @@ impl Workspace {
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         theme::apply(!cx.is_dark(), cx);
         let style = cx.terminal_style();
-        for session in &self.sessions {
-            session.view.update(cx, |v, cx| v.set_style(style.clone(), cx));
-        }
-        cx.notify();
+        self.project(Route::All, cx, |workspace, cx| {
+            for session in &workspace.sessions {
+                session.view.update(cx, |view, cx| view.set_style(style.clone(), cx));
+            }
+            cx.notify();
+        });
     }
 
     /// Clicking non-focusable chrome (toolbar, header, empty space) moves focus
@@ -736,9 +776,11 @@ impl Workspace {
         let strip_width = visible.iter().map(|ix| widths[*ix].min(fit.single_tab_max)).sum::<f32>()
             + crate::tabs::TAB_GAP * visible.len().saturating_sub(1) as f32;
         let has_tabs = !visible.is_empty();
+        let source = self.handle;
         let tabs = visible.into_iter().map(|ix| {
             let s = &self.sessions[ix];
             let active = Some(ix) == self.active;
+            let id = s.id;
             div()
                 .id(("tab", s.id))
                 .w(px(widths[ix].min(fit.single_tab_max)))
@@ -817,6 +859,9 @@ impl Workspace {
                         })),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
+                .context_menu(move |menu, window, cx| {
+                    transfer::tab_context_menu(menu, source, id, window, cx)
+                })
         });
 
         let new_tab = div()
@@ -1178,6 +1223,11 @@ impl Render for Workspace {
                     .on_click(|_, _, cx| cx.stop_propagation()).child(picker.clone()))
         });
 
+        #[cfg(debug_assertions)]
+        let demo_tab_menu = self.demo_tab_menu.as_ref().map(|(menu, _)| {
+            gpui::deferred(gpui::anchored().position(gpui::point(px(312.), px(38.)))
+                .snap_to_window_with_margin(px(8.)).child(menu.clone())).with_priority(3)
+        });
         div()
             .id("workspace")
             .relative()
@@ -1211,6 +1261,11 @@ impl Render for Workspace {
             .children(self.session_menu.as_ref().map(|menu| gpui::deferred(
                 gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(menu.view.clone())
             ).with_priority(3)))
+            .map(|root| {
+                #[cfg(debug_assertions)]
+                let root = root.children(demo_tab_menu);
+                root
+            })
             .children(palette)
             .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
                 if let Some(owner) = drag_owner.upgrade() {

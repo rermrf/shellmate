@@ -33,7 +33,7 @@ pub(super) struct Services {
     pub group_ids: Ids,
     pub recent_sessions: RefCell<Vec<usize>>,
     pub running_recordings: RefCell<HashMap<usize, archive::RunningRecording>>,
-    pub records_window: RefCell<Option<WeakEntity<crate::records::panel::RecordsWindow>>>,
+    pub records_window: RefCell<Option<crate::records::panel::OpenRecords>>,
     pub quit_dialog: RefCell<Option<WeakEntity<crate::dialogs::quit::QuitDialog>>>,
     #[cfg(target_os = "macos")]
     pub status_bar: RefCell<status_item::StatusBar>,
@@ -42,6 +42,7 @@ pub(super) struct Services {
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub handle: AnyWindowHandle,
+    pub(super) number: usize,
     pub workspace: WeakEntity<Workspace>,
 }
 
@@ -112,6 +113,7 @@ impl Route {
 pub(crate) struct Hub {
     pub(super) services: Rc<Services>,
     windows: Vec<Entry>,
+    window_ids: Ids,
     _timer: gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -124,6 +126,10 @@ fn make_recent<T>(entries: &mut [T], matches: impl Fn(&T) -> bool) {
     }
 }
 
+fn first_other<T, K: PartialEq>(entries: &[T], source: K, key: impl Fn(&T) -> K) -> Option<&T> {
+    entries.iter().find(|entry| key(entry) != source)
+}
+
 impl Hub {
     pub fn init(store: HostStore, temporary: bool, cx: &mut App) {
         let preferences = store.preferences().unwrap_or_default();
@@ -133,6 +139,7 @@ impl Hub {
         let activity = secrets.clone();
         let keys = cx.intercept_keystrokes(move |_, _, _| activity.activity());
         let closed = cx.on_window_closed(|cx, id| {
+            crate::dialogs::modal::forget_window(id, cx);
             let windows = &mut cx.global_mut::<Self>().windows;
             if let Some(ix) = windows.iter().position(|e| e.handle.window_id() == id) {
                 windows.remove(ix);
@@ -188,6 +195,7 @@ impl Hub {
                 status_bar,
             }),
             windows: Vec::new(),
+            window_ids: Ids::default(),
             _timer: timer,
             _subscriptions: vec![closed, keys],
         });
@@ -198,15 +206,25 @@ impl Hub {
             .map_or(&[], |hub| hub.windows.as_slice())
     }
 
-    pub fn install(handle: AnyWindowHandle, workspace: &Entity<Workspace>, cx: &mut App) {
+    pub(super) fn entry(handle: AnyWindowHandle, cx: &App) -> Option<Entry> {
+        Self::windows(cx).iter().find(|entry| entry.handle == handle).cloned()
+    }
+
+    pub(super) fn most_recent_other(source: AnyWindowHandle, cx: &App) -> Option<Entry> {
+        first_other(Self::windows(cx), source, |entry| entry.handle).cloned()
+    }
+
+    pub fn install(handle: AnyWindowHandle, workspace: &Entity<Workspace>, focus: bool, cx: &mut App) {
         let workspace = workspace.downgrade();
-        cx.global_mut::<Self>().windows.insert(
-            0,
-            Entry {
-                handle,
-                workspace: workspace.clone(),
-            },
-        );
+        let hub = cx.global_mut::<Self>();
+        hub.windows.push(Entry {
+            handle,
+            number: hub.window_ids.allocate(),
+            workspace: workspace.clone(),
+        });
+        if focus {
+            Self::activated(handle, cx);
+        }
         log::info!("window opened {}", handle.window_id().as_u64());
         handle
             .update(cx, |_, w, cx| {
@@ -320,6 +338,14 @@ mod tests {
             make_recent(&mut entries, |id| *id == key);
         }
         assert_eq!(entries, [3, 1, 2]);
+    }
+
+    #[test]
+    fn moving_all_tabs_uses_the_most_recent_other_window() {
+        let windows = [3, 1, 2];
+        assert_eq!(first_other(&windows, 3, |id| *id), Some(&1));
+        assert_eq!(first_other(&windows, 1, |id| *id), Some(&3));
+        assert_eq!(first_other(&[3], 3, |id| *id), None);
     }
 
     #[test]

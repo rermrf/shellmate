@@ -1,6 +1,6 @@
 //! Host key confirmation: first connection to a host, and a key that changed.
 
-use gpui::component::{Sizable as _, WindowExt as _};
+use gpui::component::Sizable as _;
 use gpui::component::checkbox::Checkbox;
 use gpui::prelude::*;
 use gpui::{App, Context, FontWeight, IntoElement, Render, Window, div, px};
@@ -21,11 +21,12 @@ pub struct HostKeyDialog {
 
 impl HostKeyDialog {
     /// Opens the dialog; `reply` receives the decision (dropping it counts as "no").
-    pub fn open(request: HostKeyRequest, reply: oneshot::Sender<HostKeyDecision>, window: &mut Window, cx: &mut App) {
+    pub fn open(request: HostKeyRequest, reply: oneshot::Sender<HostKeyDecision>, window: &mut Window, cx: &mut App) -> (super::modal::Handle, gpui::WeakEntity<Self>) {
         let changed = request.state == FingerprintState::Changed;
         let body = cx.new(|_| Self { request, reply: Some(reply), acknowledged: false });
         let first = Cell::new(true);
-        crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
+        let weak = body.downgrade();
+        let modal = crate::dialogs::open_modal(window, cx, move |dialog, window, cx| {
             if first.replace(false) {
                 body.update(cx, |b, cx| b.focus(window, cx));
             }
@@ -47,6 +48,11 @@ impl HostKeyDialog {
                 })
                 .child(body.clone())
         });
+        (modal, weak)
+    }
+
+    pub(crate) fn take_question(&mut self) -> Option<crate::connect::UiMsg> {
+        Some(crate::connect::UiMsg::HostKey { request: self.request.clone(), reply: self.reply.take()? })
     }
 
     fn answer(&mut self, trust: HostKeyDecision) {
@@ -220,7 +226,7 @@ impl HostKeyDialog {
                             .w(px(101.))
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.answer(HostKeyDecision::Once);
-                                w.close_dialog(cx);
+                                crate::dialogs::modal::close(w, cx);
                             })),
                     )
                     .child(

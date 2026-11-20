@@ -802,7 +802,7 @@ impl Workspace {
             }
             "retry" => self.on_monitor_panel_event(session_id, &MonitorPanelEvent::Retry, window, cx),
             "close-now" => self.close_session(session_id, window, cx),
-            "dismiss" => window.close_all_dialogs(cx),
+            "dismiss" => crate::dialogs::modal::close_all(window, cx),
             // Logs how things stand (no process names or command lines).
             "log" => {
                 let Some(monitor) = group_id.and_then(|id| self.group(id)).and_then(|g| std::cell::Ref::filter_map(g, |g| g.monitor.as_ref()).ok()) else {

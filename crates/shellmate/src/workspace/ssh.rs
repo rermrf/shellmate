@@ -224,6 +224,29 @@ pub fn panel_hint(panel: Panel) -> &'static str {
     }
 }
 
+type TakeQuestion = Box<dyn FnOnce(&mut gpui::App) -> Option<UiMsg>>;
+
+pub(super) struct OpenConnectionPrompt {
+    modal: crate::dialogs::modal::Handle,
+    take_question: TakeQuestion,
+}
+
+impl OpenConnectionPrompt {
+    pub(super) fn is_open(&self) -> bool {
+        self.modal.is_open()
+    }
+
+    fn new<T: 'static>(
+        (modal, body): (crate::dialogs::modal::Handle, gpui::WeakEntity<T>),
+        take: fn(&mut T) -> Option<UiMsg>,
+    ) -> Self {
+        Self {
+            modal,
+            take_question: Box::new(move |cx| body.update(cx, |body, _| take(body)).ok().flatten()),
+        }
+    }
+}
+
 impl Workspace {
     // ---- lookups ---------------------------------------------------------------------------
 
@@ -280,22 +303,22 @@ impl Workspace {
 
     /// A connection nobody is on any more goes away with whatever it was doing: the running
     /// attempt is aborted, and a dialog it asked is closed.
-    pub(super) fn release_group(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn release_group(&mut self, group_id: usize, cx: &mut Context<Self>) {
         if self.sessions.iter().any(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id)) || !self.peers(super::Route::Group(group_id),cx).is_empty() {
             return;
         }
-        let ix = self.hub.groups.borrow().iter().position(|group| group.id == group_id);
-        if let Some(ix) = ix {
-            let group = self.hub.groups.borrow_mut().remove(ix);
-            if group.has_open_prompt() {
-                window.close_all_dialogs(cx);
-            }
-            // The rules of the host go on with another connection to it, if there is one.
-            let handoff = group.forward.as_ref().map(|forward| (group.key.host().clone(), forward.rules.clone()));
-            drop(group);
-            if let Some((host, rules)) = handoff {
-                self.forward_handed_over(&host, rules, cx);
-            }
+        let mut groups = self.hub.groups.borrow_mut();
+        let Some(ix) = groups.iter().position(|group| group.id == group_id) else { return };
+        let host = groups[ix].key.host();
+        let owns_rules = super::group::forward_owner(groups.iter(), host) == Some(group_id);
+        let group = groups.remove(ix);
+        drop(groups);
+        // Sibling groups have no rule catalog of their own to hand to the owner.
+        let handoff = group.forward.as_ref().filter(|f| owns_rules && f.loaded)
+            .map(|forward| (group.key.host().clone(), forward.rules.clone()));
+        drop(group);
+        if let Some((host, rules)) = handoff {
+            self.forward_handed_over(&host, rules, cx);
         }
     }
 
@@ -461,7 +484,7 @@ impl Workspace {
             .map(|ssh| ssh.host.id.clone())
             .or_else(||self.group(group_id).map(|g|g.key.host().clone()));
         let Some(host_id) = host_id else {
-            return self.release_group(group_id, window, cx);
+            return self.release_group(group_id, cx);
         };
         let fail = |this: &mut Self, reason: String, window: &mut Window, cx: &mut Context<Self>| {
             this.attempt_failed(group_id, Failure::Stop(reason), false, window, cx)
@@ -649,25 +672,91 @@ impl Workspace {
             cx.notify();
         }
         drop(group);
-        if prompt != Prompt::None {
-            // The question is about this connection: show the tab it belongs to.
-            let on_group = |s: &Session| s.ssh().is_some_and(|ssh| ssh.group == group_id);
-            let showing = self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(on_group);
-            if !showing && let Some(ix) = self.sessions.iter().position(on_group) {
-                self.activate(ix, window, cx);
-            }
-        }
         match msg {
-            UiMsg::VaultUnlock { reason, reply } => crate::security::ensure_unlocked(self.hub.secrets.clone(),reason,window,cx,move|ok,_,_|{let _=reply.send(ok);}),
             UiMsg::Event(event) => {
                 let line = connect::format_event(&event, names);
                 self.notice_participants(group_id, &line, cx);
             }
-            UiMsg::HostKey { request, reply } => HostKeyDialog::open(request, reply, window, cx),
-            UiMsg::Password { request, reply } => SecretDialog::open_password(request, reply, window, cx),
-            UiMsg::Passphrase { request, reply } => SecretDialog::open_passphrase(request, reply, window, cx),
-            UiMsg::Challenge { request, reply } => ChallengeDialog::open(request, reply, window, cx),
+            question => self.show_group_question(group_id, question, window, cx),
         }
+    }
+
+    pub(super) fn show_group_question(
+        &mut self,
+        group_id: usize,
+        question: UiMsg,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_group = |session: &Session| session.ssh().is_some_and(|ssh| ssh.group == group_id);
+        let Some(index) = self.active.filter(|&ix| self.sessions.get(ix).is_some_and(on_group))
+            .or_else(|| self.sessions.iter().position(on_group))
+        else { return };
+        if self.active != Some(index) {
+            self.activate(index, window, cx);
+        }
+        self.open_connection_prompt(self.sessions[index].id, question, window, cx);
+    }
+
+    pub(super) fn open_connection_prompt(
+        &mut self,
+        session: usize,
+        question: UiMsg,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = match question {
+            UiMsg::VaultUnlock { reason, reply } => {
+                let manager = self.hub.secrets.clone();
+                if !manager.is_locked() {
+                    let _ = reply.send(true);
+                    return;
+                }
+                let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(reply)));
+                let answer = reply.clone();
+                let modal = crate::security::PasswordDialog::open_connection_unlock(
+                    manager, reason,
+                    move |ok| {
+                        if let Some(reply) = answer.borrow_mut().take() {
+                            let _ = reply.send(ok);
+                        }
+                    },
+                    window, cx,
+                );
+                let reply = std::rc::Rc::downgrade(&reply);
+                OpenConnectionPrompt {
+                    modal,
+                    take_question: Box::new(move |_| {
+                        Some(UiMsg::VaultUnlock { reason, reply: reply.upgrade()?.borrow_mut().take()? })
+                    }),
+                }
+            }
+            UiMsg::Event(_) => return,
+            UiMsg::HostKey { request, reply } => OpenConnectionPrompt::new(
+                HostKeyDialog::open(request, reply, window, cx), HostKeyDialog::take_question,
+            ),
+            UiMsg::Password { request, reply } => OpenConnectionPrompt::new(
+                SecretDialog::open_password(request, reply, window, cx), SecretDialog::take_question,
+            ),
+            UiMsg::Passphrase { request, reply } => OpenConnectionPrompt::new(
+                SecretDialog::open_passphrase(request, reply, window, cx), SecretDialog::take_question,
+            ),
+            UiMsg::Challenge { request, reply } => OpenConnectionPrompt::new(
+                ChallengeDialog::open(request, reply, window, cx), ChallengeDialog::take_question,
+            ),
+        };
+        self.connection_prompts.retain(|_, old| old.modal.is_open());
+        self.connection_prompts.insert(session, prompt);
+    }
+
+    pub(super) fn take_connection_prompt(&mut self, session: usize, window: &mut Window, cx: &mut gpui::App) -> Option<UiMsg> {
+        let prompt = self.connection_prompts.remove(&session)?;
+        if !prompt.modal.is_open() {
+            return None;
+        }
+        let question = (prompt.take_question)(cx);
+        prompt.modal.close(window, cx);
+        question
     }
 
     /// The SSH task finished: attach the shells, or let the loop decide about the failure.
@@ -903,6 +992,7 @@ impl Workspace {
                     tab.title = format!("本机 · {label}").into();
                     tab.typed = Some(TypedLine { text, enter });
                     let id = tab.id;
+                    self.update_window_title(window);
                     self.type_pending(id, window, cx);
                 }
                 return;
@@ -957,7 +1047,7 @@ impl Workspace {
         terminal.update(cx, |terminal, cx| {
             terminal.notice(&format!("\x1b[33m! 无法在已有连接上新开通道（{why}），改为重新连接"), cx)
         });
-        self.release_group(old_group, window, cx);
+        self.release_group(old_group, cx);
         self.sync_files(group, cx);
         self.launch_attempt(group, window, cx);
     }

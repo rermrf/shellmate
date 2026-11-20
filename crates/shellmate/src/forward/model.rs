@@ -418,6 +418,9 @@ pub const EMPTY_KINDS: [(&str, &str); 3] = [
 
 /// The question before the last tab of a connection with running rules is closed: the title and the text.
 pub fn close_confirmation(host: &str, running: usize, connections: u32) -> (String, String) {
+    if running == 0 {
+        return (format!("关闭 {host} 的最后一个会话？"), format!("当前 {connections} 个转发连接会断开"));
+    }
     let mut text = format!("关闭后 {running} 条端口转发会停止");
     if connections > 0 {
         text.push_str(&format!("（当前 {connections} 个连接会断开）"));

@@ -83,7 +83,12 @@ pub fn run_operation(
 ) {
     PasswordDialog::open(manager, purpose, None, Box::new(done), window, cx);
 }
+// An unlock can finish after its originating window has been removed.
+struct VaultUnlocked;
+impl Global for VaultUnlocked {}
+
 pub struct PasswordDialog {
+    modal: Option<dialogs::modal::Handle>,
     manager: Arc<CredentialStore>,
     purpose: Purpose,
     input: Entity<PasswordInput>,
@@ -109,6 +114,40 @@ impl PasswordDialog {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        Self::open_tracked(manager, purpose, initial, done, window, cx).0
+    }
+
+    pub(crate) fn open_connection_unlock(
+        manager: Arc<CredentialStore>,
+        reason: &str,
+        done: impl FnOnce(bool) + 'static,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> dialogs::modal::Handle {
+        let (body, modal) = Self::open_tracked(manager, Purpose::Unlock(reason.into()), None,
+            Box::new(move |ok, _, _| done(ok)), window, cx);
+        body.update(cx, |body, cx| {
+            let observer = cx.observe_global_in::<VaultUnlocked>(window, |dialog, window, cx| {
+                if let Some(modal) = &dialog.modal
+                    && modal.is_open() && !dialog.manager.is_locked()
+                {
+                    modal.close(window, cx);
+                    dialog.finish(true, window, cx);
+                }
+            });
+            body._subscriptions.push(observer);
+        });
+        modal
+    }
+
+    fn open_tracked(
+        manager: Arc<CredentialStore>,
+        purpose: Purpose,
+        initial: Option<zeroize::Zeroizing<String>>,
+        done: Completion,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Entity<Self>, dialogs::modal::Handle) {
         let body = cx.new(|cx| {
             let input = cx.new(|cx| PasswordInput::new("输入口令", Surface::Window, window, cx));
             if let Some(initial) = initial {
@@ -130,6 +169,7 @@ impl PasswordDialog {
                 })
                 .collect();
             Self {
+                modal: None,
                 manager,
                 purpose,
                 input,
@@ -153,8 +193,9 @@ impl PasswordDialog {
             })
             .detach();
         });
-        open_secure(window, cx, 540., Self::preferred_height, body.clone());
-        body
+        let modal = open_secure(window, cx, 540., Self::preferred_height, body.clone());
+        body.update(cx, |body, _| body.modal = Some(modal.clone()));
+        (body, modal)
     }
     fn preferred_height(&self) -> f32 {
         let base = match self.purpose {
@@ -183,7 +224,7 @@ impl PasswordDialog {
             move |ok, w, cx| {
                 if ok {
                     this.update(cx, |s, cx| {
-                        w.close_dialog(cx);
+                        crate::dialogs::modal::close(w, cx);
                         w.refresh();
                         w.push_notification(Notification::info("凭据库已重置，原操作已中止"), cx);
                         s.finish(false, w, cx);
@@ -305,9 +346,15 @@ impl PasswordDialog {
                     .map_err(|e| e.to_string()),
             }
         });
+        let unlock = matches!(self.purpose, Purpose::Unlock(_));
+        let app = cx.to_async();
         cx.spawn_in(window, async move |this, cx| {
             let result: Result<Output, String> = task.await;
+            if unlock && matches!(result, Ok(Output::Done)) {
+                app.update(|cx| cx.set_global(VaultUnlocked));
+            }
             this.update_in(cx, |s, w, cx| {
+                let Some(modal) = s.modal.as_ref().filter(|modal| modal.is_open()) else { return };
                 s.busy = false;
                 match result {
                     Err(e) => {
@@ -316,7 +363,7 @@ impl PasswordDialog {
                         cx.notify();
                     }
                     Ok(Output::Done) => {
-                        w.close_dialog(cx);
+                        modal.close(w, cx);
                         w.refresh();
                         s.finish(true, w, cx);
                     }
@@ -325,7 +372,7 @@ impl PasswordDialog {
                         let manager = s.manager.clone();
                         let unlock_manager = manager.clone();
                         let done = s.done.take();
-                        w.close_dialog(cx);
+                        modal.close(w, cx);
                         w.refresh();
                         w.defer(cx, move |w, cx| {
                             let needs_unlock = bundle
@@ -403,7 +450,7 @@ impl PasswordDialog {
                 s.busy = false;
                 match result {
                     Ok(ok) => {
-                        w.close_dialog(cx);
+                        crate::dialogs::modal::close(w, cx);
                         w.refresh();
                         if ok {
                             w.push_notification(Notification::success("已导出加密配置包"), cx);
@@ -810,7 +857,7 @@ impl DialogBody for PreviewDialog {
                 s.preview = Some(preview);
                 match result {
                     Ok(count) => {
-                        w.close_dialog(cx);
+                        crate::dialogs::modal::close(w, cx);
                         w.refresh();
                         w.push_notification(
                             Notification::success(format!("已导入 {count} 项")),
@@ -1058,7 +1105,7 @@ fn open_secure<V: DialogBody>(
     width: f32,
     preferred: impl Fn(&V) -> f32 + 'static,
     body: Entity<V>,
-) {
+) -> dialogs::modal::Handle {
     let first = std::cell::Cell::new(true);
     dialogs::open_modal(window, cx, move |dialog, w, cx| {
         if first.replace(false) {
@@ -1095,7 +1142,7 @@ fn open_secure<V: DialogBody>(
             body.clone(),
             height,
         )
-    });
+    })
 }
 fn secure_shell(
     title: &'static str,
