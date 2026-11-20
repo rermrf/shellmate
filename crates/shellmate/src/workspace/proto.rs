@@ -384,6 +384,10 @@ impl Workspace {
             }
             "set-local" => self.open_settings(3, window, cx),
             "quit-confirm" => self.confirm_quit(super::lifecycle::Activity { sessions: 3, transfers: 1, forwards: 2 }, window, cx),
+            "set-conn-close-window" => {
+                self.set_close_window_preference(shellmate_store::CloseWindowWithSessions::Disconnect, cx).unwrap();
+                self.open_settings(4, window, cx);
+            }
             "set-conn" | "settings-window" => self.open_settings(4, window, cx),
             _ => {}
         }

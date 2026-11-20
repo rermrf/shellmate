@@ -155,6 +155,27 @@ pub struct TypedLine {
     pub enter: bool,
 }
 
+fn duplicate_index(source: usize, remaining: usize) -> usize {
+    source.saturating_add(1).min(remaining)
+}
+
+/// Reuse the shell-reported remote directory without interpreting any shell metacharacters.
+fn duplicate_line(protocol: Option<shellmate_core::Protocol>, cwd: Option<&str>) -> Option<TypedLine> {
+    use shellmate_core::Protocol;
+    if !matches!(protocol, Some(Protocol::Ssh | Protocol::Mosh | Protocol::Telnet)) {
+        return None;
+    }
+    let cwd = cwd.filter(|cwd| !cwd.is_empty())?;
+    Some(TypedLine {
+        text: format!(" cd -- '{}' && clear", cwd.replace('\'', "'\\''")),
+        enter: true,
+    })
+}
+
+fn telnet_shell_ready(cwd: Option<&str>, screen: &str) -> bool {
+    cwd.is_some() || shellmate_telnet::login::authentication_result(screen.trim_end().lines().last().unwrap_or("")) == Some(true)
+}
+
 /// How long the shell of a new tab must be quiet (after it wrote something) before a line is typed into it.
 pub const TYPE_QUIET: Duration = Duration::from_millis(200);
 /// How long a line waits for its shell at the most.
@@ -938,6 +959,13 @@ impl Workspace {
     pub(super) fn type_pending(&mut self, session_id: usize, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else { return };
         if session.typed.is_none() || session.typing.is_some() { return; }
+        let ready = match &session.kind {
+            SessionKind::Local => !session.exited,
+            SessionKind::Ssh(ssh) => ssh.status == SshStatus::Connected,
+            SessionKind::Stream(stream) => stream.connected,
+        };
+        if !ready { return; }
+        let telnet = session.host().is_some_and(|host| host.protocol == shellmate_core::Protocol::Telnet);
         let terminal = session.terminal.clone();
         // When the shell last wrote something (anything that happens after the shell was attached).
         let last_output: Rc<std::cell::Cell<Option<std::time::Instant>>> = Rc::new(std::cell::Cell::new(None));
@@ -953,8 +981,20 @@ impl Workspace {
             let started = std::time::Instant::now();
             loop {
                 cx.background_executor().timer(Duration::from_millis(40)).await;
-                if typing_time(last_output.get(), started.elapsed(), std::time::Instant::now()) {
+                // A TCP connection alone is not a shell: never send cd to a login/password prompt.
+                let ready = !telnet || terminal.read_with(cx, |t, _| telnet_shell_ready(t.cwd(), &t.screen_text()));
+                if ready && typing_time(last_output.get(), started.elapsed(), std::time::Instant::now()) {
                     break;
+                }
+                if telnet && started.elapsed() >= Duration::from_secs(30) {
+                    this.update(cx, |s, _| {
+                        if let Some(session) = s.sessions.iter_mut().find(|s| s.id == session_id) {
+                            session.typed = None;
+                            session.typing = None;
+                        }
+                    }).ok();
+                    log::warn!("duplicate directory skipped: Telnet shell readiness was not reported");
+                    return;
                 }
             }
             drop(watcher);
@@ -1142,11 +1182,19 @@ impl Workspace {
     /// login), a local one a new shell in the directory the current one is working in.
     pub(crate) fn duplicate_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active.filter(|ix| *ix < self.sessions.len()) else {
+            log::debug!("duplicate type=Local cwd=default command=None (empty workspace)");
             return self.open_local(window, cx);
         };
         if !Session::duplicable(self.sessions[ix].host().map(|host| host.protocol)) {window.push_notification(Notification::info("串口设备不能同时打开两次，请先关闭端口"),cx);return;}
+        let protocol = self.sessions[ix].host().map(|host| host.protocol);
+        let cwd = self.sessions[ix].terminal.read(cx).cwd().map(str::to_owned);
+        let typed = duplicate_line(protocol, cwd.as_deref());
+        if protocol.is_some() { log::debug!("duplicate type={protocol:?} cwd={cwd:?} command={typed:?}"); }
         if let SessionKind::Stream(s)=&self.sessions[ix].kind {
-            let host=s.host.clone();self.open_stream(host,window,cx);return;
+            let host = s.host.clone();
+            self.open_stream(host, window, cx);
+            self.finish_duplicate(ix, typed, window, cx);
+            return;
         }
         let Some(ssh) = self.sessions[ix].ssh() else {
             let terminal = self.sessions[ix].terminal.clone();
@@ -1154,7 +1202,10 @@ impl Workspace {
                 .update(cx, |terminal, _| terminal.foreground_process())
                 .and_then(|process| process.cwd)
                 .filter(|cwd| cwd.is_dir());
-            return self.open_local_in(cwd, window, cx);
+            log::debug!("duplicate local cwd={cwd:?}");
+            self.open_local_in(cwd, window, cx);
+            self.finish_duplicate(ix, None, window, cx);
+            return;
         };
         let (source_group, host_id) = (ssh.group, ssh.host.id.clone());
         let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
@@ -1178,6 +1229,20 @@ impl Workspace {
                 self.push_ssh_tab(title, host, chain, group, window, cx);
                 self.launch_attempt(group, window, cx);
             }
+        }
+        self.finish_duplicate(ix, typed, window, cx);
+    }
+
+    /// Place the newly created tab immediately after the source, retaining its entity and bindings.
+    fn finish_duplicate(&mut self, source: usize, typed: Option<TypedLine>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.last_mut() else { return };
+        let id = session.id;
+        log::debug!("duplicate session={id} type={:?} command={typed:?}", session.host().map_or("Local", |h| h.protocol.label()));
+        session.typed = typed;
+        if let Some(detached) = self.detach_session(id, self.handle, window, cx) {
+            let index = duplicate_index(source, self.sessions.len());
+            self.attach_session(detached, index, window, cx);
+            self.activate(index, window, cx);
         }
     }
 
@@ -1204,6 +1269,58 @@ mod tests {
     use shellmate_core::AuthMethod;
 
     use super::*;
+
+    #[test]
+    fn telnet_directory_waits_for_a_shell_not_authentication_prompts() {
+        for prompt in ["login:", "Password:", "Login incorrect\nlogin:", "custom appliance prompt", ""] {
+            assert!(!telnet_shell_ready(None, prompt));
+        }
+        assert!(telnet_shell_ready(None, "user@server:~$ "));
+        assert!(telnet_shell_ready(None, "Welcome\nuser@server:~$ \n\n\n"));
+        assert!(telnet_shell_ready(Some("/srv"), "custom prompt"));
+    }
+
+    #[test]
+    fn duplicate_inserts_to_the_right_and_preserves_later_tabs() {
+        for (source, expected) in [(0, vec![1, 4, 2, 3]), (1, vec![1, 2, 4, 3]), (2, vec![1, 2, 3, 4])] {
+            let mut tabs = vec![1, 2, 3];
+            let index = duplicate_index(source, tabs.len());
+            tabs.insert(index, 4);
+            assert_eq!(tabs, expected);
+            assert_eq!(tabs[index], 4);
+        }
+        assert_eq!(duplicate_index(0, 0), 0);
+    }
+
+    #[test]
+    fn duplicate_directory_is_one_literal_shell_argument() {
+        use shellmate_core::Protocol;
+        for cwd in ["/tmp", "/space here", "/含中文", "/a'b", "/$HOME/`whoami`", "/a\nb"] {
+            let line = duplicate_line(Some(Protocol::Ssh), Some(cwd)).unwrap();
+            assert!(line.enter);
+            assert!(line.text.starts_with(" cd -- '"));
+            assert!(line.text.ends_with("' && clear"));
+            // Ask an isolated POSIX shell to decode the argument without changing directories.
+            let quoted = line.text.strip_prefix(" cd -- ").unwrap().strip_suffix(" && clear").unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("printf '%s' {quoted}")])
+                .output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), cwd);
+        }
+    }
+
+    #[test]
+    fn duplicate_directory_follows_protocol_and_reported_cwd() {
+        use shellmate_core::Protocol;
+        for protocol in [None, Some(Protocol::Ssh), Some(Protocol::Mosh), Some(Protocol::Telnet), Some(Protocol::Serial)] {
+            assert_eq!(Session::duplicable(protocol), protocol != Some(Protocol::Serial));
+            let line = duplicate_line(protocol, Some("/srv"));
+            assert_eq!(line.is_some(), matches!(protocol, Some(Protocol::Ssh | Protocol::Mosh | Protocol::Telnet)));
+            assert!(duplicate_line(protocol, None).is_none());
+            assert!(duplicate_line(protocol, Some("")).is_none());
+        }
+    }
 
     #[test]
     fn only_cancelled_authentication_ends_a_first_connect_quietly() {

@@ -45,7 +45,11 @@ impl HostStore {
                 p.set(key, value != "0");
             }
         }
+        p.close_window_with_sessions = CloseWindowWithSessions::parse(self.setting(CloseWindowWithSessions::KEY)?.as_deref());
         Ok(p)
+    }
+    pub fn set_close_window_with_sessions(&mut self, value: CloseWindowWithSessions) -> Result<()> {
+        self.set_setting(CloseWindowWithSessions::KEY, value.as_str())
     }
     pub fn set_preference(&mut self, key: Preference, value: bool) -> Result<()> {
         self.set_setting(key.key(), if value { "1" } else { "0" })
@@ -140,13 +144,41 @@ impl Preference {
         }
     }
 }
+/// Policy for closing a nonfinal workspace that still contains sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloseWindowWithSessions {
+    #[default]
+    Ask,
+    Move,
+    Disconnect,
+}
+impl CloseWindowWithSessions {
+    pub const KEY: &'static str = "close_window_with_sessions";
+    pub const ALL: [Self; 3] = [Self::Ask, Self::Move, Self::Disconnect];
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("move") => Self::Move,
+            Some("disconnect") => Self::Disconnect,
+            _ => Self::Ask,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Ask => "ask", Self::Move => "move", Self::Disconnect => "disconnect" }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Ask => "每次询问", Self::Move => "移到其他窗口", Self::Disconnect => "断开并关闭" }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
+    pub close_window_with_sessions: CloseWindowWithSessions,
     values: [bool; Preference::ALL.len()],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            close_window_with_sessions: CloseWindowWithSessions::Ask,
             values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true],
         }
     }
@@ -162,6 +194,21 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn close_window_policy_defaults_roundtrips_and_rejects_unknown_values() {
+        let mut store = HostStore::open_in_memory().unwrap();
+        assert_eq!(store.preferences().unwrap().close_window_with_sessions, CloseWindowWithSessions::Ask);
+        for value in CloseWindowWithSessions::ALL {
+            store.set_close_window_with_sessions(value).unwrap();
+            assert_eq!(store.setting(CloseWindowWithSessions::KEY).unwrap().as_deref(), Some(value.as_str()));
+            assert_eq!(store.preferences().unwrap().close_window_with_sessions, value);
+        }
+        for invalid in ["", "MOVE", "0", "unknown"] {
+            store.set_setting(CloseWindowWithSessions::KEY, invalid).unwrap();
+            assert_eq!(store.preferences().unwrap().close_window_with_sessions, CloseWindowWithSessions::Ask);
+        }
+    }
+
     #[test]
     fn window_preferences_persist_after_reopen() {
         let dir = tempfile::tempdir().unwrap();

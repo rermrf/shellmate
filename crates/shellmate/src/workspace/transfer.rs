@@ -225,6 +225,7 @@ impl Workspace {
 #[derive(Clone, Copy)]
 pub(super) enum Destination {
     New(Placement),
+    NewForDrag(Placement, gpui::Point<Pixels>, gpui::Point<Pixels>),
     Existing(AnyWindowHandle, usize),
 }
 
@@ -250,14 +251,17 @@ pub(super) fn move_sessions(handle: AnyWindowHandle, target: Destination, ids: V
         return;
     }
     let (destination, index) = match target {
-        Destination::New(placement) => (open_secondary(placement, cx), 0),
+        Destination::New(placement) | Destination::NewForDrag(placement, _, _) => (open_secondary(placement, cx), 0),
         Destination::Existing(handle, index) => (Hub::entry(handle, cx), index),
     };
-    if let Some(destination) = destination
-        && !move_tabs(&source, &destination, &ids, index, cx)
-        && matches!(target, Destination::New(_))
-    {
-        destination.update(cx, |_, window, _| window.remove_window());
+    if let Some(destination) = destination {
+        if !move_tabs(&source, &destination, &ids, index, cx) {
+            if matches!(target, Destination::New(_) | Destination::NewForDrag(..)) {
+                destination.update(cx, |_, window, _| window.remove_window());
+            }
+        } else if let Destination::NewForDrag(_, pointer, grab) = target {
+            super::tab_drag::place_new_tab(&destination, ids[0], pointer, grab, cx);
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 use super::{Hub, SessionKind, Workspace, forward::ForwardImpact, ssh::SshStatus};
 use crate::dialogs::{quit::QuitDialog, window::{Choice, WindowCloseDialog}};
 use gpui::{App, Context, WeakEntity, Window};
-use shellmate_store::{Preference, Preferences};
+use shellmate_store::{CloseWindowWithSessions, Preference, Preferences};
 
 #[cfg(target_os = "macos")]
 pub(crate) fn native_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
@@ -37,14 +37,20 @@ fn close_behavior(prefs: &Preferences) -> Close {
 enum WindowClose {
     Last,
     Confirm,
+    Move,
+    Disconnect,
     Remove,
 }
 
-fn window_close(windows: usize, sessions: usize) -> WindowClose {
+fn window_close(windows: usize, sessions: usize, policy: CloseWindowWithSessions) -> WindowClose {
     match (windows, sessions) {
         (0 | 1, _) => WindowClose::Last,
         (_, 0) => WindowClose::Remove,
-        _ => WindowClose::Confirm,
+        _ => match policy {
+            CloseWindowWithSessions::Ask => WindowClose::Confirm,
+            CloseWindowWithSessions::Move => WindowClose::Move,
+            CloseWindowWithSessions::Disconnect => WindowClose::Disconnect,
+        },
     }
 }
 
@@ -155,6 +161,16 @@ impl Activity {
 }
 
 impl Workspace {
+    pub(crate) fn set_close_window_preference(&mut self, value: CloseWindowWithSessions, cx: &mut Context<Self>) -> Result<(), String> {
+        self.hub.store.borrow_mut().set_close_window_with_sessions(value).map_err(|e| e.to_string())?;
+        self.hub.preferences.borrow_mut().close_window_with_sessions = value;
+        cx.emit(super::CloseWindowPreferenceChanged(value));
+        for entry in self.peers(super::Route::All, cx) {
+            cx.defer(move |cx| { entry.update(cx, |_, _, cx| cx.emit(super::CloseWindowPreferenceChanged(value))); });
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     pub(super) fn sync_hidden_activation_policy(&self, cx: &mut App) {
         let policy = if self.peers(super::Route::All,cx).iter().all(|e| e.workspace.upgrade().is_none_or(|w| w.read(cx).hidden)) && close_behavior(&self.hub.preferences.borrow()) == Close::HideAsAccessory {
@@ -166,8 +182,16 @@ impl Workspace {
     }
 
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match window_close(Hub::windows(cx).len(), self.sessions.len()) {
+        let policy = self.hub.preferences.borrow().close_window_with_sessions;
+        match window_close(Hub::windows(cx).len(), self.sessions.len(), policy) {
             WindowClose::Remove => return window.remove_window(),
+            WindowClose::Move | WindowClose::Disconnect => {
+                let choice = if policy == CloseWindowWithSessions::Move { Choice::Move } else { Choice::Disconnect };
+                let scope = CloseScope { tabs: self.sessions.iter().map(|s| s.id).collect(), forwards: self.forward_impact(|_| true, cx) };
+                let handle = self.handle;
+                cx.defer(move |cx| scope.confirm(handle, choice, cx));
+                return;
+            }
             WindowClose::Confirm => {
                 if self.close_dialog.as_ref().is_none_or(|dialog| !dialog.is_open()) {
                     let connecting = self.sessions.iter().filter(|session| match &session.kind {
@@ -188,9 +212,20 @@ impl Workspace {
                         (rules, connections) => Some(format!("选择「断开并关闭」会停止 {rules} 条端口转发，并断开 {connections} 个转发连接。")),
                     };
                     let handle = self.handle;
+                    let workspace = cx.weak_entity();
+                    let mut scope = Some(scope);
                     self.close_dialog = Some(WindowCloseDialog::open(
-                        scope.tabs.len(), connecting, warning,
-                        move |choice, cx| cx.defer(move |cx| scope.confirm(handle, choice, cx)),
+                        self.sessions.len(), connecting, warning,
+                        move |choice, remember, cx| {
+                            if let Some(value) = choice.remembered(remember) {
+                                workspace.update(cx, |ws, cx| ws.set_close_window_preference(value, cx))
+                                    .map_err(|_| "窗口已关闭".to_string())??;
+                            }
+                            if let Some(scope) = scope.take() {
+                                cx.defer(move |cx| scope.confirm(handle, choice, cx));
+                            }
+                            Ok(())
+                        },
                         window, cx,
                     ));
                 }
@@ -222,7 +257,7 @@ impl Workspace {
     }
 
     pub(super) fn close_empty_window_if_needed(&self, window: &mut Window, cx: &App) -> bool {
-        let close = window_close(Hub::windows(cx).len(), self.sessions.len()) == WindowClose::Remove;
+        let close = window_close(Hub::windows(cx).len(), self.sessions.len(), CloseWindowWithSessions::Ask) == WindowClose::Remove;
         if close {
             window.remove_window();
         }
@@ -372,6 +407,7 @@ pub(crate) fn debug_hooks(cx: &mut App) {
     super::tab_drag::debug::install(cx);
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
+        ("SHELLMATE_DEBUG_DUPLICATE_AFTER", |cx| Hub::update(cx, Workspace::duplicate_active)),
         ("SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER", |cx| Hub::update(cx, Workspace::move_session_to_new_window)),
         ("SHELLMATE_DEBUG_NEW_WINDOW_AFTER", |cx| Hub::update(cx, Workspace::new_window)),
         ("SHELLMATE_DEBUG_MERGE_BACK_AFTER", super::transfer::merge_back),
@@ -410,15 +446,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nonfinal_window_policy_never_changes_last_or_empty_window_behavior() {
+        for (policy, expected) in [(CloseWindowWithSessions::Ask, WindowClose::Confirm), (CloseWindowWithSessions::Move, WindowClose::Move), (CloseWindowWithSessions::Disconnect, WindowClose::Disconnect)] {
+            assert_eq!(window_close(2, 3, policy), expected);
+            assert_eq!(window_close(1, 3, policy), WindowClose::Last);
+            assert_eq!(window_close(2, 0, policy), WindowClose::Remove);
+            assert_eq!(window_close(1, 0, policy), WindowClose::Last);
+        }
+    }
+
+    #[test]
     fn nonfinal_windows_confirm_only_when_they_have_tabs() {
-        assert_eq!(window_close(1, 3), WindowClose::Last);
-        assert_eq!(window_close(2, 3), WindowClose::Confirm);
+        assert_eq!(window_close(1, 3, CloseWindowWithSessions::Ask), WindowClose::Last);
+        assert_eq!(window_close(2, 3, CloseWindowWithSessions::Ask), WindowClose::Confirm);
     }
 
     #[test]
     fn losing_the_last_tab_closes_only_a_nonfinal_window() {
-        assert_eq!(window_close(2, 0), WindowClose::Remove);
-        assert_eq!(window_close(1, 0), WindowClose::Last);
+        assert_eq!(window_close(2, 0, CloseWindowWithSessions::Ask), WindowClose::Remove);
+        assert_eq!(window_close(1, 0, CloseWindowWithSessions::Ask), WindowClose::Last);
     }
 
     #[test]

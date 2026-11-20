@@ -94,6 +94,7 @@ pub const SCENES: &[&str] = &[
     "set-term-scrolled",
     "set-local",
     "set-conn",
+    "set-conn-close-window",
     "host-new", "host-new-focus",
     "rail", "rail-mid", "rail-mid-expand", "drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid",
     "local",
@@ -228,7 +229,7 @@ pub fn reading(scene: &str, dark: bool) -> &'static readings::Reading {
         match scene {
             _ if monitor::PORT_SCENES.contains(&scene) || monitor::SERVICE_SCENES.contains(&scene) => "local",
             s if s.starts_with("update-") || matches!(s, "settings-update" | "main-update-pill" | "quit-confirm" | "close-window-dialog" | "tabmenu-move") => "main",
-            "settings-window" => "set-conn",
+            "settings-window" | "set-conn-close-window" => "set-conn",
             "rail-mid" | "rail-mid-expand" => "main",
             "drawer-mid" => "ai",
             "drawer-swap-mid" => "cmds",
@@ -295,7 +296,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 94 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 95 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }
@@ -309,7 +310,7 @@ mod tests {
                     if *scene == "side-scrolled" { "main" } else { scene.strip_suffix("-scrolled").unwrap() }
                 } else { match *scene {
                     s if s.starts_with("update-") || matches!(s, "settings-update" | "main-update-pill" | "quit-confirm" | "close-window-dialog" | "tabmenu-move") => "main",
-                    "settings-window" => "set-conn",
+                    "settings-window" | "set-conn-close-window" => "set-conn",
                     "rail-mid" | "rail-mid-expand" => "main",
                     "drawer-mid" => "ai",
                     "drawer-swap-mid" => "cmds",

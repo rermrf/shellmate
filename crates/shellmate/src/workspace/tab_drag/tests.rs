@@ -75,6 +75,7 @@ fn reorder_accounts_for_removal_and_both_adjacent_gaps_are_noops() {
         source,
         session_id: 3,
         grab_offset: Point::default(),
+        window_grab: Point::default(), frame: Bounds::default(), strip: None, mode: DragMode::Reorder,
         over: Over::Outside,
     };
     for (slot, action) in [
@@ -109,6 +110,7 @@ fn release_inserts_appends_or_tears_off_at_the_original_grab_offset() {
         source,
         session_id: 3,
         grab_offset,
+        window_grab: grab_offset, frame: Bounds::default(), strip: None, mode: DragMode::Reorder,
         over: Over::Outside,
     };
     let release = |over, count| drop_action(drag, 0, count, over, screen, size);
@@ -125,7 +127,7 @@ fn release_inserts_appends_or_tears_off_at_the_original_grab_offset() {
     assert_eq!(release(Over::Outside, 1), DropAction::Keep);
     assert_eq!(
         release(Over::Outside, 2),
-        DropAction::New(rect(-251., 398., 1000., 700.))
+        DropAction::Keep
     );
 }
 
@@ -135,4 +137,52 @@ fn drag_requires_more_than_four_points_from_the_press() {
     assert!(within_click_distance(down, point(px(10.), px(24.))));
     assert!(within_click_distance(down, point(px(12.), px(23.))));
     assert!(!within_click_distance(down, point(px(13.), px(23.))));
+}
+
+#[test]
+fn tearoff_requires_vertical_distance_and_stays_pending_until_release() {
+    let strip = Some(rect(200., 100., 400., 54.));
+    for p in [point(px(-1000.), px(130.)), point(px(2000.), px(130.)), point(px(300.), px(76.)), point(px(300.), px(178.))] {
+        assert_eq!(DragMode::Reorder.moved(strip, p, Over::Outside), DragMode::Reorder);
+    }
+    for p in [point(px(300.), px(75.9)), point(px(300.), px(178.1))] {
+        let mode = DragMode::Reorder.moved(strip, p, Over::Outside);
+        assert_eq!(mode, DragMode::TearOffPending);
+        assert_eq!(mode.moved(strip, point(px(300.), px(130.)), Over::Strip(handle(1), 0)), mode);
+        assert_eq!(mode.restore_origin(), None); // source session has not detached; Esc is lossless.
+    }
+}
+
+#[test]
+fn single_tab_transparency_merge_and_escape_have_one_state_transition() {
+    let origin = point(px(-800.), px(60.));
+    let source = handle(1);
+    let target = handle(2);
+    let mode = DragMode::start(1, origin);
+    assert_eq!(mode.excluded(source), Some(source));
+    assert_eq!(DragMode::start(2, origin), DragMode::Reorder);
+    let transparent = mode.moved(None, Point::default(), Over::Strip(target, 2));
+    assert_eq!(transparent, DragMode::MoveWindow { origin, transparent: true });
+    assert_eq!(transparent.restore_origin(), Some(origin));
+    assert_eq!(transparent.moved(None, Point::default(), Over::Outside), mode);
+    let drag = ActiveDrag { source, session_id: 9, grab_offset: Point::default(), window_grab: Point::default(), frame: Bounds::default(), strip: None, mode, over: Over::Outside };
+    for over in [Over::Outside, Over::Body(target), Over::Obstructed, Over::Strip(source, 0)] {
+        assert_eq!(drop_action(drag, 0, 1, over, Point::default(), Size::default()), DropAction::Keep);
+    }
+    assert_eq!(drop_action(drag, 0, 1, Over::Strip(target, 2), Point::default(), Size::default()), DropAction::Insert(target, 2));
+}
+
+#[test]
+fn pending_tearoff_can_return_merge_or_create_without_touching_source_until_release() {
+    let source = handle(1);
+    let target = handle(2);
+    let pointer = point(px(2300.), px(-200.));
+    let dims = size(px(1200.), px(800.));
+    let drag = ActiveDrag { source, session_id: 9, grab_offset: point(px(20.), px(10.)), window_grab: point(px(350.), px(25.)), frame: Bounds::default(), strip: None, mode: DragMode::TearOffPending, over: Over::Outside };
+    for over in [Over::Outside, Over::Body(source), Over::Body(target), Over::Obstructed] {
+        assert_eq!(drop_action(drag, 1, 3, over, pointer, dims), DropAction::New(rect(1950., -225., 1200., 800.)));
+    }
+    assert_eq!(drop_action(drag, 1, 3, Over::Strip(source, 0), pointer, dims), DropAction::Reorder(0));
+    assert_eq!(drop_action(drag, 1, 3, Over::Strip(source, 2), pointer, dims), DropAction::Keep);
+    assert_eq!(drop_action(drag, 1, 3, Over::Strip(target, 2), pointer, dims), DropAction::Insert(target, 2));
 }

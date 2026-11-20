@@ -244,6 +244,8 @@ pub struct Workspace {
 pub(crate) struct PreferenceChanged(pub shellmate_store::Preference, pub bool);
 
 impl gpui::EventEmitter<PreferenceChanged> for Workspace {}
+pub(crate) struct CloseWindowPreferenceChanged(pub shellmate_store::CloseWindowWithSessions);
+impl gpui::EventEmitter<CloseWindowPreferenceChanged> for Workspace {}
 
 /// Shows a notification once the window's root view exists: notifications cannot be pushed
 /// while the root view is still being built (`Workspace::new`).
@@ -880,6 +882,7 @@ impl Workspace {
                 })
         });
 
+        let new_tab_tip = if self.active.is_some() { "复制当前会话 ⇧⌘T" } else { "新建本机终端 ⌘T" };
         let new_tab = div()
             .id("new-tab")
             .size(px(crate::tabs::PLUS_WIDTH))
@@ -891,8 +894,8 @@ impl Workspace {
             .cursor_pointer()
             .hover(|d| d.bg(p.card3.opacity(0.7)))
             .child(AppIcon::Plus.at(15.).text_color(p.tx2))
-            .tooltip(|window, cx| Tooltip::new("新建本机终端 ⌘T").build(window, cx))
-            .on_click(cx.listener(|this, _, window, cx| this.open_local(window, cx)));
+            .tooltip(move |window, cx| Tooltip::new(new_tab_tip).build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.duplicate_active(window, cx)));
 
         let theme_icon = if cx.is_dark() { AppIcon::Sun } else { AppIcon::Moon };
         div()

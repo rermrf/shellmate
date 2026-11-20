@@ -181,6 +181,7 @@ impl Workspace {
                         stream.connected = true;
                         session.exited = false;
                         let _ = this.hub.store.borrow_mut().touch_connected(&host.id);
+                        this.type_pending(id, window, cx);
                     }
                     outcome => {
                         let reason = match outcome {

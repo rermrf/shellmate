@@ -7,6 +7,8 @@ enum Target {
     Here(usize),
     Window(usize, usize),
     Outside(Point<Pixels>),
+    MoveWindow(Point<Pixels>),
+    TearOff(Point<Pixels>),
 }
 
 fn ordinal(s: &str) -> Option<usize> {
@@ -22,14 +24,15 @@ fn parse(spec: &str) -> Option<(usize, Target)> {
             let (window, slot) = args.split_once(':')?;
             Target::Window(ordinal(window)? + 1, ordinal(slot)?)
         }
-        "outside" => {
+        "outside" | "move-window" | "tearoff" => {
             let (x, y) = args.split_once(',')?;
             let x: f32 = x.parse().ok()?;
             let y: f32 = y.parse().ok()?;
             if !x.is_finite() || !y.is_finite() {
                 return None;
             }
-            Target::Outside(point(px(x), px(y)))
+            let point = point(px(x), px(y));
+            match kind { "move-window" => Target::MoveWindow(point), "tearoff" => Target::TearOff(point), _ => Target::Outside(point) }
         }
         _ => return None,
     };
@@ -58,15 +61,25 @@ pub(in crate::workspace) fn install(cx: &mut App) {
             let found = source
                 .update(cx, |ws, window, cx| {
                     let session_id = ws.sessions.get(index)?.id;
+                    let frame = screen_bounds(window);
                     let mut screen = Point::default();
+                    let mut mode = DragMode::Reorder;
                     let over = match target {
                         Target::Here(slot) => Over::Strip(source.handle, slot),
                         Target::Window(n, slot) => Over::Strip(
                             Hub::windows(cx).iter().find(|e| e.number == n)?.handle,
                             slot,
                         ),
-                        Target::Outside(p) => {
+                        Target::MoveWindow(p) => {
+                            if ws.sessions.len() != 1 { return None; }
                             screen = p;
+                            mode = DragMode::start(1, frame.origin);
+                            Over::Outside
+                        }
+                        Target::Outside(p) | Target::TearOff(p) => {
+                            if ws.sessions.len() < 2 { return None; }
+                            screen = p;
+                            mode = DragMode::Reorder.moved(Some(Bounds::new(Point::default(), Size::default())), point(px(0.), px(25.)), Over::Outside);
                             Over::Outside
                         }
                     };
@@ -74,9 +87,19 @@ pub(in crate::workspace) fn install(cx: &mut App) {
                         source: source.handle,
                         session_id,
                         grab_offset: Point::default(),
+                        window_grab: Point::default(),
+                        frame,
+                        strip: None,
+                        mode,
                         over,
                     };
-                    finish(drag, over, screen, window.bounds().size, cx);
+                    if matches!(mode, DragMode::MoveWindow { .. }) {
+                        cx.global_mut::<Hub>().tab_drag.active = Some(drag);
+                        follow_at(screen, window, cx);
+                        clear(cx);
+                        restore_window(drag, false, window, cx);
+                    }
+                    finish(drag, over, screen, frame.size, cx);
                     Some(())
                 })
                 .flatten()
@@ -109,6 +132,8 @@ fn commands_are_one_based_and_coordinates_can_be_negative() {
         parse("3:outside:-200,40.5"),
         Some((2, Target::Outside(point(px(-200.), px(40.5)))))
     );
+    assert_eq!(parse("1:move-window:300,-200"), Some((0, Target::MoveWindow(point(px(300.), px(-200.))))));
+    assert_eq!(parse("2:tearoff:-400,100"), Some((1, Target::TearOff(point(px(-400.), px(100.))))));
     for invalid in [
         "0:self:1",
         "2:self:0",

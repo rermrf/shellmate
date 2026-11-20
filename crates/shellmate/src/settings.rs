@@ -58,6 +58,10 @@ impl SettingsWindow {
                 },
             );
             if let Some(workspace) = workspace.upgrade() {
+                cx.subscribe(&workspace, |settings: &mut Self, _, change: &crate::workspace::CloseWindowPreferenceChanged, cx| {
+                    settings.preferences.close_window_with_sessions = change.0;
+                    cx.notify();
+                }).detach();
                 cx.subscribe(&workspace, |settings: &mut Self, _, change: &crate::workspace::PreferenceChanged, cx| {
                     settings.preferences.set(change.0, change.1);
                     cx.notify();
@@ -726,6 +730,32 @@ impl Render for SettingsWindow {
                                 })),
                         )),
                 );
+                // Keep established prototype fixtures stable; the new scene exercises this row.
+                let show_close_policy = !crate::prototype_fixture()
+                    || std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s == "proto:set-conn-close-window");
+                if key == P::QuitOnWindowClose && show_close_policy {
+                    use shellmate_store::CloseWindowWithSessions as Policy;
+                    let selected = self.preferences.close_window_with_sessions;
+                    let owner = cx.weak_entity();
+                    rows = rows.child(div().py(px(12.)).flex().flex_col().gap(px(4.))
+                        .child(div().flex().items_center().gap(px(12.))
+                            .child(div().flex_1().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("关闭含会话的窗口"))
+                            .child(crate::ui::segmented(Policy::KEY,
+                                Policy::ALL.iter().map(|value| crate::ui::SegmentItem::new(value.label(), *value == selected)).collect(),
+                                move |index, _, cx| {
+                                    owner.update(cx, |settings, cx| {
+                                        let result = settings.workspace.update(cx, |ws, cx| ws.set_close_window_preference(Policy::ALL[index], cx));
+                                        settings.error = match result {
+                                            Ok(Ok(())) => { settings.preferences.close_window_with_sessions = Policy::ALL[index]; None },
+                                            Ok(Err(error)) => Some(error),
+                                            Err(_) => Some("窗口已关闭".into()),
+                                        };
+                                        cx.notify();
+                                    }).ok();
+                                }, cx)))
+                        .child(div().text_size(px(12.)).line_height(px(16.)).text_color(p.tx2)
+                            .child("只在还有其他窗口时生效；关闭最后一个窗口仍按「关闭窗口时」处理。")));
+                }
             }
             if self.section == LOCAL_TERMINAL {
                 let status = match self.finder_enabled {

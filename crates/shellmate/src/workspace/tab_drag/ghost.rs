@@ -129,6 +129,15 @@ pub(super) fn close(cx: &mut App) {
     }
 }
 
+/// Move a complete workspace without activating it, using desktop top-left points.
+pub(super) fn move_window(window: &Window, origin: Point<Pixels>) {
+    if let Some(native) = lifecycle::native_window(window)
+        && let Some(top) = primary_screen_top()
+    {
+        native.setFrameOrigin(appkit_origin(origin, px(native.frame().size.height as f32), top));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

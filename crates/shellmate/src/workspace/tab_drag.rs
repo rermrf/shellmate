@@ -96,22 +96,21 @@ fn primary_screen_top() -> Option<f64> {
 // gpui-pre-macos 0.3.12 reports Window::bounds relative to its NSScreen.
 // Normalize to the primary display's top-left when comparing different displays.
 fn screen_bounds(window: &Window) -> Bounds<Pixels> {
-    let bounds = window.bounds();
     #[cfg(target_os = "macos")]
-    if let Some(screen) = lifecycle::native_window(window).and_then(|w| w.screen()) {
-        let frame = screen.frame();
-        if let Some(top) = primary_screen_top() {
-            let offset = point(
-                px(frame.origin.x as f32),
-                px((top - frame.origin.y - frame.size.height) as f32),
-            );
-            return Bounds::new(bounds.origin + offset, bounds.size);
-        }
+    if let Some(native) = lifecycle::native_window(window)
+        && let Some(top) = primary_screen_top()
+    {
+        // Read the live frame: GPUI's cached bounds may lag setFrameOrigin by a callback.
+        let frame = native.frame();
+        return Bounds::new(
+            point(px(frame.origin.x as f32), px((top - frame.origin.y - frame.size.height) as f32)),
+            size(px(frame.size.width as f32), px(frame.size.height as f32)),
+        );
     }
-    bounds
+    window.bounds()
 }
 
-fn over_at(screen: Point<Pixels>, window: &Window, cx: &mut App) -> Over {
+fn over_at(screen: Point<Pixels>, excluded: Option<AnyWindowHandle>, window: &Window, cx: &mut App) -> Over {
     // On macOS GPUI's window_stack() wraps NSApp.orderedWindows in front-to-back order.
     let stack = cx
         .window_stack()
@@ -119,6 +118,7 @@ fn over_at(screen: Point<Pixels>, window: &Window, cx: &mut App) -> Over {
     stack
         .into_iter()
         .find_map(|handle| {
+            if Some(handle) == excluded { return None; }
             #[cfg(target_os = "macos")]
             if handle.downcast::<ghost::FloatingTab>().is_some() {
                 return None;
@@ -164,14 +164,22 @@ impl DraggedTab {
         cx: &mut App,
     ) -> Entity<TabPreview> {
         let current = window.mouse_position();
-        let drag = &mut cx.global_mut::<Hub>().tab_drag;
-        let down = drag.press.take().map_or(current, |(_, pos)| pos);
+        let frame = screen_bounds(window);
+        let down = cx.global_mut::<Hub>().tab_drag.press.take().map_or(current, |(_, pos)| pos);
         self.grab_offset.set(down - (current - offset));
+        let (count, strip) = Hub::entry(self.source, cx).and_then(|e| e.workspace.upgrade())
+            .map(|ws| { let ws = ws.read(cx); (ws.sessions.len(), ws.tab_strip.bounds) })
+            .unwrap_or((0, None));
+        let drag = &mut cx.global_mut::<Hub>().tab_drag;
         drag.consume_release = Some(self.source);
         drag.active = Some(ActiveDrag {
             source: self.source,
             session_id: self.session_id,
             grab_offset: self.grab_offset.get(),
+            window_grab: down,
+            frame,
+            strip: strip.map(|b| Bounds::new(frame.origin + b.origin, b.size)),
+            mode: DragMode::start(count, frame.origin),
             over: Over::Outside,
         });
         update_over(current, window, cx);
@@ -193,7 +201,7 @@ pub(super) struct TabPreview {
 
 impl Render for TabPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let over = cx.global::<Hub>().tab_drag.active.map(|drag| drag.over);
+        let over = cx.global::<Hub>().tab_drag.active.filter(|drag| drag.mode == DragMode::Reorder).map(|drag| drag.over);
         let visible = matches!(over, Some(Over::Strip(handle, _)) if handle == self.source && handle == window.window_handle());
         let mut preview = div().font_family(theme::UI_FONT);
         if visible
@@ -225,11 +233,45 @@ impl Render for TabPreview {
     }
 }
 
+/// R2 exceeded the 50 ms budget: defer the full workspace creation until release.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragMode {
+    Reorder,
+    MoveWindow { origin: Point<Pixels>, transparent: bool },
+    TearOffPending,
+}
+
+impl DragMode {
+    fn start(count: usize, origin: Point<Pixels>) -> Self {
+        if count == 1 { Self::MoveWindow { origin, transparent: false } } else { Self::Reorder }
+    }
+
+    fn moved(self, strip: Option<Bounds<Pixels>>, screen: Point<Pixels>, over: Over) -> Self {
+        match self {
+            Self::MoveWindow { origin, .. } => Self::MoveWindow { origin, transparent: matches!(over, Over::Strip(_, _)) },
+            Self::Reorder if strip.is_some_and(|b| screen.y < b.top() - px(24.) || screen.y > b.bottom() + px(24.)) => Self::TearOffPending,
+            mode => mode,
+        }
+    }
+
+    fn excluded(self, source: AnyWindowHandle) -> Option<AnyWindowHandle> {
+        matches!(self, Self::MoveWindow { .. }).then_some(source)
+    }
+
+    fn restore_origin(self) -> Option<Point<Pixels>> {
+        match self { Self::MoveWindow { origin, .. } => Some(origin), _ => None }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ActiveDrag {
     source: AnyWindowHandle,
     session_id: usize,
     grab_offset: Point<Pixels>,
+    window_grab: Point<Pixels>,
+    frame: Bounds<Pixels>,
+    strip: Option<Bounds<Pixels>>,
+    mode: DragMode,
     over: Over,
 }
 
@@ -257,23 +299,45 @@ fn notify_marker(over: Over, cx: &mut App) {
     }
 }
 
+fn pointer_screen(position: Point<Pixels>, window: &Window, mode: DragMode) -> Point<Pixels> {
+    #[cfg(target_os = "macos")]
+    if matches!(mode, DragMode::MoveWindow { .. }) && let Some(top) = primary_screen_top() {
+        // Moving the event receiver changes its coordinate space while AppKit is dispatching
+        // queued drag callbacks. Sample the desktop pointer to avoid feeding that movement back.
+        let pointer = objc2_app_kit::NSEvent::mouseLocation();
+        return point(px(pointer.x as f32), px((top - pointer.y) as f32));
+    }
+    screen_bounds(window).origin + position
+}
+
 fn update_over(position: Point<Pixels>, window: &Window, cx: &mut App) {
-    let screen = screen_bounds(window).origin + position;
-    let over = over_at(screen, window, cx);
-    if let Some(drag) = &mut cx.global_mut::<Hub>().tab_drag.active {
-        let previous = std::mem::replace(&mut drag.over, over);
-        #[cfg(target_os = "macos")]
-        let active = *drag;
-        if previous.marker() != over.marker() {
-            notify_marker(previous, cx);
-            notify_marker(over, cx);
-        }
-        #[cfg(target_os = "macos")]
-        if over == Over::Outside {
-            ghost::follow(active, screen, cx);
-        } else {
+    let Some(drag) = cx.global::<Hub>().tab_drag.active else { return };
+    let screen = pointer_screen(position, window, drag.mode);
+    follow_at(screen, window, cx);
+}
+
+fn follow_at(screen: Point<Pixels>, window: &Window, cx: &mut App) {
+    let Some(mut active) = cx.global::<Hub>().tab_drag.active else { return };
+    let over = over_at(screen, active.mode.excluded(active.source), window, cx);
+    let previous = active.over;
+    active.over = over;
+    active.mode = active.mode.moved(active.strip, screen, over);
+    cx.global_mut::<Hub>().tab_drag.active = Some(active);
+    if previous.marker() != over.marker() {
+        notify_marker(previous, cx);
+        notify_marker(over, cx);
+    }
+    #[cfg(target_os = "macos")]
+    match active.mode {
+        DragMode::MoveWindow { transparent, .. } => {
             ghost::close(cx);
+            ghost::move_window(window, screen - active.window_grab);
+            if let Some(native) = lifecycle::native_window(window) {
+                native.setAlphaValue(if transparent { 0. } else { 1. });
+            }
         }
+        DragMode::TearOffPending if !matches!(over, Over::Strip(_, _)) => ghost::follow(active, screen, cx),
+        _ => ghost::close(cx),
     }
 }
 
@@ -291,8 +355,23 @@ fn clear(cx: &mut App) -> Option<ActiveDrag> {
     Some(drag)
 }
 
+fn restore_window(drag: ActiveDrag, cancelled: bool, window: &Window, cx: &mut App) {
+    if let Some(origin) = drag.mode.restore_origin() {
+        let restore = move |window: &Window| {
+            #[cfg(target_os = "macos")]
+            {
+                if cancelled { ghost::move_window(window, origin); }
+                if let Some(native) = lifecycle::native_window(window) { native.setAlphaValue(1.); }
+            }
+        };
+        if window.window_handle() == drag.source { restore(window); }
+        else { let _ = drag.source.update(cx, |_, w, _| restore(w)); }
+    }
+}
+
 pub(super) fn escape(window: &mut Window, cx: &mut App) {
-    if clear(cx).is_some() {
+    if let Some(drag) = clear(cx) {
+        restore_window(drag, true, window, cx);
         cx.stop_active_drag(window);
         cx.stop_propagation();
     }
@@ -357,10 +436,10 @@ pub(super) fn paint_and_listen(window: &mut Window, cx: &mut App) {
         }
         gesture.consume_release = None;
         if let Some(drag) = clear(cx) {
-            let frame = screen_bounds(window);
-            let screen = frame.origin + event.position;
-            let over = over_at(screen, window, cx);
-            finish(drag, over, screen, frame.size, cx);
+            let screen = pointer_screen(event.position, window, drag.mode);
+            let over = over_at(screen, drag.mode.excluded(drag.source), window, cx);
+            restore_window(drag, false, window, cx);
+            finish(drag, over, screen, drag.frame.size, cx);
         }
         cx.stop_propagation();
     });
@@ -382,6 +461,16 @@ fn drop_action(
     screen: Point<Pixels>,
     size: Size<Pixels>,
 ) -> DropAction {
+    match drag.mode {
+        DragMode::MoveWindow { .. } => return match over {
+            Over::Strip(target, slot) if target != drag.source => DropAction::Insert(target, slot),
+            _ => DropAction::Keep,
+        },
+        DragMode::TearOffPending if !matches!(over, Over::Strip(_, _)) => {
+            return DropAction::New(Bounds::new(screen - drag.window_grab, size));
+        }
+        _ => {}
+    }
     match over {
         Over::Strip(target, slot) if target == drag.source => {
             let slot = slot.min(count);
@@ -394,7 +483,6 @@ fn drop_action(
         }
         Over::Strip(target, slot) => DropAction::Insert(target, slot),
         Over::Body(target) if target != drag.source => DropAction::Insert(target, usize::MAX),
-        Over::Outside if count > 1 => DropAction::New(Bounds::new(screen - drag.grab_offset, size)),
         _ => DropAction::Keep,
     }
 }
@@ -430,8 +518,24 @@ fn finish(drag: ActiveDrag, over: Over, screen: Point<Pixels>, size: Size<Pixels
             }
             DropAction::Insert(handle, index) => transfer::Destination::Existing(handle, index),
             // The bounds are global. GPUI uses the primary display as their reference.
-            DropAction::New(bounds) => transfer::Destination::New((bounds, None)),
+            DropAction::New(bounds) => transfer::Destination::NewForDrag((bounds, None), screen, drag.grab_offset),
         };
         transfer::move_sessions(source.handle, destination, vec![drag.session_id], cx);
+    });
+}
+
+/// Correct the new frame using the first real layout, rather than a fixed tab width/sidebar size.
+pub(super) fn place_new_tab(entry: &hub::Entry, id: usize, pointer: Point<Pixels>, grab: Point<Pixels>, cx: &mut App) {
+    let owner = entry.workspace.clone();
+    let _ = entry.handle.update(cx, |_, window, _| {
+        window.on_next_frame(move |window, _| window.on_next_frame(move |window, cx| {
+            let Some(owner) = owner.upgrade() else { return };
+            let ws = owner.read(cx);
+            let Some(index) = ws.sessions.iter().position(|s| s.id == id) else { return };
+            if let Some((_, rect)) = ws.tab_strip.tabs.iter().find(|(i, _)| *i == index) {
+                #[cfg(target_os = "macos")]
+                ghost::move_window(window, pointer - grab - rect.origin);
+            }
+        }));
     });
 }

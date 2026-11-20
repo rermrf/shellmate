@@ -16,7 +16,7 @@ pub use secrets::{KEYCHAIN_SERVICE, KeychainStore, MemoryStore, SecretError, Sec
 pub use productivity::{Snippet, SnippetGroup, HistoryEntry, HISTORY_ENABLED, HISTORY_SHORTCUT, HISTORY_LIMIT};
 
 mod recordings;
-pub use recordings::{Recording,Preference,Preferences};
+pub use recordings::{Recording,Preference,Preferences,CloseWindowWithSessions};
 
 mod vault;
 pub use vault::{SharedStore, CredentialStore, VaultStore, Backend, SecurityStatus};
