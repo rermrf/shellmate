@@ -183,7 +183,11 @@ jobs:
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
-            gh release create "$TAG" "${files[@]}" --draft --verify-tag \
+            # A version with a pre-release part (0.2.0-beta.1) is published as a pre-release, so GitHub's
+            # "latest" and the in-app updater keep pointing at the newest stable version.
+            prerelease=()
+            case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag "${prerelease[@]}" \
               --title "Shellmate $VERSION" --notes-file notes.md
           fi
 
