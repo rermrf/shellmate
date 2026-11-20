@@ -8,6 +8,8 @@ use std::cell::Cell;
 
 #[cfg(debug_assertions)]
 pub(super) mod debug;
+#[cfg(target_os = "macos")]
+mod ghost;
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +86,13 @@ fn hit_window(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn primary_screen_top() -> Option<f64> {
+    let screens = objc2_app_kit::NSScreen::screens(objc2::MainThreadMarker::new().expect("UI thread"));
+    let primary = screens.firstObject()?.frame();
+    Some(primary.origin.y + primary.size.height)
+}
+
 // gpui-pre-macos 0.3.12 reports Window::bounds relative to its NSScreen.
 // Normalize to the primary display's top-left when comparing different displays.
 fn screen_bounds(window: &Window) -> Bounds<Pixels> {
@@ -91,11 +100,7 @@ fn screen_bounds(window: &Window) -> Bounds<Pixels> {
     #[cfg(target_os = "macos")]
     if let Some(screen) = lifecycle::native_window(window).and_then(|w| w.screen()) {
         let frame = screen.frame();
-        if let Some(primary) =
-            objc2_app_kit::NSScreen::screens(objc2::MainThreadMarker::new().expect("UI thread"))
-                .firstObject()
-        {
-            let top = primary.frame().origin.y + primary.frame().size.height;
+        if let Some(top) = primary_screen_top() {
             let offset = point(
                 px(frame.origin.x as f32),
                 px((top - frame.origin.y - frame.size.height) as f32),
@@ -114,6 +119,10 @@ fn over_at(screen: Point<Pixels>, window: &Window, cx: &mut App) -> Over {
     stack
         .into_iter()
         .find_map(|handle| {
+            #[cfg(target_os = "macos")]
+            if handle.downcast::<ghost::FloatingTab>().is_some() {
+                return None;
+            }
             let inspect = |w: &Window, cx: &App| {
                 if !w.is_visible() {
                     return None;
@@ -228,6 +237,8 @@ struct ActiveDrag {
 pub(super) struct TabDrag {
     press: Option<(AnyWindowHandle, Point<Pixels>)>,
     active: Option<ActiveDrag>,
+    #[cfg(target_os = "macos")]
+    ghost: Option<gpui::WindowHandle<ghost::FloatingTab>>,
     // A cancelled drag still owns the eventual release (also over close/retry buttons).
     consume_release: Option<AnyWindowHandle>,
 }
@@ -251,9 +262,17 @@ fn update_over(position: Point<Pixels>, window: &Window, cx: &mut App) {
     let over = over_at(screen, window, cx);
     if let Some(drag) = &mut cx.global_mut::<Hub>().tab_drag.active {
         let previous = std::mem::replace(&mut drag.over, over);
+        #[cfg(target_os = "macos")]
+        let active = *drag;
         if previous.marker() != over.marker() {
             notify_marker(previous, cx);
             notify_marker(over, cx);
+        }
+        #[cfg(target_os = "macos")]
+        if over == Over::Outside {
+            ghost::follow(active, screen, cx);
+        } else {
+            ghost::close(cx);
         }
     }
 }
@@ -266,6 +285,8 @@ pub(super) fn moved(event: &DragMoveEvent<DraggedTab>, window: &mut Window, cx: 
 
 fn clear(cx: &mut App) -> Option<ActiveDrag> {
     let drag = cx.global_mut::<Hub>().tab_drag.active.take()?;
+    #[cfg(target_os = "macos")]
+    ghost::close(cx);
     notify_marker(drag.over, cx);
     Some(drag)
 }
