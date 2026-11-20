@@ -1,13 +1,13 @@
-//! The workspace owns one optional status item and its foreground action receiver.
+//! One application status item and its foreground action receiver.
 mod model;
 mod native;
 
 use super::streams::StreamSession;
-use super::{Session, SessionKind, Workspace, group::Prompt, lifecycle::MainWindow};
+use super::{Session, SessionKind, Workspace, group::Prompt, Hub};
 use crate::updater;
 use async_channel::Sender;
-use gpui::{App, Context};
-use model::{Action, Icon, Row, Snapshot, Status};
+use gpui::App;
+use model::{Action, Icon, Snapshot, Status};
 use native::NativeItem;
 use shellmate_store::Preference;
 use shellmate_term::SessionEnd;
@@ -31,17 +31,22 @@ pub(super) struct StatusBar {
 }
 
 impl StatusBar {
-    pub(super) fn new(cx: &mut Context<Workspace>) -> Self {
+    pub(super) fn new(cx: &mut App) -> Self {
         let (sender, receiver) = async_channel::unbounded();
-        cx.spawn(async move |workspace, cx| {
+        cx.spawn(async move |cx| {
             while let Ok(message) = receiver.recv().await {
                 match message {
                     Message::Run(action) => cx.update(|cx| run(action, cx)),
                     Message::Menu(request) => {
-                        let prepared = workspace.read_with(cx, |s, cx| {
-                            Some((s.status_bar.item.clone()?, s.status_menu(cx)))
+                        let prepared = cx.update(|cx| {
+                            let hub = cx.global::<Hub>();
+                            let item = hub.services.status_bar.borrow().item.clone()?;
+                            let sessions = Hub::windows(cx).iter().filter_map(|e| e.workspace.upgrade())
+                                .flat_map(|w| w.read(cx).status_rows(cx)).collect::<Vec<_>>();
+                            let snapshots = sessions.iter().map(|(id,title,status)| Snapshot { id:*id, title, status:*status }).collect::<Vec<_>>();
+                            Some((item, model::menu(&snapshots, cx.global::<updater::Updater>().available_version())))
                         });
-                        if let Ok(Some((item, rows))) = prepared {
+                        if let Some((item, rows)) = prepared {
                             // AppKit can spin a nested event loop. Release all GPUI borrows first.
                             item.menu(rows, request);
                         }
@@ -83,7 +88,7 @@ impl Workspace {
                 };
                 Status::ssh(
                     ssh.status,
-                    group.map_or(Prompt::None, |g| g.prompt),
+                    group.as_ref().map_or(Prompt::None, |g| g.prompt),
                     group.is_some_and(|g| {
                         g.machine.has_connected()
                             && g.machine.phase() == crate::reconnect::Phase::Failed
@@ -95,13 +100,20 @@ impl Workspace {
     }
 
     pub(super) fn sync_status_item(&mut self, cx: &App) {
-        if !self.preferences.get(Preference::ShowStatusIcon) {
-            self.status_bar.item = None;
-            self.status_bar.last = None;
+        if !self.hub.preferences.borrow().get(Preference::ShowStatusIcon) {
+            self.hub.status_bar.borrow_mut().item = None;
+            self.hub.status_bar.borrow_mut().last = None;
             return;
         }
-        let icon = Icon::from_sessions(self.sessions.iter().map(|s| self.status_of(s, cx)));
-        let bar = &mut self.status_bar;
+        let mut statuses = self.sessions.iter().map(|s| self.status_of(s, cx)).collect::<Vec<_>>();
+        for entry in self.peers(super::Route::All, cx) {
+            if let Some(w) = entry.workspace.upgrade() {
+                let peer = w.read(cx);
+                statuses.extend(peer.sessions.iter().map(|s| peer.status_of(s,cx)));
+            }
+        }
+        let icon = Icon::from_sessions(statuses.into_iter());
+        let bar = &mut *self.hub.status_bar.borrow_mut();
         if bar.last != Some(icon) {
             let item = bar
                 .item
@@ -111,21 +123,10 @@ impl Workspace {
         }
     }
 
-    fn status_menu(&self, cx: &App) -> Vec<Row> {
-        let sessions: Vec<_> = self
-            .sessions
-            .iter()
-            .map(|s| Snapshot {
-                id: s.id,
-                title: &s.title,
-                status: self.status_of(s, cx),
-            })
-            .collect();
-        model::menu(
-            &sessions,
-            cx.global::<updater::Updater>().available_version(),
-        )
+    fn status_rows(&self, cx: &App) -> Vec<(usize, gpui::SharedString, Status)> {
+        self.sessions.iter().map(|s| (s.id, s.title.clone(), self.status_of(s, cx))).collect()
     }
+
 }
 
 fn stream_status(stream: &StreamSession, end: Option<&SessionEnd>) -> Status {
@@ -144,19 +145,20 @@ fn stream_status(stream: &StreamSession, end: Option<&SessionEnd>) -> Status {
 
 fn run(action: Action, cx: &mut App) {
     match action {
-        Action::Show => MainWindow::reopen(cx),
-        Action::Quit => MainWindow::update(cx, Workspace::request_quit),
-        Action::CheckUpdate => MainWindow::with_restored_window(cx, updater::manual),
-        Action::OpenUpdate => MainWindow::with_restored_window(cx, updater::open),
-        Action::Tab(id) => MainWindow::with_restored_workspace(cx, move |s, w, cx| {
+        Action::Show => Hub::reopen(cx),
+        Action::Quit => Hub::update(cx, Workspace::request_quit),
+        Action::CheckUpdate => Hub::with_restored_window(cx, updater::manual),
+        Action::OpenUpdate => Hub::with_restored_window(cx, updater::open),
+        Action::Tab(id) => if let Some(entry) = super::Route::Session(id).target(cx) { entry.update(cx, move |s, w, cx| {
+            s.show_window(w,cx);
             if let Some(ix) = s.sessions.iter().position(|tab| tab.id == id) {
                 s.activate(ix, w, cx);
             }
-        }),
-        Action::Local => MainWindow::with_restored_workspace(cx, Workspace::open_local),
-        Action::Connect => MainWindow::with_restored_workspace(cx, Workspace::new_host),
+        }); },
+        Action::Local => Hub::with_restored_workspace(cx, Workspace::open_local),
+        Action::Connect => Hub::with_restored_workspace(cx, Workspace::new_host),
         Action::Settings => {
-            MainWindow::with_restored_workspace(cx, |s, w, cx| s.open_settings(0, w, cx))
+            Hub::with_restored_workspace(cx, |s, w, cx| s.open_settings(0, w, cx))
         }
     }
 }

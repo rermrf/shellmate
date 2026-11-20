@@ -46,8 +46,7 @@ impl Workspace {
         for id in self.sessions.iter().map(|s|s.id).collect::<Vec<_>>(){self.finalize_archives(id,cx);}
         self.sessions.clear();
         self.active = None;
-        self.store = shellmate_store::SharedStore::new(store);
-        self.secrets=crate::security::fixture_coordinator(self.store.clone());
+        *self.hub.store.borrow_mut() = store;
         self.reload_book(window, cx);
         let count = if scenario == "tabs" {
             7
@@ -56,7 +55,7 @@ impl Workspace {
         } else {
             2
         };
-        let mut demo_hosts = self.book.hosts.iter().take(count).cloned().collect::<Vec<_>>();
+        let mut demo_hosts = self.hub.book.borrow().hosts.iter().take(count).cloned().collect::<Vec<_>>();
         while demo_hosts.len() < count {
             demo_hosts.push(Host::new(format!("dev-box-{}", demo_hosts.len()), "demo.invalid"));
         }
@@ -76,8 +75,7 @@ impl Workspace {
                 v.top_radius = CARD_RADIUS;
                 v
             });
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.hub.session_ids.allocate();
             let subscription = self.watch_terminal(id, &terminal, window, cx);
             let ssh = ssh::SshSession::demo(host.clone());
             self.sessions.push(Session {
@@ -91,12 +89,12 @@ impl Workspace {
                 files: None,
                 forward: None,
                 monitor: None,
-                typed: None,
+                typed: None, typing: None,
                 kind: SessionKind::Ssh(Box::new(ssh)),
-                _subscription: subscription,
+                _subscription: Some(subscription),
             });
         }
-        let host_ids: Vec<_> = self.book.hosts.iter().take(2).map(|h| h.id.to_string()).collect();
+        let host_ids: Vec<_> = self.hub.book.borrow().hosts.iter().take(2).map(|h| h.id.to_string()).collect();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -126,7 +124,7 @@ impl Workspace {
         .into_iter()
         .enumerate()
         {
-            self.store
+            self.hub.store
                 .borrow_mut()
                 .add_history(&HistoryEntry {
                     id: 0,
@@ -139,7 +137,7 @@ impl Workspace {
                 .unwrap();
         }
         if scenario != "commands-empty" {
-            self.store.borrow_mut().save_snippets(&model::samples()).unwrap();
+            self.hub.store.borrow_mut().save_snippets(&model::samples()).unwrap();
         }
         self.refresh_snippets(cx);
         self.activate(0, window, cx);
@@ -154,7 +152,7 @@ impl Workspace {
             "commands" | "commands-empty" => {}
             "manage" => Manager::open(
                 model::samples(),
-                self.store.clone(),
+                self.hub.store.clone(),
                 cx.entity().downgrade(),
                 window,
                 cx,

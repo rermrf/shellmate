@@ -119,6 +119,7 @@ struct Demo {
 }
 
 pub struct FilesPanel {
+    owner: gpui::AnyWindowHandle,
     pub(super) width: f32,
     pub(super) details_open: bool,
     pub(super) model: FilesModel,
@@ -174,7 +175,7 @@ impl FilesPanel {
         if let Some(dir) = terminal.read(cx).cwd() {
             model.on_terminal_cwd(dir);
         }
-        let subscription = cx.subscribe_in(terminal, window, |this, _, event: &TerminalEvent, _, cx| {
+        let subscription = cx.subscribe(terminal, |this, _, event: &TerminalEvent, cx| {
             if matches!(event, TerminalEvent::Output) && this.local_visible {
                 this.schedule_cwd(cx);
             }
@@ -185,6 +186,7 @@ impl FilesPanel {
             }
         });
         Self {
+            owner: window.window_handle(),
             width:1144., details_open:false,
             model,
             session: None,
@@ -733,13 +735,14 @@ impl FilesPanel {
         let runtime = self.runtime.clone();
         let dir = destination.clone();
         let planning = runtime.spawn(super::source::blocking(move || CopyPlan::new(paths, dir)));
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = async {
                 let plan = planning.await.map_err(|err| err.to_string())?.map_err(|err| err.to_string())?;
                 let choice = if plan.clash.count == 0 { Choice::Skip } else {
                     let (send, recv) = async_channel::bounded(1);
-                    this.update_in(cx, |panel, window, cx| {
-                        if panel.local_visible {
+                    let owner = this.read_with(cx, |p,_| p.owner).map_err(|e| e.to_string())?;
+                    owner.update(cx, |_, window, cx| {
+                        if this.upgrade().is_some_and(|p| p.read(cx).local_visible) {
                             crate::dialogs::clash::ClashDialog::local(plan.clash.clone(), std::rc::Rc::new(move |_, answer, _, _| { let _ = send.try_send(answer); }), window, cx);
                         }
                     }).map_err(|err| err.to_string())?;
@@ -749,7 +752,7 @@ impl FilesPanel {
                 runtime.spawn(super::source::blocking(move || plan.execute(choice))).await.map_err(|err| err.to_string())?
                     .map(|count| format!("已拷贝 {count} 项")).map_err(|err| err.to_string())
             }.await;
-            this.update_in(cx, |panel, _, cx| {
+            this.update(cx, |panel, cx| {
                 panel.copying = false;
                 panel.copy_status = Some(result.unwrap_or_else(|err| format!("拷贝失败：{err}")));
                 panel.on_remote_changed(&destination, cx);
@@ -901,6 +904,26 @@ impl FilesPanel {
 
     // ---- the name editor ---------------------------------------------------------------------------------
 
+    fn watch_rename(state: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(state, |this, state, event: &InputEvent, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        let text = state.read(cx).value().to_string();
+                        this.commit_rename(&text, cx);
+                    }
+                })
+    }
+
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.owner = window.window_handle();
+        self.focus = cx.focus_handle();
+        self.perm_focus = cx.focus_handle();
+        self.menu = None;
+        if let Some(rename) = &mut self.rename {
+            rename.state = shellmate_term::view::move_input(&rename.state,"",window,cx);
+            rename._subscription = Self::watch_rename(&rename.state,cx);
+        }
+    }
+
     /// Keeps the text field in step with the model: one while a name is being edited.
     pub(super) fn sync_rename_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match (self.model.edit().map(|edit| edit.name.clone()), self.rename.is_some()) {
@@ -908,12 +931,7 @@ impl FilesPanel {
                 #[cfg(debug_assertions)]
                 let name = self.demo.rename_text.take().unwrap_or(name);
                 let state = cx.new(|cx| InputState::new(window, cx).default_value(name));
-                let subscription = cx.subscribe_in(&state, window, |this, state, event: &InputEvent, _, cx| {
-                    if let InputEvent::PressEnter { .. } = event {
-                        let text = state.read(cx).value().to_string();
-                        this.commit_rename(&text, cx);
-                    }
-                });
+                let subscription = Self::watch_rename(&state,cx);
                 state.update(cx, |state, cx| {
                     state.focus(window, cx);
                     state.select_all(window, cx);

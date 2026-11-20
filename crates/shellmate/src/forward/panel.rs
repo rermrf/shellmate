@@ -85,8 +85,18 @@ impl ForwardPanel {
         };
         let (name, listen, target) =
             (make(&values.name, window, cx), make(&values.listen, window, cx), make(&values.target, window, cx));
+        let subscriptions = Self::watch_form([&name,&listen,&target],window,cx);
+        let kind = values.kind;
+        let first = name.clone();
+        self.form = Some(FormFields { kind, name, listen, target, submitted: false, _subscriptions: subscriptions });
+        self.set_placeholders(window, cx);
+        first.update(cx, |input, cx| window.focus(&input.focus_handle(cx), cx));
+        cx.notify();
+    }
+
+    fn watch_form(inputs: [&Entity<InputState>;3], window: &mut Window, cx: &mut Context<Self>) -> Vec<Subscription> {
         let mut subscriptions = Vec::new();
-        for input in [&name, &listen, &target] {
+        for input in inputs {
             subscriptions.push(cx.subscribe_in(input, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
                 match event {
                     InputEvent::PressEnter { .. } => this.submit(window, cx),
@@ -95,12 +105,19 @@ impl ForwardPanel {
                 }
             }));
         }
-        let kind = values.kind;
-        let first = name.clone();
-        self.form = Some(FormFields { kind, name, listen, target, submitted: false, _subscriptions: subscriptions });
-        self.set_placeholders(window, cx);
-        first.update(cx, |input, cx| window.focus(&input.focus_handle(cx), cx));
-        cx.notify();
+        subscriptions
+    }
+
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use shellmate_term::view::move_input;
+        self.focus = cx.focus_handle();
+        if let Some(form) = &mut self.form {
+            form.name = move_input(&form.name, "", window, cx);
+            form.listen = move_input(&form.listen, "", window, cx);
+            form.target = move_input(&form.target, "", window, cx);
+            form._subscriptions = Self::watch_form([&form.name,&form.listen,&form.target],window,cx);
+            self.set_placeholders(window,cx);
+        }
     }
 
     /// Debug review hook: 添加并启动 pressed with the form as it is.

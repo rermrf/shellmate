@@ -80,7 +80,7 @@ impl Workspace {
         self.broadcast_bar.update(cx, |b, cx| b.targets(count, chip, cx));
     }
     pub(super) fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
-        let history = self
+        let history = self.hub
             .store
             .borrow()
             .history("", None, shellmate_store::HISTORY_LIMIT)
@@ -152,11 +152,12 @@ impl Workspace {
             .into_iter()
             .filter_map(|id| self.sessions.iter().find(|s| s.id == id))
             .map(|s| {
+                let book = self.hub.book.borrow();
                 let production = s.host().is_some_and(|host| {
                     let group = host
                         .group
                         .as_ref()
-                        .and_then(|id| self.book.group(id))
+                        .and_then(|id| book.group(id))
                         .map_or("", |g| g.name.as_str());
                     crate::productivity::model::production(group)
                 });
@@ -201,7 +202,7 @@ impl Workspace {
         }
         if !self
             .split
-            .toggle(main, &self.session_rows(cx), &self.recent_sessions)
+            .toggle(main, &self.session_rows(cx), &self.hub.recent_sessions.borrow())
         {
             window.push_notification(Notification::info("没有可用于分屏的其他会话"), cx);
             return;
@@ -247,8 +248,8 @@ impl Workspace {
         cx.notify();
     }
     pub(super) fn touch_session(&mut self, id: usize) {
-        self.recent_sessions.retain(|s| *s != id);
-        self.recent_sessions.insert(0, id);
+        self.hub.recent_sessions.borrow_mut().retain(|s| *s != id);
+        self.hub.recent_sessions.borrow_mut().insert(0, id);
     }
     pub(super) fn flip_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.split.flip();

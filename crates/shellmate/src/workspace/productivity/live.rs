@@ -18,7 +18,7 @@ impl Workspace {
         let Some(ids) = names
             .iter()
             .map(|name| {
-                self.book
+                self.hub.book.borrow()
                     .hosts
                     .iter()
                     .find(|h| h.name == *name)
@@ -152,8 +152,8 @@ impl Workspace {
                         }
                         w.show_panel(Panel::Terminal, window, cx);
                         w.split.close();
-                        w.recent_sessions.retain(|id| *id != tabs[1]);
-                        w.recent_sessions.insert(0, tabs[1]);
+                        w.hub.recent_sessions.borrow_mut().retain(|id| *id != tabs[1]);
+                        w.hub.recent_sessions.borrow_mut().insert(0, tabs[1]);
                         w.toggle_split(window, cx);
                         log::info!("p6live split-left-right");
                     })

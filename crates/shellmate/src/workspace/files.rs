@@ -33,7 +33,7 @@ use crate::runtime;
 /// The files panel of a tab and what keeps it wired to the workspace.
 pub struct FilesTab {
     pub panel: Entity<FilesPanel>,
-    pub(super) _subscription: Subscription,
+    pub(super) _subscription: Option<Subscription>,
 }
 
 /// What a panel shows about the session, given the link and the state of its own tab.
@@ -66,13 +66,13 @@ impl Workspace {
         {
             return;
         }
-        let Some((after, reconnect)) = self.group_mut(group_id).and_then(|group| group.preload_after.take()) else {
+        let Some((after, reconnect)) = self.group_mut(group_id).and_then(|mut group| group.preload_after.take()) else {
             return;
         };
-        let task = cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |_, cx| {
             cx.background_executor().timer(after.saturating_duration_since(std::time::Instant::now())).await;
-            let job = this.update(cx, |this, cx| {
-                if !this.preferences.get(shellmate_store::Preference::PreloadPanels) {
+            let job = super::Route::Session(id).deliver(cx, |this, _, cx| {
+                if !this.hub.preferences.borrow().get(shellmate_store::Preference::PreloadPanels) {
                     return None;
                 }
                 let session = this
@@ -83,7 +83,7 @@ impl Workspace {
                     .terminal
                     .read(cx)
                     .cwd()
-                    .filter(|_| this.preferences.get(shellmate_store::Preference::FollowDirectory))
+                    .filter(|_| this.hub.preferences.borrow().get(shellmate_store::Preference::FollowDirectory))
                     .unwrap_or(".")
                     .to_string();
                 let group = this.group(group_id)?;
@@ -97,38 +97,38 @@ impl Workspace {
                     }
                 }))
             });
-            if let Ok(Some(job)) = job {
+            if let Some(Some(job)) = job {
                 let _abort = super::group::AbortOnDrop::new(job.abort_handle());
                 let _ = job.await;
             }
         });
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.preload = Some((id, task));
         }
     }
 
     /// Gives a new connection its SFTP link (the session itself is opened lazily) and starts
     /// following it.
-    pub(super) fn attach_link(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn attach_link(&mut self, group_id: usize, cx: &mut Context<Self>) {
         let Some(runtime) = runtime::get(cx) else { return };
         let (link, changes, events) = SftpLink::new(runtime.handle());
-        let changed = cx.spawn_in(window, async move |this, cx| {
+        let changed = cx.spawn(async move |_, cx| {
             while changes.recv().await.is_ok() {
-                if this.update_in(cx, |this, _, cx| this.sync_files(group_id, cx)).is_err() {
+                if super::Route::Group(group_id).deliver(cx, |this, _, cx| this.sync_files(group_id, cx)).is_none() {
                     break;
                 }
             }
         });
-        let queue = cx.spawn_in(window, async move |this, cx| {
+        let queue = cx.spawn(async move |_, cx| {
             while let Ok(event) = events.recv().await {
-                if this.update_in(cx, |this, window, cx| this.on_transfer_event(group_id, &event, window, cx)).is_err()
+                if super::Route::Group(group_id).deliver(cx, |this, window, cx| this.on_transfer_event(group_id, &event, window, cx)).is_none()
                 {
                     break;
                 }
             }
         });
         let transfers = cx.new(|_| TransferList::new());
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.link = Some(link);
             group.link_tasks = vec![changed, queue];
             group.transfers = Some(transfers);
@@ -159,6 +159,9 @@ impl Workspace {
         match event {
             TransferEvent::RemoteChanged(dir) => self.remote_changed(group_id, dir, cx),
             TransferEvent::Added(view) | TransferEvent::State(view) if view.state == TransferState::AwaitingClash => {
+                for entry in self.peers(super::Route::Group(group_id), cx) {
+                    entry.update(cx, |w, window,cx| w.pump_clash(group_id,window,cx));
+                }
                 self.pump_clash(group_id, window, cx)
             }
             _ => {}
@@ -169,11 +172,12 @@ impl Workspace {
     /// Something changed in `dir` on the server: every panel of the connection that shows it lists it again.
     fn remote_changed(&mut self, group_id: usize, dir: &str, cx: &mut Context<Self>) {
         if let Some(LinkState::Ready(session)) =
-            self.group(group_id).and_then(|group| group.link.as_ref()).map(SftpLink::state)
+            self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.link.as_ref()).ok()).map(|link| link.state())
         {
             session.invalidate(dir);
         }
-        let panels: Vec<_> = self
+        self.project(super::Route::Group(group_id), cx, |w,cx| {
+        let panels: Vec<_> = w
             .sessions
             .iter()
             .filter(|s| s.ssh().is_some_and(|ssh| ssh.group == group_id))
@@ -182,6 +186,7 @@ impl Workspace {
         for panel in panels {
             panel.update(cx, |panel, cx| panel.on_remote_changed(dir, cx));
         }
+        });
     }
 
     // ---- names that exist ---------------------------------------------------------------------------
@@ -201,6 +206,7 @@ impl Workspace {
             .awaiting_clash()
             .find(|view| !group.clash.dismissed.contains(&view.id))
             .and_then(|view| view.clash.clone().map(|clash| (view.id, clash)));
+        drop(group);
         if let Some((id, clash)) = next {
             self.open_clash(group_id, id, clash, window, cx);
         }
@@ -219,7 +225,7 @@ impl Workspace {
     }
 
     fn open_clash(&mut self, group_id: usize, id: ItemId, clash: Clash, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.clash.open = Some(id);
             group.clash.dismissed.remove(&id);
         }
@@ -243,7 +249,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.clash.open = None;
             match choice {
                 Some(choice) => {
@@ -275,6 +281,7 @@ impl Workspace {
                 transfers.read(cx).get(id).filter(|v| v.state == TransferState::AwaitingClash).cloned()
             })
             .and_then(|view| view.clash);
+        drop(group);
         if let Some(clash) = clash {
             self.open_clash(group_id, id, clash, window, cx);
         }
@@ -282,9 +289,9 @@ impl Workspace {
 
     /// The connection came up (the first time, or after a reconnect).
     pub(super) fn link_connected(&mut self, group_id: usize, connection: &Connection, cx: &mut Context<Self>) {
-        let wanted =
-            self.sessions.iter().any(|s| s.files.is_some() && s.ssh().is_some_and(|ssh| ssh.group == group_id));
-        if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
+        let has_files = |w: &Self| w.sessions.iter().any(|s| s.files.is_some() && s.ssh().is_some_and(|ssh| ssh.group == group_id));
+        let wanted = has_files(self) || self.peers(super::Route::Group(group_id),cx).iter().any(|e| e.workspace.upgrade().is_some_and(|w| has_files(w.read(cx))));
+        if let Some(link) = self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.link.as_ref()).ok()) {
             // Reopens the session only if there was one; a panel that has been waiting for the
             // connection asks for it.
             link.connection_restored(connection);
@@ -297,11 +304,11 @@ impl Workspace {
 
     /// The connection was lost: the session is gone, the transfers wait.
     pub(super) fn link_lost(&mut self, group_id: usize, cx: &mut Context<Self>) {
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.preload = None;
             group.preload_after = None;
         }
-        if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
+        if let Some(link) = self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.link.as_ref()).ok()) {
             link.connection_lost();
         }
         self.sync_files(group_id, cx);
@@ -319,8 +326,12 @@ impl Workspace {
 
     /// Tells every panel of the connection where the session stands.
     pub(super) fn sync_files(&mut self, group_id: usize, cx: &mut Context<Self>) {
+        self.project(super::Route::Group(group_id), cx, |w,cx| w.sync_files_here(group_id,cx));
+    }
+
+    fn sync_files_here(&self, group_id: usize, cx: &mut Context<Self>) {
         let Some(group) = self.group(group_id) else { return };
-        let state = group.link.as_ref().map(SftpLink::state);
+        let state = group.link.as_ref().map(|link| link.state());
         let queue = group.link.as_ref().map(|link| link.queue().clone());
         let transfers = group.transfers.clone();
         let panels: Vec<_> = self
@@ -385,13 +396,18 @@ impl Workspace {
         let Some(runtime) = runtime::get(cx) else { return false };
         let (session_id, terminal) = (self.sessions[ix].id, self.sessions[ix].terminal.clone());
         let panel = cx.new(|cx| FilesPanel::new(&terminal, runtime, window, cx));
-        panel.update(cx,|p,cx|p.set_follow(self.preferences.get(shellmate_store::Preference::FollowDirectory),cx));
+        panel.update(cx,|p,cx|p.set_follow(self.hub.preferences.borrow().get(shellmate_store::Preference::FollowDirectory),cx));
         if self.sessions[ix].host().is_none() {
             let Some(home) = self.local_files_home() else { return false };
             panel.update(cx, |panel, _| panel.set_local(home));
         }
-        let subscription =
-            cx.subscribe_in(&panel, window, move |this: &mut Self, _panel, event: &FilesEvent, window, cx| match event {
+        let subscription = Self::bind_files(session_id, &panel, window, cx);
+        self.sessions[ix].files = Some(FilesTab { panel, _subscription: Some(subscription) });
+        true
+    }
+
+    pub(super) fn bind_files(session_id: usize, panel: &Entity<FilesPanel>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe_in(panel, window, move |this: &mut Self, _panel, event: &FilesEvent, window, cx| match event {
                 #[cfg(debug_assertions)]
                 FilesEvent::FixtureTrashReady => _panel.update(cx, |panel, cx| panel.ask_delete(window, cx)),
                 FilesEvent::RetrySession => this.retry_sftp(session_id, window, cx),
@@ -401,9 +417,7 @@ impl Workspace {
                 FilesEvent::EditorRefused { path, error } => {
                     this.refuse_editor(session_id, path.clone(), error, window, cx)
                 }
-            });
-        self.sessions[ix].files = Some(FilesTab { panel, _subscription: subscription });
-        true
+            })
     }
 
     fn local_files_home(&self) -> Option<std::path::PathBuf> {
@@ -432,7 +446,7 @@ impl Workspace {
         else {
             return;
         };
-        if let Some(link) = self.group(group_id).and_then(|group| group.link.as_ref()) {
+        if let Some(link) = self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.link.as_ref()).ok()) {
             link.session_lost(session);
         }
         self.sync_files(group_id, cx);

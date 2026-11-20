@@ -166,7 +166,7 @@ struct GridSink {
     raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     agent: Arc<Mutex<crate::agent::AgentState>>,
-    alive: Arc<AtomicBool>,
+    alive: Arc<Mutex<Arc<AtomicBool>>>,
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
     osc7: Mutex<Osc7Scanner>,
@@ -225,12 +225,12 @@ impl OutputHandler for GridSink {
     }
 
     fn exited(&self, code: Option<u32>) {
-        self.alive.store(false, Ordering::Release);
+        self.alive.lock().store(false, Ordering::Release);
         let _ = self.tx.try_send(Msg::Exited { generation: self.generation, code });
     }
 
     fn disconnected(&self, reason: String) {
-        self.alive.store(false, Ordering::Release);
+        self.alive.lock().store(false, Ordering::Release);
         let _ = self.tx.try_send(Msg::Disconnected { generation: self.generation, reason });
     }
 }
@@ -244,7 +244,7 @@ pub struct Terminal {
     raw_grid: Arc<Mutex<Option<RawGrid>>>,
     output_capture: Arc<Mutex<crate::capture_output::OutputCapture>>,
     agent: Arc<Mutex<crate::agent::AgentState>>,
-    alive: Arc<AtomicBool>,
+    alive: Arc<Mutex<Arc<AtomicBool>>>,
     backend: Option<Box<dyn TerminalBackend>>,
     /// `Some` for terminals that own a local shell: Enter restarts it in place.
     local: Option<PtyOptions>,
@@ -316,7 +316,7 @@ impl Terminal {
             raw_grid:Arc::new(Mutex::new(None)),
             output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             agent: Arc::new(Mutex::new(crate::agent::AgentState::default())),
-            alive: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(Mutex::new(Arc::new(AtomicBool::new(false)))),
             backend: None,
             local,
             size,
@@ -379,7 +379,7 @@ impl Terminal {
         *self.capture.lock() = Capture::default();
         *self.raw_grid.lock()=None;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.alive = Arc::new(AtomicBool::new(true));
+        self.alive = Arc::new(Mutex::new(Arc::new(AtomicBool::new(true))));
         *self.agent.lock() = crate::agent::AgentState::default();
         let sink = OutputSink::new(GridSink {
             term: self.term.clone(),
@@ -452,7 +452,7 @@ impl Terminal {
     }
 
     fn close_backend(&mut self) {
-        self.alive.store(false, Ordering::Release);
+        self.alive.lock().store(false, Ordering::Release);
         if let Some(mut backend) = self.backend.take() {
             backend.close();
         }
@@ -593,8 +593,17 @@ impl Terminal {
     }
 
     /// A generation-specific connection lease: reconnect never revives an old run.
-    pub fn agent_liveness(&self) -> Arc<AtomicBool> { self.alive.clone() }
-    pub fn agent_connected(&self) -> bool { self.alive.load(Ordering::Acquire) && self.backend.is_some() && !self.replay }
+    /// Retire outstanding AI work when its window loses the tab. The output sink
+    /// still signals disconnect on the new lease for this same backend.
+    pub fn rebind_agent(&mut self) {
+        let nonce = self.agent.lock().active.as_ref().map(|(id,_)| id.clone());
+        if let Some(nonce) = nonce { self.agent_finish(&nonce, true); }
+        let mut lease = self.alive.lock();
+        let connected = lease.swap(false, Ordering::AcqRel);
+        *lease = Arc::new(AtomicBool::new(connected));
+    }
+    pub fn agent_liveness(&self) -> Arc<AtomicBool> { self.alive.lock().clone() }
+    pub fn agent_connected(&self) -> bool { self.alive.lock().load(Ordering::Acquire) && self.backend.is_some() && !self.replay }
     pub fn agent_busy(&self) -> bool { self.agent.lock().busy(self.mode().contains(TermMode::ALT_SCREEN)) || self.capture.lock().running() }
     pub fn agent_start(&mut self, command: &str, nonce: &str) -> Result<crate::agent::CaptureHandle, &'static str> {
         if !self.agent_connected() { return Err("disconnected"); }
@@ -995,7 +1004,7 @@ mod sink_tests {
             raw_grid:raw_grid.clone(),
             output_capture:output_capture.clone(),
             agent: agent.clone(),
-            alive: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(Mutex::new(Arc::new(AtomicBool::new(true)))),
             osc7: Mutex::new(Osc7Scanner::new()),
             pending: pending.clone(),
             tx,
@@ -1177,4 +1186,4 @@ mod sink_tests {
 #[path = "capture_pty_tests.rs"]
 mod capture_pty_tests;
 
-impl Drop for Terminal { fn drop(&mut self) { self.alive.store(false, Ordering::Release); } }
+impl Drop for Terminal { fn drop(&mut self) { self.alive.lock().store(false, Ordering::Release); } }

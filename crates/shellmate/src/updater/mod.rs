@@ -16,10 +16,9 @@ use crate::{
         download, install,
         release::Release,
     },
-    workspace::Workspace,
 };
 use anyhow::{Context as _, Result};
-use gpui::{App, Global, WeakEntity};
+use gpui::{App, Global};
 use preferences::Preferences;
 use semver::Version;
 use shellmate_store::SharedStore;
@@ -50,7 +49,6 @@ pub struct Updater {
     cancel: Option<oneshot::Sender<()>>,
     staged: Option<install::Staged>,
     at_quit: bool,
-    windows: Vec<WeakEntity<Workspace>>,
 }
 
 impl Global for Updater {}
@@ -73,11 +71,7 @@ fn api() -> Option<String> {
     }
 }
 
-pub fn init(store: SharedStore, workspace: WeakEntity<Workspace>, cx: &mut App) {
-    if cx.has_global::<Updater>() {
-        cx.global_mut::<Updater>().windows.push(workspace);
-        return;
-    }
+pub fn init(store: SharedStore, cx: &mut App) {
     let api = api();
     let (prefs, cache) = Preferences::load(store, api.as_deref());
     let mut state = Updater {
@@ -90,7 +84,6 @@ pub fn init(store: SharedStore, workspace: WeakEntity<Workspace>, cx: &mut App) 
         cancel: None,
         staged: None,
         at_quit: false,
-        windows: vec![workspace],
     };
     if let Ok(release) = Release::parse(&state.cache.json) {
         state.accept(release, false);
@@ -366,7 +359,7 @@ fn restart(cx: &mut App) {
     } else if let Err(e) = install::relaunch(&staged.bundle) {
         s.phase = Phase::Fallback(e.to_string());
     } else {
-        cx.quit();
+        crate::workspace::Hub::quit(cx);
     }
     cx.refresh_windows();
 }

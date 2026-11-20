@@ -25,7 +25,6 @@ impl Workspace {
         &mut self,
         id: usize,
         connection: Connection,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(ssh) = self.ssh_mut(id) else { return };
@@ -48,9 +47,9 @@ impl Workspace {
             return;
         };
         let join = runtime.spawn(mosh::prepare(connection, client));
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn(async move |_, cx| {
             let result = join.await;
-            this.update_in(cx, |this, window, cx| {
+            super::Route::Session(id).deliver(cx, |this, window, cx| {
                 let prepared = match result {
                     Ok(Ok(p)) => p,
                     Ok(Err(e)) => {
@@ -111,15 +110,14 @@ impl Workspace {
                 };
                 if attached {
                     let host_id = ssh.host.id.clone();
-                    if !this.temporary_hosts.contains_key(&host_id) {
-                        let _ = this.store.borrow_mut().touch_connected(&host_id);
+                    if !this.hub.temporary_hosts.borrow().contains_key(&host_id) {
+                        let _ = this.hub.store.borrow_mut().touch_connected(&host_id);
                     }
                     this.type_pending(id, window, cx);
                 }
                 this.sync_sidebar(cx);
                 cx.notify();
-            })
-            .ok();
+            });
         });
         if let Some(m) = self.ssh_mut(id).and_then(|s| s.mosh.as_mut()) {
             m.task = Some(task);
@@ -142,8 +140,8 @@ impl Workspace {
         cx.notify();
     }
     pub(super) fn poll_mosh_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let lost = self
-            .groups
+        let lost = self.hub
+            .groups.borrow()
             .iter()
             .filter(|g| {
                 g.auxiliary.as_ref().is_some_and(Connection::is_closed)
@@ -152,7 +150,7 @@ impl Workspace {
             .map(|g| g.id)
             .collect::<Vec<_>>();
         for id in lost {
-            if let Some(g) = self.group_mut(id) {
+            if let Some(mut g) = self.group_mut(id) {
                 g.auxiliary = None;
             }
             self.link_lost(id, cx);

@@ -25,29 +25,29 @@ use crate::runtime;
 /// The forwarding panel of a tab and what keeps it wired to the workspace.
 pub struct ForwardTab {
     pub panel: Entity<ForwardPanel>,
-    pub(super) _subscription: Subscription,
+    pub(super) _subscription: Option<Subscription>,
 }
 
 impl Workspace {
     // ---- the engine of a connection ------------------------------------------------------------
 
     /// Gives a new connection its forwarder and starts following what it says.
-    pub(super) fn attach_forwarder(&mut self, group_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn attach_forwarder(&mut self, group_id: usize, cx: &mut Context<Self>) {
         let Some(runtime) = runtime::get(cx) else { return };
         let (events, changes) = async_channel::unbounded();
-        let options = Options { grants: self.forward_grants.clone(), ..Options::default() };
+        let options = Options { grants: self.hub.forward_grants.clone(), ..Options::default() };
         let forwarder = Forwarder::with_options(runtime.handle(), events, options);
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn(async move |_, cx| {
             while let Ok(event) = changes.recv().await {
                 if let ForwardEvent::State { id, state } = &event {
                     log::debug!("端口转发 规则 {id:?} → {state:?}");
                 }
-                if this.update_in(cx, |this, _, cx| this.sync_forward_group(group_id, cx)).is_err() {
+                if super::Route::Group(group_id).deliver(cx, |this, _, cx| this.sync_forward_group(group_id, cx)).is_none() {
                     break;
                 }
             }
         });
-        if let Some(group) = self.group_mut(group_id) {
+        if let Some(mut group) = self.group_mut(group_id) {
             group.forward =
                 Some(GroupForward { forwarder, rules: Vec::new(), loaded: false, started: false, _task: Some(task) });
         }
@@ -55,12 +55,12 @@ impl Workspace {
 
     /// The connection that carries the rules of `host`: the one with the lowest number.
     pub(super) fn forward_owner(&self, host: &HostId) -> Option<usize> {
-        group::forward_owner(&self.groups, host)
+        group::forward_owner(self.hub.groups.borrow().iter(), host)
     }
 
     /// Whether the rules of `host` are kept in the host library (the host is saved there).
     fn forward_persisted(&self, host: &HostId) -> bool {
-        !self.library_is_temporary && matches!(self.store.borrow().host(host), Ok(Some(_)))
+        !self.hub.library_is_temporary && matches!(self.hub.store.borrow().host(host), Ok(Some(_)))
     }
 
     /// Reads the rules of the owner from the library (once; later changes go through [`Workspace`]
@@ -71,9 +71,10 @@ impl Workspace {
         if group.forward.as_ref().is_none_or(|forward| forward.loaded) {
             return;
         }
+        drop(group);
         let persisted = self.forward_persisted(&host);
         let rules = if persisted {
-            match self.store.borrow().forward_rules(&host) {
+            match self.hub.store.borrow().forward_rules(&host) {
                 Ok(rules) => rules,
                 Err(err) => {
                     log::error!("could not read the forwarding rules: {err}");
@@ -83,7 +84,7 @@ impl Workspace {
         } else {
             Vec::new()
         };
-        if let Some(forward) = self.group_mut(owner).and_then(|group| group.forward.as_mut()) {
+        if let Some(mut forward) = self.group_mut(owner).and_then(|g| std::cell::RefMut::filter_map(g, |g| g.forward.as_mut()).ok()) {
             forward.rules = rules;
             forward.loaded = true;
         }
@@ -92,7 +93,7 @@ impl Workspace {
     /// The connection came up (the first time, or after a reconnect). The engine takes it; on the
     /// first time the enabled rules start.
     pub(super) fn forward_connected(&mut self, group_id: usize, connection: &Connection, cx: &mut Context<Self>) {
-        if let Some(forward) = self.group(group_id).and_then(|group| group.forward.as_ref()) {
+        if let Some(forward) = self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.forward.as_ref()).ok()) {
             forward.forwarder.connection_restored(connection);
         }
         self.forward_start_enabled(group_id, cx);
@@ -101,7 +102,7 @@ impl Workspace {
 
     /// The connection was lost: local listeners stay, remote ones are asked for again after the reconnect.
     pub(super) fn forward_lost(&mut self, group_id: usize, cx: &mut Context<Self>) {
-        if let Some(forward) = self.group(group_id).and_then(|group| group.forward.as_ref()) {
+        if let Some(forward) = self.group(group_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.forward.as_ref()).ok()) {
             forward.forwarder.connection_lost();
         }
         self.sync_forward_group(group_id, cx);
@@ -115,7 +116,7 @@ impl Workspace {
             return;
         }
         self.ensure_rules(group_id);
-        let Some(group) = self.group_mut(group_id) else { return };
+        let Some(mut group) = self.group_mut(group_id) else { return };
         let up = group.live_connection().is_some();
         let Some(forward) = group.forward.as_mut().filter(|forward| up && !forward.started) else { return };
         forward.started = true;
@@ -128,7 +129,7 @@ impl Workspace {
     /// connection to the host takes them over.
     pub(super) fn forward_handed_over(&mut self, host: &HostId, rules: Vec<ForwardRule>, cx: &mut Context<Self>) {
         if let Some(owner) = self.forward_owner(host) {
-            if let Some(forward) = self.group_mut(owner).and_then(|group| group.forward.as_mut()) {
+            if let Some(mut forward) = self.group_mut(owner).and_then(|g| std::cell::RefMut::filter_map(g, |g| g.forward.as_mut()).ok()) {
                 forward.rules = rules;
                 forward.loaded = true;
             }
@@ -141,13 +142,20 @@ impl Workspace {
 
     /// Tells every forwarding panel of a connection's host where things stand.
     pub(super) fn sync_forward_group(&mut self, group_id: usize, cx: &mut Context<Self>) {
-        if let Some(host) = self.group(group_id).map(|group| group.key.host().clone()) {
+        let host = self.group(group_id).map(|group| group.key.host().clone());
+        if let Some(host) = host {
             self.sync_forward(&host, cx);
         }
     }
 
     /// Hands the current view to every forwarding panel of the tabs on `host`.
     pub(super) fn sync_forward(&mut self, host: &HostId, cx: &mut Context<Self>) {
+        self.project(super::Route::All, cx, |w, cx| w.sync_forward_here(host,cx));
+        // The Docker page shows which container ports are forwarded already.
+        self.sync_monitor_host(host, cx);
+    }
+
+    fn sync_forward_here(&mut self, host: &HostId, cx: &mut Context<Self>) {
         let tabs: Vec<_> = self
             .sessions
             .iter()
@@ -161,8 +169,6 @@ impl Workspace {
             let view = self.forward_view(group_id, &host);
             panel.update(cx, |panel, cx| panel.set_view(view, cx));
         }
-        // The Docker page shows which container ports are forwarded already.
-        self.sync_monitor_host(host, cx);
     }
 
     /// The view of the tab on connection `group_id` to `host`: the rules of the host as the
@@ -181,7 +187,7 @@ impl Workspace {
                 .map_or_else(|| "另一个会话".to_string(), |s| format!("「{}」", s.title));
             notes.push(format!("这些规则在到此主机的另一条连接（会话{tab}）上运行，这里显示的是同一份。"));
         }
-        let Some(forward) = self.group(owner_id).and_then(|group| group.forward.as_ref()) else {
+        let Some(forward) = self.group(owner_id).and_then(|g| std::cell::Ref::filter_map(g, |g| g.forward.as_ref()).ok()) else {
             return ForwardView::empty(&host.name);
         };
         let views = forward.forwarder.views();
@@ -212,12 +218,15 @@ impl Workspace {
         }
         let view = self.forward_view(group_id, &host);
         let panel = cx.new(|cx| ForwardPanel::new(view, cx));
-        let subscription =
-            cx.subscribe_in(&panel, window, move |this: &mut Self, _, event: &ForwardPanelEvent, window, cx| {
-                this.on_forward_event(session_id, event, window, cx)
-            });
-        self.sessions[ix].forward = Some(ForwardTab { panel, _subscription: subscription });
+        let subscription = Self::bind_forward(session_id, &panel, window, cx);
+        self.sessions[ix].forward = Some(ForwardTab { panel, _subscription: Some(subscription) });
         true
+    }
+
+    pub(super) fn bind_forward(session_id: usize, panel: &Entity<ForwardPanel>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe_in(panel, window, move |this: &mut Self, _, event: &ForwardPanelEvent, window, cx| {
+                this.on_forward_event(session_id, event, window, cx)
+            })
     }
 
     // ---- what the user does --------------------------------------------------------------------
@@ -254,7 +263,8 @@ impl Workspace {
     ) -> Option<R> {
         let owner = self.forward_owner(host)?;
         self.ensure_rules(owner);
-        let forward = self.group_mut(owner)?.forward.as_mut()?;
+        let mut group = self.group_mut(owner)?;
+        let forward = group.forward.as_mut()?;
         match change(forward) {
             Ok(result) => Some(result),
             Err(message) => {
@@ -273,7 +283,7 @@ impl Workspace {
         if !self.forward_persisted(host) {
             return Ok(());
         }
-        save(&mut self.store.borrow_mut()).map_err(|err| format!("无法保存端口转发规则：{err}"))
+        save(&mut self.hub.store.borrow_mut()).map_err(|err| format!("无法保存端口转发规则：{err}"))
     }
 
     pub(super) fn add_rule(&mut self, host: &HostId, rule: ForwardRule, window: &mut Window, cx: &mut Context<Self>) {
@@ -409,7 +419,7 @@ impl Workspace {
     /// Closes the tab at `ix`. The last tab of a connection that has forwards running asks first:
     /// the forwards stop with it.
     pub(super) fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match self.close_question(ix) {
+        match self.close_question(ix, cx) {
             Some((session_id, title, text)) => {
                 let workspace = cx.entity().downgrade();
                 ConfirmDialog::open(
@@ -437,18 +447,18 @@ impl Workspace {
     }
 
     /// What to ask before closing the tab at `ix`, if anything: the tab's id, the title and the text.
-    fn close_question(&self, ix: usize) -> Option<(usize, String, String)> {
+    fn close_question(&self, ix: usize, cx: &gpui::App) -> Option<(usize, String, String)> {
         let session = self.sessions.get(ix)?;
         let ssh = session.ssh()?;
         let group = self.group(ssh.group)?;
         let others_on_connection =
             self.sessions.iter().filter(|s| s.ssh().is_some_and(|other| other.group == ssh.group)).count() - 1;
-        if others_on_connection > 0 || self.forward_owner(&ssh.host.id) != Some(group.id) {
+        if others_on_connection > 0 || !self.peers(super::Route::Group(ssh.group), cx).is_empty() || self.forward_owner(&ssh.host.id) != Some(group.id) {
             return None;
         }
         // Another connection to the host takes the rules over: they go on running.
-        let adopter = self
-            .groups
+        let adopter = self.hub
+            .groups.borrow()
             .iter()
             .any(|other| other.id != group.id && other.key.host() == &ssh.host.id && other.live_connection().is_some());
         let forward = group.forward.as_ref()?;
@@ -519,7 +529,7 @@ impl Workspace {
                 let target = self
                     .forward_owner(&host.id)
                     .and_then(|owner| self.group(owner))
-                    .and_then(|g| g.forward.as_ref())
+                    .and_then(|g| std::cell::Ref::filter_map(g, |g| g.forward.as_ref()).ok())
                     .and_then(|f| {
                         f.rules.iter().find(|rule| rule.name == arg).map(|rule| (rule.id.clone(), rule.enabled))
                     });
@@ -565,7 +575,7 @@ impl Workspace {
             // Logs how the rules stand (and how many connections the engine has).
             "log" => {
                 let owner = self.forward_owner(&host.id).and_then(|owner| self.group(owner));
-                if let Some(forward) = owner.and_then(|owner| owner.forward.as_ref()) {
+                if let Some(forward) = owner.and_then(|g| std::cell::Ref::filter_map(g, |g| g.forward.as_ref()).ok()) {
                     let states: Vec<String> = forward
                         .forwarder
                         .views()

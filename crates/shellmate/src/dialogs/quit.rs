@@ -40,7 +40,7 @@ impl DialogBody for QuitDialog {
             cx.notify();
             return false;
         }
-        cx.quit();
+        crate::workspace::Hub::quit(cx);
         true
     }
     fn cancel(&mut self, _: &mut Window, _: &mut Context<Self>) {}

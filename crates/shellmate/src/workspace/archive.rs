@@ -2,7 +2,7 @@
 use super::*;
 use shellmate_store::{Preference as P, Recording};
 use shellmate_term::{archive, cast::Header};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 pub(super) struct RunningRecording {
     pub row: Recording,
     pub start: Instant,
@@ -19,21 +19,10 @@ impl RunningRecording {
     }
 }
 impl Workspace {
-    pub(super) fn archive_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.archive_task = Some(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this
-                    .update_in(cx, |w, window, cx| w.tick_archives(window, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
+    pub(super) fn watch_archive_shutdown(&mut self, cx: &mut Context<Self>) {
         self._subscriptions.push(cx.on_release(|w, cx| {
             for session in &w.sessions {
-                if let Some(r) = w.running_recordings.remove(&session.id) {
+                if let Some(r) = w.hub.running_recordings.borrow_mut().remove(&session.id) {
                     let result = session.terminal.update(cx, |t, _| t.stop_recording());
                     let (duration, size) = match result {
                         Ok(Some(r)) => (r.duration, r.size),
@@ -42,7 +31,7 @@ impl Workspace {
                             std::fs::metadata(&r.row.path).map_or(0, |m| m.len()),
                         ),
                     };
-                    let _ = w.store.borrow_mut().finish_recording(r.row.id, duration, size);
+                    let _ = w.hub.store.borrow_mut().finish_recording(r.row.id, duration, size);
                 }
                 session.terminal.update(cx, |t, _| {
                     t.finalize_log();
@@ -50,20 +39,20 @@ impl Workspace {
                 });
             }
         }));
-        self._subscriptions.push(cx.on_app_quit(|w, cx| {
-            let ids = w.sessions.iter().map(|s| s.id).collect::<Vec<_>>();
-            for id in ids {
-                w.finalize_archives(id, cx);
-            }
-            async {}
-        }));
     }
+
+    pub(super) fn finish_archives(&mut self, cx: &mut Context<Self>) {
+        for id in self.sessions.iter().map(|s| s.id).collect::<Vec<_>>() {
+            self.finalize_archives(id,cx);
+        }
+    }
+
     pub(super) fn start_session_archives(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_terminal_preferences(id, cx);
-        if self.preferences.get(P::SessionLog) {
+        if self.hub.preferences.borrow().get(P::SessionLog) {
             self.set_session_logging(id, true, cx);
         }
-        if self.preferences.get(P::AutoRecord)
+        if self.hub.preferences.borrow().get(P::AutoRecord)
             && let Err(e) = self.start_recording(id, cx)
         {
             push_notification_later(window, cx, Notification::error(e));
@@ -72,13 +61,13 @@ impl Workspace {
     fn apply_terminal_preferences(&self, id: usize, cx: &mut Context<Self>) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
             s.view.update(cx, |v, cx| {
-                v.copy_on_select = self.preferences.get(P::CopySelection);
-                v.right_click_paste = self.preferences.get(P::RightPaste);
+                v.copy_on_select = self.hub.preferences.borrow().get(P::CopySelection);
+                v.right_click_paste = self.hub.preferences.borrow().get(P::RightPaste);
                 cx.notify();
             });
             s.terminal.update(cx, |t, cx| {
-                t.set_bracketed_paste(self.preferences.get(P::BracketedPaste));
-                t.set_prompt_highlighting(self.preferences.get(P::PromptHighlight), cx);
+                t.set_bracketed_paste(self.hub.preferences.borrow().get(P::BracketedPaste));
+                t.set_prompt_highlighting(self.hub.preferences.borrow().get(P::PromptHighlight), cx);
             });
         }
     }
@@ -86,11 +75,11 @@ impl Workspace {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
             let label = s.host().map_or("本机", |h| h.name.as_str());
             s.terminal
-                .update(cx, |t, _| t.set_logging(on.then(|| self.log_root.clone()), label));
+                .update(cx, |t, _| t.set_logging(on.then(|| self.hub.log_root.borrow().clone()), label));
         }
     }
     pub(super) fn start_recording(&mut self, id: usize, cx: &mut Context<Self>) -> Result<(), String> {
-        if self.running_recordings.contains_key(&id) {
+        if self.hub.running_recordings.borrow().contains_key(&id) {
             return Ok(());
         }
         let session = self.sessions.iter().find(|s| s.id == id).ok_or("会话已关闭")?;
@@ -100,7 +89,7 @@ impl Workspace {
         );
         let now = archive::now();
         let size = session.terminal.read(cx).size();
-        let (path, file) = archive::recording_file(&self.data_root, &label, now)
+        let (path, file) = archive::recording_file(&self.hub.data_root.borrow(), &label, now)
             .map_err(|e| format!("无法创建录制：{e}"))?;
         let title = format!("{label} · {}", archive::local_time(now, "%m-%d %H:%M"));
         let mut header = Header::new(size.cols, size.rows);
@@ -131,7 +120,7 @@ impl Workspace {
             cols: size.cols,
             rows: size.rows,
         };
-        match self.store.borrow_mut().add_recording(&row) {
+        match self.hub.store.borrow_mut().add_recording(&row) {
             Ok(id) => row.id = id,
             Err(e) => {
                 let _ = session.terminal.update(cx, |t, _| t.stop_recording());
@@ -139,7 +128,7 @@ impl Workspace {
                 return Err(format!("无法保存录制索引：{e}"));
             }
         }
-        self.running_recordings.insert(
+        self.hub.running_recordings.borrow_mut().insert(
             id,
             RunningRecording {
                 row,
@@ -156,7 +145,7 @@ impl Workspace {
         id: usize,
         cx: &mut Context<Self>,
     ) -> Result<Option<i64>, String> {
-        let Some(running) = self.running_recordings.remove(&id) else {
+        let Some(running) = self.hub.running_recordings.borrow_mut().remove(&id) else {
             return Ok(None);
         };
         let mut duration = running.row.duration;
@@ -172,7 +161,7 @@ impl Workspace {
                 Err(e) => error = Some(format!("录制保存失败：{e}")),
             }
         }
-        self.store
+        self.hub.store
             .borrow_mut()
             .finish_recording(running.row.id, duration, size)
             .map_err(|e| e.to_string())?;
@@ -187,7 +176,7 @@ impl Workspace {
         let Some(id) = self.focused_session().map(|s| s.id) else {
             return;
         };
-        if self.running_recordings.contains_key(&id) {
+        if self.hub.running_recordings.borrow().contains_key(&id) {
             match self.stop_recording(id, cx) {
                 Ok(_) => {
                     window.push_notification(Notification::success("已保存 .cast · 可在「记录」中回放"), cx)
@@ -209,7 +198,7 @@ impl Workspace {
         }
         error
     }
-    fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.poll_streams(window,cx);
         self.poll_mosh_connections(window,cx);
         let mut stopped = vec![];
@@ -218,13 +207,13 @@ impl Workspace {
             if let Some(e) = error {
                 window.push_notification(Notification::error(e), cx);
             }
-            if let Some(r) = self.running_recordings.get_mut(&s.id) {
+            if let Some(r) = self.hub.running_recordings.borrow_mut().get_mut(&s.id) {
                 if s.terminal.read(cx).recording_seconds().is_none() {
                     stopped.push(s.id);
                 } else {
                     let size = std::fs::metadata(&r.row.path).map_or(0, |m| m.len());
                     r.row.duration = s.terminal.read(cx).recording_duration().unwrap_or(r.row.duration);
-                    let _ = self
+                    let _ = self.hub
                         .store
                         .borrow_mut()
                         .finish_recording(r.row.id, r.row.duration, size);
@@ -234,11 +223,11 @@ impl Workspace {
         for id in stopped {
             let _ = self.stop_recording(id, cx);
         }
-        if !crate::prototype_fixture() && let Some(panel) = self.records_window.as_ref().and_then(|p| p.upgrade()) {
-            let active = self.running_recordings.values().map(|r| r.row.id).collect();
-            panel.update(cx, |p, cx| p.sync_recordings(active, self.preferences.get(P::PromptHighlight), cx));
+        if !crate::prototype_fixture() && let Some(panel) = self.hub.records_window.borrow().as_ref().and_then(|p| p.upgrade()) {
+            let active = self.hub.running_recordings.borrow().values().map(|r| r.row.id).collect();
+            panel.update(cx, |p, cx| p.sync_recordings(active, self.hub.preferences.borrow().get(P::PromptHighlight), cx));
         }
-        if !self.hidden && !self.running_recordings.is_empty() {
+        if !self.hidden && !self.hub.running_recordings.borrow().is_empty() {
             cx.notify();
         }
     }
@@ -249,22 +238,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        self.store
+        self.hub.store
             .borrow_mut()
             .set_preference(key, value)
             .map_err(|e| e.to_string())?;
-        self.preferences.set(key, value);
+        self.hub.preferences.borrow_mut().set(key, value);
+        for entry in self.peers(Route::All,cx) {
+            cx.defer(move |cx| { entry.update(cx, |w,window,cx| w.apply_preference(key,value,window,cx)); });
+        }
+        self.apply_preference(key,value,window,cx);
+        Ok(())
+    }
+    fn apply_preference(&mut self, key: P, value: bool, window: &mut Window,cx: &mut Context<Self>) {
         if key == P::ShowStatusIcon {
             #[cfg(target_os = "macos")]
             {
                 self.sync_status_item(cx);
                 if self.hidden { self.sync_hidden_activation_policy(cx); }
             }
-            return Ok(());
+            return;
         }
-        if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit) { return Ok(()); }
+        if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit) { return; }
         if key == P::PreloadPanels && !value {
-            for group in &mut self.groups {
+            for group in &mut *self.hub.groups.borrow_mut() {
                 group.preload = None;
                 group.preload_after = None;
             }
@@ -288,10 +284,9 @@ impl Workspace {
         }
         self.tick_archives(window, cx);
         cx.notify();
-        Ok(())
     }
     pub(crate) fn clear_history(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
-        self.store
+        self.hub.store
             .borrow_mut()
             .clear_history()
             .map_err(|e| e.to_string())?;
@@ -300,26 +295,26 @@ impl Workspace {
         cx.notify();
         Ok(())
     }
-    pub(crate) fn credentials(&self)->std::sync::Arc<shellmate_store::CredentialStore>{self.secrets.clone()}
+    pub(crate) fn credentials(&self)->std::sync::Arc<shellmate_store::CredentialStore>{self.hub.secrets.clone()}
     pub(crate) fn refresh_bundle(&mut self,w:&mut Window,cx:&mut Context<Self>){self.reload_book(w,cx);self.refresh_snippets(cx);}
     pub(crate) fn export_bundle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        crate::security::PasswordDialog::open(self.secrets.clone(), crate::security::Purpose::Export,
+        crate::security::PasswordDialog::open(self.hub.secrets.clone(), crate::security::Purpose::Export,
             None, Box::new(|_, _, _| {}), window, cx);
     }
 
     pub(crate) fn import_bundle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.weak_entity();
-        crate::security::open_import(self.secrets.clone(), move |ok, window, cx| {
+        crate::security::open_import(self.hub.secrets.clone(), move |ok, window, cx| {
             if ok { workspace.update(cx, |workspace, cx| workspace.refresh_bundle(window, cx)).ok(); }
         }, window, cx);
     }
     pub(super) fn open_settings(&mut self, section: usize, window: &mut Window, cx: &mut Context<Self>) {
         crate::settings::SettingsWindow::open(
             cx.entity().downgrade(),
-            self.preferences.clone(),
-            self.secrets.clone(),
+            self.hub.preferences.borrow().clone(),
+            self.hub.secrets.clone(),
             section,
-            self.store.clone(),
+            self.hub.store.clone(),
             window,
             cx,
         );
@@ -331,16 +326,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let active = self.running_recordings.values().map(|r| r.row.id).collect();
+        let active = self.hub.running_recordings.borrow().values().map(|r| r.row.id).collect();
         let view = crate::records::panel::RecordsWindow::open(
-            self.store.clone(),
-            self.log_root.clone(),
+            self.hub.store.clone(),
+            self.hub.log_root.borrow().clone(),
             selected,
             logs,
             active,
             window,
             cx,
         );
-        self.records_window = Some(view.downgrade());
+        *self.hub.records_window.borrow_mut() = Some(view.downgrade());
     }
 }

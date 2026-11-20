@@ -86,11 +86,7 @@ pub(super) struct PortsPage {
 impl PortsPage {
     pub(super) fn new(window: &mut Window, cx: &mut Context<MonitorPanel>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("过滤端口、进程、PID 或地址"));
-        let subscription = cx.subscribe(&query, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        });
+        let subscription = Self::watch_query(&query,cx);
         Self {
             query,
             filters: Filters::default(),
@@ -99,6 +95,19 @@ impl PortsPage {
             _subscription: subscription,
         }
     }
+    fn watch_query(query: &Entity<InputState>, cx: &mut Context<MonitorPanel>) -> Subscription {
+        cx.subscribe(query, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+    }
+
+    pub(super) fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<MonitorPanel>) {
+        self.query = shellmate_term::view::move_input(&self.query, "过滤端口、进程、PID 或地址", window, cx);
+        self._subscription = Self::watch_query(&self.query,cx);
+    }
+
 }
 
 fn button(label: &'static str, bg: Hsla, fg: Hsla) -> gpui::Stateful<gpui::Div> {

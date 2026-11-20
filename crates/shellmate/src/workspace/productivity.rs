@@ -12,7 +12,7 @@ use shellmate_store::{HistoryEntry, Snippet};
 
 impl Workspace {
     pub(crate) fn refresh_snippets(&mut self, cx: &mut Context<Self>) {
-        match self.store.borrow().snippets() {
+        match self.hub.store.borrow().snippets() {
             Ok(groups) => self.commands.update(cx, |d, cx| {
                 d.groups = groups;
                 cx.notify();
@@ -30,7 +30,7 @@ impl Workspace {
         let data = PaletteData {
             monitor: self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(|s| s.supports_panel(Panel::Monitor)),
             forward: self.active.and_then(|ix| self.sessions.get(ix)).is_some_and(|s| s.supports_panel(Panel::Forward)),
-            book: self.book.clone(),
+            book: self.hub.book.borrow().clone(),
             sessions: self
                 .sessions
                 .iter()
@@ -58,7 +58,7 @@ impl Workspace {
         let host = self
             .focused_session()
             .map(|s| s.host().map_or_else(|| "local".into(), |h| h.id.to_string()));
-        let picker = cx.new(|cx| Picker::history(self.store.clone(), host, current, window, cx));
+        let picker = cx.new(|cx| Picker::history(self.hub.store.clone(), host, current, window, cx));
         self.install_picker(picker, window, cx);
     }
     fn install_picker(&mut self, picker: Entity<Picker>, window: &mut Window, cx: &mut Context<Self>) {
@@ -128,13 +128,13 @@ impl Workspace {
             Event::Send(command) => self.confirm_command(command.clone(), window, cx),
             Event::Manage => Manager::open(
                 self.commands.read(cx).groups.clone(),
-                self.store.clone(),
+                self.hub.store.clone(),
                 cx.entity().downgrade(),
                 window,
                 cx,
             ),
             Event::Samples => {
-                let result = self.store.borrow_mut().save_snippets(&model::samples());
+                let result = self.hub.store.borrow_mut().save_snippets(&model::samples());
                 match result {
                     Ok(()) => self.refresh_snippets(cx),
                     Err(_) => window.push_notification(Notification::error("无法保存示例命令"), cx),
@@ -248,7 +248,7 @@ impl Workspace {
             cwd,
             time,
         };
-        if self.store.borrow_mut().add_history(&entry).is_err() {
+        if self.hub.store.borrow_mut().add_history(&entry).is_err() {
             log::warn!("could not save command history");
         }
         if self.broadcast.enabled {

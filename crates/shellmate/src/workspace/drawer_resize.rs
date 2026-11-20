@@ -51,7 +51,7 @@ impl Workspace {
     }
 
     fn save_drawer_width(&self) {
-        if let Err(err) = self
+        if let Err(err) = self.hub
             .store
             .borrow_mut()
             .set_setting(SETTING, &self.ai_drawer_width.to_string())

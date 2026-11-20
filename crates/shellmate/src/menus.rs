@@ -5,7 +5,7 @@ use shellmate_term::view as terminal;
 use crate::workspace::{CloseTab, DuplicateSession, NewLocalTerminal, NextTab, OpenPalette, Panel,
     PreviousTab, Quit, ToggleSidebar, ToggleTheme};
 
-use crate::workspace::{Workspace, lifecycle::MainWindow};
+use crate::workspace::{Workspace, Hub};
 
 actions!(shellmate, [CloseWindow, About, CheckUpdates, Settings, LockVault, HideApp, HideOthers, ShowAll, NewConnection,
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
@@ -115,7 +115,7 @@ pub(crate) fn init_hidden_shortcuts(cx: &mut App) {
 }
 
 fn forward_edit(cx: &mut App, input: &'static dyn Action, terminal: Option<&'static dyn Action>) {
-    MainWindow::with_restored_window(cx, move |window, cx| {
+    Hub::with_restored_window(cx, move |window, cx| {
         let target = edit_target(window.is_action_available(input, cx),
             terminal.is_some_and(|action| window.is_action_available(action, cx)));
         let action = match target {
@@ -146,19 +146,19 @@ pub(crate) fn init(cx: &mut App) {
         .on_action(|_: &EditCopy, cx| forward_edit(cx, &input::Copy, Some(&terminal::Copy)))
         .on_action(|_: &EditPaste, cx| forward_edit(cx, &input::Paste, Some(&terminal::Paste)))
         .on_action(|_: &EditSelectAll, cx| forward_edit(cx, &input::SelectAll, Some(&terminal::SelectAll)))
-        .on_action(|_: &CheckUpdates, cx| MainWindow::with_restored_window(cx, crate::updater::manual))
-        .on_action(|_: &About, cx| MainWindow::with_restored_window(cx, crate::dialogs::about::open))
+        .on_action(|_: &CheckUpdates, cx| Hub::with_restored_window(cx, crate::updater::manual))
+        .on_action(|_: &About, cx| Hub::with_restored_window(cx, crate::dialogs::about::open))
         .on_action(|_: &HideApp, cx| cx.hide())
         .on_action(|_: &HideOthers, cx| cx.hide_other_apps())
         .on_action(|_: &ShowAll, cx| cx.unhide_other_apps())
-        .on_action(|_: &Minimize, cx| MainWindow::with_restored_window(cx, |window, _| window.minimize_window()))
-        .on_action(|_: &Zoom, cx| MainWindow::with_restored_window(cx, |window, _| window.zoom_window()))
-        .on_action(|_: &Fullscreen, cx| MainWindow::with_restored_window(cx, |window, _| window.toggle_fullscreen()))
-        .on_action(|_: &CloseWindow, cx| MainWindow::update(cx, Workspace::close_window))
-        .on_action(|_: &Quit, cx| MainWindow::update(cx, Workspace::request_quit))
+        .on_action(|_: &Minimize, cx| Hub::with_restored_window(cx, |window, _| window.minimize_window()))
+        .on_action(|_: &Zoom, cx| Hub::with_restored_window(cx, |window, _| window.zoom_window()))
+        .on_action(|_: &Fullscreen, cx| Hub::with_restored_window(cx, |window, _| window.toggle_fullscreen()))
+        .on_action(|_: &CloseWindow, cx| Hub::update(cx, Workspace::close_window))
+        .on_action(|_: &Quit, cx| Hub::update(cx, Workspace::request_quit))
         .on_action(|action: &ReopenForMenu, cx| {
             let name = action.0;
-            MainWindow::update(cx, move |s, w, cx| s.perform_hidden_menu(name, w, cx));
+            Hub::update(cx, move |s, w, cx| s.perform_hidden_menu(name, w, cx));
         });
 }
 

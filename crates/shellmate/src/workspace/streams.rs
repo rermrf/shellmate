@@ -55,8 +55,7 @@ impl Workspace {
             TerminalView::new(terminal.clone(), style, cx)
                 .with_search_icon(crate::icons::AppIcon::Search.at(14.))
         });
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.hub.session_ids.allocate();
         let subscription = self.watch_terminal(id, &terminal, window, cx);
         self.sessions.push(Session {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -69,9 +68,9 @@ impl Workspace {
             files: None,
             forward: None,
             monitor: None,
-            typed: None,
+            typed: None, typing: None,
             kind: SessionKind::Stream(Box::new(StreamSession::new(host))),
-            _subscription: subscription,
+            _subscription: Some(subscription),
         });
         self.start_session_archives(id, window, cx);
         self.activate(self.sessions.len() - 1, window, cx);
@@ -81,8 +80,8 @@ impl Workspace {
         if crate::prototype_fixture() {
             return;
         }
-        if self.secrets.is_locked() && self.sessions.iter().any(|s|s.id==id&&s.host().is_some_and(|h|h.protocol==Protocol::Telnet)) {
-            let this=cx.entity().downgrade();crate::security::ensure_unlocked(self.secrets.clone(),"连接 Telnet",window,cx,move|ok,w,cx|{if ok{this.update(cx,|s,cx|s.start_stream(id,w,cx)).ok();}});return;
+        if self.hub.secrets.is_locked() && self.sessions.iter().any(|s|s.id==id&&s.host().is_some_and(|h|h.protocol==Protocol::Telnet)) {
+            let this=cx.entity().downgrade();crate::security::ensure_unlocked(self.hub.secrets.clone(),"连接 Telnet",window,cx,move|ok,w,cx|{if ok{this.update(cx,|s,cx|s.start_stream(id,w,cx)).ok();}});return;
         }
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
             return;
@@ -118,10 +117,10 @@ impl Workspace {
             abort.abort();
         }
         stream.connected = false;
-        let secrets = self.secrets.clone();
+        let secrets = self.hub.secrets.clone();
         let endpoint = connect::Endpoint::of(&host, &connect::default_user());
-        let form = self
-            .pending_forms
+        let form = self.hub
+            .pending_forms.borrow()
             .get(&host.id)
             .filter(|(e, _)| *e == endpoint)
             .map(|(_, f)| f.answer.secret.clone());
@@ -140,9 +139,9 @@ impl Workspace {
         });
         stream.attempt = Some(join.abort_handle());
         cx.notify();
-        stream.task = Some(cx.spawn_in(window, async move |this, cx| {
+        stream.task = Some(cx.spawn(async move |_, cx| {
             let result = join.await;
-            this.update_in(cx, |this, window, cx| {
+            super::Route::Session(id).deliver(cx, |this, window, cx| {
                 let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else {
                     return;
                 };
@@ -169,7 +168,7 @@ impl Workspace {
                         });
                         stream.connected = true;
                         session.exited = false;
-                        let _ = this.store.borrow_mut().touch_connected(&host.id);
+                        let _ = this.hub.store.borrow_mut().touch_connected(&host.id);
                     }
                     outcome => {
                         let reason = match outcome {
@@ -185,8 +184,7 @@ impl Workspace {
                 }
                 this.sync_sidebar(cx);
                 cx.notify();
-            })
-            .ok();
+            });
         }));
     }
     pub(super) fn poll_streams(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -229,12 +227,11 @@ impl Workspace {
         {
             window.push_notification(Notification::error(e.to_string()), cx);
         }
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(180))
                 .await;
-            this.update_in(cx, |this, w, cx| this.poll_streams(w, cx))
-                .ok();
+            super::Route::Session(id).deliver(cx, |this, w, cx| this.poll_streams(w, cx));
         })
         .detach();
         cx.notify();

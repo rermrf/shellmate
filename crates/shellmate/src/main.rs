@@ -54,7 +54,7 @@ const FONTS: [&[u8]; 4] = [
 /// database), else `~/Library/Application Support/Shellmate/shellmate.db`. If that fails the
 /// app runs on a temporary in-memory library and returns the reason to show to the user.
 fn open_store() -> (HostStore, Option<String>) {
-    #[cfg(debug_assertions)] if proto::requested(){return (HostStore::open_in_memory().expect("fixture database"),None);}
+    #[cfg(debug_assertions)] if proto::requested() || std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s.starts_with("p6:")) {return (HostStore::open_in_memory().expect("fixture database"),None);}
     let path = std::env::var_os("SHELLMATE_DB").map(std::path::PathBuf::from).or_else(HostStore::default_path);
     let opened = match &path {
         Some(path) => HostStore::open(path),
@@ -99,7 +99,7 @@ fn main() {
             log::warn!("open url: workspace unavailable: {err}");
         }
     });
-    app.on_reopen(workspace::lifecycle::MainWindow::reopen);
+    app.on_reopen(workspace::Hub::reopen);
     app.run(move |cx: &mut App| {
         init_actions(cx);
         if let Err(err) = cx.text_system().add_fonts(FONTS.iter().map(|f| Cow::Borrowed(*f)).collect()) {
@@ -117,35 +117,11 @@ fn main() {
         };
         theme::apply(dark, cx);
 
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
-        #[cfg(debug_assertions)]
-        let bounds = if proto::requested() {
-            let (width, height) = proto::window_size();
-            Bounds::new(point(px(60.), px(60.)), size(px(width as f32), px(height as f32)))
-        } else { bounds };
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Shellmate".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(21.))),
-            }),
-            app_owns_titlebar_drag: true,
-            window_min_size: Some(size(px(980.), px(620.))),
-            ..Default::default()
-        };
         let (store, store_notice) = open_store();
-        let (main_window, workspace) = gpui::open_window(options, cx, move |window, cx| {
-            // The Dock icon follows the system appearance, like macOS's own dark icons.
-            window
-                .observe_window_appearance(|window, _| {
-                    app_icon::apply(app_icon::is_dark(window.appearance()))
-                })
-                .detach();
-            cx.new(|cx| Workspace::new(store, store_notice, window, cx))
-        })
-        .expect("failed to open the main window");
-        workspace::lifecycle::MainWindow::install(main_window, &workspace, cx);
+        workspace::Hub::init(store, store_notice.is_some(), cx);
+        let (main_window, workspace) = open_workspace(true, store_notice, cx).expect("failed to open the main window");
+        #[cfg(not(debug_assertions))]
+        let _ = (main_window, workspace);
         workspace::open_urls::listen(url_receiver, cx);
         #[cfg(debug_assertions)]
         workspace::open_urls::debug_hook(debug_sender, cx);
@@ -162,4 +138,36 @@ fn main() {
             main_window.update(cx, |_, window, _| menus::dump::after_frame(path.into(), window)).ok();
         }
     });
+}
+
+fn open_workspace(first: bool, store_notice: Option<String>, cx: &mut App) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
+    let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+    #[cfg(debug_assertions)]
+    let bounds = if proto::requested() {
+        let (width, height) = proto::window_size();
+        Bounds::new(point(px(60.), px(60.)), size(px(width as f32), px(height as f32)))
+    } else { bounds };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Shellmate".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(12.), px(21.))),
+        }),
+        app_owns_titlebar_drag: true,
+        window_min_size: Some(size(px(980.), px(620.))),
+        ..Default::default()
+    };
+    let (main_window, workspace) = gpui::open_window(options, cx, move |window, cx| {
+        // The Dock icon follows the system appearance, like macOS's own dark icons.
+        window
+            .observe_window_appearance(|window, _| {
+                app_icon::apply(app_icon::is_dark(window.appearance()))
+            })
+            .detach();
+        cx.new(|cx| Workspace::new(store_notice, first, window, cx))
+    })
+    ?;
+    workspace::Hub::install(main_window, &workspace, cx);
+    Ok((main_window, workspace))
 }

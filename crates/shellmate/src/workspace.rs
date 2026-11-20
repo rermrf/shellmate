@@ -29,6 +29,10 @@ use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
 mod files;
+mod hub;
+mod transfer;
+pub(crate) use hub::Hub;
+use hub::{Services, Route};
 mod forward;
 mod group;
 mod hosts;
@@ -163,8 +167,9 @@ struct Session {
     /// A command line to type into the shell as soon as it is there (a tab opened for a command: strace, du,
     /// or a `sudo` command the user has to type the password for).
     typed: Option<ssh::TypedLine>,
+    typing: Option<gpui::Task<()>>,
     kind: SessionKind,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 impl Drop for Session {
@@ -191,27 +196,13 @@ impl Session {
 }
 
 pub struct Workspace {
-    #[cfg(target_os = "macos")]
-    status_bar: status_item::StatusBar,
+    hub: Rc<Services>,
+    handle: gpui::AnyWindowHandle,
     hidden: bool,
-    quit_dialog: Option<gpui::WeakEntity<crate::dialogs::quit::QuitDialog>>,
     last_menu_state: Option<(crate::menus::MenuState, Option<menu_actions::Available>)>,
     hidden_focus_actions: Vec<&'static str>,
-    store: shellmate_store::SharedStore,
-    /// Saved passwords and key passphrases (the macOS keychain).
-    secrets: Arc<shellmate_store::CredentialStore>,
-    security_task: Option<gpui::Task<()>>,
-    pending_forms: HashMap<HostId, (connect::Endpoint, connect::FormCredential)>,
-    book: Rc<HostBook>,
     sidebar: Entity<Sidebar>,
     sessions: Vec<Session>,
-    preferences: shellmate_store::Preferences,
-    data_root: PathBuf,
-    log_root: PathBuf,
-    running_recordings: HashMap<usize,archive::RunningRecording>,
-    archive_task: Option<gpui::Task<()>>,
-    records_window: Option<gpui::WeakEntity<crate::records::panel::RecordsWindow>>,
-    temporary_hosts: HashMap<HostId, shellmate_core::Host>,
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
     ai_drawer: Option<Entity<crate::ai::panel::Drawer>>,
@@ -222,7 +213,6 @@ pub struct Workspace {
     broadcast: crate::productivity::multi::Broadcast,
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
-    recent_sessions: Vec<usize>,
     session_menu: Option<multi::OpenSessionMenu>,
     #[cfg(debug_assertions)]
     review_confirmation: Option<gpui::WeakEntity<crate::productivity::panel::Confirmation>>,
@@ -230,22 +220,10 @@ pub struct Workspace {
     live_review: bool,
     picker: Option<Entity<crate::productivity::panel::Picker>>,
     picker_subscription: Option<Subscription>,
-    /// The host library is a temporary in-memory one (the saved file could not be opened): nothing
-    /// saved in it, rules included, survives the run.
-    library_is_temporary: bool,
-    /// What the servers granted for remote forwards in this run, shared by every connection (see `GrantMemory`).
-    forward_grants: shellmate_forward::GrantMemory,
-    /// Debug review hook: the monitor panels show made-up data and ignore what the servers say.
     monitor_frozen: bool,
-    local_monitor: Option<group::GroupMonitor>,
-    /// The SSH connections behind the SSH tabs; a connection is shared by the tabs copied from each other.
-    groups: Vec<group::ConnGroup>,
     active: Option<usize>,
     sidebar_open: bool,
     sidebar_motion: SidebarMotion,
-    next_id: usize,
-    next_group: usize,
-    user_host: SharedString,
     focus_handle: FocusHandle,
     /// The editor modal, if one is open (one at a time per window).
     editor: Option<Entity<FileEditor>>,
@@ -262,8 +240,10 @@ fn push_notification_later(window: &mut Window, cx: &mut App, notification: Noti
 impl Workspace {
     /// `store_notice` is shown once when the host library could not be opened and
     /// `store` is a temporary in-memory fallback.
-    pub fn new(store: HostStore, store_notice: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let book = Rc::new(HostBook::default());
+    pub fn new(store_notice: Option<String>, first: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let hub = cx.global::<Hub>().services.clone();
+        let book = hub.book.borrow().clone();
+        let store = hub.store.borrow();
         // The sidebar comes back the way it was left.
         let collapsed = match store.setting(SIDEBAR_COLLAPSED) {
             Ok(value) => value.as_deref() == Some("1"),
@@ -284,16 +264,16 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.observe_window_activation(window, |s, w, cx| {
-                if !w.is_window_active() { s.end_drawer_drag(cx); }
+                if w.is_window_active() {
+                    Hub::activated(s.handle, cx);
+                    s.last_menu_state = None;
+                    s.sync_menus(cx);
+                } else { s.end_drawer_drag(cx); }
             }),
             cx.subscribe_in(&commands, window, Self::on_command_event),
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
         ];
-        let preferences=store.preferences().unwrap_or_default();
-        let store=shellmate_store::SharedStore::new(store);
-        let secrets=crate::security::coordinator(store.clone());
-        let workspace=cx.entity().downgrade();
-        crate::updater::init(store.clone(), workspace.clone(), cx);
+        drop(store);
         let mut subscriptions=subscriptions;
         // Background session changes can affect menu validation while AppKit has stopped drawing.
         subscriptions.push(cx.observe_self(|s, cx| {
@@ -301,59 +281,41 @@ impl Workspace {
             s.sync_status_item(cx);
             if s.hidden { s.sync_menus(cx); }
         }));
-        subscriptions.push(cx.intercept_keystrokes(move|_,_,cx|{workspace.update(cx,|s,_|s.secrets.activity()).ok();}));
         let mut this = Self {
-            #[cfg(target_os = "macos")]
-            status_bar: status_item::StatusBar::new(cx),
+            hub,
+            handle: window.window_handle(),
             hidden: false,
-            quit_dialog: None,
             last_menu_state: None,
             hidden_focus_actions: Vec::new(),
-            preferences,
-            data_root:shellmate_term::archive::data_root(),log_root:shellmate_term::archive::log_root(),
-            running_recordings:HashMap::new(),archive_task:None,records_window:None,
-            store,
-            secrets, security_task: None,
-            pending_forms: HashMap::new(),
-            book,
             sidebar,
             sessions: Vec::new(),
-            temporary_hosts: HashMap::new(),
             commands,
             commands_open: false, ai_drawer:None,ai_open:false,
             ai_drawer_width, ai_drawer_drag: Default::default(),
             drawer_motion: Default::default(),
-            broadcast: Default::default(), broadcast_bar, split: Default::default(),recent_sessions:Vec::new(),session_menu:None,
+            broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
             picker: None,
             picker_subscription: None,
-            library_is_temporary: store_notice.is_some(),
-            forward_grants: shellmate_forward::GrantMemory::new(),
             monitor_frozen: false,
-            local_monitor: None,
-            groups: Vec::new(),
             active: None,
             sidebar_open: !collapsed,
             sidebar_motion: SidebarMotion::settled(!collapsed),
-            next_id: 1,
-            next_group: 1,
-            user_host: user_at_host().into(),
             focus_handle: cx.focus_handle(),
             editor: None,
             _editor_subscription: None,
             _subscriptions: subscriptions,
         };
-        this.security_task=Some(cx.spawn_in(window,async move|this,cx|{loop{cx.background_executor().timer(std::time::Duration::from_secs(1)).await; if this.update_in(cx,|s,w,cx|{if s.secrets.tick(){w.push_notification(Notification::info("凭据库已锁定"),cx);}}).is_err(){break}}}));
         if let Some(message) = store_notice {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
-        this.reload_book(window, cx);
-        let open_local=!crate::prototype_fixture();
+        if first { this.reload_book(window, cx); }
+        let open_local=first && !crate::prototype_fixture();
         if open_local {this.open_local(window, cx);}
         #[cfg(target_os = "macos")]
         this.sync_status_item(cx);
-        this.archive_timer(window,cx);
+        this.watch_archive_shutdown(cx);
         this
     }
 
@@ -383,11 +345,11 @@ impl Workspace {
 
     /// Re-reads hosts and groups from the store into the sidebar.
     fn reload_book(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let loaded = self.store.borrow().book();
+        let loaded = self.hub.store.borrow().book();
         match loaded {
             Ok(book) => {
-                self.book = Rc::new(book);
-                self.sidebar.update(cx, |sidebar, cx| sidebar.set_book(self.book.clone(), cx));
+                *self.hub.book.borrow_mut() = Rc::new(book);
+                self.project(Route::All, cx, |w, cx| { w.sidebar.update(cx, |sidebar, cx| sidebar.set_book(w.hub.book.borrow().clone(), cx)); });
             }
             Err(err) => {
                 log::error!("failed to load hosts: {err}");
@@ -421,7 +383,7 @@ impl Workspace {
     /// The loaded host book (debug review hook).
     #[cfg(debug_assertions)]
     pub(crate) fn book(&self) -> Rc<HostBook> {
-        self.book.clone()
+        self.hub.book.borrow().clone()
     }
 
     // ---- sessions ------------------------------------------------------
@@ -434,7 +396,7 @@ impl Workspace {
     fn open_local_in(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let style = cx.terminal_style();
         let palette = style.palette.clone();
-        let options = PtyOptions { cwd, login:self.preferences.get(shellmate_store::Preference::LoginShell), ..PtyOptions::default() };
+        let options = PtyOptions { cwd, login:self.hub.preferences.borrow().get(shellmate_store::Preference::LoginShell), ..PtyOptions::default() };
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(terminal.clone(), style, cx).with_search_icon(crate::icons::AppIcon::Search.at(14.));
@@ -442,8 +404,7 @@ impl Workspace {
             view
         });
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.hub.session_ids.allocate();
         let subscription = self.watch_terminal(id, &terminal, window, cx);
 
         let open_locals = self.sessions.len();
@@ -459,9 +420,9 @@ impl Workspace {
             files: None,
             forward: None,
             monitor: None,
-            typed: None,
+            typed: None, typing: None,
             kind: SessionKind::Local,
-            _subscription: subscription,
+            _subscription: Some(subscription),
         });
         self.start_session_archives(id,window,cx);
         self.sessions.last().unwrap().terminal.update(cx,|t,cx|t.start_local(options,cx));
@@ -544,13 +505,13 @@ impl Workspace {
         // connection that is still being made is cancelled together with the dialog it asked.
         let group = self.sessions[ix].ssh().map(|ssh| ssh.group);
         let closed=self.sessions[ix].id;
-        if let Some(group) = group.and_then(|id| self.group_mut(id)) && group.preload.as_ref().is_some_and(|(owner, _)| *owner == closed) { group.preload = None; }
-        let was_recording=self.running_recordings.contains_key(&closed);
+        if let Some(mut group) = group.and_then(|id| self.group_mut(id)) && group.preload.as_ref().is_some_and(|(owner, _)| *owner == closed) { group.preload = None; }
+        let was_recording=self.hub.running_recordings.borrow().contains_key(&closed);
         if let Some(error)=self.finalize_archives(closed,cx){window.push_notification(Notification::error(error),cx);}
         else if was_recording{window.push_notification(Notification::success("已保存 .cast · 可在「记录」中回放"),cx);}
         self.split.close_session(self.main_id(),closed);
         self.broadcast.checked.remove(&closed);
-        self.recent_sessions.retain(|id|*id!=closed);
+        self.hub.recent_sessions.borrow_mut().retain(|id|*id!=closed);
         self.session_menu=None;
         self.sessions[ix].terminal.read(cx).agent_liveness().store(false, std::sync::atomic::Ordering::Release);
         self.sessions.remove(ix);
@@ -648,7 +609,7 @@ impl Workspace {
         let animate = animate && std::env::var_os("SHELLMATE_DEMO").is_none();
         self.sidebar_motion.retarget(open, cx.background_executor().now(), animate);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(!open, cx));
-        if let Err(err) = self.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
+        if let Err(err) = self.hub.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
             log::warn!("could not save the sidebar setting: {err}");
         }
         cx.notify();
@@ -1027,7 +988,7 @@ impl Workspace {
             let options = t.options().cloned().unwrap_or_default();
             (options.command_line(), shell_name(&options.shell_path()), t.foreground_process())
         });
-        let mut parts = vec![self.user_host.to_string(), command];
+        let mut parts = vec![self.hub.user_host.borrow().to_string(), command];
         if let Some(cwd) = fg.as_ref().and_then(|f| f.cwd.as_deref()) {
             parts.push(tilde(cwd));
         }
@@ -1056,7 +1017,8 @@ impl Workspace {
             vec![format!("PTY {}×{}",size.cols,size.rows),"xterm-256color".into(),"UTF-8".into(),mosh.footer()]
         }else{status_fields};
         let view = focused.view.clone();
-        let recording=self.running_recordings.get(&focused.id);
+        let recordings=self.hub.running_recordings.borrow();
+        let recording=recordings.get(&focused.id);
         let recording_seconds = recording.map(|r| r.display_seconds());
         #[cfg(debug_assertions)]
         let recording_seconds = if std::env::var("SHELLMATE_DEMO").is_ok_and(|s| crate::proto::request(s.strip_prefix("proto:").unwrap_or(&s)).0 == "rv-recording") {
@@ -1182,7 +1144,7 @@ impl Render for Workspace {
         self.sidebar.update(cx, |sidebar, _| sidebar.frame = self.sidebar_motion.frame);
         if !self.hidden { self.sync_menus(cx); }
         let p = cx.palette().clone();
-        let activity=self.secrets.clone();
+        let activity=self.hub.secrets.clone();
         let content = match self.active.and_then(|ix| self.sessions.get(ix)) {
             Some(Session { panel: Panel::Files, files: Some(files), .. }) => {
                 div().flex_1().min_w_0().min_h_0().flex().child(files.panel.clone()).into_any_element()

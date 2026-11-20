@@ -130,8 +130,8 @@ impl Workspace {
     pub(super) fn open_ai(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.ai_drawer.is_none() {
             let workspace = cx.entity().downgrade();
-            let db = self.store.clone();
-            let credentials = self.secrets.clone();
+            let db = self.hub.store.clone();
+            let credentials = self.hub.secrets.clone();
             self.ai_drawer =
                 Some(cx.new(|cx| crate::ai::panel::Drawer::new(workspace, db, credentials, w, cx)));
         }

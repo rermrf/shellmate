@@ -14,8 +14,8 @@ impl Workspace {
             "shellmate-archive-demo-{}",
             shellmate_core::HostId::generate()
         ));
-        self.data_root = scratch.join("data");
-        self.log_root = scratch.join("logs");
+        *self.hub.data_root.borrow_mut() = scratch.join("data");
+        *self.hub.log_root.borrow_mut() = scratch.join("logs");
         if let Some(section) = scenario.strip_prefix("settings-") {
             let section = match section {
                 "cred" => 0,
@@ -30,7 +30,7 @@ impl Workspace {
         if scenario == "recording" {
             if let Some(id) = self.focused_session().map(|s| s.id) {
                 let _ = self.start_recording(id, cx);
-                if let Some(r) = self.running_recordings.get_mut(&id) {
+                if let Some(r) = self.hub.running_recordings.borrow_mut().get_mut(&id) {
                     r.demo_elapsed = Some(12.);
                 }
             }
@@ -46,7 +46,7 @@ impl Workspace {
         .enumerate()
         {
             let (path, file) =
-                archive::recording_file(&self.data_root, host, now - i as i64 * 86400).unwrap();
+                archive::recording_file(&self.hub.data_root.borrow(), host, now - i as i64 * 86400).unwrap();
             let mut header = Header::new(100, 28);
             header.title = Some(title.into());
             header.timestamp = Some(now);
@@ -83,9 +83,9 @@ impl Workspace {
                 cols: 100,
                 rows: 28,
             };
-            self.store.borrow_mut().add_recording(&row).unwrap();
+            self.hub.store.borrow_mut().add_recording(&row).unwrap();
         }
-        let mut log = shellmate_term::session_log::LogWriter::new(self.log_root.clone(), "prod-web-01");
+        let mut log = shellmate_term::session_log::LogWriter::new(self.hub.log_root.borrow().clone(), "prod-web-01");
         log.lines(
             &[
                 "nginx: configuration file syntax is ok",
@@ -101,7 +101,7 @@ impl Workspace {
         .unwrap();
         log.flush().unwrap();
         self.open_records(None, scenario == "logs", window, cx);
-        if let Some(view) = self.records_window.as_ref().and_then(|v| v.upgrade()) {
+        if let Some(view) = self.hub.records_window.borrow().as_ref().and_then(|v| v.upgrade()) {
             view.update(cx, |r, cx| {
                 if scenario == "logs" {
                     r.demo_query("nginx", window, cx);
@@ -118,8 +118,8 @@ impl Workspace {
         let Some((mode, name)) = args.split_once(':') else {
             return;
         };
-        let Some(host) = self
-            .book
+        let Some(host) = self.hub
+            .book.borrow()
             .hosts
             .iter()
             .find(|h| h.name == name)
@@ -202,7 +202,7 @@ impl Workspace {
                     match w.stop_recording(id, cx) {
                         Ok(row) => {
                             w.open_records(row, false, window, cx);
-                            if let Some(view) = w.records_window.as_ref().and_then(|v| v.upgrade()) {
+                            if let Some(view) = w.hub.records_window.borrow().as_ref().and_then(|v| v.upgrade()) {
                                 view.update(cx, |r, cx| r.demo_position(true, cx));
                             }
                         }

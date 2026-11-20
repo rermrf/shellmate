@@ -1,5 +1,5 @@
 //! Finder, Dock drops and the debug hook share one ordered queue, including at cold launch.
-use super::lifecycle::MainWindow;
+use super::Hub;
 use gpui::App;
 use reqwest::Url;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ pub(crate) fn listen(receiver: async_channel::Receiver<Vec<String>>, cx: &mut Ap
                 .await;
             if !dirs.is_empty() {
                 cx.update(|cx| {
-                    MainWindow::with_restored_workspace(cx, move |workspace, window, cx| {
+                    Hub::with_restored_workspace(cx, move |workspace, window, cx| {
                         for dir in dirs {
                             log::info!("open url: local terminal in {}", dir.display());
                             workspace.open_local_in(Some(dir), window, cx);

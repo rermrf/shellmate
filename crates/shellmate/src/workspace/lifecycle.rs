@@ -1,79 +1,8 @@
-//! The single workspace window outlives its AppKit visibility.
-use super::{SessionKind, Workspace, ssh::SshStatus};
+//! Workspace visibility and application-wide quit coordination.
+use super::{Hub, SessionKind, Workspace, ssh::SshStatus};
 use crate::dialogs::quit::QuitDialog;
-use gpui::{AnyWindowHandle, App, Context, Entity, Global, WeakEntity, Window};
+use gpui::{App, Context, WeakEntity, Window};
 use shellmate_store::{Preference, Preferences};
-
-#[derive(Clone)]
-pub(crate) struct MainWindow {
-    handle: AnyWindowHandle,
-    workspace: WeakEntity<Workspace>,
-}
-
-impl Global for MainWindow {}
-
-impl MainWindow {
-    pub(crate) fn install(handle: AnyWindowHandle, workspace: &Entity<Workspace>, cx: &mut App) {
-        let workspace = workspace.downgrade();
-        cx.set_global(Self {
-            handle,
-            workspace: workspace.clone(),
-        });
-        handle
-            .update(cx, |_, window, cx| {
-                window.on_window_should_close(cx, move |window, cx| {
-                    workspace
-                        .update(cx, |s, cx| s.close_window(window, cx))
-                        .ok();
-                    false
-                });
-            })
-            .expect("newly opened workspace window");
-    }
-
-    pub(crate) fn update(
-        cx: &mut App,
-        run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) {
-        if let Some(main) = cx.try_global::<Self>().cloned() {
-            // An action can bubble here from inside an update of this very window.
-            cx.defer(move |cx| {
-                main.handle
-                    .update(cx, |_, window, cx| {
-                        main.workspace.update(cx, |s, cx| run(s, window, cx)).ok();
-                    })
-                    .ok();
-            });
-        }
-    }
-
-    pub(super) fn with_restored_workspace(
-        cx: &mut App,
-        run: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) {
-        Self::update(cx, move |s, window, cx| {
-            s.show_window(window, cx);
-            run(s, window, cx);
-        });
-    }
-
-    pub(crate) fn with_restored_window(
-        cx: &mut App,
-        run: impl FnOnce(&mut Window, &mut App) + 'static,
-    ) {
-        Self::with_restored_workspace(cx, move |_, window, cx| run(window, cx));
-    }
-
-    pub(crate) fn reopen(cx: &mut App) {
-        if let Some(main) = cx.try_global::<Self>().cloned() {
-            main.handle
-                .update(cx, |_, w, cx| {
-                    main.workspace.update(cx, |s, cx| s.show_window(w, cx)).ok();
-                })
-                .ok();
-        }
-    }
-}
 
 #[cfg(target_os = "macos")]
 fn native_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
@@ -145,6 +74,9 @@ pub(super) struct Activity {
 }
 
 impl Activity {
+    fn across_windows(sessions: impl IntoIterator<Item=usize>, transfers: usize, forwards: usize) -> Self {
+        Self { sessions: sessions.into_iter().sum(), transfers, forwards }
+    }
     fn should_confirm(&self, enabled: bool) -> bool {
         enabled && *self != Self::default()
     }
@@ -167,7 +99,7 @@ impl Activity {
 impl Workspace {
     #[cfg(target_os = "macos")]
     pub(super) fn sync_hidden_activation_policy(&self, cx: &mut App) {
-        let policy = if close_behavior(&self.preferences) == Close::HideAsAccessory {
+        let policy = if self.peers(super::Route::All,cx).iter().all(|e| e.workspace.upgrade().is_none_or(|w| w.read(cx).hidden)) && close_behavior(&self.hub.preferences.borrow()) == Close::HideAsAccessory {
             gpui::ActivationPolicy::Accessory
         } else {
             gpui::ActivationPolicy::Regular
@@ -176,7 +108,7 @@ impl Workspace {
     }
 
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if close_behavior(&self.preferences) == Close::Quit {
+        if close_behavior(&self.hub.preferences.borrow()) == Close::Quit {
             return self.request_quit(window, cx);
         }
         if self.hidden {
@@ -240,7 +172,8 @@ impl Workspace {
     fn set_window_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
         self.hidden = hidden;
         // The component input caret has its own timer independent of AppKit's display link.
-        gpui::base::Theme::global_mut(cx).cursor_blink = if hidden {
+        let all_hidden = hidden && self.peers(super::Route::All,cx).iter().all(|e| e.workspace.upgrade().is_none_or(|w| w.read(cx).hidden));
+        gpui::base::Theme::global_mut(cx).cursor_blink = if all_hidden {
             gpui::base::input::CursorBlink::steady()
         } else {
             gpui::component::Theme::global(cx).cursor_blink
@@ -250,14 +183,14 @@ impl Workspace {
                 .view
                 .update(cx, |view, cx| view.set_display_paused(hidden, cx));
         }
-        if let Some(records) = self.records_window.as_ref().and_then(WeakEntity::upgrade) {
+        if let Some(records) = self.hub.records_window.borrow().as_ref().and_then(WeakEntity::upgrade) {
             records.update(cx, |panel, cx| panel.set_window_visible(!hidden, cx));
         }
         self.sync_monitor_activity(cx);
     }
 
-    fn quit_activity(&self, cx: &mut Context<Self>) -> Activity {
-        let sessions = self
+    fn busy_sessions(&self, cx: &mut App) -> usize {
+        self
             .sessions
             .iter()
             .filter(|s| match &s.kind {
@@ -275,33 +208,37 @@ impl Workspace {
                         })
                 }
             })
-            .count();
-        let transfers = self
-            .groups
+            .count()
+    }
+    fn quit_activity(&self, cx: &mut Context<Self>) -> Activity {
+        let mut counts = vec![self.busy_sessions(cx)];
+        for entry in self.peers(super::Route::All,cx) {
+            if let Some(peer) = entry.workspace.upgrade() {
+                counts.push(peer.update(cx, |s,cx| s.busy_sessions(cx)));
+            }
+        }
+        let transfers = self.hub
+            .groups.borrow()
             .iter()
             .filter_map(|g| g.link.as_ref())
             .map(|link| link.queue().running_count())
             .sum();
-        let forwards = self
-            .groups
+        let forwards = self.hub
+            .groups.borrow()
             .iter()
             .filter_map(|g| g.forward.as_ref())
             .map(|f| f.forwarder.listening_rules())
             .sum();
-        Activity {
-            sessions,
-            transfers,
-            forwards,
-        }
+        Activity::across_windows(counts, transfers, forwards)
     }
 
     pub(crate) fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_window(window, cx);
         let activity = self.quit_activity(cx);
-        if activity.should_confirm(self.preferences.get(Preference::ConfirmQuit)) {
+        if activity.should_confirm(self.hub.preferences.borrow().get(Preference::ConfirmQuit)) {
             self.confirm_quit(activity, window, cx);
         } else {
-            cx.quit();
+            Hub::quit(cx);
         }
     }
 
@@ -311,13 +248,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .quit_dialog
+        if self.hub
+            .quit_dialog.borrow()
             .as_ref()
             .and_then(WeakEntity::upgrade)
             .is_none()
         {
-            self.quit_dialog = Some(QuitDialog::open(
+            *self.hub.quit_dialog.borrow_mut() = Some(QuitDialog::open(
                 activity.message(),
                 cx.weak_entity(),
                 window,
@@ -331,18 +268,20 @@ impl Workspace {
 pub(crate) fn debug_hooks(cx: &mut App) {
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
+        ("SHELLMATE_DEBUG_MOVE_TO_NEW_WINDOW_AFTER", super::transfer::move_to_new_window),
+        ("SHELLMATE_DEBUG_MERGE_BACK_AFTER", super::transfer::merge_back),
         #[cfg(target_os = "macos")]
         ("SHELLMATE_DEBUG_STATUS_CLICK_AFTER", |cx| {
-            MainWindow::update(cx, |s, _, _| s.status_bar.debug_click())
+            Hub::update(cx, |s, _, _| s.hub.status_bar.borrow().debug_click())
         }),
         #[cfg(target_os = "macos")]
         ("SHELLMATE_DEBUG_STATUS_MENU_AFTER", |cx| {
-            MainWindow::update(cx, |s, _, _| s.status_bar.debug_menu())
+            Hub::update(cx, |s, _, _| s.hub.status_bar.borrow().debug_menu())
         }),
         ("SHELLMATE_DEBUG_HIDE_AFTER", |cx| {
-            MainWindow::update(cx, Workspace::close_window)
+            Hub::update(cx, Workspace::close_window)
         }),
-        ("SHELLMATE_DEBUG_REOPEN_AFTER", MainWindow::reopen),
+        ("SHELLMATE_DEBUG_REOPEN_AFTER", Hub::reopen),
         ("SHELLMATE_DEBUG_QUIT_AFTER", |cx| {
             cx.dispatch_action(&super::Quit)
         }),
@@ -375,6 +314,12 @@ mod tests {
         assert_eq!(close_behavior(&prefs), Close::Quit);
         prefs.set(Preference::ShowStatusIcon, true);
         assert_eq!(close_behavior(&prefs), Close::Quit);
+    }
+
+    #[test]
+    fn quit_activity_counts_each_shared_engine_once() {
+        let activity = Activity::across_windows([2, 0, 3], 1, 4);
+        assert_eq!((activity.sessions,activity.transfers,activity.forwards),(5,1,4));
     }
 
     #[test]

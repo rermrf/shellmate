@@ -136,20 +136,7 @@ impl MonitorPanel {
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("过滤命令、用户或 PID"));
         let service_query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索服务"));
-        let subscriptions = vec![
-            cx.subscribe_in(&query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.refresh(cx);
-                    cx.notify();
-                }
-            }),
-            cx.subscribe_in(&service_query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.refresh_services(cx);
-                    cx.notify();
-                }
-            }),
-        ];
+        let subscriptions = Self::watch_queries(&query, &service_query, window, cx);
         let ports = data.ports.as_ref().map(|_| ports::PortsPage::new(window, cx));
         let mut panel = Self {
             host: host.into(),
@@ -186,6 +173,32 @@ impl MonitorPanel {
         panel.refresh(cx);
         panel.refresh_services(cx);
         panel
+    }
+
+    fn watch_queries(query: &Entity<InputState>, service_query: &Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> Vec<Subscription> {
+        vec![
+            cx.subscribe_in(query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh(cx);
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(service_query, window, |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_services(cx);
+                    cx.notify();
+                }
+            }),
+        ]
+    }
+
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use shellmate_term::view::move_input;
+        self.focus = cx.focus_handle();
+        self.query = move_input(&self.query, "过滤命令、用户或 PID", window, cx);
+        self.service_query = move_input(&self.service_query, "搜索服务", window, cx);
+        self._subscriptions = Self::watch_queries(&self.query, &self.service_query, window, cx);
+        if let Some(ports) = &mut self.ports { ports.rebind_window(window, cx); }
     }
 
     /// What the panel shows now.

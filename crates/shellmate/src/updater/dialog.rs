@@ -241,10 +241,9 @@ impl Render for UpdateDialog {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("更新已准备好"),
                 );
-                let count: usize = s
-                    .windows
+                let count: usize = crate::workspace::Hub::windows(cx)
                     .iter()
-                    .filter_map(|w| w.read_with(cx, |w, _| w.live_session_count()).ok())
+                    .filter_map(|entry| entry.workspace.upgrade().map(|w| w.read(cx).live_session_count()))
                     .sum();
                 #[cfg(debug_assertions)]
                 let count = if crate::prototype_fixture() { 2 } else { count };

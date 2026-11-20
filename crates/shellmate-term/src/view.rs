@@ -112,6 +112,17 @@ pub struct TerminalView {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Recreate a single-line gpui-component input with the new window's focus observers.
+pub fn move_input(input: &gpui::Entity<InputState>, placeholder: &'static str, window: &mut Window, cx: &mut App) -> gpui::Entity<InputState> {
+    let state = input.read(cx);
+    let (value, selection, reversed) = (state.value().to_string(), state.selected_range(), state.is_selection_reversed());
+    cx.new(|cx| {
+        let mut state = InputState::new(window,cx).placeholder(placeholder).default_value(value);
+        state.set_selected_range_with_direction(selection, reversed, cx);
+        state
+    })
+}
+
 impl TerminalView {
     pub fn new(terminal: gpui::Entity<Terminal>, style: TerminalStyle, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
@@ -262,13 +273,30 @@ impl TerminalView {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("在输出中搜索"));
-        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+        let subscription = Self::watch_search(&input, window, cx);
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.search = Some(Search { input, matches: Vec::new(), active: None, _subscription: subscription });
+        cx.notify();
+    }
+
+    fn watch_search(input: &gpui::Entity<InputState>, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| match event {
             InputEvent::Change => this.refresh_search(true, cx),
             InputEvent::PressEnter { shift, .. } => this.step_search(!*shift, cx),
             _ => {}
-        });
-        input.update(cx, |state, cx| state.focus(window, cx));
-        self.search = Some(Search { input, matches: Vec::new(), active: None, _subscription: subscription });
+        })
+    }
+
+    pub fn rebind_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle = cx.focus_handle();
+        self.geometry = None;
+        self.marked_text = None;
+        self.selecting = false;
+        self.hold_grid_size = false;
+        if let Some(search) = &mut self.search {
+            search.input = move_input(&search.input, "在输出中搜索", window, cx);
+            search._subscription = Self::watch_search(&search.input, window, cx);
+        }
         cx.notify();
     }
 

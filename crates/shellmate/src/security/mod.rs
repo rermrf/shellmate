@@ -7,7 +7,7 @@ pub use dialogs::PreviewDialog;
 use shellmate_store::{CredentialStore, SharedStore};
 use std::sync::Arc;
 pub fn coordinator(db: SharedStore) -> Arc<CredentialStore> {
-    if crate::prototype_fixture() {
+    if crate::prototype_fixture() || (cfg!(debug_assertions) && std::env::var("SHELLMATE_DEMO").is_ok_and(|s| s.starts_with("p6:"))) {
         return fixture_coordinator(db);
     }
     Arc::new(CredentialStore::new(

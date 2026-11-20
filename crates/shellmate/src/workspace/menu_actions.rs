@@ -98,11 +98,11 @@ fn hidden_menus(state: &MenuState, available: Available, focused: &[&str]) -> Ve
 impl Workspace {
     /// Only the master-password vault can be locked; the system keychain unlocks with the login session.
     pub(super) fn vault_lock_available(&self) -> bool {
-        self.secrets.backend() == shellmate_store::Backend::Master
+        self.hub.secrets.backend() == shellmate_store::Backend::Master
     }
 
     pub(super) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.secrets.lock();
+        self.hub.secrets.lock();
         window.push_notification(Notification::info("凭据库已锁定"), cx);
     }
 
@@ -120,11 +120,12 @@ impl Workspace {
     }
 
     pub(super) fn sync_menus(&mut self, cx: &mut Context<Self>) {
+        if Hub::windows(cx).first().is_some_and(|e| e.handle != self.handle) { return; }
         let state = MenuState {
             sidebar_open: self.sidebar_open,
             panel: self.active.and_then(|index| self.sessions.get(index)).map(|session| session.panel),
             split: self.split.other.is_some(),
-            recording: self.focused_session().is_some_and(|session| self.running_recordings.contains_key(&session.id)),
+            recording: self.focused_session().is_some_and(|session| self.hub.running_recordings.borrow().contains_key(&session.id)),
             broadcast: self.broadcast.enabled,
             dark: cx.is_dark(),
             commands_open: self.commands_open,
@@ -138,7 +139,8 @@ impl Workspace {
                 Some(available) => hidden_menus(&state, available, &self.hidden_focus_actions),
                 None => menus(&state),
             };
-            cx.defer(move |cx| cx.set_menus(tree));
+            let handle = self.handle;
+            cx.defer(move |cx| { if Hub::windows(cx).first().is_some_and(|e| e.handle == handle) { cx.set_menus(tree); } });
         }
     }
 
@@ -146,7 +148,7 @@ impl Workspace {
         let session = self.active.and_then(|index| self.sessions.get(index));
         let focused_id = self.focused_session().map(|session| session.id);
         let mut available = Available::for_sessions(&self.session_rows(cx), session.map(|s| (s.id, s.panel)), focused_id,
-            &self.split, focused_id.is_some_and(|id| self.running_recordings.contains_key(&id)));
+            &self.split, focused_id.is_some_and(|id| self.hub.running_recordings.borrow().contains_key(&id)));
         available.vault_lock = self.vault_lock_available();
         available
     }

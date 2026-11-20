@@ -30,12 +30,10 @@ impl Workspace {
         self.drawer_motion = Default::default();
         self.ai_drawer_width = if scene == "ai-markdown-wide" { 560. } else { drawer_resize::DEFAULT_WIDTH };
         self.sessions.clear();
-        self.groups.clear();
+        self.hub.groups.borrow_mut().clear();
         self.active = None;
         self.monitor_frozen = true;
-        self.preferences = Default::default();
-        self.store = shellmate_store::SharedStore::new(HostStore::open_in_memory().expect("fixture"));
-        self.secrets=crate::security::fixture_coordinator(self.store.clone());
+        *self.hub.preferences.borrow_mut() = Default::default();
         for (i, (name, tone)) in [
             ("生产环境", GroupTone::Accent),
             ("测试环境", GroupTone::Warn),
@@ -45,7 +43,7 @@ impl Workspace {
         .into_iter()
         .enumerate()
         {
-            self.store
+            self.hub.store
                 .borrow_mut()
                 .save_group(&Group {
                     id: GroupId::from_raw(name),
@@ -115,20 +113,20 @@ impl Workspace {
             for (i,host) in hosts.iter_mut().enumerate() {
                 host.name=format!("{}-{i}",proto::stress::HOST);host.addr=host.name.clone();host.user=Some(proto::stress::USER.into());host.port=65535;host.protocol=Protocol::Ssh;
             }
-            let mut group=self.store.borrow().groups().unwrap().remove(0);
-            group.name="生产环境 · 欧洲西部数据中心 · 客户数据与结算平台".into();self.store.borrow_mut().save_group(&group).unwrap();
+            let mut group=self.hub.store.borrow().groups().unwrap().remove(0);
+            group.name="生产环境 · 欧洲西部数据中心 · 客户数据与结算平台".into();self.hub.store.borrow_mut().save_group(&group).unwrap();
         }
-        self.store.borrow_mut().save_hosts(&hosts).unwrap();
+        self.hub.store.borrow_mut().save_hosts(&hosts).unwrap();
         self.reload_book(window, cx);
-        self.store
+        self.hub.store
             .borrow_mut()
             .save_snippets(&crate::productivity::model::samples())
             .unwrap();
         self.refresh_snippets(cx);
         for h in DATA["HIST"].a().iter().rev() {
             let label = h["h"].s();
-            let host = self
-                .book
+            let host = self.hub
+                .book.borrow()
                 .hosts
                 .iter()
                 .find(|x| x.name == label)
@@ -139,7 +137,7 @@ impl Workspace {
                 v if v.contains(':') => proto::timestamp(v),
                 v => proto::timestamp(&format!("{v} 09:41")),
             };
-            self.store
+            self.hub.store
                 .borrow_mut()
                 .add_history(&shellmate_store::HistoryEntry {
                     id: 0,
@@ -158,7 +156,7 @@ impl Workspace {
         if scene=="mosh" {session_sources.push(("h8","MOSH"));}
         if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
         for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
-            let host = self.book.host(&HostId::from_raw(host_id)).unwrap().clone();
+            let host = self.hub.book.borrow().host(&HostId::from_raw(host_id)).unwrap().clone();
             let terminal = cx.new(|cx| Terminal::new(cx.terminal_style().palette, cx));
             terminal.update(cx, |t, cx| {
                 let mut size = t.size();
@@ -206,7 +204,7 @@ impl Workspace {
                 v.top_radius = CARD_RADIUS;
                 v
             });
-            let id = i + 1;
+            let id = self.hub.session_ids.allocate();
             let subscription = self.watch_terminal(id, &terminal, window, cx);
             let mut ssh = ssh::SshSession::demo(host.clone());
             if let Some(mosh)=&mut ssh.mosh {mosh.independent=true;mosh.port=Some(60001);}
@@ -229,18 +227,18 @@ impl Workspace {
                 files: None,
                 forward: None,
                 monitor: None,
-                typed: None,
+                typed: None, typing: None,
                 kind,
-                _subscription: subscription,
+                _subscription: Some(subscription),
             });
         }
-        self.next_id = self.sessions.len()+1;
+
         self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if matches!(scene,"telnet"|"mosh"){4}else{0}, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
         let settings = |section, window: &mut Window, cx: &mut Context<Self>| {
-            crate::settings::SettingsWindow::open(cx.entity().downgrade(), self.preferences.clone(),
-                self.secrets.clone(), section, self.store.clone(), window, cx)
+            crate::settings::SettingsWindow::open(cx.entity().downgrade(), self.hub.preferences.borrow().clone(),
+                self.hub.secrets.clone(), section, self.hub.store.clone(), window, cx)
         };
         match scene {
             "cmds" | "bc" | "qc" | "tabmenu" => {
@@ -310,7 +308,7 @@ impl Workspace {
                 }
                 self.sessions[0].forward = Some(forward::ForwardTab {
                     panel,
-                    _subscription: subscription,
+                    _subscription: Some(subscription),
                 });
                 self.sessions[0].panel = Panel::Forward;
             }
@@ -321,7 +319,7 @@ impl Workspace {
             }
             "rv" | "rv-log" | "rv-end" | "rv-wide" | "rv-recording" => {
                 let panel = crate::records::panel::RecordsWindow::open(
-                    self.store.clone(),
+                    self.hub.store.clone(),
                     PathBuf::from("/nonexistent-shellmate-fixture"),
                     None,
                     false,
@@ -330,7 +328,7 @@ impl Workspace {
                     cx,
                 );
                 panel.update(cx, |r, cx| r.proto_scene(scene, cx));
-                self.records_window = Some(panel.downgrade());
+                *self.hub.records_window.borrow_mut() = Some(panel.downgrade());
             }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
@@ -356,11 +354,11 @@ impl Workspace {
                 if s.starts_with("update-") { crate::updater::open(window, cx); }
             }
             "set-ai" | "set-ai-replace" => {
-                self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();
+                self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();
                 let view = settings(5, window, cx);
                 if scene == "set-ai-replace" { view.update(cx, |settings, cx| settings.fixture_replace_key(cx)); }
             }
-            "set-ai-anthropic"=>{self.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
+            "set-ai-anthropic"=>{self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-cred" => self.open_settings(0, window, cx),
             "set-cred-master" | "set-cred-focus" | "set-cred-typed" => {
                 let (value, focused) = match scene {
@@ -370,10 +368,10 @@ impl Workspace {
                 };
                 settings(0, window, cx).update(cx, |settings, cx| settings.fixture_master(value, focused, window, cx));
             }
-            "vault-unlock" => {self.secrets.switch_to_master("Fixture9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).expect("fixture vault");self.secrets.set_touch_id(true).expect("fixture device key");self.secrets.lock();crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Unlock("连接 prod-web-01".into()),None,Box::new(|_,_,_|{}),window,cx);},
-            "bundle-export" => {crate::security::PasswordDialog::open(self.secrets.clone(),crate::security::Purpose::Export,None,Box::new(|_,_,_|{}),window,cx);},
-            "bundle-preview" => {let mut incoming=self.secrets.export_bundle(shellmate_store::bundle::Contents{credentials:false,..Default::default()}).expect("fixture bundle");if let Some(host)=incoming.items.iter_mut().find(|i|i.kind==shellmate_store::bundle::Kind::Host){host.fields.insert("addr".into(),serde_json::json!("10.0.1.99"));}
-                if let Some(mut host)=incoming.items.iter().find(|i|i.kind==shellmate_store::bundle::Kind::Host).cloned(){host.id="fixture-import-new".into();host.fields.insert("name".into(),serde_json::json!("新设备"));incoming.items.push(host);}let preview=self.secrets.preview_bundle(incoming).expect("fixture preview");crate::security::PreviewDialog::open_with_manager(preview,self.secrets.clone(),None,window,cx);},
+            "vault-unlock" => {self.hub.secrets.switch_to_master("Fixture9!Meadow",shellmate_vault::KdfParams{memory_kib:8192,iterations:1,parallelism:1}).expect("fixture vault");self.hub.secrets.set_touch_id(true).expect("fixture device key");self.hub.secrets.lock();crate::security::PasswordDialog::open(self.hub.secrets.clone(),crate::security::Purpose::Unlock("连接 prod-web-01".into()),None,Box::new(|_,_,_|{}),window,cx);},
+            "bundle-export" => {crate::security::PasswordDialog::open(self.hub.secrets.clone(),crate::security::Purpose::Export,None,Box::new(|_,_,_|{}),window,cx);},
+            "bundle-preview" => {let mut incoming=self.hub.secrets.export_bundle(shellmate_store::bundle::Contents{credentials:false,..Default::default()}).expect("fixture bundle");if let Some(host)=incoming.items.iter_mut().find(|i|i.kind==shellmate_store::bundle::Kind::Host){host.fields.insert("addr".into(),serde_json::json!("10.0.1.99"));}
+                if let Some(mut host)=incoming.items.iter().find(|i|i.kind==shellmate_store::bundle::Kind::Host).cloned(){host.id="fixture-import-new".into();host.fields.insert("name".into(),serde_json::json!("新设备"));incoming.items.push(host);}let preview=self.hub.secrets.preview_bundle(incoming).expect("fixture preview");crate::security::PreviewDialog::open_with_manager(preview,self.hub.secrets.clone(),None,window,cx);},
             "set-sync" => self.open_settings(1, window, cx),
             "set-term" => self.open_settings(2, window, cx),
             "set-term-scrolled" => {
@@ -442,7 +440,7 @@ impl Workspace {
         let palette = cx.terminal_style().palette;
         terminal.update(cx,|t,cx|{t.attach(move|sink,_|{let dim=palette.dim;let green=palette.ansi[2];let blue=palette.ansi[4];let text=format!("\x1b[38;2;{};{};{}mLast login: Thu Nov 12 09:12:40 on ttys002\r\n\x1b[1;38;2;{};{};{}mchen@MacBook-Pro\x1b[0m \x1b[1;38;2;{};{};{}m~\x1b[0m % \x1b[?25l",dim.r,dim.g,dim.b,green.r,green.g,green.b,blue.r,blue.g,blue.b);sink.output(text.as_bytes());Ok(Box::new(Inert))},cx);});
         let view = cx.new(|cx| TerminalView::new(terminal.clone(), cx.terminal_style(), cx).with_search_icon(crate::icons::AppIcon::Search.at(14.)));
-        let id = 5;
+        let id = self.hub.session_ids.allocate();
         let subscription = self.watch_terminal(id, &terminal, window, cx);
         self.sessions.push(Session {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -455,12 +453,12 @@ impl Workspace {
             files: None,
             forward: None,
             monitor: None,
-            typed: None,
+            typed: None, typing: None,
             kind: SessionKind::Local,
-            _subscription: subscription,
+            _subscription: Some(subscription),
         });
-        self.next_id = 6;
-        self.user_host = "chen@MacBook-Pro".into();
+
+        *self.hub.user_host.borrow_mut() = "chen@MacBook-Pro".into();
         self.activate(4, window, cx);
     }
 
@@ -527,7 +525,7 @@ impl Workspace {
         self.sessions[ix].monitor = Some(monitor::MonitorTab {
             panel,
             page,
-            _subscription: subscription,
+            _subscription: Some(subscription),
         });
         self.sessions[ix].panel = Panel::Monitor;
     }
@@ -544,7 +542,7 @@ impl Workspace {
         let subscription = cx.subscribe(&panel, |_, _, _: &crate::files::panel::FilesEvent, _| {});
         self.sessions[0].files = Some(files::FilesTab {
             panel: panel.clone(),
-            _subscription: subscription,
+            _subscription: Some(subscription),
         });
         self.sessions[0].panel = Panel::Files;
         if scene == "editor" {

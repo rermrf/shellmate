@@ -91,7 +91,7 @@ impl Shell {
         let capture = Arc::new(Mutex::new(Capture::default()));
         let sink = GridSink {
             agent: Arc::new(Mutex::new(crate::agent::AgentState::default())),
-            alive: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(Mutex::new(Arc::new(AtomicBool::new(true)))),
             raw_grid:Arc::new(Mutex::new(None)),
             term: term.clone(),
             parser: Arc::new(Mutex::new(Processor::new())),
