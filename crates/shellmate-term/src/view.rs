@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 mod replay;
+mod mouse;
+use mouse::ButtonEvent;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Point as GridPoint, Side};
@@ -84,13 +86,22 @@ struct Search {
     _subscription: Subscription,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum LeftPress {
+    #[default]
+    Idle,
+    Selecting,
+    // Last cell delivered to the application for this press.
+    Reported(GridPoint<usize>),
+}
+
 pub struct TerminalView {
     terminal: gpui::Entity<Terminal>,
     focus_handle: FocusHandle,
     style: TerminalStyle,
     pub(crate) geometry: Option<Geometry>,
     marked_text: Option<String>,
-    selecting: bool,
+    left_press: LeftPress,
     scroll_remainder: f32,
     replay_viewport: replay::ReplayViewport,
     pub replay_show_times: bool,
@@ -139,7 +150,7 @@ impl TerminalView {
             style: style.clone(),
             geometry: None,
             marked_text: None,
-            selecting: false,
+            left_press: LeftPress::Idle,
             scroll_remainder: 0.,
             replay_viewport: Default::default(),
             replay_show_times: true,
@@ -291,7 +302,7 @@ impl TerminalView {
         self.focus_handle = cx.focus_handle();
         self.geometry = None;
         self.marked_text = None;
-        self.selecting = false;
+        self.left_press = LeftPress::Idle;
         self.hold_grid_size = false;
         if let Some(search) = &mut self.search {
             search.input = move_input(&search.input, "在输出中搜索", window, cx);
@@ -374,22 +385,30 @@ impl TerminalView {
 
     fn grid_point(&self, position: gpui::Point<Pixels>, cx: &App) -> Option<(GridPoint, Side)> {
         let g = self.geometry?;
-        let x = f32::from(position.x - g.origin.x).max(0.);
-        let y = f32::from(position.y - g.origin.y).max(0.);
-        let (cw, lh) = (f32::from(g.size.cell_width), f32::from(g.size.line_height));
-        let col = ((x / cw) as usize).min(g.size.cols as usize - 1);
         let terminal = self.terminal.read(cx);
         let term = terminal.term().lock();
         let count = if terminal.is_replay() { term.total_lines() } else { g.size.rows as usize };
-        let line = ((y / lh) as usize).min(count - 1);
-        let side = if (x / cw).fract() > 0.5 { Side::Right } else { Side::Left };
+        let (cell, side) = g.viewport_cell(position, count);
         let offset = if terminal.is_replay() { term.history_size() } else { term.grid().display_offset() };
-        Some((viewport_to_point(offset, GridPoint::new(line, Column(col))), side))
+        Some((viewport_to_point(offset, cell), side))
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
         self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
+        self.left_press = LeftPress::Idle;
+        let terminal = self.terminal.read(cx);
+        let mode = terminal.mode();
+        if !event.modifiers.shift && !terminal.is_replay() && !terminal.is_exited() && mode.intersects(TermMode::MOUSE_MODE) {
+            if let Some(g) = self.geometry {
+                let (cell, _) = g.viewport_cell(event.position, usize::from(g.size.rows));
+                if let Some(bytes) = mouse::report(mode, ButtonEvent::LeftDown, event.modifiers, cell) {
+                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                    self.left_press = LeftPress::Reported(cell);
+                }
+            }
+            return;
+        }
         let Some((point, side)) = self.grid_point(event.position, cx) else { return };
         let ty = match event.click_count {
             2 => SelectionType::Semantic,
@@ -404,13 +423,27 @@ impl TerminalView {
                 _ => term.selection = Some(Selection::new(ty, point, side)),
             }
         }
-        self.selecting = true;
+        self.left_press = LeftPress::Selecting;
         cx.notify();
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+        if event.pressed_button != Some(MouseButton::Left) {
             return;
+        }
+        match self.left_press {
+            LeftPress::Idle => return,
+            LeftPress::Reported(last) => {
+                let Some(g) = self.geometry else { return };
+                let (cell, _) = g.viewport_cell(event.position, usize::from(g.size.rows));
+                let mode = self.terminal.read(cx).mode();
+                if cell != last && let Some(bytes) = mouse::report(mode, ButtonEvent::LeftDrag, event.modifiers, cell) {
+                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                    self.left_press = LeftPress::Reported(cell);
+                }
+                return;
+            }
+            LeftPress::Selecting => {}
         }
         let Some((point, side)) = self.grid_point(event.position, cx) else { return };
         {
@@ -423,9 +456,21 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.selecting) {
-            return;
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match std::mem::take(&mut self.left_press) {
+            LeftPress::Idle => return,
+            LeftPress::Reported(last) => {
+                let mode = self.terminal.read(cx).mode();
+                let cell = self.geometry.map_or(last, |g| g.viewport_cell(event.position, usize::from(g.size.rows)).0);
+                // Classic reports cannot encode every cell of a wide terminal. Still
+                // release a previously reported press if the pointer crossed that limit.
+                let release = |cell| mouse::report(mode, ButtonEvent::LeftUp, event.modifiers, cell);
+                if let Some(bytes) = release(cell).or_else(|| release(last)) {
+                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                }
+                return;
+            }
+            LeftPress::Selecting => {}
         }
         let selected=self.terminal.read(cx).selection_text();
         if selected.is_none(){self.terminal.read(cx).term().lock().selection=None;}
@@ -456,19 +501,17 @@ impl TerminalView {
         self.scroll_remainder -= lines as f32;
 
         let mode = self.terminal.read(cx).mode();
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !event.modifiers.shift {
-            // Full-screen apps (less, vim) get arrow keys instead of scrollback.
-            let app = mode.contains(TermMode::APP_CURSOR);
-            let seq = match (lines > 0, app) {
-                (true, true) => "\x1bOA",
-                (true, false) => "\x1b[A",
-                (false, true) => "\x1bOB",
-                (false, false) => "\x1b[B",
-            };
-            let bytes = seq.repeat(lines.unsigned_abs() as usize);
-            self.terminal.update(cx, |t, _| t.input(bytes.as_bytes()));
-        } else {
-            self.terminal.update(cx, |t, _| t.scroll(lines));
+        match mouse::wheel_action(mode, event.modifiers, lines, g, event.position) {
+            mouse::Action::History => self.terminal.update(cx, |t, _| t.scroll(lines)),
+            mouse::Action::Arrow(seq) => {
+                let bytes = seq.repeat(lines.unsigned_abs() as usize);
+                self.terminal.update(cx, |t, _| t.input(&bytes));
+            }
+            mouse::Action::Report(report) => {
+                let bytes = report.repeat(lines.unsigned_abs() as usize);
+                self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+            }
+            mouse::Action::Ignore => return,
         }
         cx.notify();
     }

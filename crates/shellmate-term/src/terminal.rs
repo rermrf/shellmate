@@ -584,7 +584,8 @@ impl Terminal {
         self.parser.lock().advance(&mut *term, text.as_bytes());
     }
 
-    fn write_raw(&mut self, bytes: &[u8]) {
+    /// Send terminal protocol bytes without treating them as typed command input.
+    pub(crate) fn write_raw(&mut self, bytes: &[u8]) {
         if let Some(backend) = self.backend.as_mut()
             && let Err(err) = backend.write(bytes)
         {
