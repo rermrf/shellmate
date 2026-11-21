@@ -124,7 +124,7 @@ impl Workspace {
     }
 
     fn status_rows(&self, cx: &App) -> Vec<(usize, gpui::SharedString, Status)> {
-        self.sessions.iter().map(|s| (s.id, s.title.clone(), self.status_of(s, cx))).collect()
+        self.sessions.iter().map(|s| (s.id, s.display_title(cx), self.status_of(s, cx))).collect()
     }
 
 }

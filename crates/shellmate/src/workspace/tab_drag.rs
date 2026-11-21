@@ -310,13 +310,13 @@ fn pointer_screen(position: Point<Pixels>, window: &Window, mode: DragMode) -> P
     screen_bounds(window).origin + position
 }
 
-fn update_over(position: Point<Pixels>, window: &Window, cx: &mut App) {
+fn update_over(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
     let Some(drag) = cx.global::<Hub>().tab_drag.active else { return };
     let screen = pointer_screen(position, window, drag.mode);
     follow_at(screen, window, cx);
 }
 
-fn follow_at(screen: Point<Pixels>, window: &Window, cx: &mut App) {
+fn follow_at(screen: Point<Pixels>, window: &mut Window, cx: &mut App) {
     let Some(mut active) = cx.global::<Hub>().tab_drag.active else { return };
     let over = over_at(screen, active.mode.excluded(active.source), window, cx);
     let previous = active.over;
@@ -331,7 +331,7 @@ fn follow_at(screen: Point<Pixels>, window: &Window, cx: &mut App) {
     match active.mode {
         DragMode::MoveWindow { transparent, .. } => {
             ghost::close(cx);
-            ghost::move_window(window, screen - active.window_grab);
+            ghost::move_window(window, screen - active.window_grab, cx);
             if let Some(native) = lifecycle::native_window(window) {
                 native.setAlphaValue(if transparent { 0. } else { 1. });
             }
@@ -355,17 +355,17 @@ fn clear(cx: &mut App) -> Option<ActiveDrag> {
     Some(drag)
 }
 
-fn restore_window(drag: ActiveDrag, cancelled: bool, window: &Window, cx: &mut App) {
+fn restore_window(drag: ActiveDrag, cancelled: bool, window: &mut Window, cx: &mut App) {
     if let Some(origin) = drag.mode.restore_origin() {
-        let restore = move |window: &Window| {
+        let restore = move |window: &mut Window, cx: &mut App| {
             #[cfg(target_os = "macos")]
             {
-                if cancelled { ghost::move_window(window, origin); }
+                if cancelled { ghost::move_window(window, origin, cx); }
                 if let Some(native) = lifecycle::native_window(window) { native.setAlphaValue(1.); }
             }
         };
-        if window.window_handle() == drag.source { restore(window); }
-        else { let _ = drag.source.update(cx, |_, w, _| restore(w)); }
+        if window.window_handle() == drag.source { restore(window, cx); }
+        else { let _ = drag.source.update(cx, |_, w, cx| restore(w, cx)); }
     }
 }
 
@@ -534,7 +534,7 @@ pub(super) fn place_new_tab(entry: &hub::Entry, id: usize, pointer: Point<Pixels
             let Some(index) = ws.sessions.iter().position(|s| s.id == id) else { return };
             if let Some((_, rect)) = ws.tab_strip.tabs.iter().find(|(i, _)| *i == index) {
                 #[cfg(target_os = "macos")]
-                ghost::move_window(window, pointer - grab - rect.origin);
+                ghost::move_window(window, pointer - grab - rect.origin, cx);
             }
         }));
     });

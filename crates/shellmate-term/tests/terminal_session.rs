@@ -22,6 +22,7 @@ struct Calls {
     writes: Vec<u8>,
     resizes: Vec<(u16, u16)>,
     closed: bool,
+    activity: Option<shellmate_core::io::CloseActivity>,
 }
 
 struct Fake(Arc<Mutex<Calls>>);
@@ -39,6 +40,10 @@ impl TerminalBackend for Fake {
 
     fn close(&mut self) {
         self.0.lock().unwrap().closed = true;
+    }
+
+    fn close_activity(&self) -> shellmate_core::io::CloseActivity {
+        self.0.lock().unwrap().activity.clone().unwrap_or(shellmate_core::io::CloseActivity::Unknown)
     }
 }
 
@@ -193,6 +198,102 @@ async fn connecting(cx: &mut AsyncApp, harness: Harness) {
     assert!(!harness.shows(cx, "user@host:~$ ✓"), "the notice starts on its own line");
 }
 
+async fn titles(cx: &mut AsyncApp, harness: Harness) {
+    let terminal = harness.terminal.clone();
+    let (_, sink) = attach(&terminal, cx);
+    // Actual Claude Code title, split even inside the UTF-8 symbol; OSC 0 + BEL.
+    for byte in "\x1b]0;✳ Claude Code\x07".as_bytes() { sink.output(&[*byte]); }
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.title().map(|s| s.as_ref()), Some("✳ Claude Code")));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+    sink.output("\x1b]0;✳ Claude Code\x07".as_bytes());
+    harness.settle(cx).await;
+    assert!(harness.take_events().is_empty(), "unchanged title must not trigger more UI work");
+
+    // Standard title save/restore around a nested TUI; OSC 2 + ST, including semicolons.
+    sink.output("\x1b[22;0t\x1b]2;⠋ 正在处理;项目 α\x1b\\".as_bytes());
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.title().map(|s| s.as_ref()), Some("⠋ 正在处理;项目 α")));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+    sink.output(b"\x1b[23;0t");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.title().map(|s| s.as_ref()), Some("✳ Claude Code")));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+
+    sink.output(b"\x1b]2;\x07\x1b[22;0t\x1b]2;temporary\x07\x1b[23;0t");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert!(t.title().is_none()));
+    assert_eq!(harness.take_events(), [const { TerminalEvent::TitleChanged }; 3]);
+
+    // Reconnect keeps scrollback but resets title, saved titles and an incomplete OSC.
+    sink.output(b"kept scrollback\x1b]2;old app\x07\x1b[22;0t");
+    harness.settle(cx).await;
+    harness.take_events();
+    sink.output(b"\x1b]2;queued stale title\x07\x1b]2;partial");
+    let (_, new_sink) = attach(&terminal, cx);
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+    harness.settle(cx).await;
+    assert!(harness.take_events().is_empty(), "queued titles belong to the old backend");
+    terminal.read_with(cx, |t, _| assert!(t.title().is_none()));
+    new_sink.output(b"fresh marker\x07\x1b[23;0t");
+    harness.settle(cx).await;
+    assert!(harness.shows(cx, "kept scrollback") && harness.shows(cx, "fresh marker"));
+    terminal.read_with(cx, |t, _| assert!(t.title().is_none(), "old saved title must not return"));
+    assert_eq!(harness.take_events(), [TerminalEvent::Bell], "the incomplete old OSC must not consume new output");
+    sink.output(b"\x1b]0;late old sink\x07");
+    new_sink.output(b"\x1b[22;0t\x1b]0;new app\x07");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.title().map(|s| s.as_ref()), Some("new app")));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+
+    // Popping the initially unset title produces Alacritty's ResetTitle event.
+    new_sink.output(b"\x1b[23;0t");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert!(t.title().is_none()));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged]);
+    new_sink.output(b"\x1b]0;new app\x07");
+    harness.settle(cx).await;
+    harness.take_events();
+
+    new_sink.disconnected("test disconnect");
+    harness.settle(cx).await;
+    harness.take_events();
+    let (_, restarted) = attach(&terminal, cx);
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged, TerminalEvent::Restarted]);
+    restarted.output(b"\x1b]0;failure cleanup\x07");
+    harness.settle(cx).await;
+    harness.take_events();
+    terminal.update(cx, |t, cx| { t.attach(|_, _| Err(anyhow::anyhow!("test failure")), cx); });
+    terminal.read_with(cx, |t, _| assert!(t.title().is_none()));
+    assert_eq!(harness.take_events(), [TerminalEvent::TitleChanged, TerminalEvent::Disconnected("test failure".into())]);
+}
+
+async fn close_activity(cx: &mut AsyncApp, harness: Harness) {
+    use shellmate_core::io::{CloseActivity, ProcessInfo};
+    let terminal = &harness.terminal;
+    let (calls, sink) = attach(terminal, cx);
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Unknown));
+    calls.lock().unwrap().activity = Some(CloseActivity::Idle);
+    terminal.update(cx, |t, _| { t.foreground_process(); });
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Idle));
+    let busy = CloseActivity::Busy(vec![ProcessInfo { pid: 42, name: "vim".into(), cwd: None }]);
+    calls.lock().unwrap().activity = Some(busy.clone());
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), busy, "close bypasses the foreground cache"));
+    calls.lock().unwrap().activity = Some(CloseActivity::Idle);
+    sink.output(b"\x1b[?1049h");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Unknown));
+    sink.output(b"\x1b[?1049l\x1b]133;C\x07");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Unknown));
+    sink.output(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Idle));
+    sink.exited(Some(0));
+    harness.settle(cx).await;
+    terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Idle));
+}
+
 fn main() {
     if std::env::var_os("SHELLMATE_GUI_TESTS").is_none() {
         println!("terminal_session: skipped (set SHELLMATE_GUI_TESTS=1 to run; needs a macOS login session)");
@@ -211,9 +312,13 @@ fn main() {
     gpui::application().run(|cx| {
         let lifecycle = Harness::new(cx);
         let progress = Harness::new(cx);
+        let title = Harness::new(cx);
+        let closing = Harness::new(cx);
         cx.spawn(async move |cx| {
             run(cx, lifecycle).await;
             connecting(cx, progress).await;
+            titles(cx, title).await;
+            close_activity(cx, closing).await;
             println!("terminal_session: ok");
             cx.update(|cx| cx.quit());
         })

@@ -40,6 +40,15 @@ pub struct ProcessInfo {
     pub cwd: Option<PathBuf>,
 }
 
+/// Fresh state for a destructive close, independent of title/output caches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloseActivity {
+    Idle,
+    Busy(Vec<ProcessInfo>),
+    /// The backend cannot establish that the terminal is idle.
+    Unknown,
+}
+
 /// Something that can be wired to a terminal: it receives input and resizes,
 /// and reports output / exit / disconnects through the [`OutputSink`] it was
 /// created with.
@@ -63,6 +72,8 @@ pub trait TerminalBackend: Send {
     fn foreground_process(&self) -> Option<ProcessInfo> {
         None
     }
+
+    fn close_activity(&self) -> CloseActivity { CloseActivity::Unknown }
 }
 
 /// Receiver of everything a backend produces. Implemented by the terminal model.
@@ -162,5 +173,6 @@ mod tests {
     #[test]
     fn foreground_process_defaults_to_none() {
         assert_eq!(Dummy.foreground_process(), None);
+        assert_eq!(Dummy.close_activity(), CloseActivity::Unknown);
     }
 }

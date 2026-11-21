@@ -72,8 +72,11 @@ impl FloatingTab {
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         };
-        let handle = cx.open_window(options, |_, cx| cx.new(|_| self))?;
-        handle.update(cx, |_, window, _| {
+        let handle = cx.open_window(options, |window, cx| {
+            window_scale::install(window);
+            cx.new(|_| self)
+        })?;
+        handle.update(cx, |_, window, cx| {
             let Some(panel) = lifecycle::native_window(window) else {
                 window.remove_window();
                 anyhow::bail!("floating tab has no NSWindow");
@@ -88,6 +91,7 @@ impl FloatingTab {
             panel.setContentSize(NSSize::new(size.width.to_f64(), size.height.to_f64()));
             panel.setFrameOrigin(appkit_origin(origin, size.height, primary_top));
             panel.orderFront(None);
+            window_scale::sync(window, cx);
             Ok(())
         })??;
         Ok(handle)
@@ -100,9 +104,10 @@ pub(super) fn follow(drag: ActiveDrag, pointer: Point<Pixels>, cx: &mut App) {
         return;
     };
     if let Some(handle) = cx.global::<Hub>().tab_drag.ghost {
-        let moved = handle.update(cx, |view, window, _| {
+        let moved = handle.update(cx, |view, window, cx| {
             if let Some(panel) = lifecycle::native_window(window) {
                 panel.setFrameOrigin(appkit_origin(origin, view.size.height, top));
+                window_scale::sync(window, cx);
             }
         });
         if moved.is_ok() {
@@ -130,11 +135,12 @@ pub(super) fn close(cx: &mut App) {
 }
 
 /// Move a complete workspace without activating it, using desktop top-left points.
-pub(super) fn move_window(window: &Window, origin: Point<Pixels>) {
+pub(super) fn move_window(window: &mut Window, origin: Point<Pixels>, cx: &mut App) {
     if let Some(native) = lifecycle::native_window(window)
         && let Some(top) = primary_screen_top()
     {
         native.setFrameOrigin(appkit_origin(origin, px(native.frame().size.height as f32), top));
+        window_scale::sync(window, cx);
     }
 }
 

@@ -8,6 +8,11 @@ use anyhow::{Context as _, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use shellmate_core::io::{ProcessInfo, PtyDims, TerminalBackend};
 
+#[cfg(target_os = "macos")]
+mod startup;
+#[cfg(target_os = "macos")]
+mod activity;
+
 /// How to launch the local shell.
 #[derive(Clone, Debug)]
 pub struct PtyOptions {
@@ -49,6 +54,8 @@ impl PtyOptions {
 
 pub struct LocalPty {
     pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    initial_program: String,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -108,6 +115,10 @@ impl LocalPty {
         mut on_output: impl FnMut(&[u8]) + Send + 'static,
         on_exit: impl FnOnce(Option<u32>) + Send + 'static,
     ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let initial_program = cmd.get_argv().first()
+            .and_then(|arg| std::path::Path::new(arg).file_name())
+            .map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
         let dims = nonzero_dims(dims);
         let pair = native_pty_system()
             .openpty(pty_size(dims))
@@ -161,6 +172,8 @@ impl LocalPty {
         }
         Ok(Self {
             pid,
+            #[cfg(target_os = "macos")]
+            initial_program,
             master: pair.master,
             writer,
             killer,
@@ -224,6 +237,14 @@ impl TerminalBackend for LocalPty {
         let pid = self.master.process_group_leader()?;
         process_info(pid)
     }
+
+    fn close_activity(&self) -> shellmate_core::io::CloseActivity {
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = self.pid {
+            return activity::inspect(pid, &self.initial_program);
+        }
+        shellmate_core::io::CloseActivity::Unknown
+    }
 }
 
 impl Drop for LocalPty {
@@ -235,13 +256,9 @@ impl Drop for LocalPty {
 #[cfg(target_os = "macos")]
 fn process_info(pid: i32) -> Option<ProcessInfo> {
 
-    let mut name_buf = [0u8; 256];
-    // SAFETY: the buffer is valid for `len` bytes and proc_name NUL-terminates.
-    let len = unsafe { libc::proc_name(pid, name_buf.as_mut_ptr().cast(), name_buf.len() as u32) };
-    if len <= 0 {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&name_buf[..len as usize]).into_owned();
+    // The forked PTY child can still report Shellmate's name before exec.
+    // Withhold that snapshot so callers use the configured shell/cwd instead.
+    let name = startup::process_name(pid)?;
     Some(ProcessInfo { pid, name, cwd: process_cwd(pid) })
 }
 
@@ -278,6 +295,45 @@ fn process_info(_pid: i32) -> Option<ProcessInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_never_exposes_parent_name_and_foreground_jobs_still_update() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        for attempt in 0..16 {
+            let mut command = CommandBuilder::new("/bin/zsh");
+            command.args(["-d", "-f", "-i"]);
+            command.cwd(dir.path());
+            command.env("ZDOTDIR", dir.path());
+            command.env("PS1", "ready> ");
+            let mut pty = LocalPty::spawn_builder(command, PtyDims::default(), |_| {}, |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let process = pty.foreground_process();
+                if let Some(process) = process {
+                    assert_eq!(process.name, "zsh", "startup attempt {attempt}: {process:?}");
+                    assert_eq!(process.pid as u32, pty.child_pid().unwrap());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "shell never became ready");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if attempt == 0 {
+                pty.write(b"sleep 1\r").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !pty.foreground_process().is_some_and(|p| p.name == "sleep") {
+                    assert!(Instant::now() < deadline, "foreground job was hidden");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                while !pty.foreground_process().is_some_and(|p| p.name == "zsh") {
+                    assert!(Instant::now() < deadline, "shell did not regain the foreground");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn proc_pidinfo_reports_pty_shell_cwd_after_cd() {

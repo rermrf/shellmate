@@ -148,7 +148,7 @@ impl Workspace {
     }
 
     fn refresh_after_detach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.update_window_title(window);
+        self.update_window_title(window, cx);
         self.update_pane_radii(cx);
         self.sync_ai_context(cx);
         let selected = self.active.and_then(|ix| self.sessions.get(ix)).map(|s| {
@@ -337,7 +337,7 @@ pub(super) fn tab_context_menu(
         .filter(|entry| entry.handle != source)
         .filter_map(|entry| {
             let workspace = entry.workspace.upgrade()?;
-            let title = workspace.read(cx).active_tab_title().unwrap_or("Shellmate");
+            let title = workspace.read(cx).active_tab_title(cx).unwrap_or_else(|| "Shellmate".into());
             Some((entry.handle, format!("窗口 {} · {title}", entry.number)))
         })
         .collect();

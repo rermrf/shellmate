@@ -1,10 +1,12 @@
 use super::{DialogBody, Notice, Tone, actions, button, hint, notice, palette, stack};
 use crate::workspace::Workspace;
+use crate::workspace::close_guard::CloseImpact;
 use gpui::{App, Context, WeakEntity, Window, component::checkbox::Checkbox, prelude::*};
 use shellmate_store::Preference;
 
 pub(crate) struct QuitDialog {
     message: String,
+    review: Option<CloseImpact>,
     workspace: WeakEntity<Workspace>,
     remember: bool,
     error: Option<String>,
@@ -13,12 +15,14 @@ pub(crate) struct QuitDialog {
 impl QuitDialog {
     pub(crate) fn open(
         message: String,
+        review: Option<CloseImpact>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut App,
     ) -> WeakEntity<Self> {
         let body = cx.new(|_| Self {
             message,
+            review,
             workspace,
             remember: false,
             error: None,
@@ -31,6 +35,20 @@ impl QuitDialog {
 
 impl DialogBody for QuitDialog {
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(reviewed) = &self.review {
+            let Ok(current) = self.workspace.update(cx, |s, cx| s.quit_impact(cx)) else {
+                self.error = Some("窗口已关闭，请重新发起退出。".into());
+                cx.notify();
+                return false;
+            };
+            if !current.covered_by(reviewed) {
+                self.message = current.message();
+                self.review = Some(current);
+                self.error = Some("运行任务或连接已变化，请确认更新后的影响。".into());
+                cx.notify();
+                return false;
+            }
+        }
         if self.remember
             && let Ok(Err(error)) = self.workspace.update(cx, |s, cx| {
                 s.set_preference(Preference::ConfirmQuit, false, window, cx)

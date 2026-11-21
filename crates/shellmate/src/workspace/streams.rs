@@ -25,11 +25,10 @@ impl StreamSession {
             task: None,
         }
     }
-    pub(super) fn connected_or_reconnecting(&self, exited: bool) -> bool {
-        if let Some(state) = self.serial.as_ref().map(Control::state).or_else(|| self.snapshot.clone()) {
-            return state.open || state.retrying;
-        }
-        self.connected || (exited && self.retry_in_flight())
+    pub(super) fn close_connection_state(&self) -> (bool, bool) {
+        let state = self.serial.as_ref().map(Control::state).or_else(|| self.snapshot.clone());
+        (state.as_ref().map_or(self.connected, |s| s.open),
+            self.retry_in_flight() || state.is_some_and(|s| s.retrying))
     }
 
     pub(super) fn retry_in_flight(&self) -> bool {
@@ -61,6 +60,7 @@ impl Workspace {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
             title: host.name.clone().into(),
+            local_title: None,
             view,
             terminal,
             exited: false,

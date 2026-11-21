@@ -184,7 +184,13 @@ pub(crate) fn open_tracked<V: DialogBody>(
             .w(px(width))
             .close_button(host_editor)
             .overlay_closable(false)
-            .on_ok(move |_, window, cx| on_ok.update(cx, |body, cx| body.confirm(window, cx)))
+            .on_ok(move |_, window, cx| {
+                // Match clicking the primary button. The component's default Enter
+                // path restores the old focus after its animation, even when the
+                // confirmed action has already destroyed that terminal/tab.
+                on_ok.update(cx, |body, cx| body.submit(window, cx));
+                false // submit owns dismissal; do not schedule a second close.
+            })
             .on_cancel(move |_, window, cx| {
                 on_cancel.update(cx, |body, cx| { if !body.can_cancel() { return false; } body.cancel(window, cx); true })
             })

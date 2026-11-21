@@ -86,7 +86,7 @@ impl Shell {
                 cols: 100,
                 ..Default::default()
             },
-            Listener(tx.clone()),
+            Listener(tx.clone(), Arc::new(AtomicU64::new(1))),
         )));
         let capture = Arc::new(Mutex::new(Capture::default()));
         let sink = GridSink {
@@ -138,7 +138,7 @@ impl Shell {
         while let Ok(message) = self.messages.try_recv() {
             match message {
                 Msg::Command { command, .. } => self.history.push(command),
-                Msg::Alac(AlacEvent::PtyWrite(reply)) => {
+                Msg::Alac { event: AlacEvent::PtyWrite(reply), .. } => {
                     self.writer.write_all(reply.as_bytes()).unwrap();
                     self.writer.flush().unwrap();
                 }

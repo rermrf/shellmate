@@ -166,7 +166,7 @@ impl CloseWindowWithSessions {
         match self { Self::Ask => "ask", Self::Move => "move", Self::Disconnect => "disconnect" }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Ask => "每次询问", Self::Move => "移到其他窗口", Self::Disconnect => "断开并关闭" }
+        match self { Self::Ask => "按需询问", Self::Move => "移到其他窗口", Self::Disconnect => "断开并关闭" }
     }
 }
 

@@ -36,7 +36,7 @@ impl Workspace {
                 .iter()
                 .map(|s| SessionItem {
                     id: s.id,
-                    title: s.title.to_string(),
+                    title: s.display_title(cx).to_string(),
                     detail: s.host().map_or("本机终端",|h|h.protocol.label()).into(),
                     host: s.host().map(|h| h.id.clone()),
                 })

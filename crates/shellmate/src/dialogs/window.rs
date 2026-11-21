@@ -38,6 +38,7 @@ impl WindowCloseDialog {
             format!("这个窗口里有 {sessions} 个会话，其中 {connecting} 个正在连接。")
         };
         if let Some(impact) = impact {
+            message.push('\n');
             message.push_str(&impact);
         }
         let body = cx.new(|_| Self {

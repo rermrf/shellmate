@@ -31,7 +31,7 @@ pub struct ForwardTab {
 }
 
 /// Effects of destroying the forwarding engines owned by a set of closing tabs.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ForwardImpact {
     pub rules: usize,
     pub connections: u32,
@@ -425,8 +425,7 @@ impl Workspace {
 
     // ---- closing the last tab -----------------------------------------------------------------
 
-    /// Closes the tab at `ix`. The last tab of a connection that has forwards running asks first:
-    /// the forwards stop with it.
+    /// Every user-initiated tab close reviews local jobs, connections and shared resources.
     pub(super) fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.sessions.get(ix).map(|s| s.id) else { return };
         if let Some((_, editor)) = self.editor.as_ref().filter(|(owner, _)| *owner == id) {
@@ -442,23 +441,29 @@ impl Workspace {
             }));
             return;
         }
-        match self.close_question(ix, cx) {
-            Some((session_id, title, text)) => {
-                let workspace = cx.entity().downgrade();
-                ConfirmDialog::open(
-                    title,
-                    text,
-                    "关闭",
-                    true,
-                    move |window, cx| {
-                        workspace.update(cx, |workspace, cx| workspace.close_session(session_id, window, cx)).ok();
-                        Ok(())
-                    },
-                    window,
-                    cx,
-                );
-            }
-            None => self.close_now(ix, window, cx),
+        let impact = self.close_impact(&[id], cx);
+        log::debug!("tab close: session={id} needs_confirmation={}", impact.needs_confirmation());
+        if impact.needs_confirmation() {
+            let handle = self.handle;
+            ConfirmDialog::open(
+                "关闭会话？",
+                impact.message(),
+                "关闭会话",
+                true,
+                move |_, cx| {
+                    let reviewed = impact.clone();
+                    cx.defer(move |cx| {
+                        if let Some(entry) = super::Hub::entry(handle, cx) {
+                            entry.update(cx, |ws, window, cx| ws.confirm_tab_close(id, &reviewed, window, cx));
+                        }
+                    });
+                    Ok(())
+                },
+                window,
+                cx,
+            );
+        } else {
+            self.close_now(ix, window, cx);
         }
     }
 
@@ -467,18 +472,6 @@ impl Workspace {
         if let Some(ix) = self.sessions.iter().position(|s| s.id == session_id) {
             self.close_now(ix, window, cx);
         }
-    }
-
-    /// What to ask before closing the tab at `ix`, if anything: the tab's id, the title and the text.
-    fn close_question(&self, ix: usize, cx: &gpui::App) -> Option<(usize, String, String)> {
-        let session = self.sessions.get(ix)?;
-        let ssh = session.ssh()?;
-        let impact = self.forward_impact(|tab| tab.id == session.id, cx);
-        if impact == ForwardImpact::default() {
-            return None;
-        }
-        let (title, text) = model::close_confirmation(&ssh.host.name, impact.rules, impact.connections);
-        Some((session.id, title, text))
     }
 
     /// Count a shared group once, and only if its last tab will actually disappear.

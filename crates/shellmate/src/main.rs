@@ -172,6 +172,8 @@ fn open_workspace_at(
         ..Default::default()
     };
     let (main_window, workspace) = gpui::open_window(options, cx, move |window, cx| {
+        #[cfg(target_os = "macos")]
+        workspace::window_scale::install(window);
         // The Dock icon follows the system appearance, like macOS's own dark icons.
         window
             .observe_window_appearance(|window, _| {

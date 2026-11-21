@@ -754,7 +754,7 @@ impl Render for SettingsWindow {
                                     }).ok();
                                 }, cx)))
                         .child(div().text_size(px(12.)).line_height(px(16.)).text_color(p.tx2)
-                            .child("只在还有其他窗口时生效；关闭最后一个窗口仍按「关闭窗口时」处理。")));
+                            .child("「按需询问」会直接关闭空闲本机终端，有任务或连接时才提示。仅对非最后一个窗口生效；最后一个窗口仍按「关闭窗口时」处理。")));
                 }
             }
             if self.section == LOCAL_TERMINAL {

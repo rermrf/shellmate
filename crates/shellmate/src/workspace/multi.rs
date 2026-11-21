@@ -27,7 +27,7 @@ impl Workspace {
             .iter()
             .map(|s| SessionRow {
                 id: s.id,
-                title: s.title.to_string(),
+                title: s.display_title(cx).to_string(),
                 local: s.host().is_none(),
                 protocol:s.host().map_or(shellmate_core::Protocol::Ssh,|h|h.protocol),
                 status: if self.command_available(Some(s.id), cx) {
@@ -352,14 +352,14 @@ impl Workspace {
                         .px(px(6.)).py(px(2.))
                         .cursor_pointer()
                         .text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("{} ▾", session.title))
+                        .child(format!("{} ▾", session.display_title(cx)))
                         .on_click(cx.listener(|this, event: &gpui::ClickEvent, w, cx| {
                             cx.stop_propagation();
                             this.open_session_menu(session_menu::Kind::Split, event.position(), w, cx);
                         })),
                 );
             } else {
-                header = header.child(div().text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD).child(session.title.clone()));
+                header = header.child(div().text_size(px(11.5)).line_height(px(13.)).font_weight(FontWeight::SEMIBOLD).child(session.display_title(cx)));
             }
             header = header
                 .child(

@@ -199,6 +199,7 @@ impl Workspace {
         error
     }
     pub(super) fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_titles(window, cx);
         self.poll_streams(window,cx);
         self.poll_mosh_connections(window,cx);
         let mut stopped = vec![];

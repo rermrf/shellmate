@@ -33,6 +33,9 @@ mod files;
 mod hub;
 mod transfer;
 mod tab_drag;
+mod titles;
+#[cfg(target_os = "macos")]
+pub(crate) mod window_scale;
 pub(crate) use hub::Hub;
 use hub::{Services, Route};
 mod forward;
@@ -56,6 +59,7 @@ mod drawer_resize;
 mod drawer_motion;
 mod menu_actions;
 pub(crate) mod lifecycle;
+pub(crate) mod close_guard;
 pub(crate) mod open_urls;
 
 actions!(
@@ -157,6 +161,7 @@ struct Session {
     ai_alive: Arc<std::sync::atomic::AtomicBool>,
     id: usize,
     title: SharedString,
+    local_title: Option<SharedString>,
     view: Entity<TerminalView>,
     terminal: Entity<Terminal>,
     /// The local shell exited (SSH sessions track their state in [`ssh::SshSession`]).
@@ -435,6 +440,7 @@ impl Workspace {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
             title: title.into(),
+            local_title: None,
             view,
             terminal,
             exited: false,
@@ -482,6 +488,12 @@ impl Workspace {
                 (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => this.retry_tab(id, window, cx),
                 _ => {}
             }
+            if matches!(event, TerminalEvent::TitleChanged | TerminalEvent::CwdChanged(_) | TerminalEvent::Restarted | TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) {
+                if let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) {
+                    session.refresh_local_title(cx);
+                }
+                this.update_window_title(window, cx);
+            }
             this.sync_sidebar(cx);
             this.sync_ai_context(cx);
             cx.notify();
@@ -506,7 +518,8 @@ impl Workspace {
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
-        self.update_window_title(window);
+        self.sessions[ix].refresh_local_title(cx);
+        self.update_window_title(window, cx);
         self.sync_local_files_activity(cx);
         self.sync_ai_context(cx);
         self.sidebar.update(cx, |s, cx| s.select(Some(selected), cx));
@@ -519,12 +532,12 @@ impl Workspace {
         cx.notify();
     }
 
-    fn active_tab_title(&self) -> Option<&str> {
-        self.active.and_then(|ix| self.sessions.get(ix)).map(|session| session.title.as_ref())
+    fn active_tab_title(&self, cx: &App) -> Option<SharedString> {
+        self.active.and_then(|ix| self.sessions.get(ix)).map(|session| session.display_title(cx))
     }
 
-    fn update_window_title(&self, window: &mut Window) {
-        window.set_window_title(&transfer::window_title(self.active_tab_title()));
+    fn update_window_title(&self, window: &mut Window, cx: &App) {
+        window.set_window_title(&transfer::window_title(self.active_tab_title(cx).as_deref()));
     }
 
     /// Closes the tab at `ix` right away (see [`Workspace::close`] for the confirmation).
@@ -563,7 +576,7 @@ impl Workspace {
         match self.active {
             _ if self.sessions.is_empty() => {
                 self.active = None;
-                self.update_window_title(window);
+                self.update_window_title(window, cx);
                 self.sync_ai_context(cx);
                 window.focus(&self.focus_handle, cx);
                 self.sidebar.update(cx, |s, cx| s.select(None, cx));
@@ -738,7 +751,9 @@ impl Workspace {
                 d.child(AppIcon::Laptop.icon().text_color(session_dot(s, &p)))
             })
             .when(!matches!(s.kind, SessionKind::Local), |d| d.child(dot(session_dot(s, &p), 7.)))
-            .child(crate::ui::ellipsis(("tab-title", s.id), s.title.clone()).flex_1().max_w(px(crate::tabs::TITLE_MAX)))
+            .child(div().id(("tab-title", s.id)).min_w_0().truncate().child(s.display_title(cx)).flex_1().max_w(px(crate::tabs::TITLE_MAX))
+                .tooltip({ let tip = s.title_tooltip(cx); move |window, cx| Tooltip::new(tip.clone())
+                    .max_w((window.viewport_size().width - px(48.)).min(px(680.))).whitespace_normal().build(window, cx) }))
             .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id), |d| {
                 d.child(
                     div()
@@ -817,7 +832,7 @@ impl Workspace {
             .enumerate()
             .map(|(ix, session)| {
                 let title = measure(
-                    &session.title,
+                    &session.display_title(cx),
                     13.,
                     if Some(ix) == self.active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
                     window,

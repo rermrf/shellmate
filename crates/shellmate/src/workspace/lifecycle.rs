@@ -1,5 +1,5 @@
 //! Workspace visibility and application-wide quit coordination.
-use super::{Hub, SessionKind, Workspace, forward::ForwardImpact, ssh::SshStatus};
+use super::{Hub, SessionKind, Workspace, close_guard::CloseImpact, ssh::SshStatus};
 use crate::dialogs::{quit::QuitDialog, window::{Choice, WindowCloseDialog}};
 use gpui::{App, Context, WeakEntity, Window};
 use shellmate_store::{CloseWindowWithSessions, Preference, Preferences};
@@ -42,22 +42,23 @@ enum WindowClose {
     Remove,
 }
 
-fn window_close(windows: usize, sessions: usize, policy: CloseWindowWithSessions) -> WindowClose {
+fn window_close(windows: usize, sessions: usize, risky: bool, policy: CloseWindowWithSessions) -> WindowClose {
     match (windows, sessions) {
         (0 | 1, _) => WindowClose::Last,
         (_, 0) => WindowClose::Remove,
         _ => match policy {
-            CloseWindowWithSessions::Ask => WindowClose::Confirm,
+            CloseWindowWithSessions::Ask if risky => WindowClose::Confirm,
+            CloseWindowWithSessions::Ask => WindowClose::Disconnect,
             CloseWindowWithSessions::Move => WindowClose::Move,
             CloseWindowWithSessions::Disconnect => WindowClose::Disconnect,
         },
     }
 }
 
-/// The tabs and forwarding impact the user actually saw in the close dialog.
+/// The tabs, jobs and resources the user actually saw in the close dialog.
 struct CloseScope {
     tabs: Vec<usize>,
-    forwards: ForwardImpact,
+    impact: CloseImpact,
 }
 
 impl CloseScope {
@@ -69,12 +70,12 @@ impl CloseScope {
         }
         let move_tabs = entry.update(cx, |workspace, window, cx| {
             let same_tabs = workspace.sessions.iter().map(|s| s.id).eq(self.tabs.iter().copied());
-            let increased_impact = choice == Choice::Disconnect && {
-                let current = workspace.forward_impact(|_| true, cx);
-                current.rules > self.forwards.rules || current.connections > self.forwards.connections
-            };
+            let increased_impact = choice == Choice::Disconnect
+                && !workspace.close_impact(&self.tabs, cx).covered_by(&self.impact);
             if !same_tabs || increased_impact {
-                workspace.close_window(window, cx);
+                // A remembered choice applies to future requests, not to new work
+                // that appeared while this particular confirmation was open.
+                workspace.close_window_with_policy(CloseWindowWithSessions::Ask, window, cx);
                 return None;
             }
             if let Some((_, editor)) = &workspace.editor {
@@ -130,36 +131,6 @@ fn has_shellmate_main_menu() -> bool {
         .is_some_and(|menu| menu.itemWithTitle(ns_string!("新建本机终端")).is_some())
 }
 
-#[derive(Default, PartialEq, Eq)]
-pub(super) struct Activity {
-    pub(super) sessions: usize,
-    pub(super) transfers: usize,
-    pub(super) forwards: usize,
-}
-
-impl Activity {
-    fn across_windows(sessions: impl IntoIterator<Item=usize>, transfers: usize, forwards: usize) -> Self {
-        Self { sessions: sessions.into_iter().sum(), transfers, forwards }
-    }
-    fn should_confirm(&self, enabled: bool) -> bool {
-        enabled && *self != Self::default()
-    }
-
-    fn message(&self) -> String {
-        let counts = [
-            (self.sessions, "会话"),
-            (self.transfers, "文件传输"),
-            (self.forwards, "端口转发"),
-        ];
-        let parts: Vec<_> = counts
-            .into_iter()
-            .filter(|(n, _)| *n > 0)
-            .map(|(n, label)| format!("{n} 个{label}"))
-            .collect();
-        format!("有{}正在进行，退出后会全部断开。", parts.join("、"))
-    }
-}
-
 impl Workspace {
     pub(crate) fn set_close_window_preference(&mut self, value: CloseWindowWithSessions, cx: &mut Context<Self>) -> Result<(), String> {
         self.hub.store.borrow_mut().set_close_window_with_sessions(value).map_err(|e| e.to_string())?;
@@ -183,11 +154,18 @@ impl Workspace {
 
     pub(crate) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let policy = self.hub.preferences.borrow().close_window_with_sessions;
-        match window_close(Hub::windows(cx).len(), self.sessions.len(), policy) {
+        self.close_window_with_policy(policy, window, cx);
+    }
+
+    fn close_window_with_policy(&mut self, policy: CloseWindowWithSessions, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs: Vec<_> = self.sessions.iter().map(|s| s.id).collect();
+        let impact = self.close_impact(&tabs, cx);
+        log::debug!("window close: tabs={} needs_confirmation={}", tabs.len(), impact.needs_confirmation());
+        match window_close(Hub::windows(cx).len(), self.sessions.len(), impact.needs_confirmation(), policy) {
             WindowClose::Remove => return window.remove_window(),
             WindowClose::Move | WindowClose::Disconnect => {
                 let choice = if policy == CloseWindowWithSessions::Move { Choice::Move } else { Choice::Disconnect };
-                let scope = CloseScope { tabs: self.sessions.iter().map(|s| s.id).collect(), forwards: self.forward_impact(|_| true, cx) };
+                let scope = CloseScope { tabs, impact };
                 let handle = self.handle;
                 cx.defer(move |cx| scope.confirm(handle, choice, cx));
                 return;
@@ -200,22 +178,13 @@ impl Workspace {
                             || stream.snapshot.as_ref().is_some_and(|state| state.retrying),
                         SessionKind::Local => false,
                     }).count();
-                    let scope = CloseScope {
-                        tabs: self.sessions.iter().map(|s| s.id).collect(),
-                        forwards: self.forward_impact(|_| true, cx),
-                    };
-                    let impact = scope.forwards;
-                    let warning = match (impact.rules, impact.connections) {
-                        (0, 0) => None,
-                        (0, n) => Some(format!("选择「断开并关闭」会断开 {n} 个转发连接。")),
-                        (n, 0) => Some(format!("选择「断开并关闭」会停止 {n} 条端口转发。")),
-                        (rules, connections) => Some(format!("选择「断开并关闭」会停止 {rules} 条端口转发，并断开 {connections} 个转发连接。")),
-                    };
+                    let warning = format!("选择「断开并关闭」时：\n{}", impact.message());
+                    let scope = CloseScope { tabs, impact };
                     let handle = self.handle;
                     let workspace = cx.weak_entity();
                     let mut scope = Some(scope);
                     self.close_dialog = Some(WindowCloseDialog::open(
-                        self.sessions.len(), connecting, warning,
+                        self.sessions.len(), connecting, Some(warning),
                         move |choice, remember, cx| {
                             if let Some(value) = choice.remembered(remember) {
                                 workspace.update(cx, |ws, cx| ws.set_close_window_preference(value, cx))
@@ -257,7 +226,7 @@ impl Workspace {
     }
 
     pub(super) fn close_empty_window_if_needed(&self, window: &mut Window, cx: &App) -> bool {
-        let close = window_close(Hub::windows(cx).len(), self.sessions.len(), CloseWindowWithSessions::Ask) == WindowClose::Remove;
+        let close = window_close(Hub::windows(cx).len(), self.sessions.len(), false, CloseWindowWithSessions::Ask) == WindowClose::Remove;
         if close {
             window.remove_window();
         }
@@ -327,54 +296,11 @@ impl Workspace {
         self.sync_monitor_activity(cx);
     }
 
-    fn busy_sessions(&self, cx: &mut App) -> usize {
-        self
-            .sessions
-            .iter()
-            .filter(|s| match &s.kind {
-                SessionKind::Ssh(ssh) => matches!(
-                    ssh.status,
-                    SshStatus::Connected | SshStatus::Reconnecting(_)
-                ),
-                SessionKind::Stream(stream) => stream.connected_or_reconnecting(s.exited),
-                SessionKind::Local => {
-                    !s.exited
-                        && s.terminal.update(cx, |t, _| {
-                            t.child_pid()
-                                .zip(t.foreground_process())
-                                .is_some_and(|(shell, fg)| fg.pid != shell)
-                        })
-                }
-            })
-            .count()
-    }
-    fn quit_activity(&self, cx: &mut Context<Self>) -> Activity {
-        let mut counts = vec![self.busy_sessions(cx)];
-        for entry in self.peers(super::Route::All,cx) {
-            if let Some(peer) = entry.workspace.upgrade() {
-                counts.push(peer.update(cx, |s,cx| s.busy_sessions(cx)));
-            }
-        }
-        let transfers = self.hub
-            .groups.borrow()
-            .iter()
-            .filter_map(|g| g.link.as_ref())
-            .map(|link| link.queue().running_count())
-            .sum();
-        let forwards = self.hub
-            .groups.borrow()
-            .iter()
-            .filter_map(|g| g.forward.as_ref())
-            .map(|f| f.forwarder.listening_rules())
-            .sum();
-        Activity::across_windows(counts, transfers, forwards)
-    }
-
     pub(crate) fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_window(window, cx);
-        let activity = self.quit_activity(cx);
-        if activity.should_confirm(self.hub.preferences.borrow().get(Preference::ConfirmQuit)) {
-            self.confirm_quit(activity, window, cx);
+        let impact = self.quit_impact(cx);
+        if impact.needs_confirmation() && self.hub.preferences.borrow().get(Preference::ConfirmQuit) {
+            self.confirm_quit(impact.message(), Some(impact), window, cx);
         } else {
             Hub::quit(cx);
         }
@@ -382,7 +308,8 @@ impl Workspace {
 
     pub(super) fn confirm_quit(
         &mut self,
-        activity: Activity,
+        message: String,
+        review: Option<CloseImpact>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -393,7 +320,8 @@ impl Workspace {
             .is_none()
         {
             *self.hub.quit_dialog.borrow_mut() = Some(QuitDialog::open(
-                activity.message(),
+                message,
+                review,
                 cx.weak_entity(),
                 window,
                 cx,
@@ -448,23 +376,23 @@ mod tests {
     #[test]
     fn nonfinal_window_policy_never_changes_last_or_empty_window_behavior() {
         for (policy, expected) in [(CloseWindowWithSessions::Ask, WindowClose::Confirm), (CloseWindowWithSessions::Move, WindowClose::Move), (CloseWindowWithSessions::Disconnect, WindowClose::Disconnect)] {
-            assert_eq!(window_close(2, 3, policy), expected);
-            assert_eq!(window_close(1, 3, policy), WindowClose::Last);
-            assert_eq!(window_close(2, 0, policy), WindowClose::Remove);
-            assert_eq!(window_close(1, 0, policy), WindowClose::Last);
+            assert_eq!(window_close(2, 3, true, policy), expected);
+            assert_eq!(window_close(1, 3, true, policy), WindowClose::Last);
+            assert_eq!(window_close(2, 0, false, policy), WindowClose::Remove);
+            assert_eq!(window_close(1, 0, false, policy), WindowClose::Last);
         }
     }
 
     #[test]
     fn nonfinal_windows_confirm_only_when_they_have_tabs() {
-        assert_eq!(window_close(1, 3, CloseWindowWithSessions::Ask), WindowClose::Last);
-        assert_eq!(window_close(2, 3, CloseWindowWithSessions::Ask), WindowClose::Confirm);
+        assert_eq!(window_close(1, 3, true, CloseWindowWithSessions::Ask), WindowClose::Last);
+        assert_eq!(window_close(2, 3, true, CloseWindowWithSessions::Ask), WindowClose::Confirm);
     }
 
     #[test]
     fn losing_the_last_tab_closes_only_a_nonfinal_window() {
-        assert_eq!(window_close(2, 0, CloseWindowWithSessions::Ask), WindowClose::Remove);
-        assert_eq!(window_close(1, 0, CloseWindowWithSessions::Ask), WindowClose::Last);
+        assert_eq!(window_close(2, 0, false, CloseWindowWithSessions::Ask), WindowClose::Remove);
+        assert_eq!(window_close(1, 0, false, CloseWindowWithSessions::Ask), WindowClose::Last);
     }
 
     #[test]
@@ -480,31 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn quit_activity_counts_each_shared_engine_once() {
-        let activity = Activity::across_windows([2, 0, 3], 1, 4);
-        assert_eq!((activity.sessions,activity.transfers,activity.forwards),(5,1,4));
-    }
-
-    #[test]
-    fn confirmation_and_wording_follow_activity() {
-        assert!(!Activity::default().should_confirm(true));
-        for (sessions, transfers, forwards, text) in [
-            (2, 0, 0, "2 个会话"),
-            (0, 1, 0, "1 个文件传输"),
-            (0, 0, 2, "2 个端口转发"),
-            (3, 1, 2, "3 个会话、1 个文件传输、2 个端口转发"),
-        ] {
-            let activity = Activity {
-                sessions,
-                transfers,
-                forwards,
-            };
-            assert!(activity.should_confirm(true));
-            assert!(!activity.should_confirm(false));
-            assert_eq!(
-                activity.message(),
-                format!("有{text}正在进行，退出后会全部断开。")
-            );
-        }
+    fn idle_windows_disconnect_without_asking_but_explicit_move_is_preserved() {
+        assert_eq!(window_close(2, 5, false, CloseWindowWithSessions::Ask), WindowClose::Disconnect);
+        assert_eq!(window_close(2, 5, true, CloseWindowWithSessions::Ask), WindowClose::Confirm);
+        assert_eq!(window_close(2, 5, false, CloseWindowWithSessions::Move), WindowClose::Move);
+        assert_eq!(window_close(2, 5, true, CloseWindowWithSessions::Disconnect), WindowClose::Disconnect);
     }
 }

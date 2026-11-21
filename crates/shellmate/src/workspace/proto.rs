@@ -220,6 +220,7 @@ impl Workspace {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 id,
                 title: host.name.into(),
+                local_title: None,
                 view,
                 terminal,
                 exited: false,
@@ -383,7 +384,7 @@ impl Workspace {
                 settings(2, window, cx).update(cx, |s, cx| s.fixture_scroll(120., cx));
             }
             "set-local" => self.open_settings(3, window, cx),
-            "quit-confirm" => self.confirm_quit(super::lifecycle::Activity { sessions: 3, transfers: 1, forwards: 2 }, window, cx),
+            "quit-confirm" => self.confirm_quit("有3 个会话、1 个文件传输、2 个端口转发正在进行，退出后会全部断开。".into(), None, window, cx),
             "set-conn-close-window" => {
                 self.set_close_window_preference(shellmate_store::CloseWindowWithSessions::Disconnect, cx).unwrap();
                 self.open_settings(4, window, cx);
@@ -455,6 +456,7 @@ impl Workspace {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
             title: "本机".into(),
+            local_title: None,
             view,
             terminal,
             exited: false,

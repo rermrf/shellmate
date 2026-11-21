@@ -385,6 +385,7 @@ impl Workspace {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id: session_id,
             title: title.into(),
+            local_title: None,
             view,
             terminal,
             exited: false,
@@ -1032,7 +1033,7 @@ impl Workspace {
                     tab.title = format!("本机 · {label}").into();
                     tab.typed = Some(TypedLine { text, enter });
                     let id = tab.id;
-                    self.update_window_title(window);
+                    self.update_window_title(window, cx);
                     self.type_pending(id, window, cx);
                 }
                 return;

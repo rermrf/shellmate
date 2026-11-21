@@ -82,6 +82,7 @@ impl Workspace {
                 ai_alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 id,
                 title: host.name.into(),
+                local_title: None,
                 view,
                 terminal,
                 exited: false,

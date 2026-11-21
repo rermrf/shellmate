@@ -16,7 +16,7 @@ use alacritty_terminal::index::{Column, Direction, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Handler as _, NamedColor, Processor};
 use gpui::{ClipboardItem, Context, EventEmitter, Pixels, SharedString, Task, px};
 use parking_lot::Mutex;
 use shellmate_core::io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
@@ -92,7 +92,7 @@ impl Dimensions for TerminalSize {
 enum Msg {
     /// New output was parsed into the grid.
     Output,
-    Alac(AlacEvent),
+    Alac { generation: u64, event: AlacEvent },
     Exited { generation: u64, code: Option<u32> },
     Disconnected { generation: u64, reason: String },
     /// The shell reported its working directory (OSC 7).
@@ -102,11 +102,12 @@ enum Msg {
 
 /// Forwards alacritty's events (title, bell, replies to queries) to the UI.
 #[derive(Clone)]
-pub struct Listener(async_channel::Sender<Msg>);
+pub struct Listener(async_channel::Sender<Msg>, Arc<AtomicU64>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: AlacEvent) {
-        let _ = self.0.try_send(Msg::Alac(event));
+        let generation = self.1.load(Ordering::Acquire);
+        let _ = self.0.try_send(Msg::Alac { generation, event });
     }
 }
 
@@ -186,6 +187,9 @@ impl OutputHandler for GridSink {
         let reported = self.osc7.lock().feed_with_offsets(bytes);
         {
             let mut term = self.term.lock();
+            // Attach advances the generation under this lock. An old reader may
+            // have passed the first check before waiting for it.
+            if self.current.load(Ordering::Acquire) != self.generation { return; }
             self.output_capture.lock().output(bytes);
             let mut capture = self.capture.lock();
             let mut parser = self.parser.lock();
@@ -212,6 +216,7 @@ impl OutputHandler for GridSink {
         if self.current.load(Ordering::Acquire)!=self.generation {return;}
         if !raw.is_empty() || !display.is_empty() { self.agent.lock().last_output = Some(Instant::now()); }
         let mut source=self.raw_grid.lock();
+        if self.current.load(Ordering::Acquire)!=self.generation {return;}
         let source=source.get_or_insert_with(||{
             let term=self.term.lock();let size=TerminalSize{cols:term.columns() as u16,rows:term.screen_lines() as u16,..Default::default()};RawGrid::new(size)
         });
@@ -295,7 +300,8 @@ impl Terminal {
     fn build(local: Option<PtyOptions>, palette: TerminalPalette, cx: &mut Context<Self>) -> Self {
         let (tx, rx) = async_channel::unbounded::<Msg>();
         let size = TerminalSize::default();
-        let term = Term::new(Config::default(), &size, Listener(tx.clone()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let term = Term::new(Config::default(), &size, Listener(tx.clone(), generation.clone()));
 
         let io = cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
@@ -327,7 +333,7 @@ impl Terminal {
             ended: None,
             cwd: None,
             auto_reconnect: false,
-            generation: Arc::new(AtomicU64::new(0)),
+            generation,
             tx,
             output_pending: Arc::new(AtomicBool::new(false)),
             foreground: None,
@@ -376,9 +382,23 @@ impl Terminal {
         self.close_backend();
         self.prompt_idle = None;
         self.prompt_highlighter.reset();
-        *self.capture.lock() = Capture::default();
-        *self.raw_grid.lock()=None;
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = {
+            // Match the serial-output lock order, preserving screen and scrollback.
+            let mut raw = self.raw_grid.lock();
+            let mut term = self.term.lock();
+            // alacritty 0.26 caps its private title stack at 4096 and exposes only
+            // pop_title. Drain it before changing generation so these events,
+            // and any already queued old titles, are discarded together.
+            for _ in 0..4096 { term.pop_title(); }
+            term.set_title(None);
+            *self.parser.lock() = Processor::new();
+            *self.capture.lock() = Capture::default();
+            *raw = None;
+            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        self.cwd = None;
+        self.foreground = None;
+        self.set_title(None, cx);
         self.alive = Arc::new(Mutex::new(Arc::new(AtomicBool::new(true))));
         *self.agent.lock() = crate::agent::AgentState::default();
         let sink = OutputSink::new(GridSink {
@@ -400,8 +420,6 @@ impl Terminal {
             Ok(backend) => {
                 self.backend = Some(backend);
                 self.ended = None;
-                self.cwd = None;
-                self.foreground = None;
                 if was_ended {
                     cx.emit(TerminalEvent::Restarted);
                 }
@@ -510,7 +528,7 @@ impl Terminal {
                     self.output_pending.store(false, Ordering::Release);
                     output = true;
                 }
-                Msg::Alac(event) => self.handle_alac_event(event, cx),
+                Msg::Alac { generation, event } if generation == self.current_generation() => self.handle_alac_event(event, cx),
                 Msg::Exited { generation, code } if generation == self.current_generation() => {
                     self.close_backend();
                     self.ended = Some(SessionEnd::Exited(code));
@@ -534,7 +552,7 @@ impl Terminal {
                 Msg::Command { generation, command, time } if generation == self.current_generation() => {
                     cx.emit(TerminalEvent::Command { command, cwd: self.cwd.clone(), time });
                 }
-                Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } | Msg::Command { .. } => {}
+                Msg::Alac { .. } | Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } | Msg::Command { .. } => {}
             }
         }
         if output {
@@ -550,14 +568,8 @@ impl Terminal {
         if self.replay{return;}
         match event {
             AlacEvent::PtyWrite(text) => self.write_raw(text.as_bytes()),
-            AlacEvent::Title(title) => {
-                self.title = Some(title.into());
-                cx.emit(TerminalEvent::TitleChanged);
-            }
-            AlacEvent::ResetTitle => {
-                self.title = None;
-                cx.emit(TerminalEvent::TitleChanged);
-            }
+            AlacEvent::Title(title) => self.set_title(Some(title.into()), cx),
+            AlacEvent::ResetTitle => self.set_title(None, cx),
             AlacEvent::Bell => cx.emit(TerminalEvent::Bell),
             AlacEvent::ClipboardStore(_, text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             AlacEvent::ColorRequest(index, format) => {
@@ -574,6 +586,15 @@ impl Terminal {
                 self.write_raw(format(self.size.window_size()).as_bytes())
             }
             _ => {}
+        }
+    }
+
+    fn set_title(&mut self, title: Option<SharedString>, cx: &mut Context<Self>) {
+        let title = title.filter(|title| !title.trim().is_empty());
+        if self.title != title {
+            self.title = title;
+            cx.emit(TerminalEvent::TitleChanged);
+            cx.notify();
         }
     }
 
@@ -726,7 +747,7 @@ impl Terminal {
     }
     pub fn finalize_log(&mut self){self.output_capture.lock().stop_logging();}
     pub fn is_replay(&self)->bool{self.replay}
-    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.replay_timestamp=None;self.replay_times=Default::default();self.prompt_idle=None;self.prompt_highlighter.reset();self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
+    pub fn replay_reset(&mut self,cols:u16,rows:u16){self.replay=true;self.replay_timestamp=None;self.replay_times=Default::default();self.prompt_idle=None;self.prompt_highlighter.reset();self.size.cols=cols;self.size.rows=rows;let term=Term::new(Config::default(),&self.size,Listener(self.tx.clone(), self.generation.clone()));*self.term.lock()=term;*self.parser.lock()=Processor::new();}
     pub fn replay_event(&mut self, event: &crate::cast::Event, timestamp: Option<i64>, cx: &mut Context<Self>) {
         self.replay_timestamp = timestamp;
         match &event.data {
@@ -848,6 +869,21 @@ impl Terminal {
         let info = self.backend.as_ref().and_then(|backend| backend.foreground_process());
         self.foreground = Some((Instant::now(), info.clone()));
         info
+    }
+
+    /// Destructive actions must not reuse the title's 500 ms process cache.
+    pub fn close_activity(&self) -> shellmate_core::io::CloseActivity {
+        use shellmate_core::io::CloseActivity;
+        let Some(backend) = &self.backend else { return CloseActivity::Idle };
+        let activity = backend.close_activity();
+        if activity == CloseActivity::Idle
+            && (self.mode().contains(TermMode::ALT_SCREEN)
+                || self.capture.lock().running()
+                || self.agent.lock().active.as_ref().is_some_and(|(_, scanner)| scanner.running()))
+        {
+            return CloseActivity::Unknown;
+        }
+        activity
     }
 
     /// The working directory the shell last reported with OSC 7, if it ever did since the
@@ -991,8 +1027,8 @@ mod sink_tests {
     fn fixture(generation: u64) -> Fixture {
         let (tx, rx) = async_channel::unbounded();
         let size = TerminalSize::default();
-        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, Listener(tx.clone()))));
         let current = Arc::new(AtomicU64::new(generation));
+        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, Listener(tx.clone(), current.clone()))));
         let pending = Arc::new(AtomicBool::new(false));
         let capture=Arc::new(Mutex::new(Capture::default()));
         let raw_grid=Arc::new(Mutex::new(None));
