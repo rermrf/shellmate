@@ -227,6 +227,8 @@ pub struct Workspace {
     split: crate::productivity::multi::Split,
     session_menu: Option<multi::OpenSessionMenu>,
     tab_strip: tab_drag::TabStrip,
+    /// Tab width held while the pointer is over the tab bar.
+    tab_hold: crate::tabs::Hold,
     #[cfg(debug_assertions)]
     demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
     #[cfg(debug_assertions)]
@@ -289,7 +291,11 @@ impl Workspace {
                     Hub::activated(s.handle, cx);
                     s.last_menu_state = None;
                     s.sync_menus(cx);
-                } else { s.end_drawer_drag(cx); }
+                } else {
+                    s.end_drawer_drag(cx);
+                    // A pointer that left while the window was away may never report it.
+                    s.release_tab_hold(cx);
+                }
             }),
             cx.subscribe_in(&commands, window, Self::on_command_event),
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
@@ -319,6 +325,7 @@ impl Workspace {
             drawer_motion: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
             tab_strip: Default::default(),
+            tab_hold: Default::default(),
             #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -730,6 +737,17 @@ impl Workspace {
         let s = &self.sessions[ix];
         let active = Some(ix) == self.active;
         let p = cx.palette().clone();
+        let local = matches!(s.kind, SessionKind::Local);
+        // Narrow tabs give way in this order: title (down to a floor), broadcast chip, reconnect badge;
+        // a chip is shown whole or not at all.
+        let badge = s.ssh().and_then(|ssh| ssh.badge());
+        let chips = crate::tabs::chips(
+            f32::from(width),
+            local,
+            badge.as_deref().map(crate::tabs::chip_estimate),
+            self.broadcast.enabled && self.broadcast.checked.contains(&s.id),
+        );
+        let floor = if f32::from(width) >= crate::tabs::TAB_MIN { crate::tabs::TITLE_FLOOR } else { 0. };
         div()
             .id(("tab", s.id))
             .w(width)
@@ -742,19 +760,18 @@ impl Workspace {
             .pl(px(12.))
             .pr(px(6.))
             .rounded(px(12.))
+            .overflow_hidden()
             .cursor_pointer()
             .text_size(px(13.))
             .line_height(px(16.))
             .when(active, |d| d.bg(p.card).shadow(item_shadow(&p)).font_weight(FontWeight::SEMIBOLD).text_color(p.tx))
             .when(!active, |d| d.font_weight(FontWeight::MEDIUM).text_color(p.tx2).hover(|d| d.bg(p.card.opacity(0.5))))
-            .when(matches!(s.kind, SessionKind::Local), |d| {
-                d.child(AppIcon::Laptop.icon().text_color(session_dot(s, &p)))
-            })
-            .when(!matches!(s.kind, SessionKind::Local), |d| d.child(dot(session_dot(s, &p), 7.)))
-            .child(div().id(("tab-title", s.id)).min_w_0().truncate().child(s.display_title(cx)).flex_1().max_w(px(crate::tabs::TITLE_MAX))
+            .when(local, |d| d.child(AppIcon::Laptop.icon().flex_none().text_color(session_dot(s, &p))))
+            .when(!local, |d| d.child(dot(session_dot(s, &p), 7.)))
+            .child(div().id(("tab-title", s.id)).min_w(px(floor)).truncate().child(s.display_title(cx)).flex_1()
                 .tooltip({ let tip = s.title_tooltip(cx); move |window, cx| Tooltip::new(tip.clone())
                     .max_w((window.viewport_size().width - px(48.)).min(px(680.))).whitespace_normal().build(window, cx) }))
-            .when(self.broadcast.enabled && self.broadcast.checked.contains(&s.id), |d| {
+            .when(chips.broadcast, |d| {
                 d.child(
                     div()
                         .flex_none()
@@ -766,8 +783,8 @@ impl Workspace {
                         .child("广播"),
                 )
             })
-            .children(s.ssh().and_then(|ssh| ssh.badge().map(|badge| (ssh.status, badge))).map(|(status, badge)| {
-                let failed = status == ssh::SshStatus::Failed;
+            .children(s.ssh().zip(badge.filter(|_| chips.badge)).map(|(ssh, badge)| {
+                let failed = ssh.status == ssh::SshStatus::Failed;
                 let color = if failed { p.err } else { p.warn };
                 let id = s.id;
                 div()
@@ -811,9 +828,16 @@ impl Workspace {
             )
     }
 
+    /// The pointer is no longer over the tab bar: the tabs may take the width the titles ask for.
+    fn release_tab_hold(&mut self, cx: &mut Context<Self>) {
+        if self.tab_hold.leave() {
+            cx.notify();
+        }
+    }
+
     fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        // Shape the same fonts/weights the strip renders; titles are capped, chips are not.
+        // Shape the same fonts/weights the strip renders.
         let measure = |text: &str, size: f32, weight: FontWeight, window: &mut Window| {
             let font = gpui::Font { weight, ..gpui::font(theme::UI_FONT) };
             let run = gpui::TextRun {
@@ -826,30 +850,6 @@ impl Workspace {
             };
             f32::from(window.text_system().shape_line(text.to_string().into(), px(size), &[run], None).width).ceil()
         };
-        let widths = self
-            .sessions
-            .iter()
-            .enumerate()
-            .map(|(ix, session)| {
-                let title = measure(
-                    &session.display_title(cx),
-                    13.,
-                    if Some(ix) == self.active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
-                    window,
-                );
-                let reconnect =
-                    session.ssh().and_then(|ssh| ssh.badge()).map(|badge| measure(&badge, 10., FontWeight::BOLD, window));
-                let broadcast = (self.broadcast.enabled && self.broadcast.checked.contains(&session.id)).then(|| {
-                    measure(
-                        "广播",
-                        10.,
-                        if Some(ix) == self.active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM },
-                        window,
-                    )
-                });
-                crate::tabs::tab_width(title, matches!(session.kind, SessionKind::Local), reconnect, broadcast)
-            })
-            .collect::<Vec<_>>();
         let pill = cx.global::<crate::updater::Updater>().pill();
         let pill_width = pill.as_ref().map_or(0., |label| {
             8. + 24. + AppIcon::Shield.size() + 6. + measure(label, 12.5, FontWeight::SEMIBOLD, window)
@@ -874,10 +874,28 @@ impl Workspace {
         } else {
             cap
         };
-        let fit = crate::tabs::fit_tabs(&widths, available, overflow_width, self.active, cap);
-        let visible = fit.visible;
-        let strip_width = visible.iter().map(|ix| widths[*ix].min(fit.single_tab_max)).sum::<f32>()
-            + crate::tabs::TAB_GAP * visible.len().saturating_sub(1) as f32;
+        // Every tab is as wide as the longest title asks, whichever tabs are visible. Titles are measured
+        // semibold for all of them, so activating a tab never changes the width.
+        let target = crate::tabs::target_width(self.sessions.iter().map(|session| crate::tabs::Content {
+            title: measure(&session.display_title(cx), 13., FontWeight::SEMIBOLD, window),
+            local: matches!(session.kind, SessionKind::Local),
+            badge: session.ssh().and_then(|ssh| ssh.badge()).as_deref().map(crate::tabs::chip_estimate),
+            broadcast: self.broadcast.enabled && self.broadcast.checked.contains(&session.id),
+        }));
+        let layout = crate::tabs::layout(
+            self.sessions.len(),
+            available,
+            overflow_width,
+            self.active,
+            cap,
+            target,
+            self.tab_hold.held(),
+        );
+        self.tab_hold.rendered(layout.width);
+        let strip_width = layout.strip_width();
+        let width = px(layout.width);
+        let overflow = layout.overflow;
+        let visible = layout.visible;
         let has_tabs = !visible.is_empty();
         let source = self.handle;
         let indices = visible.clone();
@@ -885,7 +903,6 @@ impl Workspace {
         let strip_owner = tab_owner.clone();
         let tabs = visible.into_iter().map(|ix| {
             let id = self.sessions[ix].id;
-            let width = px(widths[ix].min(fit.single_tab_max));
             self.tab_face(ix, width, false, cx)
                 .on_mouse_down(MouseButton::Left, tab_drag::press)
                 .on_drag(tab_drag::DraggedTab::new(source, id), move |tab, offset, window, cx| {
@@ -925,12 +942,31 @@ impl Workspace {
             .gap(px(8.))
             .child(
                 div()
+                    .id("tab-region")
                     .w(px(available))
                     .flex_none()
                     .min_w_0()
                     .h_full()
                     .flex()
                     .items_center()
+                    // The tabs keep their width while the pointer is over the bar: a real pointer move holds,
+                    // leaving releases (typing in between does not). Hover is deliberately not used to start the
+                    // hold: gpui re-derives it every frame from the last pointer position, which a window exit
+                    // does not update, so `on_hover(true)` can fire again after the pointer has gone.
+                    .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            this.release_tab_hold(cx);
+                        }
+                    }))
+                    .on_mouse_move(cx.listener(|this, _: &gpui::MouseMoveEvent, _, cx| {
+                        // A tab drag is not hovering: it ends the hold instead of starting one.
+                        if cx.has_active_drag() {
+                            this.release_tab_hold(cx);
+                        } else {
+                            this.tab_hold.enter();
+                        }
+                    }))
                     .child(
                         div()
                             .w(px(strip_width))
@@ -946,7 +982,7 @@ impl Workspace {
                     )
                     .child(div().flex_none().when(has_tabs, |d| d.ml(px(crate::tabs::TAB_GAP))).child(new_tab))
                     .child(window_drag_area(div().id("tabbar-drag")).flex_1().min_w_0().h_full())
-                    .when(fit.overflow, |d| {
+                    .when(overflow, |d| {
                         d.child(
                             div()
                                 .id("tab-list-button")
