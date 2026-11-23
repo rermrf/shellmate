@@ -1,7 +1,6 @@
 //! Tab ownership changes are synchronous on GPUI's foreground thread.
 use super::*;
 use gpui::{AnyWindowHandle, Bounds, DisplayId, Pixels, point};
-use gpui::component::menu::{PopupMenu, PopupMenuItem};
 use crate::productivity::multi::{Broadcast, Split};
 
 #[must_use]
@@ -56,6 +55,7 @@ impl Workspace {
             &mut self.broadcast,
         );
         self.session_menu = None;
+        self.tab_menu = None;
         self.picker = None;
         self.picker_subscription = None;
         session
@@ -232,7 +232,7 @@ pub(super) enum Destination {
     Existing(AnyWindowHandle, usize),
 }
 
-fn move_to_new(source: AnyWindowHandle, id: usize, window: &Window, cx: &mut App) {
+pub(super) fn move_to_new(source: AnyWindowHandle, id: usize, window: &Window, cx: &mut App) {
     let destination = Destination::New(new_window_placement(window, cx));
     cx.defer(move |cx| move_sessions(source, destination, vec![id], cx));
 }
@@ -329,39 +329,6 @@ pub(super) fn move_to_recent_window(source: AnyWindowHandle, tabs: Vec<usize>, c
     }
 }
 
-pub(super) fn tab_context_menu(
-    menu: PopupMenu,
-    source: AnyWindowHandle,
-    id: usize,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    let destinations: Vec<_> = Hub::windows(cx).iter()
-        .filter(|entry| entry.handle != source)
-        .filter_map(|entry| {
-            let workspace = entry.workspace.upgrade()?;
-            let title = workspace.read(cx).active_tab_title(cx).unwrap_or_else(|| "Shellmate".into());
-            Some((entry.handle, format!("窗口 {} · {title}", entry.number)))
-        })
-        .collect();
-    let menu = menu.item(PopupMenuItem::new("移到新窗口").on_click(move |_, window, cx| {
-        move_to_new(source, id, window, cx);
-    }));
-    if destinations.is_empty() {
-        return menu.item(PopupMenuItem::new("移到窗口 ›").disabled(true));
-    }
-    menu.submenu("移到窗口", window, cx, move |submenu, _, _| {
-        destinations.iter().fold(submenu, |submenu, (destination, label)| {
-            let destination = *destination;
-            submenu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _, cx| {
-                cx.defer(move |cx| {
-                    move_sessions(source, Destination::Existing(destination, usize::MAX), vec![id], cx);
-                });
-            }))
-        })
-    })
-}
-
 #[cfg(debug_assertions)]
 pub(super) fn merge_back(cx: &mut App) {
     let windows = Hub::windows(cx);
@@ -375,17 +342,34 @@ pub(super) fn merge_back(cx: &mut App) {
     }
 }
 
+/// The windows a prototype scene sets up around the main one.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DemoWindows {
+    /// The last stream tab elsewhere; the window then closes.
+    CloseDialog,
+    /// The last two tabs in a window each; the tab menu opens with the list of windows.
+    TabMenu,
+    /// All but the first tab in one window: this one keeps a single session and the menu opens on it.
+    TabMenuSingle,
+}
+
 #[cfg(debug_assertions)]
 impl Workspace {
-    pub(super) fn demo_multi_window(&mut self, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn demo_multi_window(&mut self, demo: DemoWindows, window: &mut Window, cx: &mut Context<Self>) {
         let source = self.handle;
         let current = window.bounds();
         let display = window.display(cx).map(|display| display.id());
-        let count = if close { 1 } else { 2 };
+        let close = demo == DemoWindows::CloseDialog;
         // Move fixture tabs to background windows using the production path.
-        let ids: Vec<_> = self.sessions.iter()
-            .filter(|session| !close || matches!(session.kind, SessionKind::Stream(_)))
-            .rev().take(count).map(|session| session.id).collect();
+        let groups: Vec<Vec<usize>> = if demo == DemoWindows::TabMenuSingle {
+            vec![self.sessions.iter().skip(1).map(|session| session.id).collect()]
+        } else {
+            let count = if close { 1 } else { 2 };
+            self.sessions.iter()
+                .filter(|session| !close || matches!(session.kind, SessionKind::Stream(_)))
+                .rev().take(count).map(|session| vec![session.id]).collect()
+        };
         if close {
             for session in self.sessions.iter_mut().take(2) {
                 if let SessionKind::Ssh(ssh) = &mut session.kind {
@@ -399,11 +383,11 @@ impl Workspace {
         }
         cx.defer(move |cx| {
             let Some(source) = Hub::entry(source, cx) else { return };
-            for (offset, id) in ids.into_iter().enumerate() {
+            for (offset, ids) in groups.into_iter().enumerate() {
                 let inset = px(50. + 28. * offset as f32);
                 let bounds = Bounds::new(current.origin + point(inset, inset), gpui::size(px(980.), px(620.)));
                 if let Some(destination) = open_secondary((bounds, display), cx) {
-                    move_tabs(&source, &destination, &[id], 0, cx);
+                    move_tabs(&source, &destination, &ids, 0, cx);
                 }
             }
             source.update(cx, |workspace, window, cx| {
@@ -411,31 +395,10 @@ impl Workspace {
                 if close {
                     workspace.close_window(window, cx);
                 } else {
-                    workspace.open_demo_tab_menu(window, cx);
+                    workspace.demo_tab_menu(demo == DemoWindows::TabMenu, window, cx);
                 }
             });
         });
-    }
-
-    fn open_demo_tab_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.main_id() else { return };
-        let source = self.handle;
-        let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-            tab_context_menu(menu, source, id, window, cx)
-        });
-        let subscription = cx.subscribe_in(&menu, window, |workspace, _, _: &gpui::DismissEvent, window, cx| {
-            workspace.demo_tab_menu = None;
-            workspace.focus_active(window, cx);
-            cx.notify();
-        });
-        window.focus(&menu.focus_handle(cx), cx);
-        self.demo_tab_menu = Some((menu, subscription));
-        cx.notify();
-        window.on_next_frame(|window, _| window.on_next_frame(|window, cx| {
-            for key in ["down", "down", "right"] {
-                window.dispatch_keystroke(gpui::Keystroke::parse(key).expect("popup key"), cx);
-            }
-        }));
     }
 }
 

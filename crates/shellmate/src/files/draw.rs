@@ -14,8 +14,8 @@ use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, Sizable as _};
 use gpui::prelude::*;
 use gpui::{
-    Anchor, AnyElement, BoxShadow, ClipboardItem, Context, ExternalPaths, FontWeight, Hsla, MouseButton,
-    MouseDownEvent, SharedString, Stateful, Window, anchored, black, deferred, div, point, px, transparent_black,
+    Anchor, AnyElement, ClipboardItem, Context, ExternalPaths, FontWeight, Hsla, MouseButton,
+    MouseDownEvent, SharedString, Stateful, Window, anchored, deferred, div, px, transparent_black,
     uniform_list, white,
 };
 use shellmate_sftp::{Entry, EntryKind, format_size, mode_string, path};
@@ -761,54 +761,16 @@ impl FilesPanel {
                     enabled: bool,
                     danger: bool,
                     cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(px(9.))
-                .text_size(px(13.))
-                .text_color(if danger { p.err } else { p.tx })
-                .when(enabled, |d| {
-                    d.cursor_pointer()
-                        .hover(|d| d.bg(p.card2))
-                        .on_click(cx.listener(move |this, _, window, cx| this.menu_action(action, window, cx)))
-                })
-                .when(!enabled, |d| d.opacity(0.45).cursor_not_allowed())
+            crate::ui::menu::item(id, enabled, danger, p)
+                .when(enabled, |d| d.on_click(cx.listener(move |this, _, window, cx| this.menu_action(action, window, cx))))
                 .child(label)
         };
         let (open_label, open_enabled) =
             if menu.opens_dir { ("打开", ops) } else { ("用内置编辑器打开", ops && menu.editable) };
-        let shadow = vec![
-            BoxShadow {
-                color: black().opacity(0.22),
-                offset: point(px(0.), px(12.)),
-                blur_radius: px(36.),
-                spread_radius: px(0.),
-                inset: false,
-            },
-            BoxShadow {
-                color: p.line,
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(0.),
-                spread_radius: px(1.),
-                inset: false,
-            },
-        ];
         Some(
             deferred(
                 anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(
-                    div()
-                        .id("row-menu")
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .w(px(196.))
-                        .p(px(6.))
-                        .rounded(px(14.))
-                        .bg(p.card)
-                        .shadow(shadow)
+                    crate::ui::menu::card("row-menu", p)
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
                         .child(item("menu-open", open_label, MenuAction::Open, open_enabled, false, cx))
                         .when(!self.is_local(), |menu| menu.child(item("menu-download", "下载", MenuAction::Download, ops, false, cx)))

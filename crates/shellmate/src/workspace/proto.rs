@@ -156,6 +156,11 @@ impl Workspace {
         if scene=="mosh" {session_sources.push(("h8","MOSH"));}
         // One tab more than the window shows at once: the fifth goes behind the session list.
         if scene.starts_with("tab-attention") {session_sources.push(("h2","S1"));}
+        // Sixteen tabs, the one in front far down the list that the overflow menu opens on.
+        if scene=="tab-list-scroll" {
+            session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]);
+            session_sources.extend([("h1","S1"),("h3","S1"),("h7","S1"),("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1")]);
+        }
         if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
         for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
             let host = self.hub.book.borrow().host(&HostId::from_raw(host_id)).unwrap().clone();
@@ -221,7 +226,8 @@ impl Workspace {
             self.sessions.push(Session {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 id,
-                title: host.name.into(),
+                // The second round of hosts gets a number, to tell its tabs from the first.
+                title: if scene=="tab-list-scroll" && i>=9 {format!("{} · 2",host.name).into()} else {host.name.into()},
                 local_title: None,
                 view,
                 terminal,
@@ -240,7 +246,7 @@ impl Workspace {
             });
         }
 
-        self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if matches!(scene,"telnet"|"mosh"){4}else{0}, window, cx);
+        self.activate(if matches!(scene,"serial"|"serial-hex"){2}else if matches!(scene,"telnet"|"mosh"){4}else if scene=="tab-list-scroll"{11}else{0}, window, cx);
         self.broadcast.checked = [1, 2].into();
         self.sync_productivity(cx);
         let settings = |section, window: &mut Window, cx: &mut Context<Self>| {
@@ -248,8 +254,12 @@ impl Workspace {
                 self.hub.secrets.clone(), section, self.hub.store.clone(), window, cx)
         };
         match scene {
-            "close-window-dialog" | "tabmenu-move" => {
-                self.demo_multi_window(scene == "close-window-dialog", window, cx);
+            "close-window-dialog" | "tabmenu-move" | "tabmenu-single" => {
+                self.demo_multi_window(match scene {
+                    "close-window-dialog" => transfer::DemoWindows::CloseDialog,
+                    "tabmenu-move" => transfer::DemoWindows::TabMenu,
+                    _ => transfer::DemoWindows::TabMenuSingle,
+                }, window, cx);
             }
             "cmds" | "bc" | "qc" | "tabmenu" => {
                 self.commands_open = true;
@@ -273,6 +283,9 @@ impl Workspace {
                 if scene == "tab-attention-menu" {
                     self.open_session_menu(crate::productivity::session_menu::Kind::Tabs, gpui::point(px(904.), px(52.)), window, cx);
                 }
+            }
+            "tab-list-scroll" => {
+                self.open_session_menu(crate::productivity::session_menu::Kind::Tabs, gpui::point(px(904.), px(52.)), window, cx);
             }
             "pal" => self.open_palette_query("", window, cx),
             "pal-q" => self.open_palette_query("prod", window, cx),

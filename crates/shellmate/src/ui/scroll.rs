@@ -6,7 +6,7 @@ use gpui::{
     point, prelude::*, px, size,
 };
 
-const FADE_HEIGHT: f32 = 16.;
+pub const FADE_HEIGHT: f32 = 16.;
 const BOTTOM_PADDING: f32 = 24.;
 
 #[derive(Debug, PartialEq, Eq)]

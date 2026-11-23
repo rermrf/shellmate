@@ -283,11 +283,13 @@ impl Workspace {
         } else {
             self.split.other
         };
-        let view = cx.new(|cx| SessionMenu::new(rows, active, window, cx));
+        let view = cx.new(|cx| SessionMenu::new(rows, active, position.y, window, cx));
         let subscription = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
             this.session_menu = None;
             match event {
-                session_menu::Event::Close => this.focus_active(window, cx),
+                // A tab menu that opened in the meantime has the keys.
+                session_menu::Event::Close if this.tab_menu.is_none() => this.focus_active(window, cx),
+                session_menu::Event::Close => {}
                 session_menu::Event::Pick(id) => {
                     if kind == session_menu::Kind::Tabs {
                         if let Some(ix) = this.sessions.iter().position(|s| s.id == *id) {

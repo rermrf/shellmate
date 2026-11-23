@@ -8,7 +8,6 @@ use std::sync::Arc;
 use gpui::assets::IconName as Lucide;
 use crate::icons::AppIcon;
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::menu::ContextMenuExt as _;
 use gpui::component::notification::Notification;
 use gpui::component::tooltip::Tooltip;
 use gpui::component::{Icon, WindowExt as _};
@@ -34,6 +33,7 @@ mod files;
 mod hub;
 mod transfer;
 mod tab_drag;
+mod tab_menu;
 mod titles;
 mod zoom;
 #[cfg(target_os = "macos")]
@@ -91,6 +91,7 @@ pub fn init(cx: &mut App) {
     crate::productivity::panel::init(cx);
     crate::productivity::broadcast::init(cx);
     crate::productivity::session_menu::init(cx);
+    tab_menu::init(cx);
     cx.bind_keys(bindings());
 }
 
@@ -245,6 +246,7 @@ pub struct Workspace {
     broadcast_bar: Entity<crate::productivity::broadcast::BroadcastBar>,
     split: crate::productivity::multi::Split,
     session_menu: Option<multi::OpenSessionMenu>,
+    tab_menu: Option<tab_menu::TabMenu>,
     tab_strip: tab_drag::TabStrip,
     /// Tab width held while the pointer is over the tab bar.
     tab_hold: crate::tabs::Hold,
@@ -255,8 +257,6 @@ pub struct Workspace {
     located: Option<crate::restore::Located>,
     /// What the record of the session looked at last time the window changed; see `restore.rs`.
     snapshot_sig: u64,
-    #[cfg(debug_assertions)]
-    demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
     #[cfg(debug_assertions)]
     review_confirmation: Option<gpui::WeakEntity<crate::productivity::panel::Confirmation>>,
     #[cfg(debug_assertions)]
@@ -359,13 +359,12 @@ impl Workspace {
             commands_open: false, ai_drawer:None,ai_open:false,
             ai_drawer_width, ai_drawer_drag: Default::default(),
             drawer_motion: Default::default(),
-            broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
+            broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,tab_menu:None,
             tab_strip: Default::default(),
             tab_hold: Default::default(),
             font_size: None,
             located: None,
             snapshot_sig: 0,
-            #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
             picker: None,
@@ -588,6 +587,7 @@ impl Workspace {
         let selected = session.host().map_or_else(|| "local".to_string(), |host| host.id.to_string());
         self.split.select_tab(self.main_id(),new_id);
         self.session_menu=None;
+        self.tab_menu=None;
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
@@ -648,6 +648,7 @@ impl Workspace {
         self.broadcast.checked.remove(&closed);
         self.hub.recent_sessions.borrow_mut().retain(|id|*id!=closed);
         self.session_menu=None;
+        self.tab_menu=None;
         self.sessions[ix].terminal.read(cx).agent_liveness().store(false, std::sync::atomic::Ordering::Release);
         self.sessions.remove(ix);
         self.update_pane_radii(cx);
@@ -993,9 +994,10 @@ impl Workspace {
                     tab.begin(offset, width, window, cx)
                 })
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
-                .context_menu(move |menu, window, cx| {
-                    transfer::tab_context_menu(menu, source, id, window, cx)
-                })
+                .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_menu(id, event.position, window, cx);
+                }))
         });
 
         let new_tab_tip = if self.active.is_some() { "复制当前会话 ⇧⌘T" } else { "新建本机终端 ⌘T" };
@@ -1389,11 +1391,6 @@ impl Render for Workspace {
                     .on_click(|_, _, cx| cx.stop_propagation()).child(picker.clone()))
         });
 
-        #[cfg(debug_assertions)]
-        let demo_tab_menu = self.demo_tab_menu.as_ref().map(|(menu, _)| {
-            gpui::deferred(gpui::anchored().position(gpui::point(px(312.), px(38.)))
-                .snap_to_window_with_margin(px(8.)).child(menu.clone())).with_priority(3)
-        });
         div()
             .id("workspace")
             .relative()
@@ -1428,11 +1425,7 @@ impl Render for Workspace {
             .children(self.session_menu.as_ref().map(|menu| gpui::deferred(
                 gpui::anchored().position(menu.position).snap_to_window_with_margin(px(8.)).child(menu.view.clone())
             ).with_priority(3)))
-            .map(|root| {
-                #[cfg(debug_assertions)]
-                let root = root.children(demo_tab_menu);
-                root
-            })
+            .children(self.render_tab_menu(_window, cx))
             .children(palette)
             .child(gpui::canvas(|_, _, _| (), move |bounds, _, window, cx| {
                 tab_drag::paint_and_listen(window, cx);

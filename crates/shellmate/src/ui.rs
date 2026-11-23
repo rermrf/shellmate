@@ -1,5 +1,6 @@
 //! Small presentational helpers shared by the sidebar and workspace.
 
+pub mod menu;
 pub mod scroll;
 mod field;
 pub use field::{Surface, field_box, field_input};
