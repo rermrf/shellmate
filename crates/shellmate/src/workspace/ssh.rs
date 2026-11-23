@@ -541,7 +541,8 @@ impl Workspace {
         }
         let Some((host, chain)) = self.resolve_for_connect(id, window, cx) else { return };
         let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new(), cx);
-        self.push_ssh_tab(host.name.clone(), host, chain, group, window, cx);
+        let title = self.unique_session_name(&host.name, cx);
+        self.push_ssh_tab(title, host, chain, group, window, cx);
         self.launch_attempt(group, window, cx);
     }
 
@@ -552,7 +553,8 @@ impl Workspace {
         if let Some(c)=credential {self.hub.pending_forms.borrow_mut().insert(host.id.clone(),(connect::Endpoint::of(&host,&connect::default_user()),c));}
         self.hub.temporary_hosts.borrow_mut().insert(host.id.clone(),host.clone());
         let group=self.new_group(&chain,Reconnect::initial(),AuthMemory::new(), cx);
-        self.push_ssh_tab(host.name.clone(),host,chain,group,window,cx);
+        let title=self.unique_session_name(&host.name,cx);
+        self.push_ssh_tab(title,host,chain,group,window,cx);
         self.launch_attempt(group,window,cx);
     }
 
@@ -578,7 +580,7 @@ impl Workspace {
         let Some(ssh) = self.active.and_then(|ix| self.sessions.get(ix)).and_then(|s| s.ssh()) else { return };
         let (source_group, host_id) = (ssh.group, ssh.host.id.clone());
         let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
-        let title = format!("{} · 2", host.name);
+        let title = self.unique_session_name(&host.name, cx);
         let memory = self.group(source_group).map_or_else(AuthMemory::new, |group| group.memory.duplicate());
         let group = self.new_group(&chain, Reconnect::initial(), memory, cx);
         self.push_ssh_tab(title, host, chain, group, window, cx);
@@ -1131,8 +1133,9 @@ impl Workspace {
             if self.sessions[ix].exited { return; }
             if enter {
                 self.open_local(window, cx);
+                let title = self.unique_session_name(&format!("本机 · {label}"), cx);
                 if let Some(tab) = self.sessions.last_mut() {
-                    tab.title = format!("本机 · {label}").into();
+                    tab.title = title.into();
                     tab.typed = Some(TypedLine { text, enter });
                     let id = tab.id;
                     self.update_window_title(window, cx);
@@ -1163,7 +1166,7 @@ impl Workspace {
             );
             return;
         };
-        let title = format!("{} · {label}", host.name);
+        let title = self.unique_session_name(&format!("{} · {label}", host.name), cx);
         let session_id = self.push_ssh_tab(title, host, chain, source_group, window, cx);
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.typed = Some(TypedLine { text, enter });
@@ -1313,8 +1316,7 @@ impl Workspace {
         let (source_group, host_id) = (ssh.group, ssh.host.id.clone());
         let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else { return };
 
-        let copies = self.sessions.iter().filter(|s| s.ssh().is_some_and(|ssh| ssh.host.id == host_id)).count();
-        let title = format!("{} · {}", host.name, copies + 1);
+        let title = self.unique_session_name(&host.name, cx);
         let key = PoolKey::of(&chain, &connect::default_user());
         // Same host, same route as the connection the source tab is on, and that connection is up.
         let reusable = self

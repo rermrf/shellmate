@@ -258,16 +258,7 @@ impl Workspace {
                 }
                 let id = match host.protocol {
                     Protocol::Ssh | Protocol::Mosh => {
-                        let copies = self
-                            .sessions
-                            .iter()
-                            .filter(|s| s.ssh().is_some_and(|ssh| ssh.host.id == host.id))
-                            .count();
-                        let title = if copies == 0 {
-                            host.name.clone()
-                        } else {
-                            format!("{} · {}", host.name, copies + 1)
-                        };
+                        let title = self.unique_session_name(&host.name, cx);
                         self.push_ssh_session(
                             title,
                             ssh::SshSession::pending(Host::clone(host)),

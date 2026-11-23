@@ -64,10 +64,11 @@ impl Workspace {
         });
         let id = self.hub.session_ids.allocate();
         let subscription = self.watch_terminal(id, &terminal, window, cx);
+        let title = self.unique_session_name(&host.name, cx);
         self.sessions.push(Session {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
-            title: host.name.clone().into(),
+            title: title.into(),
             local_title: None,
             view,
             terminal,

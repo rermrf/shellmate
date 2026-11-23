@@ -482,8 +482,7 @@ impl Workspace {
         let id = self.hub.session_ids.allocate();
         let subscription = self.watch_terminal(id, &terminal, window, cx);
 
-        let open_locals = self.sessions.len();
-        let title = if open_locals == 0 { "本机".to_string() } else { format!("本机 · {}", open_locals + 1) };
+        let title = self.unique_session_name("本机", cx);
         self.sessions.push(Session {
             ai_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             id,
