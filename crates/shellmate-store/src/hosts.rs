@@ -192,6 +192,12 @@ impl HostStore {
         Ok(())
     }
 
+    /// Removes what is saved under `key` (nothing happens if there is nothing).
+    pub fn delete_setting(&mut self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     // ---- groups ----------------------------------------------------------
 
     /// All groups, ordered by `sort` then name.

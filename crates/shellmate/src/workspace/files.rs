@@ -51,7 +51,7 @@ pub fn link_status(state: &LinkState, tab: SshStatus) -> LinkStatus {
         // and not coming while the connection is being re-made or is given up.
         LinkState::Idle => match tab {
             SshStatus::Connecting | SshStatus::Connected => LinkStatus::Connecting,
-            SshStatus::Reconnecting(_) | SshStatus::Failed | SshStatus::Ended => LinkStatus::Disconnected,
+            SshStatus::Reconnecting(_) | SshStatus::Failed | SshStatus::Ended | SshStatus::Pending => LinkStatus::Disconnected,
         },
     }
 }

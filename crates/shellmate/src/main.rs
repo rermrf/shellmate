@@ -20,6 +20,7 @@ mod tabs;
 mod monitor;
 mod productivity;
 mod reconnect;
+mod restore;
 #[cfg(debug_assertions)]
 mod demo;
 mod runtime;
@@ -119,7 +120,12 @@ fn main() {
 
         let (store, store_notice) = open_store();
         workspace::Hub::init(store, store_notice.is_some(), cx);
-        let (main_window, workspace) = open_workspace(store_notice, cx).expect("failed to open the main window");
+        // The windows of the last run, when they are to be opened again: decided before the first window opens.
+        let launch = workspace::restore::prepare(cx);
+        let (main_window, workspace) = open_workspace(store_notice, launch.as_ref(), cx).expect("failed to open the main window");
+        if let Some(plan) = launch {
+            workspace::restore::apply(plan, main_window, cx);
+        }
         #[cfg(not(debug_assertions))]
         let _ = (main_window, workspace);
         workspace::open_urls::listen(url_receiver, cx);
@@ -140,14 +146,23 @@ fn main() {
     });
 }
 
-fn open_workspace(store_notice: Option<String>, cx: &mut App) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
+fn open_workspace(
+    store_notice: Option<String>,
+    restoring: Option<&restore::Plan>,
+    cx: &mut App,
+) -> anyhow::Result<(gpui::AnyWindowHandle, gpui::Entity<Workspace>)> {
     let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
     #[cfg(debug_assertions)]
     let bounds = if proto::requested() {
         let (width, height) = proto::window_size();
         Bounds::new(point(px(60.), px(60.)), size(px(width as f32), px(height as f32)))
     } else { bounds };
-    open_workspace_at(true, store_notice, bounds, None, true, cx)
+    // The first window of a restored session opens where it was.
+    let (bounds, display) = match restoring.and_then(|plan| plan.windows.first()) {
+        Some(window) => workspace::restore::launch_bounds(&window.place, cx),
+        None => (bounds, None),
+    };
+    open_workspace_at(true, store_notice, bounds, display, true, cx)
 }
 
 fn open_workspace_at(

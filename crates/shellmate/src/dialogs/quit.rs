@@ -4,9 +4,14 @@ use crate::workspace::close_guard::CloseImpact;
 use gpui::{App, Context, WeakEntity, Window, component::checkbox::Checkbox, prelude::*};
 use shellmate_store::Preference;
 
+/// Said when quitting, and when an update restarts the app, while the next launch restores the session.
+pub(crate) const RESTORE_NOTE: &str = "重启后会恢复窗口和标签，正在运行的程序会结束";
+
 pub(crate) struct QuitDialog {
     message: String,
     review: Option<CloseImpact>,
+    /// The next launch opens the windows and tabs again.
+    restores: bool,
     workspace: WeakEntity<Workspace>,
     remember: bool,
     error: Option<String>,
@@ -16,6 +21,7 @@ impl QuitDialog {
     pub(crate) fn open(
         message: String,
         review: Option<CloseImpact>,
+        restores: bool,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut App,
@@ -23,6 +29,7 @@ impl QuitDialog {
         let body = cx.new(|_| Self {
             message,
             review,
+            restores,
             workspace,
             remember: false,
             error: None,
@@ -69,6 +76,7 @@ impl Render for QuitDialog {
         let p = palette(cx);
         stack()
             .child(hint(self.message.clone(), &p))
+            .children(self.restores.then(|| hint(RESTORE_NOTE, &p)))
             .child(
                 Checkbox::new("quit-remember")
                     .label("不再询问")
@@ -85,5 +93,13 @@ impl Render for QuitDialog {
                 button("quit-confirm", "退出", Tone::Danger, true)
                     .on_click(cx.listener(|s, _, w, cx| s.submit(w, cx))),
             ]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_restore_note_says_what_the_next_launch_does() {
+        assert_eq!(super::RESTORE_NOTE, "重启后会恢复窗口和标签，正在运行的程序会结束");
     }
 }

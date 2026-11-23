@@ -38,6 +38,8 @@ pub(super) struct Services {
     pub quit_dialog: RefCell<Option<WeakEntity<crate::dialogs::quit::QuitDialog>>>,
     /// The workspace windows that are the active window now. Shellmate is in front while it is not empty.
     pub active_windows: RefCell<HashSet<gpui::WindowId>>,
+    /// When the record of the session is written (`restore.rs`).
+    pub saver: RefCell<crate::restore::Saver>,
     /// The count the Dock icon shows.
     #[cfg(target_os = "macos")]
     pub dock_badge: Cell<usize>,
@@ -141,6 +143,7 @@ impl Hub {
     pub fn init(store: HostStore, temporary: bool, cx: &mut App) {
         let preferences = store.preferences().unwrap_or_default();
         cx.set_global(theme::DefaultFontSize(f32::from(preferences.terminal_font_size)));
+        let saver = crate::restore::Saver::new(preferences.get(shellmate_store::Preference::RestoreOnLaunch) && !restore::demo_run());
         let store = shellmate_store::SharedStore::new(store);
         let secrets = crate::security::coordinator(store.clone());
         crate::updater::init(store.clone(), cx);
@@ -155,6 +158,7 @@ impl Hub {
             crate::dialogs::modal::forget_window(id, cx);
             tab_drag::window_closed(id, cx);
             cx.global::<Self>().services.set_window_active(id, false);
+            cx.global::<Self>().services.saver.borrow_mut().mark();
             let windows = &mut cx.global_mut::<Self>().windows;
             if let Some(ix) = windows.iter().position(|e| e.handle.window_id() == id) {
                 windows.remove(ix);
@@ -180,6 +184,8 @@ impl Hub {
                             s.tick_archives(w, cx);
                         });
                     }
+                    // A change that was marked since the last look is written (at most every few seconds).
+                    Self::flush_snapshot(cx);
                 });
             }
         });
@@ -187,6 +193,12 @@ impl Hub {
         // click that launched the app reach it; outside an app bundle the platform logs that there
         // are no system notifications and nothing else happens.
         cx.on_system_notification_response(|response, cx| Self::notification_clicked(&response.tag, cx));
+        // The record of the session is written once more as the app quits.
+        cx.on_app_quit(|cx| {
+            Self::save_snapshot_at_quit(cx);
+            async {}
+        })
+        .detach();
         #[cfg(target_os = "macos")]
         let status_bar = status_item::StatusBar::new(cx).into();
         cx.set_global(Self {
@@ -211,6 +223,7 @@ impl Hub {
                 records_window: Default::default(),
                 quit_dialog: Default::default(),
                 active_windows: Default::default(),
+                saver: RefCell::new(saver),
                 #[cfg(target_os = "macos")]
                 dock_badge: Cell::new(0),
                 #[cfg(target_os = "macos")]
@@ -245,6 +258,7 @@ impl Hub {
             number: hub.window_ids.allocate(),
             workspace: workspace.clone(),
         });
+        hub.services.saver.borrow_mut().mark();
         if focus {
             Self::activated(handle, cx);
         }

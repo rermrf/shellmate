@@ -14,6 +14,8 @@ pub(super) enum Status {
     RetryAuth,
     Ended,
     Closed,
+    /// Restored with the last session, and not connected until its tab is shown.
+    Pending,
 }
 
 impl Status {
@@ -31,6 +33,7 @@ impl Status {
             SshStatus::Failed if reconnect_failed => Self::ReconnectFailed,
             SshStatus::Failed => Self::Failed,
             SshStatus::Ended => Self::Ended,
+            SshStatus::Pending => Self::Pending,
         }
     }
 
@@ -54,6 +57,7 @@ impl Status {
             Self::ReconnectFailed => "重连失败",
             Self::Ended => "已退出",
             Self::Closed => "已关闭",
+            Self::Pending => "未连接",
         }
         .into()
     }

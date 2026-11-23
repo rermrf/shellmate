@@ -86,9 +86,11 @@ pub enum Preference {
     SystemNotifications,
     /// An alert when a command of a local session that ran for 30 seconds or more ends in the background.
     LongCommandAlert,
+    /// The next launch opens the windows and tabs of the last run again.
+    RestoreOnLaunch,
 }
 impl Preference {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -107,6 +109,7 @@ impl Preference {
         Self::TabAlerts,
         Self::SystemNotifications,
         Self::LongCommandAlert,
+        Self::RestoreOnLaunch,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -128,6 +131,7 @@ impl Preference {
             Self::TabAlerts => "terminal.tab_alerts",
             Self::SystemNotifications => "terminal.system_notifications",
             Self::LongCommandAlert => "terminal.long_command_alert",
+            Self::RestoreOnLaunch => "restore_on_launch",
         }
     }
     pub fn label(self) -> &'static str {
@@ -150,6 +154,7 @@ impl Preference {
             Self::TabAlerts => "后台标签提醒",
             Self::SystemNotifications => "系统通知",
             Self::LongCommandAlert => "本机长命令完成提醒",
+            Self::RestoreOnLaunch => "启动时恢复上次的窗口和标签",
         }
     }
     pub fn description(self) -> &'static str {
@@ -166,6 +171,7 @@ impl Preference {
             Self::TabAlerts => "标签小圆点、菜单栏、Dock 角标",
             Self::SystemNotifications => "仅在 Shellmate 不在前台时发送",
             Self::LongCommandAlert => "本机命令运行超过 30 秒、在后台结束时提醒",
+            Self::RestoreOnLaunch => "远程标签切换到时才连接，串口按回车连接 · 关闭后会删除已保存的窗口记录",
             _ => "",
         }
     }
@@ -226,7 +232,7 @@ impl Default for Preferences {
         Self {
             close_window_with_sessions: CloseWindowWithSessions::Ask,
             terminal_font_size: TerminalFontSize::DEFAULT,
-            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true, true, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true, true, true, true, true],
         }
     }
 }
@@ -277,10 +283,32 @@ mod tests {
         assert!(!prefs.get(Preference::SystemNotifications));
         // The new settings did not shift any other preference's slot or default.
         let others = Preference::ALL.iter().filter(|key| !alerts.contains(key)).count();
-        assert_eq!(others, 15);
-        assert_eq!(Preference::ALL.iter().map(|key| *key as usize).collect::<Vec<_>>(), (0..18).collect::<Vec<_>>());
+        assert_eq!(others, 16);
+        assert_eq!(Preference::ALL.iter().map(|key| *key as usize).collect::<Vec<_>>(), (0..19).collect::<Vec<_>>());
         let keys: std::collections::HashSet<_> = Preference::ALL.iter().map(|key| key.key()).collect();
         assert_eq!(keys.len(), Preference::ALL.len(), "keys are unique");
+    }
+
+    #[test]
+    fn restoring_the_last_session_is_on_by_default_and_a_saved_record_can_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore.db");
+        let mut store = HostStore::open(&path).unwrap();
+        assert!(store.preferences().unwrap().get(Preference::RestoreOnLaunch));
+        assert!(Preferences::default().get(Preference::RestoreOnLaunch));
+        assert_eq!(Preference::RestoreOnLaunch.label(), "启动时恢复上次的窗口和标签");
+        assert!(!Preference::RestoreOnLaunch.description().is_empty());
+        store.set_preference(Preference::RestoreOnLaunch, false).unwrap();
+        drop(store);
+        let mut store = HostStore::open(&path).unwrap();
+        assert!(!store.preferences().unwrap().get(Preference::RestoreOnLaunch));
+        store.set_setting("session_restore", "{}").unwrap();
+        assert_eq!(store.setting("session_restore").unwrap().as_deref(), Some("{}"));
+        store.delete_setting("session_restore").unwrap();
+        assert_eq!(store.setting("session_restore").unwrap(), None);
+        store.delete_setting("session_restore").unwrap();
+        // Only that key went.
+        assert!(!store.preferences().unwrap().get(Preference::RestoreOnLaunch));
     }
 
     #[test]

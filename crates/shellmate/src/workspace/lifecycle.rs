@@ -321,9 +321,11 @@ impl Workspace {
             .and_then(WeakEntity::upgrade)
             .is_none()
         {
+            let restores = self.hub.saver.borrow().enabled();
             *self.hub.quit_dialog.borrow_mut() = Some(QuitDialog::open(
                 message,
                 review,
+                restores,
                 cx.weak_entity(),
                 window,
                 cx,
@@ -336,6 +338,7 @@ impl Workspace {
 pub(crate) fn debug_hooks(cx: &mut App) {
     super::tab_drag::debug::install(cx);
     super::zoom::debug_hook(cx);
+    super::restore::debug_hook(cx);
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
         ("SHELLMATE_DEBUG_DUPLICATE_AFTER", |cx| Hub::update(cx, Workspace::duplicate_active)),

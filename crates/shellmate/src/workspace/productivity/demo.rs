@@ -94,6 +94,8 @@ impl Workspace {
                 kind: SessionKind::Ssh(Box::new(ssh)),
                 alerts: Default::default(),
                 long: Default::default(),
+                pending: None,
+                restore_dir: None,
                 _subscription: Some(subscription),
             });
         }

@@ -253,6 +253,9 @@ impl Render for UpdateDialog {
                         format!("重启会断开 {count} 个会话"),
                         p,
                     ));
+                    if crate::workspace::Hub::restores_session(cx) {
+                        body = body.child(dialogs::hint(crate::dialogs::quit::RESTORE_NOTE, p));
+                    }
                 }
                 buttons.push(
                     action("update-on-quit", "退出时安装", Tone::Plain).on_click(|_, w, cx| {

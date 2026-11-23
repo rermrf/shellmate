@@ -61,6 +61,8 @@ impl Workspace {
             changed |= session.refresh_local_title(cx);
         }
         if changed {
+            // The title follows the directory and the program: the record of the session follows too.
+            self.hub.saver.borrow_mut().mark();
             self.update_window_title(window, cx);
             self.sync_productivity(cx);
             cx.notify();

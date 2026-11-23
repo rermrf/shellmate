@@ -39,9 +39,14 @@ fn cancelled_auth_prompt(error: &SshError) -> bool {
     }
 }
 
+/// The connection number of a tab that is on no connection yet.
+pub(super) const PENDING_GROUP: usize = usize::MAX;
+
 /// Where an SSH tab stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SshStatus {
+    /// Restored with the last session; it connects the first time it is shown.
+    Pending,
     /// Connecting, verifying the host key or authenticating.
     Connecting,
     /// The shell is running.
@@ -64,7 +69,7 @@ impl SshStatus {
     /// of the loop; a tab that is up stays up unless the connection was lost.
     pub fn on_view(self, view: View) -> Self {
         match (self, view) {
-            (Self::Ended, _) | (_, View::Connected) => self,
+            (Self::Ended | Self::Pending, _) | (_, View::Connected) => self,
             (_, View::Reconnecting(n)) => Self::Reconnecting(n),
             (status, View::Connecting) => if status.wants_channel() { Self::Connecting } else { status },
             (status, View::Failed) => if status.wants_channel() { Self::Failed } else { status },
@@ -107,6 +112,13 @@ impl SshSession {
         Self { host, chain, status: SshStatus::Connecting, group, channel: 1, opening: None,mosh }
     }
 
+    /// A restored tab: on no connection, and none is made until it is shown.
+    pub(super) fn pending(host: Host) -> Self {
+        let mut this = Self::new(host.clone(), vec![host], PENDING_GROUP);
+        this.status = SshStatus::Pending;
+        this
+    }
+
     /// A panel transport transition never changes an independent Mosh terminal.
     fn on_connection_view(&mut self,view:View){if self.mosh.as_ref().is_none_or(|m|!m.independent){self.status=self.status.on_view(view);}}
 
@@ -122,7 +134,7 @@ impl SshSession {
             SshStatus::Connecting | SshStatus::Reconnecting(_) => Some(LiveStatus::Connecting),
             SshStatus::Connected => Some(LiveStatus::Ok),
             SshStatus::Failed => Some(LiveStatus::Failed),
-            SshStatus::Ended => None,
+            SshStatus::Ended | SshStatus::Pending => None,
         }
     }
 
@@ -131,7 +143,7 @@ impl SshSession {
         match self.status {
             SshStatus::Reconnecting(n) => Some(format!("重连 {n}/{MAX_ATTEMPTS}")),
             SshStatus::Failed => Some("连接失败".to_string()),
-            SshStatus::Connecting | SshStatus::Connected | SshStatus::Ended => None,
+            SshStatus::Connecting | SshStatus::Connected | SshStatus::Ended | SshStatus::Pending => None,
         }
     }
 
@@ -141,6 +153,7 @@ impl SshSession {
             SshStatus::Reconnecting(n) => Some(format!("重连中 {n}/{MAX_ATTEMPTS}")),
             SshStatus::Failed => Some("连接失败".to_string()),
             SshStatus::Ended => Some("已退出".to_string()),
+            SshStatus::Pending => Some("未连接".to_string()),
             SshStatus::Connecting | SshStatus::Connected => None,
         }
     }
@@ -160,7 +173,7 @@ fn duplicate_index(source: usize, remaining: usize) -> usize {
 }
 
 /// Reuse the shell-reported remote directory without interpreting any shell metacharacters.
-fn duplicate_line(protocol: Option<shellmate_core::Protocol>, cwd: Option<&str>) -> Option<TypedLine> {
+pub(super) fn duplicate_line(protocol: Option<shellmate_core::Protocol>, cwd: Option<&str>) -> Option<TypedLine> {
     use shellmate_core::Protocol;
     if !matches!(protocol, Some(Protocol::Ssh | Protocol::Mosh | Protocol::Telnet)) {
         return None;
@@ -204,7 +217,8 @@ pub fn existing_session<'a>(sessions: impl Iterator<Item = (usize, &'a SshSessio
     let mut ended = None;
     for (index, ssh) in sessions.filter(|(_, ssh)| &ssh.host.id == host) {
         match ssh.status {
-            SshStatus::Connecting | SshStatus::Connected | SshStatus::Reconnecting(_) => return Existing::Switch(index),
+            // A restored tab connects when it is shown, which switching to it does.
+            SshStatus::Connecting | SshStatus::Connected | SshStatus::Reconnecting(_) | SshStatus::Pending => return Existing::Switch(index),
             SshStatus::Failed | SshStatus::Ended => {
                 ended.get_or_insert(index);
             }
@@ -371,6 +385,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        let session_id = self.push_ssh_session(title, SshSession::new(host, chain, group), window, cx);
+        self.start_session_archives(session_id,window,cx);
+        self.activate(self.sessions.len() - 1, window, cx);
+        session_id
+    }
+
+    /// Adds a tab with a fresh terminal for `ssh` at the end, without making it current.
+    pub(super) fn push_ssh_session(
+        &mut self,
+        title: String,
+        ssh: SshSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let style = self.terminal_style(cx);
         let palette = style.palette.clone();
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
@@ -394,14 +422,69 @@ impl Workspace {
             forward: None,
             monitor: None,
             typed: None, typing: None,
-            kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
+            kind: SessionKind::Ssh(Box::new(ssh)),
             alerts: Default::default(),
             long: Default::default(),
+            pending: None,
+            restore_dir: None,
             _subscription: Some(subscription),
         });
-        self.start_session_archives(session_id,window,cx);
-        self.activate(self.sessions.len() - 1, window, cx);
         session_id
+    }
+
+    /// A restored tab is shown for the first time: it connects, as ⌘⇧T does for a copy. On the
+    /// connection another tab of the same route has up, a new channel; otherwise a connection of its own.
+    pub(super) fn connect_pending_ssh(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host_id) = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id && s.pending.is_some())
+            .and_then(|s| s.ssh())
+            .map(|ssh| ssh.host.id.clone())
+        else {
+            return;
+        };
+        let Some((host, chain)) = self.resolve_for_connect(&host_id, window, cx) else {
+            // The reason is on screen already (a notification). The tab stays as it was, waiting, with
+            // the directory it is to go to: showing it again, or connecting its host from the list, tries again.
+            log::info!("restore: tab {id} keeps waiting, its host cannot be connected now");
+            return;
+        };
+        if !self.leave_pending(id, window, cx) {
+            return;
+        }
+        let key = PoolKey::of(&chain, &connect::default_user());
+        let shared = self
+            .hub
+            .groups
+            .borrow_mut()
+            .iter_mut()
+            .filter(|group| group.key == key)
+            .find_map(|group| group.live_connection().map(|connection| (group.id, connection, group.next_channel())));
+        if let Some(ssh) = self.ssh_mut(id) {
+            ssh.host = host;
+            ssh.chain = chain.clone();
+            ssh.status = SshStatus::Connecting;
+        }
+        match shared {
+            Some((group, connection, number)) => {
+                log::info!("restore: tab {id} joins connection {group} as channel {number}");
+                if let Some(ssh) = self.ssh_mut(id) {
+                    ssh.group = group;
+                }
+                self.open_channel(id, connection, number, window, cx);
+            }
+            None => {
+                let group = self.new_group(&chain, Reconnect::initial(), AuthMemory::new(), cx);
+                log::info!("restore: tab {id} connects on a connection of its own ({group})");
+                if let Some(ssh) = self.ssh_mut(id) {
+                    ssh.group = group;
+                }
+                self.launch_attempt(group, window, cx);
+            }
+        }
+        self.sync_sidebar(cx);
+        cx.notify();
     }
 
     /// Resolves the route of a saved host for connecting, or tells the user why not.
@@ -435,7 +518,14 @@ impl Workspace {
     pub(super) fn connect_host(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) {
         let host = self.hub.book.borrow().host(id).cloned().or_else(|| self.hub.temporary_hosts.borrow().get(id).cloned());
         if let Some(host)=host.filter(|h|matches!(h.protocol,shellmate_core::Protocol::Telnet|shellmate_core::Protocol::Serial)) {
-            if let Some(ix)=self.sessions.iter().position(|s|s.host().is_some_and(|h|&h.id==id)) {self.activate(ix,window,cx);if !self.sessions[ix].stream_connected(){self.start_stream(self.sessions[ix].id,window,cx);}return;}
+            if let Some(ix)=self.sessions.iter().position(|s|s.host().is_some_and(|h|&h.id==id)) {
+                let waiting=self.sessions[ix].pending.is_some();
+                self.activate(ix,window,cx);
+                // Showing a restored Telnet tab has connected it; a serial one still waits for this click.
+                let connecting=waiting&&self.sessions[ix].pending.is_none();
+                if !self.sessions[ix].stream_connected()&&!connecting{self.start_stream(self.sessions[ix].id,window,cx);}
+                return;
+            }
             self.open_stream(host,window,cx);return;
         }
 
@@ -993,6 +1083,8 @@ impl Workspace {
                     this.update(cx, |s, _| {
                         if let Some(session) = s.sessions.iter_mut().find(|s| s.id == session_id) {
                             session.typed = None;
+                            // The line is given up, and so is the directory the record kept for it.
+                            session.restore_dir = None;
                             session.typing = None;
                         }
                     }).ok();
@@ -1003,7 +1095,15 @@ impl Workspace {
             drop(watcher);
             this.update(cx, |s, cx| {
                 let Some(session) = s.sessions.iter_mut().find(|s| s.id == session_id) else { return };
+                // The connection may have dropped while the line waited: it is typed into the next shell
+                // (the owner calls this again when one is attached), not into nothing.
+                if !terminal.read(cx).is_attached() {
+                    session.typing = None;
+                    return;
+                }
                 let Some(typed) = session.typed.take() else { return };
+                // Typed: what the record of the session kept for it is not needed any more.
+                session.restore_dir = None;
                 session.typing = None;
                 terminal.update(cx, |terminal, _| {
                 terminal.paste(&typed.text);
@@ -1423,6 +1523,28 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_tab_is_switched_to_which_is_what_connects_it() {
+        let web = host("web", None);
+        let tabs = [tab(&web, SshStatus::Pending)];
+        assert_eq!(existing_session(tabs.iter().enumerate(), &web.id), Existing::Switch(0));
+        // It takes no part in an attempt, and nothing a connection says changes it.
+        assert!(!SshStatus::Pending.wants_channel());
+        for view in [View::Connecting, View::Connected, View::Reconnecting(2), View::Failed] {
+            assert_eq!(SshStatus::Pending.on_view(view), SshStatus::Pending, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn a_restored_tab_is_on_no_connection_and_waits_to_be_shown() {
+        let session = SshSession::pending(host("web", None));
+        assert_eq!((session.status, session.group), (SshStatus::Pending, PENDING_GROUP));
+        assert_eq!(session.chain.len(), 1);
+        assert!(session.via().is_empty());
+        let mosh = SshSession::pending(Host { protocol: shellmate_core::Protocol::Mosh, ..host("m", None) });
+        assert!(mosh.mosh.is_some(), "a restored Mosh tab is still a Mosh tab");
+    }
+
+    #[test]
     fn a_live_tab_wins_over_an_ended_one() {
         let web = host("web", None);
         let tabs = [tab(&web, SshStatus::Ended), tab(&web, SshStatus::Failed), tab(&web, SshStatus::Connected)];
@@ -1462,6 +1584,7 @@ mod tests {
             (SshStatus::Reconnecting(2), Some(LiveStatus::Connecting), Some("重连 2/5"), Some("重连中 2/5")),
             (SshStatus::Failed, Some(LiveStatus::Failed), Some("连接失败"), Some("连接失败")),
             (SshStatus::Ended, None, None, Some("已退出")),
+            (SshStatus::Pending, None, None, Some("未连接")),
         ];
         for (status, live, badge, note) in cases {
             session.status = status;

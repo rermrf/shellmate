@@ -528,6 +528,24 @@ impl Terminal {
         self.after_output(cx);
     }
 
+    /// Erases the screen and the scrollback of a terminal that has run nothing yet (the placeholder of
+    /// a restored tab). Unlike [`clear`](Self::clear) nothing is sent to a backend.
+    pub fn wipe(&mut self, cx: &mut Context<Self>) {
+        self.inject("\x1b[3J\x1b[2J\x1b[H");
+        self.after_output(cx);
+    }
+
+    /// Puts a terminal that was never started in the state Enter starts: `text` and the hint
+    /// 按回车连接 are printed, and Enter asks the owner to connect ([`TerminalEvent::RestartRequested`]).
+    /// Unlike [`disconnect`](Self::disconnect) nothing is reported as lost.
+    pub fn wait_for_enter(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.close_backend();
+        self.ended = Some(SessionEnd::Disconnected(text.to_owned()));
+        let column = self.term.lock().grid().cursor.point.column.0;
+        self.inject(&waiting_line(column, text));
+        self.after_output(cx);
+    }
+
     fn after_output(&mut self, cx: &mut Context<Self>) {
         self.foreground = None;
         // The output may have turned focus reporting on.
@@ -1027,6 +1045,12 @@ fn end_hint(local: bool, auto_reconnect: bool) -> &'static str {
     }
 }
 
+/// The line [`Terminal::wait_for_enter`] prints, starting a fresh line when the cursor is not at the left edge.
+fn waiting_line(column: usize, text: &str) -> String {
+    let lead = if column == 0 { "" } else { "\r\n" };
+    format!("{lead}\x1b[2m{text} · 按回车连接\x1b[0m\r\n")
+}
+
 /// Escapes regex metacharacters so user input is searched literally.
 fn regex_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -1041,7 +1065,13 @@ fn regex_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{end_hint, regex_escape};
+    use super::{end_hint, regex_escape, waiting_line};
+
+    #[test]
+    fn the_line_of_a_terminal_waiting_for_enter_starts_on_a_fresh_line() {
+        assert_eq!(waiting_line(0, "串口不会自动打开"), "\x1b[2m串口不会自动打开 · 按回车连接\x1b[0m\r\n");
+        assert!(waiting_line(7, "x").starts_with("\r\n\x1b[2m"));
+    }
 
     #[test]
     fn geometry_drives_full_split_flipped_and_resized_pty_dimensions() {

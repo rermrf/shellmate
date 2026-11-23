@@ -77,6 +77,9 @@ impl StatusBar {
 
 impl Workspace {
     fn status_of(&self, s: &Session, cx: &App) -> Status {
+        if s.pending.is_some() {
+            return Status::Pending;
+        }
         match &s.kind {
             SessionKind::Local if s.exited => Status::Ended,
             SessionKind::Local => Status::Local,

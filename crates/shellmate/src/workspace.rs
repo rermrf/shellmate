@@ -63,6 +63,7 @@ mod menu_actions;
 pub(crate) mod lifecycle;
 pub(crate) mod close_guard;
 pub(crate) mod open_urls;
+pub(crate) mod restore;
 
 actions!(
     shellmate,
@@ -134,7 +135,7 @@ pub(crate) enum Panel {
 }
 
 impl Panel {
-    fn supported(self, protocol: Option<shellmate_core::Protocol>) -> bool {
+    pub(crate) fn supported(self, protocol: Option<shellmate_core::Protocol>) -> bool {
         self == Panel::Terminal || (protocol.is_none() && (self == Panel::Files || (cfg!(target_os = "macos") && self == Panel::Monitor))) || matches!(protocol, Some(shellmate_core::Protocol::Ssh | shellmate_core::Protocol::Mosh))
     }
     const ALL: [Panel; 4] = [Panel::Terminal, Panel::Files, Panel::Forward, Panel::Monitor];
@@ -190,6 +191,12 @@ struct Session {
     alerts: attention::Alerts,
     /// A local session's foreground command, followed to notice one that ran long and ended.
     long: attention::LongCommand,
+    /// A restored remote tab that has not connected yet, and what it waits for.
+    pending: Option<crate::restore::Deferred>,
+    /// The directory a restored remote tab was saved with, until its `cd` line (`typed`) has been typed
+    /// into a connected shell. The record of the session keeps it until then, whether the tab has been
+    /// shown or not and whether its first connection worked or not.
+    restore_dir: Option<String>,
     _subscription: Option<Subscription>,
 }
 
@@ -244,6 +251,10 @@ pub struct Workspace {
     /// This window's terminal font size in points while it is zoomed (⌘= ⌘− ⌘0); `None` follows the
     /// default size of the settings. Never saved.
     font_size: Option<f32>,
+    /// Where this window is (kept up to date as it moves, for the record of the session).
+    located: Option<crate::restore::Located>,
+    /// What the record of the session looked at last time the window changed; see `restore.rs`.
+    snapshot_sig: u64,
     #[cfg(debug_assertions)]
     demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
     #[cfg(debug_assertions)]
@@ -322,8 +333,10 @@ impl Workspace {
         ];
         drop(store);
         let mut subscriptions=subscriptions;
+        subscriptions.push(cx.observe_window_bounds(window, |s, window, cx| s.window_moved(window, cx)));
         // Background session changes can affect menu validation while AppKit has stopped drawing.
         subscriptions.push(cx.observe_self(|s, cx| {
+            s.note_snapshot_change();
             #[cfg(target_os = "macos")]
             {
                 s.sync_status_item(cx);
@@ -350,6 +363,8 @@ impl Workspace {
             tab_strip: Default::default(),
             tab_hold: Default::default(),
             font_size: None,
+            located: None,
+            snapshot_sig: 0,
             #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -370,8 +385,10 @@ impl Workspace {
         this.hub.set_window_active(window.window_handle().window_id(), window.is_window_active());
         if first { this.reload_book(window, cx); }
         else { window.focus(&this.focus_handle, cx); }
-        let open_local=first && !crate::prototype_fixture();
+        // A launch that restores the last session opens its own tabs instead.
+        let open_local=first && !crate::prototype_fixture() && !this.hub.saver.borrow().restoring();
         if open_local {this.open_local(window, cx);}
+        this.remember_place(window, cx);
         #[cfg(target_os = "macos")]
         this.sync_status_item(cx);
         this.watch_archive_shutdown(cx);
@@ -484,6 +501,8 @@ impl Workspace {
             kind: SessionKind::Local,
             alerts: Default::default(),
             long: Default::default(),
+            pending: None,
+            restore_dir: None,
             _subscription: Some(subscription),
         });
         self.start_session_archives(id,window,cx);
@@ -532,11 +551,15 @@ impl Workspace {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
                 (SessionKind::Local, TerminalEvent::Restarted) => session.exited = false,
                 (SessionKind::Stream(s), TerminalEvent::Disconnected(_) | TerminalEvent::Exited(_)) => {s.connected=false;session.exited=true;},
-                (SessionKind::Stream(_), TerminalEvent::RestartRequested) => this.start_stream(id,window,cx),
+                (SessionKind::Stream(_), TerminalEvent::RestartRequested) => this.restart_stream(id,window,cx),
                 (SessionKind::Ssh(_), TerminalEvent::Exited(_)) => this.on_tab_exited(id, cx),
                 (SessionKind::Ssh(_), TerminalEvent::Disconnected(_)) => this.on_tab_disconnected(id, window, cx),
                 (SessionKind::Ssh(_), TerminalEvent::RestartRequested) => this.retry_tab(id, window, cx),
                 _ => {}
+            }
+            if matches!(event, TerminalEvent::CwdChanged(_)) {
+                // A remote shell told where it is: the record of the session keeps that.
+                this.hub.saver.borrow_mut().mark();
             }
             if matches!(event, TerminalEvent::TitleChanged | TerminalEvent::CwdChanged(_) | TerminalEvent::Restarted | TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) {
                 if let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) {
@@ -568,6 +591,8 @@ impl Workspace {
         self.picker = None;
         self.picker_subscription = None;
         self.active = Some(ix);
+        // The first time a restored remote tab is shown, it connects.
+        let restored_panel = self.resume_pending(new_id, crate::restore::Event::Shown, window, cx);
         self.sessions[ix].refresh_local_title(cx);
         self.update_window_title(window, cx);
         self.sync_local_files_activity(cx);
@@ -581,6 +606,9 @@ impl Workspace {
         self.sync_monitor_activity(cx);
         // Switching to a tab is looking at it.
         self.clear_watched_alerts(window, cx);
+        if let Some(panel) = restored_panel {
+            self.show_panel(panel, window, cx);
+        }
         cx.notify();
     }
 
@@ -661,7 +689,7 @@ impl Workspace {
                 }
             }
         }
-        for session in &self.sessions {if let SessionKind::Stream(stream)=&session.kind {live.insert(stream.host.id.to_string(),if stream.connected(){LiveStatus::Ok}else{LiveStatus::Failed});}}
+        for session in self.sessions.iter().filter(|s| s.pending.is_none()) {if let SessionKind::Stream(stream)=&session.kind {live.insert(stream.host.id.to_string(),if stream.connected(){LiveStatus::Ok}else{LiveStatus::Failed});}}
         let local_alive = self.sessions.iter().any(|s| matches!(s.kind, SessionKind::Local) && !s.exited);
         let active = match self.active.and_then(|ix| self.sessions.get(ix)) {
             None => Active::None,
@@ -707,18 +735,24 @@ impl Workspace {
 
     /// Shows the whole sidebar or only its rail, and remembers which.
     fn set_sidebar_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.set_sidebar(open, true, cx);
+    }
+
+    /// `remember`: also keep it as the state new windows start with (a restored window must not change that).
+    fn set_sidebar(&mut self, open: bool, remember: bool, cx: &mut Context<Self>) {
         if self.sidebar_open == open {
             return;
         }
         self.sidebar_open = open;
         #[cfg(target_os = "macos")]
         gpui::base::apply_system_reduce_motion(cx);
-        let animate = !cx.reduce_motion();
+        // A restored window is already that way when it first appears.
+        let animate = !cx.reduce_motion() && remember;
         #[cfg(debug_assertions)]
         let animate = animate && std::env::var_os("SHELLMATE_DEMO").is_none();
         self.sidebar_motion.retarget(open, cx.background_executor().now(), animate);
         self.sidebar.update(cx, |sidebar, cx| sidebar.set_collapsed(!open, cx));
-        if let Err(err) = self.hub.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
+        if remember && let Err(err) = self.hub.store.borrow_mut().set_setting(SIDEBAR_COLLAPSED, if open { "0" } else { "1" }) {
             log::warn!("could not save the sidebar setting: {err}");
         }
         cx.notify();
@@ -1451,7 +1485,7 @@ fn session_dot(session: &Session, p: &theme::Palette) -> gpui::Hsla {
             ssh::SshStatus::Connecting | ssh::SshStatus::Reconnecting(_) => p.warn,
             ssh::SshStatus::Connected => p.ok,
             ssh::SshStatus::Failed => p.err,
-            ssh::SshStatus::Ended => p.tx3,
+            ssh::SshStatus::Ended | ssh::SshStatus::Pending => p.tx3,
         },
     }
 }

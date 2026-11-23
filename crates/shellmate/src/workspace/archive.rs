@@ -58,7 +58,7 @@ impl Workspace {
             push_notification_later(window, cx, Notification::error(e));
         }
     }
-    fn apply_terminal_preferences(&self, id: usize, cx: &mut Context<Self>) {
+    pub(super) fn apply_terminal_preferences(&self, id: usize, cx: &mut Context<Self>) {
         if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
             s.view.update(cx, |v, cx| {
                 v.copy_on_select = self.hub.preferences.borrow().get(P::CopySelection);
@@ -245,6 +245,9 @@ impl Workspace {
             .set_preference(key, value)
             .map_err(|e| e.to_string())?;
         self.hub.preferences.borrow_mut().set(key, value);
+        if key == P::RestoreOnLaunch {
+            self.restore_preference_changed(value);
+        }
         for entry in self.peers(Route::All,cx) {
             cx.defer(move |cx| { entry.update(cx, |w,window,cx| w.apply_preference(key,value,window,cx)); });
         }
@@ -265,7 +268,7 @@ impl Workspace {
             }
             return;
         }
-        if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit) { return; }
+        if matches!(key, P::QuitOnWindowClose | P::ConfirmQuit | P::RestoreOnLaunch) { return; }
         if key == P::PreloadPanels && !value {
             for group in &mut *self.hub.groups.borrow_mut() {
                 group.preload = None;

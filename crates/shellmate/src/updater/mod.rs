@@ -354,6 +354,9 @@ fn restart(cx: &mut App) {
         return;
     };
     s.at_quit = false;
+    // The new copy starts right away and reads the record: it must be written before.
+    crate::workspace::Hub::save_snapshot_now(cx);
+    let s = cx.global_mut::<Updater>();
     if let Err(e) = staged.install() {
         s.phase = Phase::Error(e.to_string());
     } else if let Err(e) = install::relaunch(&staged.bundle) {

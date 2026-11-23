@@ -693,8 +693,8 @@ impl Render for SettingsWindow {
                     P::LongCommandAlert,
                 ],
                 LOCAL_TERMINAL => &[P::LoginShell],
-                _ if crate::prototype_fixture() => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory],
-                _ => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory, P::PreloadPanels],
+                _ if crate::prototype_fixture() => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::RestoreOnLaunch, P::FollowDirectory],
+                _ => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::RestoreOnLaunch, P::FollowDirectory, P::PreloadPanels],
             };
             let mut rows = div()
                 .flex_none()

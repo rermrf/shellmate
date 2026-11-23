@@ -48,6 +48,14 @@ impl Drop for StreamSession {
 }
 impl Workspace {
     pub(super) fn open_stream(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.push_stream_tab(host, window, cx);
+        self.start_session_archives(id, window, cx);
+        self.activate(self.sessions.len() - 1, window, cx);
+        self.start_stream(id, window, cx);
+    }
+
+    /// Adds a Telnet or serial tab at the end, without connecting it or making it current.
+    pub(super) fn push_stream_tab(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let style = self.terminal_style(cx);
         let terminal = cx.new(|cx| Terminal::new(style.palette.clone(), cx));
         let view = cx.new(|cx| {
@@ -72,16 +80,18 @@ impl Workspace {
             kind: SessionKind::Stream(Box::new(StreamSession::new(host))),
             alerts: Default::default(),
             long: Default::default(),
+            pending: None,
+            restore_dir: None,
             _subscription: Some(subscription),
         });
-        self.start_session_archives(id, window, cx);
-        self.activate(self.sessions.len() - 1, window, cx);
-        self.start_stream(id, window, cx);
+        id
     }
     pub(super) fn start_stream(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if crate::prototype_fixture() {
             return;
         }
+        // Whatever starts it (being shown, Enter, the sidebar), a restored tab is not waiting any more.
+        self.leave_pending(id, window, cx);
         if self.connection_prompts.get(&id).is_some_and(|prompt| prompt.is_open()) {
             return;
         }

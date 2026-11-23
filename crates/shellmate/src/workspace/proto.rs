@@ -234,6 +234,8 @@ impl Workspace {
                 kind,
                 alerts: Default::default(),
                 long: Default::default(),
+                pending: None,
+                restore_dir: None,
                 _subscription: Some(subscription),
             });
         }
@@ -479,6 +481,8 @@ impl Workspace {
             kind: SessionKind::Local,
             alerts: Default::default(),
             long: Default::default(),
+            pending: None,
+            restore_dir: None,
             _subscription: Some(subscription),
         });
 
