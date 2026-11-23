@@ -48,7 +48,7 @@ impl Drop for StreamSession {
 }
 impl Workspace {
     pub(super) fn open_stream(&mut self, host: Host, window: &mut Window, cx: &mut Context<Self>) {
-        let style = cx.terminal_style();
+        let style = self.terminal_style(cx);
         let terminal = cx.new(|cx| Terminal::new(style.palette.clone(), cx));
         let view = cx.new(|cx| {
             TerminalView::new(terminal.clone(), style, cx)

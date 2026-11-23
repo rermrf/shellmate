@@ -71,6 +71,9 @@ impl Available {
         if self.monitor {
             bind(&ShowMonitor, |workspace, window, cx| workspace.show_panel(Panel::Monitor, window, cx));
         }
+        bind(&IncreaseFontSize, Workspace::zoom_in);
+        bind(&DecreaseFontSize, Workspace::zoom_out);
+        bind(&ResetFontSize, Workspace::zoom_reset);
         bind(&ToggleTheme, |workspace, window, cx| workspace.toggle_theme(&ToggleTheme, window, cx));
         bind(&OpenPalette, |workspace, window, cx| workspace.open_palette(&OpenPalette, window, cx));
         bind(&History, Workspace::open_history);
@@ -194,7 +197,8 @@ mod tests {
             action.as_any().downcast_ref::<ReopenForMenu>().map(|a| a.0)
         }).collect();
         for name in [Settings.name(), NewLocalTerminal.name(), NewWindow.name(), NewConnection.name(), ToggleSidebar.name(),
-            ToggleTheme.name(), OpenPalette.name(), Records.name(), ToggleSearch.name(), EditPaste.name()] {
+            ToggleTheme.name(), OpenPalette.name(), Records.name(), ToggleSearch.name(), EditPaste.name(),
+            IncreaseFontSize.name(), DecreaseFontSize.name(), ResetFontSize.name()] {
             assert!(restored.contains(&name), "{name}");
         }
         for name in [CloseTab.name(), ShowForward.name(), HideApp.name(), Quit.name()] {
@@ -231,6 +235,9 @@ mod tests {
             ] {
                 for command in commands { assert_eq!(registered.contains(command), flag, "{scene} {command}"); }
             }
+            for command in [IncreaseFontSize.name(), DecreaseFontSize.name(), ResetFontSize.name()] {
+                assert!(registered.contains(command), "{scene}: zoom works in a window with or without tabs");
+            }
             if scene == "proto:main" {
                 for item in menus(&MenuState::default()).into_iter().flat_map(|menu| menu.items) {
                     if let gpui::MenuItem::Action { action, .. } = item {
@@ -238,6 +245,7 @@ mod tests {
                         let outside_workspace = [CloseWindow.name(), About.name(), CheckUpdates.name(), HideApp.name(), HideOthers.name(), ShowAll.name(), Quit.name(),
                             EditUndo.name(), EditRedo.name(), EditCut.name(), EditCopy.name(), EditPaste.name(), EditSelectAll.name(),
                             Fullscreen.name(), Minimize.name(), Zoom.name(), ToggleSearch.name(),
+                            ShowShortcuts.name(), OpenLogFolder.name(), OpenHomepage.name(),
                             shellmate_term::view::SearchUp.name(), shellmate_term::view::SearchDown.name()];
                         assert!(outside_workspace.contains(&name) || registered.contains(name), "no handler for {name}");
                     }

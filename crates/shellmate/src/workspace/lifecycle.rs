@@ -333,6 +333,7 @@ impl Workspace {
 #[cfg(debug_assertions)]
 pub(crate) fn debug_hooks(cx: &mut App) {
     super::tab_drag::debug::install(cx);
+    super::zoom::debug_hook(cx);
     type Hook = (&'static str, fn(&mut App));
     let hooks: &[Hook] = &[
         ("SHELLMATE_DEBUG_DUPLICATE_AFTER", |cx| Hub::update(cx, Workspace::duplicate_active)),

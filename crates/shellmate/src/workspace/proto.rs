@@ -384,6 +384,7 @@ impl Workspace {
                 settings(2, window, cx).update(cx, |s, cx| s.fixture_scroll(120., cx));
             }
             "set-local" => self.open_settings(3, window, cx),
+            "shortcuts" => crate::dialogs::shortcuts::open(window, cx),
             "quit-confirm" => self.confirm_quit("有3 个会话、1 个文件传输、2 个端口转发正在进行，退出后会全部断开。".into(), None, window, cx),
             "set-conn-close-window" => {
                 self.set_close_window_preference(shellmate_store::CloseWindowWithSessions::Disconnect, cx).unwrap();

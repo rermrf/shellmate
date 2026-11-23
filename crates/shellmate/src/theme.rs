@@ -120,6 +120,26 @@ pub struct AppTheme {
 
 impl Global for AppTheme {}
 
+/// The default terminal font size in points (the setting). A window may zoom away from it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DefaultFontSize(pub f32);
+
+impl Global for DefaultFontSize {}
+
+impl DefaultFontSize {
+    pub const MIN: f32 = shellmate_store::TerminalFontSize::MIN as f32;
+    pub const MAX: f32 = shellmate_store::TerminalFontSize::MAX as f32;
+    pub const DEFAULT: f32 = shellmate_store::TerminalFontSize::DEFAULT as f32;
+
+    /// The default size now.
+    pub fn get(cx: &App) -> f32 {
+        cx.try_global::<Self>().map_or(Self::DEFAULT, |size| size.0)
+    }
+}
+
+/// Line height as a multiple of the font size: 20 px at the default 13 pt.
+const LINE_HEIGHT: f32 = 20. / 13.;
+
 pub trait ActivePalette {
     fn palette(&self) -> &Palette;
     fn is_dark(&self) -> bool;
@@ -139,8 +159,8 @@ impl ActivePalette for App {
         TerminalStyle {
             font_family: SharedString::new_static(MONO_FONT),
             fallbacks: vec![CJK_FALLBACK.to_string(), "Menlo".to_string()],
-            font_size: px(13.),
-            line_height: 20. / 13.,
+            font_size: px(DefaultFontSize::get(self)),
+            line_height: LINE_HEIGHT,
             palette: self.global::<AppTheme>().terminal.clone(),
         }
     }

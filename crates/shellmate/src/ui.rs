@@ -180,6 +180,66 @@ pub fn segmented(
         }))
 }
 
+/// A small `−  value  +` control for a whole number, built like the segmented control. `on_step`
+/// receives -1 or +1; a side that cannot go further is dimmed and does nothing.
+pub fn stepper(
+    id: impl Into<ElementId>,
+    value: impl Into<SharedString>,
+    can_decrease: bool,
+    can_increase: bool,
+    on_step: impl Fn(i8, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Stateful<gpui::Div> {
+    let p = cx.palette().clone();
+    let on_step = std::rc::Rc::new(on_step);
+    let button = |id: &'static str, label: &'static str, step: i8, enabled: bool| {
+        let on_step = on_step.clone();
+        let button = div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(28.))
+            .rounded(px(8.))
+            .text_size(px(15.))
+            .line_height(px(16.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(label);
+        if enabled {
+            button
+                .bg(p.card)
+                .shadow(item_shadow(&p))
+                .text_color(p.tx)
+                .cursor_pointer()
+                .hover(|d| d.text_color(p.acc))
+                .on_click(move |_, window, cx| on_step(step, window, cx))
+        } else {
+            button.text_color(p.tx3).opacity(0.5).cursor_not_allowed()
+        }
+    };
+    div()
+        .id(id.into())
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .p(px(3.))
+        .rounded(px(11.))
+        .bg(p.card3)
+        .child(button("stepper-decrease", "−", -1, can_decrease))
+        .child(
+            div()
+                .min_w(px(52.))
+                .text_center()
+                .text_size(px(13.))
+                .line_height(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(p.tx)
+                .child(value.into()),
+        )
+        .child(button("stepper-increase", "+", 1, can_increase))
+}
+
 /// Text + icon button used in the top toolbar (广播 / AI / 快捷命令).
 pub fn toolbar_button(
     id: impl Into<ElementId>,

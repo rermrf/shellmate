@@ -16,7 +16,7 @@ use gpui::{
     prelude::*,
     px,
 };
-use shellmate_store::{Backend, Preference as P, Preferences};
+use shellmate_store::{Backend, Preference as P, Preferences, TerminalFontSize};
 
 // Re-enable the placeholder rows when remote sync is available.
 const SHOW_REMOTE_SYNC: bool = false;
@@ -64,6 +64,10 @@ impl SettingsWindow {
                 }).detach();
                 cx.subscribe(&workspace, |settings: &mut Self, _, change: &crate::workspace::PreferenceChanged, cx| {
                     settings.preferences.set(change.0, change.1);
+                    cx.notify();
+                }).detach();
+                cx.subscribe(&workspace, |settings: &mut Self, _, change: &crate::workspace::TerminalFontSizeChanged, cx| {
+                    settings.preferences.terminal_font_size = change.0;
                     cx.notify();
                 }).detach();
             }
@@ -202,6 +206,24 @@ impl SettingsWindow {
     #[cfg(debug_assertions)]
     pub fn fixture_scroll(&mut self, offset: f32, cx: &mut Context<Self>) {
         self.scroll.set_offset(gpui::point(px(0.), px(-offset)));
+        cx.notify();
+    }
+    /// One step of the default terminal font size (the − and + of 设置 › 终端).
+    fn step_font_size(&mut self, step: i8, cx: &mut Context<Self>) {
+        let (min, max) = (TerminalFontSize::MIN, TerminalFontSize::MAX);
+        let current = self.preferences.terminal_font_size;
+        let next = (i16::from(current) + i16::from(step)).clamp(i16::from(min), i16::from(max)) as u8;
+        if next == current {
+            return;
+        }
+        match self.workspace.update(cx, |w, cx| w.set_terminal_font_size(next, cx)) {
+            Ok(Ok(())) => {
+                self.preferences.terminal_font_size = next;
+                self.error = None;
+            }
+            Ok(Err(e)) => self.error = Some(e),
+            Err(_) => self.error = Some("窗口已关闭".into()),
+        }
         cx.notify();
     }
     fn toggle(&mut self, key: P, value: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -590,13 +612,34 @@ impl Render for SettingsWindow {
                         .child(row(
                             "字体",
                             format!(
-                                "{} {} · 中文回退 {} · 行高 {:.1}",
+                                "{} · 中文回退 {} · 行高 {:.1}",
                                 style.font_family,
-                                f32::from(font),
                                 crate::theme::CJK_FALLBACK,
                                 style.line_height
                             ),
                         ))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .text_size(px(13.))
+                                .line_height(px(18.))
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child("字号"))
+                                .child({
+                                    let this = cx.weak_entity();
+                                    crate::ui::stepper(
+                                        "terminal-font-size",
+                                        format!("{} pt", self.preferences.terminal_font_size),
+                                        self.preferences.terminal_font_size > TerminalFontSize::MIN,
+                                        self.preferences.terminal_font_size < TerminalFontSize::MAX,
+                                        move |step, _, cx| {
+                                            this.update(cx, |s, cx| s.step_font_size(step, cx)).ok();
+                                        },
+                                        cx,
+                                    )
+                                }),
+                        )
                         .child(
                             div()
                                 .px(px(14.))

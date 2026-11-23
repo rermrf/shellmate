@@ -10,6 +10,7 @@ pub(crate) mod about;
 pub mod clash;
 pub mod confirm;
 pub(crate) mod quit;
+pub(crate) mod shortcuts;
 pub(crate) mod window;
 pub(crate) mod modal;
 pub mod host_editor;

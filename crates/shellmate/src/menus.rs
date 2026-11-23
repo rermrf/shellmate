@@ -11,7 +11,8 @@ actions!(shellmate, [CloseWindow, About, CheckUpdates, Settings, LockVault, Hide
     ToggleSplit, ToggleRecording, ToggleBroadcast, ImportHosts, ImportBundle, ExportBundle,
     EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll, ShowTerminal, ShowFiles,
     ShowForward, ShowMonitor, Fullscreen, History, ToggleCommands, ToggleAi,
-    Records, Minimize, Zoom, MoveSessionToNewWindow]);
+    Records, Minimize, Zoom, MoveSessionToNewWindow, IncreaseFontSize, DecreaseFontSize, ResetFontSize,
+    ShowShortcuts, OpenLogFolder, OpenHomepage]);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MenuState {
@@ -64,6 +65,8 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
             Item::action("文件", ShowFiles).checked(state.panel == Some(Panel::Files)),
             Item::action("端口转发", ShowForward).checked(state.panel == Some(Panel::Forward)),
             Item::action("监控", ShowMonitor).checked(state.panel == Some(Panel::Monitor)), Item::Separator,
+            Item::action("放大", IncreaseFontSize), Item::action("缩小", DecreaseFontSize),
+            Item::action("实际大小", ResetFontSize), Item::Separator,
             Item::action("深色外观", ToggleTheme).checked(state.dark), Item::Separator, Item::action("进入全屏幕", Fullscreen),
         ]),
         Menu::new("工具").items([
@@ -77,8 +80,15 @@ pub(crate) fn menus(state: &MenuState) -> Vec<Menu> {
             Item::action("将会话移到新窗口", MoveSessionToNewWindow), Item::Separator,
             Item::action("上一个会话", PreviousTab), Item::action("下一个会话", NextTab),
         ]),
+        Menu::new("帮助").items([
+            Item::action("键盘快捷键", ShowShortcuts), Item::Separator,
+            Item::action("打开日志文件夹", OpenLogFolder), Item::action("项目主页", OpenHomepage),
+        ]),
     ]
 }
+
+/// The project's home page, opened by 帮助 › 项目主页.
+const HOMEPAGE: &str = "https://github.com/rermrf/shellmate";
 
 pub(crate) fn install(tree: Vec<Menu>, cx: &mut App) {
     cx.set_menus(tree);
@@ -92,6 +102,11 @@ pub(crate) fn install(tree: Vec<Menu>, cx: &mut App) {
             .and_then(|menu| menu.itemWithTitle(ns_string!("窗口")))
             .and_then(|item| item.submenu());
         app.setWindowsMenu(menu.as_deref());
+        // Same for the help menu: AppKit adds its search field and keeps it last.
+        let help = app.mainMenu()
+            .and_then(|menu| menu.itemWithTitle(ns_string!("帮助")))
+            .and_then(|item| item.submenu());
+        app.setHelpMenu(help.as_deref());
         for entry in Hub::windows(cx).to_vec() {
             entry.handle.update(cx, |_, window, _| {
                 if let Some(native) = crate::workspace::lifecycle::native_window(window) {
@@ -151,6 +166,15 @@ fn forward_edit(cx: &mut App, input: &'static dyn Action, terminal: Option<&'sta
     });
 }
 
+/// Opens the folder of the session logs in the Finder. It is made first: it only exists once
+/// a log has been written, and an empty folder is a better answer than a failed menu item.
+fn open_log_folder(dir: &std::path::Path, open: impl FnOnce(&std::path::Path)) {
+    match shellmate_term::archive::create_dir(dir) {
+        Ok(()) => open(dir),
+        Err(error) => log::warn!("log folder {}: {error}", dir.display()),
+    }
+}
+
 pub(crate) fn global_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-z", EditUndo, None), KeyBinding::new("cmd-shift-z", EditRedo, None),
@@ -172,6 +196,9 @@ pub(crate) fn init(cx: &mut App) {
         .on_action(|_: &EditSelectAll, cx| forward_edit(cx, &input::SelectAll, Some(&terminal::SelectAll)))
         .on_action(|_: &CheckUpdates, cx| Hub::with_restored_window(cx, crate::updater::manual))
         .on_action(|_: &About, cx| Hub::with_restored_window(cx, crate::dialogs::about::open))
+        .on_action(|_: &ShowShortcuts, cx| Hub::with_restored_window(cx, crate::dialogs::shortcuts::open))
+        .on_action(|_: &OpenLogFolder, cx| open_log_folder(&Hub::log_root(cx), |dir| cx.open_with_system(dir)))
+        .on_action(|_: &OpenHomepage, cx| cx.open_url(HOMEPAGE))
         .on_action(|_: &HideApp, cx| cx.hide())
         .on_action(|_: &HideOthers, cx| cx.hide_other_apps())
         .on_action(|_: &ShowAll, cx| cx.unhide_other_apps())
@@ -197,6 +224,7 @@ pub(crate) fn configure_appkit() {
 
 #[cfg(debug_assertions)]
 pub(crate) mod dump;
+pub(crate) mod shortcuts;
 
 #[cfg(test)]
 mod tests;

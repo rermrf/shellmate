@@ -19,6 +19,7 @@ pub use pty::{PtyOptions,LocalPty,nonzero_dims};
 pub use pty::process_cwd;
 pub use shellmate_core::io::{OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 pub use terminal::{SessionEnd, Terminal, TerminalEvent, TerminalSize};
+pub use keys::sends_input;
 pub use view::{TerminalView, init};
 
 pub mod archive;

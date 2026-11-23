@@ -34,6 +34,7 @@ mod hub;
 mod transfer;
 mod tab_drag;
 mod titles;
+mod zoom;
 #[cfg(target_os = "macos")]
 pub(crate) mod window_scale;
 pub(crate) use hub::Hub;
@@ -113,6 +114,12 @@ pub(crate) fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-cmd-2", ShowFiles, Some(CONTEXT)),
         KeyBinding::new("alt-cmd-3", ShowForward, Some(CONTEXT)),
         KeyBinding::new("alt-cmd-4", ShowMonitor, Some(CONTEXT)),
+        // The menu shows the first key of an action: ⌘= is the one without Shift, ⌘+ is the same key with it.
+        KeyBinding::new("cmd-=", IncreaseFontSize, Some(CONTEXT)),
+        KeyBinding::new("cmd-+", IncreaseFontSize, Some(CONTEXT)),
+        KeyBinding::new("cmd--", DecreaseFontSize, Some(CONTEXT)),
+        KeyBinding::new("cmd-0", ResetFontSize, Some(CONTEXT)),
+        KeyBinding::new("cmd-/", ShowShortcuts, Some(CONTEXT)),
     ]
 }
 
@@ -229,6 +236,9 @@ pub struct Workspace {
     tab_strip: tab_drag::TabStrip,
     /// Tab width held while the pointer is over the tab bar.
     tab_hold: crate::tabs::Hold,
+    /// This window's terminal font size in points while it is zoomed (⌘= ⌘− ⌘0); `None` follows the
+    /// default size of the settings. Never saved.
+    font_size: Option<f32>,
     #[cfg(debug_assertions)]
     demo_tab_menu: Option<(Entity<gpui::component::menu::PopupMenu>, Subscription)>,
     #[cfg(debug_assertions)]
@@ -251,6 +261,7 @@ pub struct Workspace {
 pub(crate) struct PreferenceChanged(pub shellmate_store::Preference, pub bool);
 
 impl gpui::EventEmitter<PreferenceChanged> for Workspace {}
+pub(crate) use zoom::TerminalFontSizeChanged;
 pub(crate) struct CloseWindowPreferenceChanged(pub shellmate_store::CloseWindowWithSessions);
 impl gpui::EventEmitter<CloseWindowPreferenceChanged> for Workspace {}
 
@@ -326,6 +337,7 @@ impl Workspace {
             broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,
             tab_strip: Default::default(),
             tab_hold: Default::default(),
+            font_size: None,
             #[cfg(debug_assertions)] demo_tab_menu: None,
             #[cfg(debug_assertions)] review_confirmation:None,
             #[cfg(debug_assertions)] live_review:false,
@@ -428,7 +440,7 @@ impl Workspace {
 
     /// Opens a local shell tab, starting in `cwd` (the home directory if `None`).
     fn open_local_in(&mut self, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let style = cx.terminal_style();
+        let style = self.terminal_style(cx);
         let palette = style.palette.clone();
         let options = PtyOptions { cwd, login:self.hub.preferences.borrow().get(shellmate_store::Preference::LoginShell), ..PtyOptions::default() };
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
@@ -691,11 +703,9 @@ impl Workspace {
 
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         theme::apply(!cx.is_dark(), cx);
-        let style = cx.terminal_style();
+        // Every window keeps its own font size: each one derives its style from the new colors.
         self.project(Route::All, cx, |workspace, cx| {
-            for session in &workspace.sessions {
-                session.view.update(cx, |view, cx| view.set_style(style.clone(), cx));
-            }
+            workspace.apply_terminal_style(cx);
             cx.notify();
         });
     }
@@ -710,11 +720,10 @@ impl Workspace {
 
     /// ⌘1…⌘8 select a tab, ⌘9 the last one.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let m = &event.keystroke.modifiers;
-        if !m.platform || m.control || m.alt || m.shift || self.sessions.is_empty() {
+        if self.sessions.is_empty() {
             return;
         }
-        if let Ok(n @ 1..=9) = event.keystroke.key.parse::<usize>() {
+        if let Some(n) = tab_number(&event.keystroke) {
             let ix = if n == 9 { self.sessions.len() - 1 } else { n - 1 };
             if ix < self.sessions.len() {
                 self.activate(ix, window, cx);
@@ -1374,6 +1383,15 @@ impl Render for Workspace {
                 }
             }).absolute().inset_0())
     }
+}
+
+/// The number (1–9) of the tab a ⌘-digit keystroke selects.
+pub(crate) fn tab_number(keystroke: &gpui::Keystroke) -> Option<usize> {
+    let m = &keystroke.modifiers;
+    if !m.platform || m.control || m.alt || m.shift {
+        return None;
+    }
+    keystroke.key.parse::<usize>().ok().filter(|n| (1..=9).contains(n))
 }
 
 /// Color of a tab's status dot: connecting yellow, ok green, failed red, ended grey.

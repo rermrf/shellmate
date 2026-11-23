@@ -103,9 +103,12 @@ impl Workspace {
             .terminal
             .update(cx, |terminal, _| terminal.rebind_agent());
         session._subscription = Some(self.watch_terminal(id, &session.terminal, window, cx));
+        // The session takes the font size of the window it lands in.
+        let style = self.terminal_style(cx);
         session.view.update(cx, |view, cx| {
             view.rebind_window(window, cx);
             view.set_display_paused(self.hidden, cx);
+            view.set_style(style, cx);
         });
         if let Some(tab) = &mut session.files {
             tab.panel

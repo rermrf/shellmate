@@ -46,10 +46,17 @@ impl HostStore {
             }
         }
         p.close_window_with_sessions = CloseWindowWithSessions::parse(self.setting(CloseWindowWithSessions::KEY)?.as_deref());
+        p.terminal_font_size = TerminalFontSize::parse(self.setting(TerminalFontSize::KEY)?.as_deref());
         Ok(p)
     }
     pub fn set_close_window_with_sessions(&mut self, value: CloseWindowWithSessions) -> Result<()> {
         self.set_setting(CloseWindowWithSessions::KEY, value.as_str())
+    }
+    /// Saves the default terminal font size (clamped to the supported range) and returns what was saved.
+    pub fn set_terminal_font_size(&mut self, points: u8) -> Result<u8> {
+        let points = TerminalFontSize::clamp(points);
+        self.set_setting(TerminalFontSize::KEY, &points.to_string())?;
+        Ok(points)
     }
     pub fn set_preference(&mut self, key: Preference, value: bool) -> Result<()> {
         self.set_setting(key.key(), if value { "1" } else { "0" })
@@ -170,15 +177,36 @@ impl CloseWindowWithSessions {
     }
 }
 
+/// The default font size of terminals, in points. A window can zoom away from it temporarily.
+pub struct TerminalFontSize;
+impl TerminalFontSize {
+    pub const KEY: &'static str = "terminal.font_size";
+    pub const MIN: u8 = 9;
+    pub const MAX: u8 = 28;
+    pub const DEFAULT: u8 = 13;
+    pub fn clamp(points: u8) -> u8 {
+        points.clamp(Self::MIN, Self::MAX)
+    }
+    /// A stored value; anything that is not a whole number of points falls back to the default.
+    pub fn parse(value: Option<&str>) -> u8 {
+        value
+            .and_then(|text| text.trim().parse::<u8>().ok())
+            .map_or(Self::DEFAULT, Self::clamp)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
     pub close_window_with_sessions: CloseWindowWithSessions,
+    /// Default terminal font size in points ([`TerminalFontSize`]).
+    pub terminal_font_size: u8,
     values: [bool; Preference::ALL.len()],
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             close_window_with_sessions: CloseWindowWithSessions::Ask,
+            terminal_font_size: TerminalFontSize::DEFAULT,
             values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true],
         }
     }
@@ -207,6 +235,32 @@ mod tests {
             store.set_setting(CloseWindowWithSessions::KEY, invalid).unwrap();
             assert_eq!(store.preferences().unwrap().close_window_with_sessions, CloseWindowWithSessions::Ask);
         }
+    }
+
+    #[test]
+    fn terminal_font_size_defaults_roundtrips_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("font.db");
+        let mut store = HostStore::open(&path).unwrap();
+        assert_eq!(store.preferences().unwrap().terminal_font_size, 13, "nothing saved yet");
+        assert_eq!(Preferences::default().terminal_font_size, TerminalFontSize::DEFAULT);
+        for (asked, saved) in [(16, 16), (9, 9), (28, 28), (0, 9), (8, 9), (29, 28), (255, 28)] {
+            assert_eq!(store.set_terminal_font_size(asked).unwrap(), saved);
+            drop(store);
+            store = HostStore::open(&path).unwrap();
+            assert_eq!(store.preferences().unwrap().terminal_font_size, saved, "asked for {asked}");
+        }
+        assert_eq!(store.setting("terminal.font_size").unwrap().as_deref(), Some("28"));
+    }
+
+    #[test]
+    fn stored_font_sizes_that_make_no_sense_fall_back_or_clamp() {
+        let mut store = HostStore::open_in_memory().unwrap();
+        for (stored, expected) in [("14", 14), (" 15 ", 15), ("3", 9), ("99", 28), ("-4", 13), ("13.5", 13), ("big", 13), ("", 13), ("300", 13)] {
+            store.set_setting(TerminalFontSize::KEY, stored).unwrap();
+            assert_eq!(store.preferences().unwrap().terminal_font_size, expected, "stored {stored:?}");
+        }
+        assert_eq!(TerminalFontSize::parse(None), 13);
     }
 
     #[test]

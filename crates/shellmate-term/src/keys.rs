@@ -8,6 +8,12 @@ use std::borrow::Cow;
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
+/// Whether the terminal itself turns `keystroke` into input for the program, with default modes
+/// (arrows, ⌘←, ⌥← ...). The keyboard shortcut sheet lists such keys by hand.
+pub fn sends_input(keystroke: &Keystroke) -> bool {
+    to_esc_str(keystroke, &TermMode::default()).is_some()
+}
+
 /// Returns the escape sequence for `keystroke`, or `None` when the key should be
 /// left to key bindings (⌘-shortcuts) or text input.
 pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode) -> Option<Cow<'static, str>> {
@@ -151,7 +157,7 @@ mod tests {
     #[test]
     fn menubar_shortcuts_never_encode_shell_input() {
         for key in ["cmd-n", "cmd-d", "cmd-y", "cmd-,", "cmd-h", "alt-cmd-h", "cmd-m", "ctrl-cmd-f",
-            "alt-cmd-1", "alt-cmd-2", "alt-cmd-3", "alt-cmd-4"] {
+            "alt-cmd-1", "alt-cmd-2", "alt-cmd-3", "alt-cmd-4", "cmd-=", "cmd-+", "cmd--", "cmd-0", "cmd-/"] {
             assert_eq!(esc(key), None, "{key}");
         }
         assert_eq!(esc("ctrl-r").as_deref(), Some("\x12"));

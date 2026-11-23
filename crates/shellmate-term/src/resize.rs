@@ -111,6 +111,51 @@ mod tests {
         }
     }
 
+    /// The terminal area of a window measured with the cell metrics of a font size (0.6 em wide cells,
+    /// line height 20/13 of the size, rounded like the element does).
+    fn measured_at(points: f32) -> TerminalSize {
+        let cell = gpui::px(points * 0.6);
+        let line = gpui::px((points * 20. / 13.).round());
+        TerminalSize::from_geometry(1200., 600., cell, line)
+    }
+
+    #[test]
+    fn a_new_font_size_reflows_the_grid_and_tells_the_backend_once() {
+        let mut current = measured_at(13.);
+        let mut throttle = ResizeThrottle::default();
+        assert_eq!(throttle.update(current.dims(), Duration::ZERO), Some(current.dims()));
+        let mut sent = Vec::new();
+        for points in [14., 15., 13., 9., 28.] {
+            let measured = measured_at(points);
+            let next = layout_resize(current, measured, false, throttle.pending())
+                .unwrap_or_else(|| panic!("{points} pt must be applied"));
+            assert_eq!(next, measured);
+            assert_ne!((next.cols, next.rows), (current.cols, current.rows), "{points} pt changes the grid");
+            sent.push(throttle.update(next.dims(), Duration::ZERO).expect("the backend hears of every new size"));
+            assert_eq!(throttle.update(next.dims(), Duration::ZERO), None, "and only once");
+            current = next;
+        }
+        let cells: Vec<_> = sent.iter().map(|d| (d.cols, d.rows)).collect();
+        assert_eq!(cells, [(142, 27), (133, 26), (153, 30), (222, 42), (71, 13)]);
+        // Larger type means fewer cells in the same window.
+        assert!(measured_at(28.).cols < measured_at(13.).cols && measured_at(28.).rows < measured_at(13.).rows);
+        assert!(measured_at(9.).cols > measured_at(13.).cols && measured_at(9.).rows > measured_at(13.).rows);
+    }
+
+    #[test]
+    fn cell_metrics_alone_are_enough_to_resize_when_the_grid_keeps_its_shape() {
+        // Same columns and rows, different pixel size: the PTY's pixel dimensions still change.
+        let before = TerminalSize { cols: 100, rows: 30, cell_width: gpui::px(7.8), line_height: gpui::px(20.) };
+        let after = TerminalSize { cell_width: gpui::px(8.4), line_height: gpui::px(22.), ..before };
+        assert_eq!((before.cols, before.rows), (after.cols, after.rows));
+        let mut throttle = ResizeThrottle::default();
+        throttle.update(before.dims(), Duration::ZERO);
+        assert_eq!(layout_resize(before, after, false, throttle.pending()), Some(after));
+        let sent = throttle.update(after.dims(), Duration::ZERO).expect("pixel size changed");
+        assert_eq!((sent.cols, sent.rows), (100, 30));
+        assert_ne!((sent.pixel_width, sent.pixel_height), (before.dims().pixel_width, before.dims().pixel_height));
+    }
+
     #[test]
     fn held_layout_sends_only_the_final_measurement_even_after_reversal() {
         let grid = |cols| TerminalSize { cols, ..Default::default() };

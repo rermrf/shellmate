@@ -28,7 +28,7 @@ use crate::dialogs::hostkey::HostKeyDialog;
 use crate::reconnect::{self, Failure, Input, MAX_ATTEMPTS, Output, Phase, Reconnect, View};
 use crate::runtime;
 use crate::sidebar::LiveStatus;
-use crate::theme::{ActivePalette, CARD_RADIUS};
+use crate::theme::CARD_RADIUS;
 
 // A rejected key still needs attention on a first connection, including at a jump hop.
 fn cancelled_auth_prompt(error: &SshError) -> bool {
@@ -371,7 +371,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let style = cx.terminal_style();
+        let style = self.terminal_style(cx);
         let palette = style.palette.clone();
         let terminal = cx.new(|cx| Terminal::new(palette, cx));
         let view = cx.new(|cx| {

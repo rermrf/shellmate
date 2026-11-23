@@ -134,6 +134,7 @@ fn first_other<T, K: PartialEq>(entries: &[T], source: K, key: impl Fn(&T) -> K)
 impl Hub {
     pub fn init(store: HostStore, temporary: bool, cx: &mut App) {
         let preferences = store.preferences().unwrap_or_default();
+        cx.set_global(theme::DefaultFontSize(f32::from(preferences.terminal_font_size)));
         let store = shellmate_store::SharedStore::new(store);
         let secrets = crate::security::coordinator(store.clone());
         crate::updater::init(store.clone(), cx);
@@ -286,6 +287,12 @@ impl Hub {
     ) {
         Self::with_restored_workspace(cx, move |_, w, cx| run(w, cx));
     }
+    /// Where session logs are written.
+    pub(crate) fn log_root(cx: &App) -> PathBuf {
+        cx.try_global::<Self>()
+            .map_or_else(shellmate_term::archive::log_root, |hub| hub.services.log_root.borrow().clone())
+    }
+
     pub(crate) fn reopen(cx: &mut App) {
         Self::update(cx, Workspace::show_window);
     }
