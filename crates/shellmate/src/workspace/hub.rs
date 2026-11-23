@@ -2,6 +2,7 @@
 use super::*;
 use gpui::{AnyWindowHandle, Global, WeakEntity};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::time::Duration;
 
 #[derive(Default)]
@@ -35,6 +36,11 @@ pub(super) struct Services {
     pub running_recordings: RefCell<HashMap<usize, archive::RunningRecording>>,
     pub records_window: RefCell<Option<crate::records::panel::OpenRecords>>,
     pub quit_dialog: RefCell<Option<WeakEntity<crate::dialogs::quit::QuitDialog>>>,
+    /// The workspace windows that are the active window now. Shellmate is in front while it is not empty.
+    pub active_windows: RefCell<HashSet<gpui::WindowId>>,
+    /// The count the Dock icon shows.
+    #[cfg(target_os = "macos")]
+    pub dock_badge: Cell<usize>,
     #[cfg(target_os = "macos")]
     pub status_bar: RefCell<status_item::StatusBar>,
 }
@@ -148,6 +154,7 @@ impl Hub {
         let closed = cx.on_window_closed(|cx, id| {
             crate::dialogs::modal::forget_window(id, cx);
             tab_drag::window_closed(id, cx);
+            cx.global::<Self>().services.set_window_active(id, false);
             let windows = &mut cx.global_mut::<Self>().windows;
             if let Some(ix) = windows.iter().position(|e| e.handle.window_id() == id) {
                 windows.remove(ix);
@@ -176,6 +183,10 @@ impl Hub {
                 });
             }
         });
+        // A click on a system notification brings its session forward. Registering this also lets a
+        // click that launched the app reach it; outside an app bundle the platform logs that there
+        // are no system notifications and nothing else happens.
+        cx.on_system_notification_response(|response, cx| Self::notification_clicked(&response.tag, cx));
         #[cfg(target_os = "macos")]
         let status_bar = status_item::StatusBar::new(cx).into();
         cx.set_global(Self {
@@ -199,6 +210,9 @@ impl Hub {
                 running_recordings: Default::default(),
                 records_window: Default::default(),
                 quit_dialog: Default::default(),
+                active_windows: Default::default(),
+                #[cfg(target_os = "macos")]
+                dock_badge: Cell::new(0),
                 #[cfg(target_os = "macos")]
                 status_bar,
             }),

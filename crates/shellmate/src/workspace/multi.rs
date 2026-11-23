@@ -30,6 +30,7 @@ impl Workspace {
                 title: s.display_title(cx).to_string(),
                 local: s.host().is_none(),
                 protocol:s.host().map_or(shellmate_core::Protocol::Ssh,|h|h.protocol),
+                attention: s.alerts.marked(),
                 status: if self.command_available(Some(s.id), cx) {
                     Status::Connected
                 } else {
@@ -210,6 +211,8 @@ impl Workspace {
         self.session_menu = None;
         self.update_pane_radii(cx);
         self.focus_active(window, cx);
+        // The other half is in view now.
+        self.clear_watched_alerts(window, cx);
         cx.notify();
     }
     pub(super) fn update_pane_radii(&self, cx: &mut Context<Self>) {
@@ -294,6 +297,7 @@ impl Workspace {
                         this.split.choose(main, *id, &this.session_rows(cx));
                         this.update_pane_radii(cx);
                         this.focus_pane(Pane::Other, window, cx);
+                        this.clear_watched_alerts(window, cx);
                     }
                 }
             }

@@ -29,6 +29,7 @@ use crate::sidebar::{Active, LiveStatus, Sidebar, SidebarEvent, SidebarMotion};
 use crate::theme::{self, ActivePalette, CARD_RADIUS};
 use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_button, window_drag_area};
 
+mod attention;
 mod files;
 mod hub;
 mod transfer;
@@ -185,6 +186,10 @@ struct Session {
     typed: Option<ssh::TypedLine>,
     typing: Option<gpui::Task<()>>,
     kind: SessionKind,
+    /// What happened in the background since somebody last looked: the tab dot and system notification.
+    alerts: attention::Alerts,
+    /// A local session's foreground command, followed to notice one that ran long and ended.
+    long: attention::LongCommand,
     _subscription: Option<Subscription>,
 }
 
@@ -298,15 +303,19 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&sidebar, window, Self::on_sidebar_event),
             cx.observe_window_activation(window, |s, w, cx| {
+                s.hub.set_window_active(w.window_handle().window_id(), w.is_window_active());
                 if w.is_window_active() {
                     Hub::activated(s.handle, cx);
                     s.last_menu_state = None;
                     s.sync_menus(cx);
+                    // Whatever waited in the tabs in view has been seen now.
+                    s.clear_watched_alerts(w, cx);
                 } else {
                     s.end_drawer_drag(cx);
                     // A pointer that left while the window was away may never report it.
                     s.release_tab_hold(cx);
                 }
+                s.sync_terminal_focus(w, cx);
             }),
             cx.subscribe_in(&commands, window, Self::on_command_event),
             cx.subscribe_in(&broadcast_bar,window,Self::on_broadcast_submit),
@@ -316,7 +325,10 @@ impl Workspace {
         // Background session changes can affect menu validation while AppKit has stopped drawing.
         subscriptions.push(cx.observe_self(|s, cx| {
             #[cfg(target_os = "macos")]
-            s.sync_status_item(cx);
+            {
+                s.sync_status_item(cx);
+                s.sync_dock_badge(cx);
+            }
             if s.hidden { s.sync_menus(cx); }
         }));
         let mut this = Self {
@@ -355,6 +367,7 @@ impl Workspace {
         if let Some(message) = store_notice {
             push_notification_later(window, cx, Notification::warning(message).title("主机库无法打开"));
         }
+        this.hub.set_window_active(window.window_handle().window_id(), window.is_window_active());
         if first { this.reload_book(window, cx); }
         else { window.focus(&this.focus_handle, cx); }
         let open_local=first && !crate::prototype_fixture();
@@ -469,6 +482,8 @@ impl Workspace {
             monitor: None,
             typed: None, typing: None,
             kind: SessionKind::Local,
+            alerts: Default::default(),
+            long: Default::default(),
             _subscription: Some(subscription),
         });
         self.start_session_archives(id,window,cx);
@@ -496,6 +511,22 @@ impl Workspace {
                 return;
             }
             if matches!(event, TerminalEvent::Focused) {this.note_terminal_focus(id,cx);return;}
+            // Background alerts: a bell, or a program asking for a notification.
+            match event {
+                TerminalEvent::Bell => return this.raise_alert(id, attention::AlertKind::Bell, window, cx),
+                TerminalEvent::Notify { title, body } => {
+                    let kind = attention::AlertKind::Notify { title: title.clone(), body: body.clone() };
+                    return this.raise_alert(id, kind, window, cx);
+                }
+                TerminalEvent::FocusReport(_focused) => {
+                    #[cfg(debug_assertions)]
+                    if let Some(session) = this.sessions.iter().find(|s| s.id == id) {
+                        attention::log_focus_report(id, &session.display_title(cx), *_focused);
+                    }
+                    return;
+                }
+                _ => {}
+            }
             let Some(session) = this.sessions.iter_mut().find(|s| s.id == id) else { return };
             match (&mut session.kind, event) {
                 (SessionKind::Local, TerminalEvent::Exited(_) | TerminalEvent::Disconnected(_)) => session.exited = true,
@@ -548,6 +579,8 @@ impl Workspace {
         self.pump_active_clash(window, cx);
         self.sync_sidebar(cx);
         self.sync_monitor_activity(cx);
+        // Switching to a tab is looking at it.
+        self.clear_watched_alerts(window, cx);
         cx.notify();
     }
 
@@ -582,6 +615,7 @@ impl Workspace {
         let was_recording=self.hub.running_recordings.borrow().contains_key(&closed);
         if let Some(error)=self.finalize_archives(closed,cx){window.push_notification(Notification::error(error),cx);}
         else if was_recording{window.push_notification(Notification::success("已保存 .cast · 可在「记录」中回放"),cx);}
+        self.clear_alerts(closed, cx);
         self.split.close_session(self.main_id(),closed);
         self.broadcast.checked.remove(&closed);
         self.hub.recent_sessions.borrow_mut().retain(|id|*id!=closed);
@@ -750,9 +784,11 @@ impl Workspace {
         // Narrow tabs give way in this order: title (down to a floor), broadcast chip, reconnect badge;
         // a chip is shown whole or not at all.
         let badge = s.ssh().and_then(|ssh| ssh.badge());
-        let chips = crate::tabs::chips(
+        // The dot for something that happened while nobody looked comes first, right after the title.
+        let crate::tabs::Shown { dot: alert, chips } = crate::tabs::shown(
             f32::from(width),
             local,
+            s.alerts.marked(),
             badge.as_deref().map(crate::tabs::chip_estimate),
             self.broadcast.enabled && self.broadcast.checked.contains(&s.id),
         );
@@ -780,6 +816,7 @@ impl Workspace {
             .child(div().id(("tab-title", s.id)).min_w(px(floor)).truncate().child(s.display_title(cx)).flex_1()
                 .tooltip({ let tip = s.title_tooltip(cx); move |window, cx| Tooltip::new(tip.clone())
                     .max_w((window.viewport_size().width - px(48.)).min(px(680.))).whitespace_normal().build(window, cx) }))
+            .when(alert, |d| d.child(dot(p.acc, crate::tabs::DOT)))
             .when(chips.broadcast, |d| {
                 d.child(
                     div()
@@ -890,6 +927,7 @@ impl Workspace {
             local: matches!(session.kind, SessionKind::Local),
             badge: session.ssh().and_then(|ssh| ssh.badge()).as_deref().map(crate::tabs::chip_estimate),
             broadcast: self.broadcast.enabled && self.broadcast.checked.contains(&session.id),
+            attention: session.alerts.marked(),
         }));
         let layout = crate::tabs::layout(
             self.sessions.len(),
@@ -901,6 +939,9 @@ impl Workspace {
             self.tab_hold.held(),
         );
         self.tab_hold.rendered(layout.width);
+        // A tab behind the session list that has something for the user: its trigger shows a dot.
+        let hidden_alert = layout.overflow
+            && self.sessions.iter().enumerate().any(|(ix, session)| session.alerts.marked() && !layout.visible.contains(&ix));
         let strip_width = layout.strip_width();
         let width = px(layout.width);
         let overflow = layout.overflow;
@@ -1006,6 +1047,10 @@ impl Workspace {
                                 .font_weight(FontWeight::NORMAL)
                                 .text_color(p.tx2)
                                 .child(overflow_label)
+                                // A badge on the corner, so that the trigger keeps its width.
+                                .when(hidden_alert, |d| {
+                                    d.relative().child(div().absolute().top(px(2.)).right(px(1.)).child(dot(p.acc, crate::tabs::DOT)))
+                                })
                                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, w, cx| {
                                     this.open_session_menu(
                                         crate::productivity::session_menu::Kind::Tabs,
@@ -1262,6 +1307,8 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every focus change draws a frame: this is where terminals learn whether they have the focus.
+        self.sync_terminal_focus(_window, cx);
         let now = cx.background_executor().now();
         self.sidebar_motion.advance(now, cx.reduce_motion());
         let target = self.drawer_kind();

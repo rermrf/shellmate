@@ -79,9 +79,16 @@ pub enum Preference {
     QuitOnWindowClose,
     ConfirmQuit,
     ShowStatusIcon,
+    /// A dot on the tab (and the menu bar icon, and the Dock badge) when a session in the background
+    /// rings the bell, asks for a notification or finishes a long command.
+    TabAlerts,
+    /// A system notification for such an alert, while Shellmate is not in front.
+    SystemNotifications,
+    /// An alert when a command of a local session that ran for 30 seconds or more ends in the background.
+    LongCommandAlert,
 }
 impl Preference {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 18] = [
         Self::CopySelection,
         Self::RightPaste,
         Self::BracketedPaste,
@@ -97,6 +104,9 @@ impl Preference {
         Self::QuitOnWindowClose,
         Self::ConfirmQuit,
         Self::ShowStatusIcon,
+        Self::TabAlerts,
+        Self::SystemNotifications,
+        Self::LongCommandAlert,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -115,6 +125,9 @@ impl Preference {
             Self::QuitOnWindowClose => "quit_on_window_close",
             Self::ConfirmQuit => "confirm_quit",
             Self::ShowStatusIcon => "show_status_icon",
+            Self::TabAlerts => "terminal.tab_alerts",
+            Self::SystemNotifications => "terminal.system_notifications",
+            Self::LongCommandAlert => "terminal.long_command_alert",
         }
     }
     pub fn label(self) -> &'static str {
@@ -134,6 +147,9 @@ impl Preference {
             Self::QuitOnWindowClose => "关闭窗口时",
             Self::ConfirmQuit => "退出前确认",
             Self::ShowStatusIcon => "在菜单栏显示图标",
+            Self::TabAlerts => "后台标签提醒",
+            Self::SystemNotifications => "系统通知",
+            Self::LongCommandAlert => "本机长命令完成提醒",
         }
     }
     pub fn description(self) -> &'static str {
@@ -147,6 +163,9 @@ impl Preference {
             Self::ShowStatusIcon => "关闭窗口后，Shellmate 只保留菜单栏图标；关掉此项则保留 Dock 图标。",
             Self::FollowDirectory => "通过 OSC 7 / shell 集成上报当前目录",
             Self::PreloadPanels => "SSH 连接后在后台打开文件列表、探测系统信息，打开文件、监控时无需等待",
+            Self::TabAlerts => "标签小圆点、菜单栏、Dock 角标",
+            Self::SystemNotifications => "仅在 Shellmate 不在前台时发送",
+            Self::LongCommandAlert => "本机命令运行超过 30 秒、在后台结束时提醒",
             _ => "",
         }
     }
@@ -207,7 +226,7 @@ impl Default for Preferences {
         Self {
             close_window_with_sessions: CloseWindowWithSessions::Ask,
             terminal_font_size: TerminalFontSize::DEFAULT,
-            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true],
+            values: [true, true, true, true, true, false, false, true, true, true, true, true, false, true, true, true, true, true],
         }
     }
 }
@@ -235,6 +254,33 @@ mod tests {
             store.set_setting(CloseWindowWithSessions::KEY, invalid).unwrap();
             assert_eq!(store.preferences().unwrap().close_window_with_sessions, CloseWindowWithSessions::Ask);
         }
+    }
+
+    #[test]
+    fn alert_preferences_are_on_by_default_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.db");
+        let mut store = HostStore::open(&path).unwrap();
+        let alerts = [Preference::TabAlerts, Preference::SystemNotifications, Preference::LongCommandAlert];
+        let prefs = store.preferences().unwrap();
+        for key in alerts {
+            assert!(prefs.get(key), "{key:?} is on until the user turns it off");
+            assert!(Preferences::default().get(key));
+            assert!(key.key().starts_with("terminal."), "{key:?} is kept with the other terminal settings");
+            assert!(!key.label().is_empty() && !key.description().is_empty());
+        }
+        store.set_preference(Preference::SystemNotifications, false).unwrap();
+        drop(store);
+        let store = HostStore::open(&path).unwrap();
+        let prefs = store.preferences().unwrap();
+        assert!(prefs.get(Preference::TabAlerts) && prefs.get(Preference::LongCommandAlert));
+        assert!(!prefs.get(Preference::SystemNotifications));
+        // The new settings did not shift any other preference's slot or default.
+        let others = Preference::ALL.iter().filter(|key| !alerts.contains(key)).count();
+        assert_eq!(others, 15);
+        assert_eq!(Preference::ALL.iter().map(|key| *key as usize).collect::<Vec<_>>(), (0..18).collect::<Vec<_>>());
+        let keys: std::collections::HashSet<_> = Preference::ALL.iter().map(|key| key.key()).collect();
+        assert_eq!(keys.len(), Preference::ALL.len(), "keys are unique");
     }
 
     #[test]

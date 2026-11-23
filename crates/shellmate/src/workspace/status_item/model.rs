@@ -67,11 +67,13 @@ pub(super) enum Icon {
 }
 
 impl Icon {
-    pub(super) fn from_sessions(statuses: impl Iterator<Item = Status>) -> Self {
+    /// One entry per session: its status, and whether something happened in it that nobody has
+    /// looked at yet (a bell, a notification, a command that ended). Either needs attention.
+    pub(super) fn from_sessions(statuses: impl Iterator<Item = (Status, bool)>) -> Self {
         let mut attention = 0;
         let mut connected = 0;
-        for status in statuses {
-            if status.attention() {
+        for (status, alert) in statuses {
+            if status.attention() || alert {
                 attention += 1;
             } else if matches!(status, Status::Connected | Status::Reconnecting(_)) {
                 connected += 1;
@@ -107,6 +109,14 @@ pub(super) struct Snapshot<'a> {
     pub id: usize,
     pub title: &'a str,
     pub status: Status,
+    /// Something is waiting for a look in this session.
+    pub alert: bool,
+}
+
+impl Snapshot<'_> {
+    fn needs_attention(&self) -> bool {
+        self.status.attention() || self.alert
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,11 +149,13 @@ pub(super) fn menu(sessions: &[Snapshot], version: Option<String>) -> Vec<Row> {
     let mut rows = vec![Row::item("打开 Shellmate", Show), Row::Separator];
     let ordered = sessions
         .iter()
-        .filter(|s| s.status.attention())
-        .chain(sessions.iter().filter(|s| !s.status.attention()));
+        .filter(|s| s.needs_attention())
+        .chain(sessions.iter().filter(|s| !s.needs_attention()));
     for session in ordered.take(LIMIT) {
+        // A session with something waiting is marked with a dot.
+        let mark = if session.alert { "● " } else { "" };
         rows.push(Row::Item(
-            format!("{} — {}", session.title, session.status.hint()),
+            format!("{mark}{} — {}", session.title, session.status.hint()),
             Some(Tab(session.id)),
         ));
     }
@@ -220,7 +232,7 @@ mod tests {
             ),
         ];
         for &(sessions, icon, tooltip) in cases {
-            let actual = Icon::from_sessions(sessions.iter().copied());
+            let actual = Icon::from_sessions(sessions.iter().map(|status| (*status, false)));
             assert_eq!(actual, icon);
             assert_eq!(actual.tooltip(), tooltip);
         }
@@ -238,6 +250,7 @@ mod tests {
                     2 => Status::Reconnecting(Some(2)),
                     _ => Status::Local,
                 },
+                alert: false,
             })
             .collect();
         let rows = menu(&sessions, None);
@@ -256,6 +269,44 @@ mod tests {
             !menu(&sessions[..10], None)
                 .iter()
                 .any(|r| matches!(r, Row::Item(t, _) if t.starts_with("还有")))
+        );
+    }
+
+    #[test]
+    fn a_session_with_something_waiting_needs_attention_whatever_its_status() {
+        use Status::*;
+        let icon = |sessions: &[(Status, bool)]| Icon::from_sessions(sessions.iter().copied());
+        assert_eq!(icon(&[(Local, true)]), Icon::Attention(1), "a bell in a healthy session");
+        assert_eq!(icon(&[(Connected, true), (Connected, false)]), Icon::Attention(1));
+        // A failed session that also has an alert is still one session.
+        assert_eq!(icon(&[(Failed, true), (Local, true), (Connected, true)]), Icon::Attention(3));
+        assert_eq!(icon(&[(Failed, true), (Failed, false)]), Icon::Attention(2));
+        assert_eq!(icon(&[(Connected, false), (Local, false)]), Icon::Connected(1));
+        assert_eq!(icon(&[(Ended, true)]), Icon::Attention(1), "an ended session can have rung before it did");
+        assert_eq!(icon(&[(Local, true)]).tooltip(), "Shellmate · 1 个会话需要处理");
+    }
+
+    #[test]
+    fn the_menu_lists_sessions_with_something_waiting_first_and_marks_them() {
+        let snapshot = |id, status, alert| Snapshot { id, title: "tab", status, alert };
+        let sessions = [
+            snapshot(0, Status::Local, false),
+            snapshot(1, Status::Connected, true),
+            snapshot(2, Status::Failed, false),
+            snapshot(3, Status::Local, true),
+        ];
+        let rows = menu(&sessions, None);
+        let tabs: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Item(title, Some(Action::Tab(id))) => Some((*id, title.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tabs,
+            [(1, "● tab — 已连接"), (2, "tab — 连接失败"), (3, "● tab — 本机"), (0, "tab — 本机")],
+            "attention first in tab order; only the ones with an alert carry the dot"
         );
     }
 

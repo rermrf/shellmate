@@ -200,6 +200,7 @@ impl Workspace {
     }
     pub(super) fn tick_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_titles(window, cx);
+        self.tick_attention(window, cx);
         self.poll_streams(window,cx);
         self.poll_mosh_connections(window,cx);
         let mut stopped = vec![];
@@ -252,6 +253,10 @@ impl Workspace {
     }
     fn apply_preference(&mut self, key: P, value: bool, window: &mut Window,cx: &mut Context<Self>) {
         cx.emit(super::PreferenceChanged(key, value));
+        if matches!(key, P::TabAlerts | P::SystemNotifications | P::LongCommandAlert) {
+            self.alert_settings_changed(cx);
+            return;
+        }
         if key == P::ShowStatusIcon {
             #[cfg(target_os = "macos")]
             {

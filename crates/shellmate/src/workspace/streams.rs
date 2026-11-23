@@ -70,6 +70,8 @@ impl Workspace {
             monitor: None,
             typed: None, typing: None,
             kind: SessionKind::Stream(Box::new(StreamSession::new(host))),
+            alerts: Default::default(),
+            long: Default::default(),
             _subscription: Some(subscription),
         });
         self.start_session_archives(id, window, cx);

@@ -43,7 +43,7 @@ impl StatusBar {
                             let item = hub.services.status_bar.borrow().item.clone()?;
                             let sessions = Hub::windows(cx).iter().filter_map(|e| e.workspace.upgrade())
                                 .flat_map(|w| w.read(cx).status_rows(cx)).collect::<Vec<_>>();
-                            let snapshots = sessions.iter().map(|(id,title,status)| Snapshot { id:*id, title, status:*status }).collect::<Vec<_>>();
+                            let snapshots = sessions.iter().map(|(id,title,status,alert)| Snapshot { id:*id, title, status:*status, alert:*alert }).collect::<Vec<_>>();
                             Some((item, model::menu(&snapshots, cx.global::<updater::Updater>().available_version())))
                         });
                         if let Some((item, rows)) = prepared {
@@ -105,11 +105,11 @@ impl Workspace {
             self.hub.status_bar.borrow_mut().last = None;
             return;
         }
-        let mut statuses = self.sessions.iter().map(|s| self.status_of(s, cx)).collect::<Vec<_>>();
+        let mut statuses = self.sessions.iter().map(|s| (self.status_of(s, cx), s.alerts.marked())).collect::<Vec<_>>();
         for entry in self.peers(super::Route::All, cx) {
             if let Some(w) = entry.workspace.upgrade() {
                 let peer = w.read(cx);
-                statuses.extend(peer.sessions.iter().map(|s| peer.status_of(s,cx)));
+                statuses.extend(peer.sessions.iter().map(|s| (peer.status_of(s,cx), s.alerts.marked())));
             }
         }
         let icon = Icon::from_sessions(statuses.into_iter());
@@ -123,8 +123,8 @@ impl Workspace {
         }
     }
 
-    fn status_rows(&self, cx: &App) -> Vec<(usize, gpui::SharedString, Status)> {
-        self.sessions.iter().map(|s| (s.id, s.display_title(cx), self.status_of(s, cx))).collect()
+    fn status_rows(&self, cx: &App) -> Vec<(usize, gpui::SharedString, Status, bool)> {
+        self.sessions.iter().map(|s| (s.id, s.display_title(cx), self.status_of(s, cx), s.alerts.marked())).collect()
     }
 
 }
@@ -149,12 +149,9 @@ fn run(action: Action, cx: &mut App) {
         Action::Quit => Hub::update(cx, Workspace::request_quit),
         Action::CheckUpdate => Hub::with_restored_window(cx, updater::manual),
         Action::OpenUpdate => Hub::with_restored_window(cx, updater::open),
-        Action::Tab(id) => if let Some(entry) = super::Route::Session(id).target(cx) { entry.update(cx, move |s, w, cx| {
-            s.show_window(w,cx);
-            if let Some(ix) = s.sessions.iter().position(|tab| tab.id == id) {
-                s.activate(ix, w, cx);
-            }
-        }); },
+        Action::Tab(id) => {
+            Hub::show_session(id, false, cx);
+        }
         Action::Local => Hub::with_restored_workspace(cx, Workspace::open_local),
         Action::Connect => Hub::with_restored_workspace(cx, Workspace::new_host),
         Action::Settings => {

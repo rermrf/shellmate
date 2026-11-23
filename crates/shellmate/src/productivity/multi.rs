@@ -17,6 +17,8 @@ pub struct SessionRow {
     pub local: bool,
     pub protocol: shellmate_core::Protocol,
     pub status: Status,
+    /// Something happened in the session since it was last looked at (a dot beside its title in the tab menu).
+    pub attention: bool,
 }
 impl SessionRow {
     pub fn connected(&self) -> bool {
@@ -248,6 +250,7 @@ mod tests {
             local: false,
             protocol:shellmate_core::Protocol::Ssh,
             status,
+            attention: false,
         }
     }
     #[test]

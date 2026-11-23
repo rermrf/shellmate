@@ -16,14 +16,16 @@ use alacritty_terminal::index::{Column, Direction, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Handler as _, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Handler as _, NamedColor, NamedPrivateMode, PrivateMode, Processor};
 use gpui::{ClipboardItem, Context, EventEmitter, Pixels, SharedString, Task, px};
 use parking_lot::Mutex;
 use shellmate_core::io::{OutputHandler, OutputSink, ProcessInfo, PtyDims, TerminalBackend};
 
 use crate::colors::TerminalPalette;
 use crate::keys::paste_payload;
+use crate::focus::FocusReporter;
 use crate::history::Capture;
+use crate::notify::NotifyScanner;
 use crate::osc7::Osc7Scanner;
 use crate::pty::{LocalPty, PtyOptions};
 
@@ -98,6 +100,8 @@ enum Msg {
     /// The shell reported its working directory (OSC 7).
     Cwd { generation: u64, path: String },
     Command { generation: u64, command: String, time: i64 },
+    /// The program asked for a desktop notification (OSC 9 or OSC 777).
+    Notify { generation: u64, title: Option<String>, body: String },
 }
 
 /// Forwards alacritty's events (title, bell, replies to queries) to the UI.
@@ -140,6 +144,13 @@ pub enum TerminalEvent {
     Focused,
     /// The painted content rectangle changed the PTY dimensions.
     SizeChanged,
+    /// The program asked for a desktop notification with `ESC ] 9 ; text BEL` or
+    /// `ESC ] 777 ; notify ; title ; body BEL`. The text has no control characters and is at most
+    /// 1 KiB. Nothing of it reaches the screen.
+    Notify { title: Option<String>, body: String },
+    /// The program was told the terminal gained (`true`) or lost the focus, as it asked with
+    /// `?1004h`. Only changes are reported to the program, and so to this event.
+    FocusReport(bool),
 }
 
 /// Why the attached backend is no longer running.
@@ -171,10 +182,25 @@ struct GridSink {
     /// Watches the stream for OSC 7 (alacritty's parser ignores it); sees the bytes before the
     /// parser does and changes nothing about them.
     osc7: Mutex<Osc7Scanner>,
+    /// Watches the stream for notification requests (OSC 9, OSC 777), which the parser ignores too.
+    notify: Mutex<NotifyScanner>,
     pending: Arc<AtomicBool>,
     tx: async_channel::Sender<Msg>,
     generation: u64,
     current: Arc<AtomicU64>,
+}
+
+impl GridSink {
+    /// Passes the notification requests found in the bytes the parser just took to the UI.
+    fn send_notifications(&self, bytes: &[u8]) {
+        for notification in self.notify.lock().feed(bytes) {
+            let _ = self.tx.try_send(Msg::Notify {
+                generation: self.generation,
+                title: notification.title,
+                body: notification.body,
+            });
+        }
+    }
 }
 
 impl OutputHandler for GridSink {
@@ -185,6 +211,7 @@ impl OutputHandler for GridSink {
         let filtered = self.agent.lock().output(bytes);
         let bytes = filtered.as_slice();
         let reported = self.osc7.lock().feed_with_offsets(bytes);
+        self.send_notifications(bytes);
         {
             let mut term = self.term.lock();
             // Attach advances the generation under this lock. An old reader may
@@ -226,6 +253,9 @@ impl OutputHandler for GridSink {
         }
         self.output_capture.lock().sync_logger(&source.term);
         let mut term=self.term.lock();self.parser.lock().advance(&mut *term,display);
+        drop(term);
+        // The screen shows `display`, so that is what can ask for a notification (as it rings the bell).
+        self.send_notifications(display);
         if !self.pending.swap(true,Ordering::AcqRel){let _=self.tx.try_send(Msg::Output);}
     }
 
@@ -277,6 +307,8 @@ pub struct Terminal {
     pub(crate) replay_timestamp: Option<i64>,
     pub(crate) prompt_highlighter: crate::prompt::PromptHighlighter,
     prompt_idle: Option<Task<()>>,
+    /// Focus reporting (DECSET 1004); the owner says whether the terminal has the focus.
+    focus: FocusReporter,
     _io: Task<()>,
 }
 
@@ -344,6 +376,7 @@ impl Terminal {
             replay_timestamp: None,
             prompt_highlighter: Default::default(),
             prompt_idle: None,
+            focus: FocusReporter::default(),
             _io: io,
         }
     }
@@ -391,6 +424,8 @@ impl Terminal {
             // and any already queued old titles, are discarded together.
             for _ in 0..4096 { term.pop_title(); }
             term.set_title(None);
+            // The new program has not asked for focus reports, whatever the old one left on.
+            term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::ReportFocusInOut));
             *self.parser.lock() = Processor::new();
             *self.capture.lock() = Capture::default();
             *raw = None;
@@ -398,6 +433,7 @@ impl Terminal {
         };
         self.cwd = None;
         self.foreground = None;
+        self.focus.reset();
         self.set_title(None, cx);
         self.alive = Arc::new(Mutex::new(Arc::new(AtomicBool::new(true))));
         *self.agent.lock() = crate::agent::AgentState::default();
@@ -410,6 +446,7 @@ impl Terminal {
             agent: self.agent.clone(),
             alive: self.alive.clone(),
             osc7: Mutex::new(Osc7Scanner::new()),
+            notify: Mutex::new(NotifyScanner::new()),
             pending: self.output_pending.clone(),
             tx: self.tx.clone(),
             generation,
@@ -493,6 +530,8 @@ impl Terminal {
 
     fn after_output(&mut self, cx: &mut Context<Self>) {
         self.foreground = None;
+        // The output may have turned focus reporting on.
+        self.send_focus_report(cx);
         self.schedule_prompt_learning(cx);
         cx.emit(TerminalEvent::Output);
         if !self.display_paused { cx.notify(); }
@@ -552,7 +591,12 @@ impl Terminal {
                 Msg::Command { generation, command, time } if generation == self.current_generation() => {
                     cx.emit(TerminalEvent::Command { command, cwd: self.cwd.clone(), time });
                 }
-                Msg::Alac { .. } | Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } | Msg::Command { .. } => {}
+                Msg::Notify { generation, title, body } if generation == self.current_generation() => {
+                    if !self.replay {
+                        cx.emit(TerminalEvent::Notify { title, body });
+                    }
+                }
+                Msg::Alac { .. } | Msg::Exited { .. } | Msg::Disconnected { .. } | Msg::Cwd { .. } | Msg::Command { .. } | Msg::Notify { .. } => {}
             }
         }
         if output {
@@ -656,6 +700,29 @@ impl Terminal {
         // Match the output parser's lock order: grid before parser.
         let mut term = self.term.lock();
         self.parser.lock().advance(&mut *term, &remaining);
+    }
+
+    /// Says whether this terminal has the focus: it is the focused element of the active window of
+    /// the foreground application. A program that turned focus reporting on (`?1004h`) is told when
+    /// that changes; see [`TerminalEvent::FocusReport`].
+    pub fn set_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        // The owner tells this on every frame: only a change is worth a look at the mode.
+        if self.focus.focused() == focused {
+            return;
+        }
+        self.focus.set_focused(focused);
+        self.send_focus_report(cx);
+    }
+
+    fn send_focus_report(&mut self, cx: &mut Context<Self>) {
+        let reporting = self.backend.is_some()
+            && self.ended.is_none()
+            && !self.replay
+            && self.mode().contains(TermMode::FOCUS_IN_OUT);
+        if let Some(report) = self.focus.poll(reporting) {
+            self.write_raw(report.bytes());
+            cx.emit(TerminalEvent::FocusReport(report.focused()));
+        }
     }
 
     /// Sends user input to the process, snapping the view back to the prompt.
@@ -1043,6 +1110,7 @@ mod sink_tests {
             agent: agent.clone(),
             alive: Arc::new(Mutex::new(Arc::new(AtomicBool::new(true)))),
             osc7: Mutex::new(Osc7Scanner::new()),
+            notify: Mutex::new(NotifyScanner::new()),
             pending: pending.clone(),
             tx,
             generation,
@@ -1208,6 +1276,58 @@ mod sink_tests {
         let msgs = drain(&f.rx);
         assert!(matches!(msgs.iter().find(|m| matches!(m, Msg::Cwd { .. })), Some(Msg::Cwd { path, .. }) if path == "/var/log"));
         assert_eq!(row(&f.term, 0), "xy");
+    }
+
+    fn notifications(rx: &async_channel::Receiver<Msg>) -> Vec<(u64, Option<String>, String)> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Notify { generation, title, body } => Some((generation, title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_requested_notification_reaches_the_ui_and_the_grid_is_unchanged() {
+        let f = fixture(4);
+        f.sink.output(b"a\x1b]9;hello\x07b\x1b]777;notify;Title;Body\x1b\\c\x1b]9;4;1;50\x07");
+        assert_eq!(
+            notifications(&f.rx),
+            [(4, None, "hello".to_string()), (4, Some("Title".to_string()), "Body".to_string())],
+            "the progress report is not one"
+        );
+        // The parser still saw everything, exactly as without the scanner.
+        assert_eq!(row(&f.term, 0), "abc");
+    }
+
+    #[test]
+    fn a_notification_cut_between_reads_is_still_reported_once() {
+        let f = fixture(1);
+        f.sink.output(b"x\x1b]9;in two");
+        f.sink.output(b" parts\x1b");
+        assert!(notifications(&f.rx).is_empty(), "not complete yet");
+        f.sink.output(b"\\y");
+        assert_eq!(notifications(&f.rx), [(1, None, "in two parts".to_string())]);
+        assert_eq!(row(&f.term, 0), "xy");
+    }
+
+    #[test]
+    fn output_of_a_replaced_backend_reports_no_notification() {
+        let f = fixture(1);
+        f.current.store(2, Ordering::Release);
+        f.sink.output(b"\x1b]9;stale\x07");
+        assert!(notifications(&f.rx).is_empty());
+    }
+
+    #[test]
+    fn only_what_the_screen_shows_can_ask_for_a_notification() {
+        // A serial display (hex, timestamps, ...) replaces the device's bytes with its own.
+        let f = fixture(1);
+        f.sink.transformed_output(b"\x1b]9;from the device\x07", b"1B 5D 39\r\n");
+        assert!(notifications(&f.rx).is_empty());
+        f.sink.transformed_output(b"\x1b]9;plain\x07", b"\x1b]9;plain\x07");
+        assert_eq!(notifications(&f.rx), [(1, None, "plain".to_string())]);
     }
 
     #[test]

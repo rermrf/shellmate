@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn workspace_handlers_for_main_local_empty_and_serial() {
         let row = |id, protocol: Option<Protocol>, status| SessionRow {
-            id, local: protocol.is_none(), protocol: protocol.unwrap_or_default(), status, title: String::new(),
+            id, local: protocol.is_none(), protocol: protocol.unwrap_or_default(), status, title: String::new(), attention: false,
         };
         let ssh = row(1, Some(Protocol::Ssh), Status::Connected);
         let local = row(5, None, Status::Connected);

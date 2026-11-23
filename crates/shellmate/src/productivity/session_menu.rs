@@ -80,6 +80,7 @@ impl Render for SessionMenu {
                             .text_size(px(13.))
                             .text_color(if self.active == Some(id) { p.acc } else { p.tx }),
                     )
+                    .when(s.attention, |d| d.child(dot(p.acc, crate::tabs::DOT)))
                     .child(div().flex_none().whitespace_nowrap().text_size(px(11.)).text_color(p.tx2).child(s.subtitle()))
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(Event::Pick(id))))
             }))).flex_none().max_h(px(406.)).surface(p.card).bottom_padding(px(0.)))

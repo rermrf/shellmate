@@ -13,11 +13,15 @@ pub const OVERFLOW_GAP: f32 = 8.;
 
 /// The title keeps this much (about two CJK glyphs) before any chip gives way.
 pub const TITLE_FLOOR: f32 = 28.;
+/// Diameter of the dot a tab shows when something happened in it while nobody looked.
+pub const DOT: f32 = 6.;
 // The parts of `Workspace::tab_face` around the title: padding, item gap, close control, chip padding.
 const PADDING: f32 = 12. + 6.;
 const ITEM_GAP: f32 = 8.;
 const CLOSE: f32 = 22.;
 const CHIP_PADDING: f32 = 10.;
+/// The attention dot and the gap that separates it from what follows.
+const DOT_ROOM: f32 = DOT + ITEM_GAP;
 
 #[derive(Debug, PartialEq)]
 pub struct Layout {
@@ -95,12 +99,15 @@ pub struct Content {
     pub badge: Option<f32>,
     /// The tab is in the broadcast set.
     pub broadcast: bool,
+    /// Something happened in the session while nobody looked: the tab shows a dot.
+    pub attention: bool,
 }
 
 impl Content {
-    /// Width at which the tab shows its chips and the whole title.
+    /// Width at which the tab shows its dot, its chips and the whole title.
     pub fn width(self) -> f32 {
         width_with(self.title.max(TITLE_FLOOR), self.local, self.badge, self.broadcast)
+            + if self.attention { DOT_ROOM } else { 0. }
     }
 }
 
@@ -192,6 +199,25 @@ pub struct Chips {
     pub broadcast: bool,
 }
 
+/// The dot shows if it fits next to the title floor and the close control. It sits right after the
+/// title, before the chips, and takes its room before either of them does.
+pub fn dot_fits(width: f32, local: bool) -> bool {
+    width >= needs(local, None, false) + DOT_ROOM
+}
+
+/// What a tab of `width` shows beside its title.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub dot: bool,
+    pub chips: Chips,
+}
+
+/// The attention dot first, then the chips judged in the width the dot leaves.
+pub fn shown(width: f32, local: bool, attention: bool, badge: Option<f32>, broadcast: bool) -> Shown {
+    let dot = attention && dot_fits(width, local);
+    Shown { dot, chips: chips(width - if dot { DOT_ROOM } else { 0. }, local, badge, broadcast) }
+}
+
 /// Which optional chips a tab of `width` shows. `badge` is the estimated width of the reconnect
 /// badge, if the session has one; `broadcast` says whether the tab is in the broadcast set. The
 /// broadcast chip is judged next to the badge only when the badge is shown.
@@ -226,11 +252,11 @@ mod tests {
     }
     /// A remote tab whose title is `title` pt wide.
     fn remote(title: f32) -> Content {
-        Content { title, local: false, badge: None, broadcast: false }
+        Content { title, local: false, badge: None, broadcast: false, attention: false }
     }
     /// A local tab whose title is `title` pt wide.
     fn local(title: f32) -> Content {
-        Content { title, local: true, badge: None, broadcast: false }
+        Content { title, local: true, badge: None, broadcast: false, attention: false }
     }
     fn near(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
@@ -421,7 +447,7 @@ mod tests {
         // Padding 18, laptop 15, title, close 22 and two gaps of 8.
         assert_eq!(local(74.).width(), 18. + 15. + 74. + 22. + 16.);
         assert_eq!(remote(74.).width(), 18. + 7. + 74. + 22. + 16.);
-        let both = Content { title: 74., local: false, badge: Some(54.), broadcast: true };
+        let both = Content { title: 74., local: false, badge: Some(54.), broadcast: true, attention: false };
         assert_eq!(both.width(), remote(74.).width() + (54. + 8.) + (30. + 8.));
     }
 
@@ -480,7 +506,7 @@ mod tests {
             for badge in [None, Some(badge), Some(chip_estimate("连接失败"))] {
                 for broadcast in [false, true] {
                     for title in [0., 40., 100.] {
-                        let content = Content { title, local, badge: badge.filter(|_| !local), broadcast };
+                        let content = Content { title, local, badge: badge.filter(|_| !local), broadcast, attention: false };
                         let shown = chips(content.width(), local, content.badge, broadcast);
                         assert_eq!(shown, Chips { badge: content.badge.is_some(), broadcast }, "{content:?}");
                         // The title gets everything the chips leave: at least its own width.
@@ -493,7 +519,7 @@ mod tests {
             }
         }
         // Rounded up to a step the chips are still there.
-        let both = Content { title: 40., local: false, badge: Some(badge), broadcast: true };
+        let both = Content { title: 40., local: false, badge: Some(badge), broadcast: true, attention: false };
         let stepped = target_width([both]);
         assert!(stepped >= both.width());
         assert_eq!(chips(stepped, false, both.badge, true), Chips { badge: true, broadcast: true });
@@ -748,6 +774,114 @@ mod tests {
                             "{width} {local} {shown:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// A tab that shows a dot.
+    fn alert(content: Content) -> Content {
+        Content { attention: true, ..content }
+    }
+
+    #[test]
+    fn the_dot_is_part_of_the_width_a_tab_asks_for() {
+        // Six points and the gap that separates it from the close control.
+        assert_eq!(DOT, 6.);
+        assert_eq!(alert(local(74.)).width(), local(74.).width() + 14.);
+        assert_eq!(alert(remote(74.)).width(), remote(74.).width() + 14.);
+        // Without one nothing changed: the existing widths are the ones of the tests above.
+        assert_eq!(local(74.).width(), 145.);
+        // 151 pt is 160 once rounded up to a step; 165 pt is 180. Every tab follows the one that has a dot.
+        assert_eq!(local(80.).width(), 151.);
+        assert_eq!(target_width([local(80.), local(80.), local(80.)]), 160.);
+        assert_eq!(target_width([local(80.), alert(local(80.)), local(80.)]), 180.);
+        // The dot adds up with the chips.
+        let plain = Content { title: 40., local: false, badge: Some(chip_estimate("重连 3/5")), broadcast: true, attention: false };
+        assert_eq!(alert(plain).width(), plain.width() + 14.);
+    }
+
+    #[test]
+    fn a_tab_shows_its_dot_and_chips_and_whole_title_at_its_content_width() {
+        let badge = chip_estimate("重连 3/5");
+        for local in [false, true] {
+            for badge in [None, Some(badge)] {
+                for broadcast in [false, true] {
+                    for title in [0., 40., 100.] {
+                        let content = Content { title, local, badge: badge.filter(|_| !local), broadcast, attention: true };
+                        let shown = shown(content.width(), local, true, content.badge, broadcast);
+                        assert_eq!(
+                            shown,
+                            Shown { dot: true, chips: Chips { badge: content.badge.is_some(), broadcast } },
+                            "{content:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // No alert, no dot, and the chips are judged as before.
+        let content = Content { title: 40., local: false, badge: Some(badge), broadcast: true, attention: false };
+        assert_eq!(
+            super::shown(content.width(), false, false, content.badge, true),
+            Shown { dot: false, chips: chips(content.width(), false, content.badge, true) }
+        );
+        assert!(!super::shown(TAB_MAX, false, false, None, false).dot);
+    }
+
+    #[test]
+    fn the_dot_is_kept_before_the_broadcast_chip_when_the_tab_is_narrow() {
+        // Wide enough for the floor, the dot and the chip, but not both after the dot: the chip goes.
+        let with_chip = needs(false, None, true);
+        let enough_for_dot = needs(false, None, false) + DOT_ROOM;
+        assert!(enough_for_dot < with_chip + DOT_ROOM);
+        let narrow = enough_for_dot;
+        let shown_narrow = shown(narrow, false, true, None, true);
+        assert_eq!(shown_narrow, Shown { dot: true, chips: Chips { badge: false, broadcast: false } });
+        // Room for both: both show.
+        let roomy = shown(with_chip + DOT_ROOM, false, true, None, true);
+        assert_eq!(roomy, Shown { dot: true, chips: Chips { badge: false, broadcast: true } });
+        // One point short of that and the chip yields to the dot.
+        let short = shown(with_chip + DOT_ROOM - 0.5, false, true, None, true);
+        assert_eq!(short, Shown { dot: true, chips: Chips { badge: false, broadcast: false } });
+        // The same tab without an alert still has the chip at that width.
+        assert!(shown(with_chip + DOT_ROOM - 0.5, false, false, None, true).chips.broadcast);
+    }
+
+    #[test]
+    fn the_dot_and_the_close_button_always_fit_at_the_minimum_width() {
+        // TAB_MIN holds the floor, the dot and the close control for a remote and a local tab.
+        for local in [false, true] {
+            assert!(dot_fits(TAB_MIN, local), "local={local}");
+            assert!(shown(TAB_MIN, local, true, None, false).dot);
+            // The chips that fit nowhere at the minimum still do not.
+            assert_eq!(
+                shown(TAB_MIN, local, true, Some(chip_estimate("重连 3/5")), true).chips,
+                Chips { badge: false, broadcast: false }
+            );
+        }
+        // A tab too narrow for the title floor and the close control has no dot to show either.
+        assert!(!dot_fits(needs(false, None, false) + DOT_ROOM - 0.5, false));
+        assert!(dot_fits(needs(false, None, false) + DOT_ROOM, false));
+        assert!(!shown(60., false, true, None, true).dot);
+    }
+
+    #[test]
+    fn everything_shown_fits_next_to_the_close_button() {
+        let badge = chip_estimate("重连 3/5");
+        for local in [false, true] {
+            for width in (0..2400).map(|n| n as f32 / 8.) {
+                for (badge, broadcast) in [(None, false), (None, true), (Some(badge), false), (Some(badge), true)] {
+                    let shown = shown(width, local, true, badge, broadcast);
+                    let gaps = 2 + usize::from(shown.dot) + usize::from(shown.chips.badge) + usize::from(shown.chips.broadcast);
+                    let used = PADDING
+                        + if local { 15. } else { 7. }
+                        + CLOSE
+                        + ITEM_GAP * gaps as f32
+                        + if shown.dot { DOT } else { 0. }
+                        + if shown.chips.badge { badge.unwrap_or(0.) } else { 0. }
+                        + if shown.chips.broadcast { chip_estimate("广播") } else { 0. };
+                    // (A tab narrower than the bare dot, title and close button shows none of them.)
+                    assert!(used <= width || shown == Shown { dot: false, chips: Chips { badge: false, broadcast: false } }, "{width} {local} {shown:?}");
                 }
             }
         }

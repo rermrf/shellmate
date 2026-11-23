@@ -92,6 +92,8 @@ impl Workspace {
                 monitor: None,
                 typed: None, typing: None,
                 kind: SessionKind::Ssh(Box::new(ssh)),
+                alerts: Default::default(),
+                long: Default::default(),
                 _subscription: Some(subscription),
             });
         }

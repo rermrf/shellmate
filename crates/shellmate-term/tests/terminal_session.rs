@@ -294,6 +294,47 @@ async fn close_activity(cx: &mut AsyncApp, harness: Harness) {
     terminal.read_with(cx, |t, _| assert_eq!(t.close_activity(), CloseActivity::Idle));
 }
 
+async fn focus_and_notifications(cx: &mut AsyncApp, harness: Harness) {
+    let terminal = &harness.terminal;
+    let (calls, sink) = attach(terminal, cx);
+    // Nothing is sent while the program has not asked for focus reports.
+    terminal.update(cx, |t, cx| t.set_focused(true, cx));
+    terminal.update(cx, |t, cx| t.set_focused(false, cx));
+    assert!(calls.lock().unwrap().writes.is_empty());
+    assert!(harness.take_events().is_empty());
+
+    // It asks while the terminal has no focus: it is told at once, and only once per change.
+    sink.output(b"\x1b[?1004h");
+    harness.settle(cx).await;
+    assert_eq!(calls.lock().unwrap().writes, b"\x1b[O");
+    assert_eq!(harness.take_events(), [TerminalEvent::FocusReport(false)]);
+    terminal.update(cx, |t, cx| t.set_focused(false, cx));
+    terminal.update(cx, |t, cx| t.set_focused(true, cx));
+    terminal.update(cx, |t, cx| t.set_focused(true, cx));
+    assert_eq!(calls.lock().unwrap().writes, b"\x1b[O\x1b[I");
+    assert_eq!(harness.take_events(), [TerminalEvent::FocusReport(true)]);
+
+    // A new backend has not asked yet, whatever the old program left on.
+    let (calls, sink) = attach(terminal, cx);
+    terminal.update(cx, |t, cx| t.set_focused(false, cx));
+    assert!(calls.lock().unwrap().writes.is_empty());
+    assert!(harness.take_events().is_empty());
+
+    // Requested notifications are events; nothing of them reaches the screen. A bell is still a bell.
+    sink.output(b"shown\x1b]9;hello\x07\x1b]777;notify;Title;Body\x1b\\\x07\x1b]9;4;1;50\x07");
+    harness.settle(cx).await;
+    assert_eq!(
+        harness.take_events(),
+        [
+            TerminalEvent::Notify { title: None, body: "hello".into() },
+            TerminalEvent::Notify { title: Some("Title".into()), body: "Body".into() },
+            TerminalEvent::Bell,
+        ]
+    );
+    assert!(harness.shows(cx, "shown"));
+    assert!(!harness.shows(cx, "hello") && !harness.shows(cx, "Body"));
+}
+
 fn main() {
     if std::env::var_os("SHELLMATE_GUI_TESTS").is_none() {
         println!("terminal_session: skipped (set SHELLMATE_GUI_TESTS=1 to run; needs a macOS login session)");
@@ -314,11 +355,13 @@ fn main() {
         let progress = Harness::new(cx);
         let title = Harness::new(cx);
         let closing = Harness::new(cx);
+        let focusing = Harness::new(cx);
         cx.spawn(async move |cx| {
             run(cx, lifecycle).await;
             connecting(cx, progress).await;
             titles(cx, title).await;
             close_activity(cx, closing).await;
+            focus_and_notifications(cx, focusing).await;
             println!("terminal_session: ok");
             cx.update(|cx| cx.quit());
         })

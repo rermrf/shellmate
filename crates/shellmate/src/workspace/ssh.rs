@@ -395,6 +395,8 @@ impl Workspace {
             monitor: None,
             typed: None, typing: None,
             kind: SessionKind::Ssh(Box::new(SshSession::new(host, chain, group))),
+            alerts: Default::default(),
+            long: Default::default(),
             _subscription: Some(subscription),
         });
         self.start_session_archives(session_id,window,cx);

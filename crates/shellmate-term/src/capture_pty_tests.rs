@@ -98,6 +98,7 @@ impl Shell {
             capture: capture.clone(),
             output_capture: Arc::new(Mutex::new(crate::capture_output::OutputCapture::default())),
             osc7: Mutex::new(Osc7Scanner::new()),
+            notify: Mutex::new(crate::notify::NotifyScanner::new()),
             pending: Arc::new(AtomicBool::new(false)),
             tx,
             generation: 1,

@@ -154,6 +154,8 @@ impl Workspace {
         let mut session_sources=vec![("h1", "S1"), ("h3", "S2"), ("h10", "S3"), ("h7", "S4")];
         if scene=="telnet" {session_sources.push(("h11","TELNET"));}
         if scene=="mosh" {session_sources.push(("h8","MOSH"));}
+        // One tab more than the window shows at once: the fifth goes behind the session list.
+        if scene.starts_with("tab-attention") {session_sources.push(("h2","S1"));}
         if stress { session_sources.extend([("h2","S1"),("h4","S1"),("h5","S1"),("h6","S1"),("h8","S1")]); }
         for (i, (host_id, lines)) in session_sources.into_iter().enumerate() {
             let host = self.hub.book.borrow().host(&HostId::from_raw(host_id)).unwrap().clone();
@@ -230,6 +232,8 @@ impl Workspace {
                 monitor: None,
                 typed: None, typing: None,
                 kind,
+                alerts: Default::default(),
+                long: Default::default(),
                 _subscription: Some(subscription),
             });
         }
@@ -260,6 +264,12 @@ impl Workspace {
                         window,
                         cx,
                     );
+                }
+            }
+            "tab-attention" | "tab-attention-menu" => {
+                self.proto_alerts(cx);
+                if scene == "tab-attention-menu" {
+                    self.open_session_menu(crate::productivity::session_menu::Kind::Tabs, gpui::point(px(904.), px(52.)), window, cx);
                 }
             }
             "pal" => self.open_palette_query("", window, cx),
@@ -467,6 +477,8 @@ impl Workspace {
             monitor: None,
             typed: None, typing: None,
             kind: SessionKind::Local,
+            alerts: Default::default(),
+            long: Default::default(),
             _subscription: Some(subscription),
         });
 

@@ -688,6 +688,9 @@ impl Render for SettingsWindow {
                     P::History,
                     P::SessionLog,
                     P::AutoRecord,
+                    P::TabAlerts,
+                    P::SystemNotifications,
+                    P::LongCommandAlert,
                 ],
                 LOCAL_TERMINAL => &[P::LoginShell],
                 _ if crate::prototype_fixture() => &[P::ShowStatusIcon, P::QuitOnWindowClose, P::ConfirmQuit, P::FollowDirectory],
@@ -767,6 +770,8 @@ impl Render for SettingsWindow {
                         }, |d| d.child(
                             Switch::new(key.key())
                                 .checked(self.preferences.get(key))
+                                // System notifications are part of the tab alerts: they go with them.
+                                .disabled(key == P::SystemNotifications && !self.preferences.get(P::TabAlerts))
                                 .color(p.ok)
                                 .on_click(cx.listener(move |this, value: &bool, w, cx| {
                                     this.toggle(key, *value, w, cx)

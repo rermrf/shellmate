@@ -215,7 +215,7 @@ impl Workspace {
                 return;
             };
             self.remember_focus_actions(window, cx);
-            self.set_window_hidden(true, cx);
+            self.set_window_hidden(true, window, cx);
             self.sync_menus(cx);
             native.orderOut(None);
             self.sync_hidden_activation_policy(cx);
@@ -268,7 +268,7 @@ impl Workspace {
             self.sync_menus(cx);
             return;
         }
-        self.set_window_hidden(false, cx);
+        self.set_window_hidden(false, window, cx);
         self.sync_menus(cx);
         self.sync_sidebar(cx);
         self.sync_ai_context(cx);
@@ -276,8 +276,10 @@ impl Workspace {
         log::info!("main window shown");
     }
 
-    fn set_window_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+    fn set_window_hidden(&mut self, hidden: bool, window: &Window, cx: &mut Context<Self>) {
         self.hidden = hidden;
+        // A hidden window draws no frames: its terminals are told here that they lost the focus.
+        self.sync_terminal_focus(window, cx);
         // The component input caret has its own timer independent of AppKit's display link.
         let all_hidden = hidden && self.peers(super::Route::All,cx).iter().all(|e| e.workspace.upgrade().is_none_or(|w| w.read(cx).hidden));
         gpui::base::Theme::global_mut(cx).cursor_blink = if all_hidden {
@@ -352,6 +354,7 @@ pub(crate) fn debug_hooks(cx: &mut App) {
             Hub::update(cx, Workspace::close_window)
         }),
         ("SHELLMATE_DEBUG_REOPEN_AFTER", Hub::reopen),
+        ("SHELLMATE_DEBUG_NOTIFY_AFTER", super::attention::debug_notify),
         ("SHELLMATE_DEBUG_QUIT_AFTER", |cx| {
             cx.dispatch_action(&super::Quit)
         }),

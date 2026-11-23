@@ -6,6 +6,8 @@ mod prompt;
 mod resize;
 mod keys;
 pub mod history;
+mod focus;
+mod notify;
 mod osc7;
 mod send;
 mod pty;
