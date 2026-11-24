@@ -7,6 +7,8 @@ mod assets;
 mod icons;
 #[cfg(debug_assertions)]
 mod proto;
+#[cfg(debug_assertions)]
+mod debug_input;
 mod connect;
 mod dialogs;
 mod editor;
@@ -79,6 +81,7 @@ pub(crate) fn prototype_fixture()->bool {
 fn init_actions(cx: &mut App) {
     menus::init(cx);
     gpui::init(cx);
+    ai::panel::init(cx);
     shellmate_term::init(cx);
     sidebar::init(cx);
     workspace::init(cx);
@@ -138,6 +141,8 @@ fn main() {
         if let Ok(name) = std::env::var("SHELLMATE_DEMO") {
             main_window.update(cx, |_, window, cx| demo::run(&name, &workspace, window, cx)).ok();
         }
+        #[cfg(debug_assertions)]
+        debug_input::install(main_window, &workspace, cx);
         cx.activate(true);
         #[cfg(debug_assertions)]
         if let Some(path) = std::env::var_os("SHELLMATE_MENU_DUMP") {

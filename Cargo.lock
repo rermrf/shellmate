@@ -7597,6 +7597,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "raw-window-handle",
  "reqwest",
+ "rig-core",
  "semver",
  "serde_json",
  "sha2 0.11.1",

@@ -202,6 +202,18 @@ impl Popup {
             )
         })
     }
+    pub fn submission(&self, text: &str) -> String {
+        let name = text.split_whitespace().next().unwrap_or("");
+        // Exact names retain their arguments. Arrow selection explicitly chooses
+        // a completion; a literal unknown prefix otherwise remains a question.
+        if COMMANDS.iter().any(|c| name == format!("/{}", c.name))
+            || (!self.navigated && text != "/")
+        {
+            text.into()
+        } else {
+            self.complete().unwrap_or_else(|| text.into())
+        }
+    }
     pub fn escape(&mut self) {
         self.open = false;
     }
@@ -307,6 +319,30 @@ mod tests {
                 dispatch(text, true, COMMANDS),
                 Dispatch::Run { .. }
             ));
+        }
+    }
+    #[test]
+    fn completion_refilters_through_the_same_change_path_as_typing() {
+        for (selection, expected, name) in [(2, "/context", "context"), (0, "/compact ", "compact")]
+        {
+            let mut popup = Popup::default();
+            popup.changed("/");
+            for _ in 0..selection {
+                popup.navigate(true);
+            }
+            let completed = popup.complete().unwrap();
+            assert_eq!(completed, expected);
+            popup.changed(&completed);
+            assert!(popup.open);
+            assert_eq!(popup.selected, 0);
+            assert!(!popup.navigated);
+            assert_eq!(
+                popup.matches().iter().map(|c| c.name).collect::<Vec<_>>(),
+                [name]
+            );
+            let mut typed = Popup::default();
+            typed.changed(expected);
+            assert_eq!(popup.complete(), typed.complete());
         }
     }
     #[test]

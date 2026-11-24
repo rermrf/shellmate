@@ -133,6 +133,7 @@ impl Drawer {
         if self.state.context_popover.open {
             let mut popover = div()
                 .id("ai-context-popover")
+                .key_context(super::CONTEXT_POPOVER_KEYS)
                 .track_focus(&self.context_focus)
                 .absolute()
                 .bottom(relative(1.))

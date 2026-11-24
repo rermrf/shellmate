@@ -43,6 +43,7 @@ pub(in crate::workspace) fn install(cx: &mut App) {
     let Ok(spec) = std::env::var("SHELLMATE_DEBUG_DRAG") else {
         return;
     };
+    if crate::debug_input::coordinate_drag(&spec) { return; }
     let Some((index, target)) = parse(&spec) else {
         log::warn!("invalid SHELLMATE_DEBUG_DRAG: {spec}");
         return;

@@ -82,6 +82,8 @@ fn text_alignment(align: Option<&AlignKind>) -> TextAlign {
 pub(super) fn render(
     scope: &str,
     node: &MarkdownNode,
+    selection: Option<gpui::Entity<crate::ai::selection_scroll::SelectionScroll>>,
+    fixture: CopyFixture,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -106,17 +108,42 @@ pub(super) fn render(
                 node.as_markdown().to_owned().into(),
                 window,
                 cx,
-            );
-            div()
+            )
+            .selectable(false);
+            let selection_layer =
+                super::code_selection::overlay(id.clone(), code.clone(), window, cx);
+            let block = div()
                 .w_full()
                 .rounded(px(10.))
                 .bg(bg)
                 .overflow_hidden()
                 .child(
-                    ScrollArea::new(id, div().w(px(width)).min_w_full().child(text), bg)
-                        .height_limit(320., true),
-                )
-                .into_any_element()
+                    ScrollArea::new(
+                        id.clone(),
+                        div()
+                            .relative()
+                            .w(px(width))
+                            .min_w_full()
+                            .child(text)
+                            .child(selection_layer),
+                        bg,
+                    )
+                    .when_some(selection.clone(), |area, selection| {
+                        area.selection(selection)
+                    })
+                    .height_limit(320., true),
+                );
+            #[cfg(debug_assertions)]
+            let block = if selection.is_some() {
+                crate::debug_input::log_code_bounds(block, id.clone(), window, cx)
+            } else {
+                block
+            };
+            if let Some(selection) = selection {
+                super::copy::overlay(block, id, code.clone(), selection, fixture, window, cx)
+            } else {
+                block.into_any_element()
+            }
         }
         Block::Table { rows, aligns } => {
             let count = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -206,7 +233,10 @@ pub(super) fn render(
                 .rounded(px(8.))
                 .bg(p.card)
                 .overflow_hidden()
-                .child(ScrollArea::new(id, track, p.card))
+                .child(
+                    ScrollArea::new(id, track, p.card)
+                        .when_some(selection, |area, selection| area.selection(selection)),
+                )
                 .into_any_element()
         }
     }
@@ -215,6 +245,22 @@ pub(super) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn code_copy_value_is_the_entire_parsed_block_without_fences_or_viewport_clipping() {
+        let text = "docker compose -f deploy/docker-compose.production.yml --project-name 服务 --profile workers --env-file deploy/production.env up -d api worker\nprintf '%s' '<not-markdown> & literal'";
+        let source = format!("```sh\n{text}\n```");
+        let root = markdown::to_mdast(&source, &ParseOptions::gfm()).unwrap();
+        let Node::Code(code) = &root.children().unwrap()[0] else {
+            panic!("code block");
+        };
+        let block = Block::Code(code.value.clone());
+        let Block::Code(copied) = block else {
+            unreachable!()
+        };
+        assert_eq!(copied, text);
+        assert!(copied.len() > 120);
+        assert!(copied.ends_with("& literal'"));
+    }
     #[test]
     fn adaptive_columns_keep_short_columns_and_bound_wrapping() {
         assert_eq!(column_floor(80.), 80.);

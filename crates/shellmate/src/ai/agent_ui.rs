@@ -480,6 +480,7 @@ impl Drawer {
             card.child(command_block(
                 &step.call.command,
                 SharedString::from(format!("{}:active-command", self.state.id)),
+                self.selection_scroll.clone(),
                 cx,
             ))
         };
@@ -655,7 +656,7 @@ impl Drawer {
                 .items_start()
                 .gap(px(8.))
                 .when(!stdout.is_empty(), |d| {
-                    d.child(div().child(stdout.to_owned()))
+                    d.child(div().child(crate::ai::markdown::plain(("step-stdout",key.0*1000+key.1),stdout.to_owned())))
                 })
                 .when(!stderr.is_empty(), |d| {
                     d.child(
@@ -664,7 +665,7 @@ impl Drawer {
                             .flex_col()
                             .gap(px(8.))
                             .child(div().text_color(p.err).child("标准错误"))
-                            .child(div().child(stderr.to_owned())),
+                            .child(div().child(crate::ai::markdown::plain(("step-stderr",key.0*1000+key.1),stderr.to_owned()))),
                     )
                 })
                 .when(!has_output, |d| d.child("（无输出）"));
@@ -719,6 +720,7 @@ impl Drawer {
                         .child(measured),
                     p.card2,
                 )
+                .selection(self.selection_scroll.clone())
                 .height_limit(if expanded { 320. } else { 8. * 18. }, expanded),
             );
             }
@@ -766,7 +768,7 @@ impl Drawer {
         // Measure all physical lines before applying the collapsed height cap.
         let measured = div()
             .flex_none()
-            .child(div().child(command.to_owned()))
+            .child(div().child(crate::ai::markdown::plain(("ended-command",key.0*1000+key.1),command.to_owned())))
             .on_children_prepainted(move |bounds, _, cx| {
                 let over = bounds
                     .first()
@@ -806,7 +808,7 @@ impl Drawer {
                 .whitespace_nowrap()
                 .child(measured),
             bg,
-        );
+        ).selection(self.selection_scroll.clone());
         let mut block =
             div()
                 .min_w_0()
@@ -957,7 +959,7 @@ fn step_header(
                 .child(purpose.to_owned()),
         )
 }
-fn command_block(command: &str, id: SharedString, cx: &App) -> Div {
+fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, cx: &App) -> Div {
     let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);
     command_surface(cx).child(ScrollArea::new(
         id,
@@ -966,9 +968,9 @@ fn command_block(command: &str, id: SharedString, cx: &App) -> Div {
             .flex_col()
             .items_start()
             .whitespace_nowrap()
-            .child(div().flex_none().child(command.to_owned())),
+            .child(div().flex_none().child(crate::ai::markdown::plain("command", command.to_owned()))),
         bg,
-    ))
+    ).selection(selection))
 }
 fn command_surface(cx: &App) -> Div {
     div()

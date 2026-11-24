@@ -29,8 +29,8 @@ fn overflow_hint(viewport: f32, content: f32, offset: f32) -> OverflowHint {
 }
 
 #[derive(Default)]
-struct State {
-    handle: ScrollHandle,
+pub(super) struct State {
+    pub(super) handle: ScrollHandle,
     hovered: bool,
 }
 
@@ -41,6 +41,7 @@ pub(super) struct ScrollArea {
     background: Hsla,
     max_height: Option<Pixels>,
     vertical: bool,
+    selection: Option<gpui::Entity<super::selection_scroll::SelectionScroll>>,
 }
 
 impl ScrollArea {
@@ -51,7 +52,16 @@ impl ScrollArea {
             background,
             max_height: None,
             vertical: false,
+            selection: None,
         }
+    }
+
+    pub fn selection(
+        mut self,
+        selection: gpui::Entity<super::selection_scroll::SelectionScroll>,
+    ) -> Self {
+        self.selection = Some(selection);
+        self
     }
 
     pub fn height_limit(mut self, height: f32, scroll: bool) -> Self {
@@ -64,6 +74,9 @@ impl ScrollArea {
 impl RenderOnce for ScrollArea {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id.clone(), cx, |_, _| State::default());
+        if let Some(selection) = &self.selection {
+            selection.update(cx, |s, _| s.register(&state));
+        }
         let handle = state.read(cx).handle.clone();
         let hovered = state.read(cx).hovered;
         let shift_handle = handle.clone();

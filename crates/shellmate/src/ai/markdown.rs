@@ -83,16 +83,53 @@ fn blocked_image() -> ImageSource {
     ImageSource::Custom(Arc::new(|_, _| None))
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CopyFixture { #[default] None, Hovered, Copied }
+
+pub(super) fn drawer_view(id: ElementId, text: SharedString, selection: gpui::Entity<super::selection_scroll::SelectionScroll>, fixture: CopyFixture, window: &Window, cx: &App) -> TextView {
+    render_view(id, text, Some(selection), fixture, window, cx)
+}
 pub(crate) fn view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
+    render_view(id, text, None, CopyFixture::None, window, cx)
+}
+fn render_view(id: ElementId, text: SharedString, selection: Option<gpui::Entity<super::selection_scroll::SelectionScroll>>, fixture: CopyFixture, window: &Window, cx: &App) -> TextView {
     let scope = format!("{id:?}");
     base_view(id, text, window, cx)
         .markdown_block_parser(blocks::parse)
         .markdown_block_renderer("ai-scroll-block", move |node, window, cx| {
-            blocks::render(&scope, node, window, cx)
+            blocks::render(&scope, node, selection.clone(), fixture, window, cx)
         })
 }
 
+/// Literal step text participates in TextView's automatic document ordering,
+/// so selections spanning prose, commands and output copy in reading order.
+#[derive(gpui::IntoElement)]
+pub(super) struct PlainText { id: ElementId, text: SharedString }
+pub(super) fn plain(id: impl Into<ElementId>, text: impl Into<SharedString>) -> PlainText {
+    PlainText { id: id.into(), text: text.into() }
+}
+fn preformatted_html(text: &str) -> String {
+    // A comment prevents HTML's special stripping of an initial pre newline.
+    format!("<pre><!--literal-->{}</pre>", text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"))
+}
+impl gpui::RenderOnce for PlainText {
+    fn render(self, window: &mut Window, _: &mut App) -> impl gpui::IntoElement {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let width = self.text.lines().map(|line| {
+            window.text_system().shape_line(line.to_owned().into(), font_size, &[style.to_run(line.len())], None).width()
+        }).max().unwrap_or(px(0.));
+        TextView::html(self.id, preformatted_html(&self.text))
+            .selectable(true).selection_format(SelectionFormat::Plain).scrollable(false)
+            .style(TextViewStyle { paragraph_gap: rems(0.), ..Default::default() })
+            .w(width).font_family(style.font_family.clone()).text_size(font_size)
+            .line_height(window.line_height()).text_color(style.color).whitespace_nowrap()
+    }
+}
+
 mod blocks;
+mod copy;
+mod code_selection;
 mod cells;
 
 fn base_view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> TextView {
@@ -409,6 +446,10 @@ mod tests {
         assert_eq!(cache.items.len(), 1);
     }
 
+    #[test]
+    fn literal_step_text_preserves_whitespace_and_cannot_become_html() {
+        assert_eq!(preformatted_html("\n  echo '<tag>' &amp;\n\tTAIL"), "<pre><!--literal-->\n  echo '&lt;tag&gt;' &amp;amp;\n\tTAIL</pre>");
+    }
     #[test]
     fn image_resolver_never_returns_a_resource() {
         assert!(matches!(blocked_image(), ImageSource::Custom(_)));

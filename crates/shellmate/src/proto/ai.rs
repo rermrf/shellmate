@@ -395,3 +395,25 @@ mod execution_tests {
         );
     }
 }
+
+
+pub const COPY_SCENES: &[&str] = &["ai-code-copy", "ai-code-copied", "ai-code-select"];
+pub const COPY_CODE: &str = "docker compose -f deploy/docker-compose.production.yml --project-name shellmate-prod --profile workers --env-file deploy/production.env up -d --remove-orphans api worker nginx";
+pub fn copy_answer() -> String {
+    format!("可以先核对启动参数，再按需执行：\n\n```sh\n{COPY_CODE}\n```\n\n这条命令使用生产环境配置，启动 API、后台任务与入口服务。")
+}
+#[cfg(test)]
+mod copy_tests {
+    #[test]
+    fn copy_scenes_have_long_code_both_themes_and_standard_sizes() {
+        for scene in super::COPY_SCENES {
+            assert!(super::super::SCENES.contains(scene));
+            assert_eq!(super::super::default_window_size(scene),(1440,900));
+            assert_eq!(super::super::request(&format!("{scene}@1100x700")),(*scene,Some((1100,700))));
+            for dark in [false,true] {assert!(super::super::readings::READINGS.iter().any(|r|r.scene==*scene && r.dark==dark));}
+        }
+        let parsed=markdown::to_mdast(&super::copy_answer(),&markdown::ParseOptions::gfm()).unwrap();
+        assert!(parsed.children().unwrap().iter().any(|n|matches!(n,markdown::mdast::Node::Code(code) if code.value==super::COPY_CODE)));
+        assert!(super::COPY_CODE.len()>150);
+    }
+}

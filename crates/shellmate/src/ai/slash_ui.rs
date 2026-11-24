@@ -1,12 +1,16 @@
 use super::Drawer;
 use crate::{
     ai::{
-        commands::{self, COMMANDS, Dispatch},
+        commands::{self, COMMANDS, ComposerKey, Dispatch},
         tasks::Status,
     },
     theme::ActivePalette,
 };
-use gpui::{component::button::Button, prelude::*, *};
+use gpui::{
+    component::{button::Button, input},
+    prelude::*,
+    *,
+};
 
 pub(super) struct LocalCard {
     pub after_turn: usize,
@@ -81,51 +85,50 @@ impl Drawer {
             },
         }
     }
-    pub(super) fn slash_key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
-        if e.keystroke.key == "escape"
-            && self.state.context_popover.open
-            && !self.input_composing(w, cx)
-        {
-            self.state.context_popover.close();
-            self.input.focus_handle(cx).focus(w, cx);
-            cx.stop_propagation();
-            w.prevent_default();
-            cx.notify();
+    pub(super) fn slash_action<A: Action>(
+        &mut self,
+        action: &A,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let composer_focused = self.input.focus_handle(cx).contains_focused(w, cx);
+        if !composer_focused && !self.context_focus.contains_focused(w, cx) {
+            cx.propagate();
             return;
         }
-        if !self.input.focus_handle(cx).contains_focused(w, cx) {
-            return;
-        }
-        use crate::ai::commands::ComposerKey;
-        match commands::composer_key(
+        match route_action(
+            action,
+            composer_focused,
             self.popup.open,
-            &e.keystroke.key,
-            e.keystroke.modifiers.shift,
+            self.state.context_popover.open,
             self.input_composing(w, cx),
         ) {
-            ComposerKey::Previous => self.popup.navigate(false),
-            ComposerKey::Next => self.popup.navigate(true),
-            ComposerKey::Dismiss => self.popup.escape(),
-            ComposerKey::Complete => {
-                if let Some(text) = self.popup.complete() {
-                    self.input.update(cx, |i, cx| i.set_value(text, w, cx));
+            ActionRoute::Native => {
+                cx.propagate();
+                return;
+            }
+            ActionRoute::CloseContext => {
+                self.state.context_popover.close();
+                self.input.focus_handle(cx).focus(w, cx);
+            }
+            ActionRoute::Composer(key) => match key {
+                ComposerKey::Previous => self.popup.navigate(false),
+                ComposerKey::Next => self.popup.navigate(true),
+                ComposerKey::Dismiss => self.popup.escape(),
+                ComposerKey::Complete => {
+                    if let Some(text) = self.popup.complete() {
+                        self.set_composer_text(text, w, cx);
+                    }
                 }
-            }
-            ComposerKey::Submit => {
-                let text = self.input.read(cx).value().to_string();
-                // Enter submits literal input; arrow selection explicitly chooses a completion.
-                let name = text.split_whitespace().next().unwrap_or("");
-                let text = if COMMANDS.iter().any(|c| name == format!("/{}", c.name))
-                    || (!self.popup.navigated && text != "/")
-                {
-                    text
-                } else {
-                    self.popup.complete().unwrap_or(text)
-                };
-                self.dispatch_input(&text, w, cx);
-            }
-            ComposerKey::Native => return,
+                ComposerKey::Submit => {
+                    let text = self.popup.submission(&self.input.read(cx).value());
+                    self.dispatch_input(&text, w, cx);
+                }
+                ComposerKey::Native => unreachable!("native routing handled above"),
+            },
         }
+        // Capture precedes the textarea's bubble-phase action handler. Stopping
+        // here also prevents Enter from emitting a second PressEnter submission.
         cx.stop_propagation();
         w.prevent_default();
         cx.notify();
@@ -340,5 +343,165 @@ impl Drawer {
                 card.into_any_element()
             })
             .collect()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ActionRoute {
+    Native,
+    CloseContext,
+    Composer(ComposerKey),
+}
+/// Match the actual actions exported/bound by gpui-base 0.9.1. In particular,
+/// Tab is IndentInline; Indent belongs to cmd-] and must retain its own behavior.
+fn route_action(
+    action: &dyn Action,
+    composer_focused: bool,
+    popup: bool,
+    context_open: bool,
+    composing: bool,
+) -> ActionRoute {
+    if composing {
+        return ActionRoute::Native;
+    }
+    let action = action.as_any();
+    let (key, shift) = if action.is::<input::MoveUp>() {
+        ("up", false)
+    } else if action.is::<input::MoveDown>() {
+        ("down", false)
+    } else if action.is::<input::IndentInline>() {
+        ("tab", false)
+    } else if action.is::<input::Escape>() {
+        ("escape", false)
+    } else if let Some(enter) = action.downcast_ref::<input::Enter>() {
+        ("enter", enter.shift)
+    } else {
+        return ActionRoute::Native;
+    };
+    if key == "escape" && context_open {
+        return ActionRoute::CloseContext;
+    }
+    if !composer_focused {
+        return ActionRoute::Native;
+    }
+    match commands::composer_key(popup, key, shift, false) {
+        ComposerKey::Native => ActionRoute::Native,
+        key => ActionRoute::Composer(key),
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::{ActionRoute, ComposerKey, commands, input, route_action};
+    use gpui::Action;
+
+    #[test]
+    fn actual_textarea_actions_preserve_native_ime_shift_and_focus_routes() {
+        let enter = input::Enter {
+            secondary: false,
+            shift: false,
+        };
+        for (action, expected) in [
+            (&input::MoveUp as &dyn Action, ComposerKey::Previous),
+            (&input::MoveDown as &dyn Action, ComposerKey::Next),
+            (&input::IndentInline as &dyn Action, ComposerKey::Complete),
+            (&input::Escape as &dyn Action, ComposerKey::Dismiss),
+            (&enter as &dyn Action, ComposerKey::Submit),
+        ] {
+            assert_eq!(
+                route_action(action, true, true, false, false),
+                ActionRoute::Composer(expected)
+            );
+            assert_eq!(
+                route_action(action, true, false, false, false),
+                ActionRoute::Native
+            );
+            assert_eq!(
+                route_action(action, true, true, false, true),
+                ActionRoute::Native
+            );
+            assert_eq!(
+                route_action(action, false, true, false, false),
+                ActionRoute::Native
+            );
+        }
+        for popup in [false, true] {
+            assert_eq!(
+                route_action(
+                    &input::Enter {
+                        secondary: false,
+                        shift: true
+                    },
+                    true,
+                    popup,
+                    false,
+                    false
+                ),
+                ActionRoute::Native
+            );
+            assert_eq!(
+                route_action(&input::Indent, true, popup, false, false),
+                ActionRoute::Native
+            );
+            assert_eq!(
+                route_action(&input::OutdentInline, true, popup, false, false),
+                ActionRoute::Native
+            );
+        }
+        for composer in [false, true] {
+            assert_eq!(
+                route_action(&input::Escape, composer, false, true, false),
+                ActionRoute::CloseContext
+            );
+            assert_eq!(
+                route_action(&input::Escape, composer, true, true, true),
+                ActionRoute::Native
+            );
+        }
+    }
+
+    #[test]
+    fn down_down_enter_dispatches_third_command_and_tab_completes() {
+        let mut popup = commands::Popup::default();
+        popup.changed("/");
+        for _ in 0..2 {
+            assert_eq!(
+                route_action(&input::MoveDown, true, popup.open, false, false),
+                ActionRoute::Composer(ComposerKey::Next)
+            );
+            popup.navigate(true);
+        }
+        assert_eq!(popup.selected, 2);
+        let enter = input::Enter {
+            secondary: false,
+            shift: false,
+        };
+        assert_eq!(
+            route_action(&enter, true, popup.open, false, false),
+            ActionRoute::Composer(ComposerKey::Submit)
+        );
+        assert_eq!(
+            commands::dispatch(&popup.submission("/"), false, commands::COMMANDS),
+            commands::Dispatch::OpenContext
+        );
+        assert_eq!(
+            route_action(&input::IndentInline, true, popup.open, false, false),
+            ActionRoute::Composer(ComposerKey::Complete)
+        );
+        assert_eq!(popup.complete().as_deref(), Some("/context"));
+        popup.changed("/co");
+        assert_eq!(popup.complete().as_deref(), Some("/compact "));
+        assert_eq!(popup.submission("/co"), "/co");
+        assert_eq!(
+            popup.submission("/compact keep focus"),
+            "/compact keep focus"
+        );
+        assert_eq!(
+            route_action(&input::Escape, true, popup.open, false, false),
+            ActionRoute::Composer(ComposerKey::Dismiss)
+        );
+        popup.escape();
+        assert!(!popup.open);
+        assert_eq!(popup.submission("/co"), "/co");
     }
 }

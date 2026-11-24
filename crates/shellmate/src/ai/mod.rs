@@ -1,3 +1,4 @@
+mod selection_scroll;
 pub(crate) mod context_view;
 pub(crate) mod commands;
 pub(crate) mod output_view;

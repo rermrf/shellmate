@@ -19,7 +19,7 @@ use gpui::{
     component::{
         Disableable, Sizable, Size,
         button::Button,
-        input::{InputEvent, InputState, Textarea, TextareaState},
+        input::{self, InputEvent, InputState, RopeExt, Textarea, TextareaState},
     },
     prelude::*,
     *,
@@ -37,6 +37,11 @@ use shellmate_store::ai::SavedConversation;
 use state::{NewConversation, new_conversation_tooltip};
 use std::sync::Arc;
 use std::sync::Mutex;
+const CONTEXT_POPOVER_KEYS: &str = "AiContextPopover";
+pub fn init(cx: &mut App) {
+    // The popover owns focus outside the textarea's Input key context.
+    cx.bind_keys([KeyBinding::new("escape", input::Escape, Some(CONTEXT_POPOVER_KEYS))]);
+}
 pub struct SessionContext {
     pub session: Option<usize>,
     pub host: Option<String>,
@@ -72,6 +77,9 @@ pub struct Drawer {
     pub configured: bool,
     pub fixture: bool,
     scroll: ScrollHandle,
+    selection_scroll: Entity<super::selection_scroll::SelectionScroll>,
+    _selection_subscription: Subscription,
+    fixture_copy: markdown::CopyFixture,
     capabilities: Capabilities,
     mode: Arc<Mutex<PermissionMode>>,
     permission_menu: bool,
@@ -102,12 +110,18 @@ impl Drawer {
                     InputEvent::PressEnter { shift, .. } => {
                         if super::commands::submits_enter(*shift, s.input_composing(w, cx)) { s.send_input(w, cx); }
                     }
-                    InputEvent::Change => { s.popup.changed(&s.input.read(cx).value()); cx.notify(); }
+                    InputEvent::Change => s.input_changed(cx),
                     _ => {}
                 }
             },
         );
         let input_layout_subscription = cx.observe(&input, |_, _, cx| cx.notify());
+        let scroll = ScrollHandle::new();
+        let selection_scroll = cx.new(|_| super::selection_scroll::SelectionScroll::new(scroll.clone()));
+        let selection_subscription = cx.subscribe(&selection_scroll, |s: &mut Self, _, _: &super::selection_scroll::DragStarted, cx| {
+            s.state.follow_bottom = false;
+            cx.notify();
+        });
         let configured = db.borrow().ai_settings().is_ok_and(|s| s.configured());
         let save_conversations = saving_enabled(&db);
         cx.spawn_in(window, async move |this, cx| {
@@ -174,7 +188,10 @@ impl Drawer {
             history_rows: vec![],
             configured,
             fixture: false,
-            scroll: ScrollHandle::new(),
+            scroll,
+            selection_scroll,
+            _selection_subscription: selection_subscription,
+            fixture_copy: Default::default(),
             capabilities: Capabilities::default(),
             mode: Arc::new(Mutex::new(PermissionMode::Ask)),
             permission_menu: false,
@@ -216,6 +233,29 @@ impl Drawer {
             self.configured = self.db.borrow().ai_settings().is_ok_and(|s| s.configured());
         }
         cx.notify();
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_focus_composer(&self, w: &mut Window, cx: &mut Context<Self>) {
+        self.input.focus_handle(cx).focus(w,cx);
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_viewport_at(&self, position: Point<Pixels>, cx: &App) -> Option<ScrollHandle> {
+        self.selection_scroll.read(cx).debug_viewport_at(position,cx)
+    }
+    fn input_changed(&mut self, cx: &mut Context<Self>) {
+        self.popup.changed(&self.input.read(cx).value());
+        cx.notify();
+    }
+    fn set_composer_text(&mut self, text: impl Into<SharedString>, w: &mut Window, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.input.update(cx, |input, cx| {
+            input.set_value(text, w, cx);
+            // Textarea set_value resets to 0..0 and emits no Change. Use the
+            // rope's UTF-16 conversion, including multi-line/Unicode text.
+            let end = input.text().offset_to_position(input.text().len());
+            input.set_cursor_position(end, w, cx);
+        });
+        self.input_changed(cx);
     }
     fn input_composing(&self, w: &mut Window, cx: &mut Context<Self>) -> bool {
         self.input.update(cx, |input, cx| input.marked_text_range(w, cx).is_some())
@@ -598,6 +638,7 @@ impl Drawer {
         cx.notify();
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.selection_scroll.update(cx, |s, _| s.stop());
         self.stop(cx);
         self.close_outputs();
         self.state.reset_conversation();
@@ -649,6 +690,7 @@ impl Drawer {
             Ok(Some(c)) => {
                 self.stop(cx);
                 self.close_outputs();
+                self.selection_scroll.update(cx, |s, _| s.stop());
                 self.state.reset_conversation();
                 self.state.id = c.id;
                 self.state.created = c.created_at;
@@ -752,14 +794,21 @@ impl Drawer {
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
         self.fixture_tasks.clear();
+        self.fixture_copy = Default::default();
+        if crate::proto::ai::COPY_SCENES.contains(&scene) {
+            self.fixture_copy = match scene { "ai-code-copied" => markdown::CopyFixture::Copied, "ai-code-copy" => markdown::CopyFixture::Hovered, _ => markdown::CopyFixture::None };
+            self.state.model.start("整理生产环境的 Docker Compose 启动命令",ContextSnapshot::default());
+            self.state.model.event(Event::TextDelta(crate::proto::ai::copy_answer()));
+            self.state.model.event(Event::Done(None));
+        }
         if let Some(fixture) = crate::proto::slash::scene(scene) {
             self.state.model = fixture.model;
             self.fixture_tasks = fixture.tasks;
             self.label = "prod-web-01".into();
             self.protocol = "SSH".into();
             self.capabilities = Capabilities { terminal:true,background:true,..Default::default() };
-            self.input.update(cx, |i,cx|i.set_value(fixture.input,w,cx));
-            self.popup.changed(fixture.input);
+            self.set_composer_text(fixture.input,w,cx);
+            if self.popup.open { crate::proto::focus_after_layout(self.input.focus_handle(cx),w); }
             if let Some(context)=fixture.context {
                 self.state.run_budget = Some((context.budget,shellmate_ai::WindowSource::Catalog));
                 self.state.model.meter = Some(super::model::ContextMeter { used:context.total,window:context.budget.window,trigger:context.budget.trigger });
@@ -1223,9 +1272,11 @@ impl Render for Drawer {
                                     text,
                                     &commands,
                                 );
-                                reply = reply.child(markdown::view(
+                                reply = reply.child(markdown::drawer_view(
                                     markdown::element_id(&self.state.id, index, n),
                                     text,
+                                    self.selection_scroll.clone(),
+                                    self.fixture_copy,
                                     window,
                                     cx,
                                 ));
@@ -1450,7 +1501,11 @@ impl Render for Drawer {
                     ),
             );
         div()
-            .capture_key_down(cx.listener(Self::slash_key))
+            .capture_action(cx.listener(Self::slash_action::<input::MoveUp>))
+            .capture_action(cx.listener(Self::slash_action::<input::MoveDown>))
+            .capture_action(cx.listener(Self::slash_action::<input::IndentInline>))
+            .capture_action(cx.listener(Self::slash_action::<input::Escape>))
+            .capture_action(cx.listener(Self::slash_action::<input::Enter>))
             .w_full()
             .flex_none()
             .h_full()
@@ -1469,6 +1524,7 @@ impl Render for Drawer {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .child(super::selection_scroll::layer(self.selection_scroll.clone()))
                     .child(body)
                     .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)),
             )

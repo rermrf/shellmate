@@ -1,5 +1,28 @@
 use super::*;
 impl Workspace {
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_focus_ai_composer(&self, window: &mut Window, cx: &mut App) {
+        if self.ai_open
+            && let Some(drawer) = &self.ai_drawer
+        {
+            drawer.update(cx, |drawer, cx| drawer.debug_focus_composer(window, cx));
+        }
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_ai_viewport_at(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &App,
+    ) -> Option<gpui::ScrollHandle> {
+        if !self.ai_open {
+            return None;
+        }
+        self.ai_drawer
+            .as_ref()?
+            .read(cx)
+            .debug_viewport_at(position, cx)
+    }
+
     pub(crate) fn ai_binding(
         &self,
         id: Option<usize>,
