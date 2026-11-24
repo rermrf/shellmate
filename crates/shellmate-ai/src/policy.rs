@@ -1332,6 +1332,37 @@ fn container(a: &[String]) -> bool {
     }
 }
 
+/// First simple command after Shellmate's wrapper and leading environment assignments.
+/// This is status interpretation only; approval continues to use the full command.
+pub fn command_words(command: &str) -> Vec<String> {
+    let command = command.strip_prefix("export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER= SYSTEMD_COLORS=0 TERM=dumb LC_ALL=C.UTF-8; ").unwrap_or(command);
+    lex(command)
+        .tokens
+        .into_iter()
+        .take_while(|t| matches!(t, Token::Word(_)))
+        .filter_map(|t| {
+            if let Token::Word(s) = t {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .skip_while(|s| {
+            s.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty()
+                    && name.bytes().enumerate().all(|(i, b)| {
+                        b == b'_' || b.is_ascii_alphabetic() || (i != 0 && b.is_ascii_digit())
+                    })
+            })
+        })
+        .collect()
+}
+pub fn changes_directory(command: &str) -> bool {
+    lex(command).tokens.iter().any(
+        |t| matches!(t, Token::Word(s) if matches!(s.as_str(), "cd" | "pushd" | "popd" | "chdir")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

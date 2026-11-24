@@ -68,6 +68,8 @@ fn call(class: Class) -> ToolCall {
         purpose: "测试".into(),
         target: Target::Background,
         timeout: Duration::from_secs(30),
+        run_in_background: false,
+        exec_limits: shellmate_ai::agent::ExecLimits::default(),
         class,
     }
 }
@@ -227,4 +229,41 @@ async fn approval_disconnect_cancels_pending_and_mode_change_applies_next_step()
     };
     let (out, ()) = tokio::join!(f.host.run(call(Class::Other)), ui);
     assert!(matches!(out, ToolOutcome::Completed(_)));
+}
+
+#[tokio::test]
+async fn local_output_tools_bypass_all_approval_modes_and_background_command_does_not() {
+    use shellmate_ai::agent::{ExecLimits, LocalTool, ReadOutput};
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Auto,
+        PermissionMode::Full,
+    ] {
+        let f = fixture(mode, false);
+        f.host
+            .local_tool(
+                LocalTool::ReadOutput(ReadOutput {
+                    id: "out".into(),
+                    offset_line: 0,
+                    limit_lines: None,
+                    grep: None,
+                }),
+                ExecLimits::default(),
+            )
+            .await;
+        f.host
+            .local_tool(
+                LocalTool::StopTask { id: "1".into() },
+                ExecLimits::default(),
+            )
+            .await;
+        assert!(f.ui.try_recv().is_err());
+        assert!(f.calls.lock().unwrap().is_empty());
+    }
+    let f = fixture(PermissionMode::Ask, false);
+    let mut c = call(Class::ReadOnly);
+    c.run_in_background = true;
+    let mut run = f.host.run(c);
+    let event = tokio::select! { event=f.ui.recv()=>event.unwrap(), _=&mut run=>panic!("approval skipped") };
+    assert!(matches!(event, Ui::Approval { .. }));
 }

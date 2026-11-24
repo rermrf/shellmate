@@ -1,4 +1,5 @@
-//! Fragment-safe, bounded OSC 6973 capture. Only the registered nonce is hidden.
+//! Fragment-safe OSC 6973 capture. Production captures stream to a shared disk spool.
+//! Only the registered nonce is hidden; PTY stdout/stderr are already merged by the OS.
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ pub struct Captured {
     pub bytes: Vec<u8>,
     pub exit_code: Option<i32>,
     pub truncated: bool,
+    pub error: Option<String>,
 }
 #[derive(Clone)]
 pub struct CaptureHandle {
@@ -24,6 +26,10 @@ pub struct MarkerScanner {
     prefix: Vec<u8>,
     pending: Vec<u8>,
     data: Arc<Mutex<Captured>>,
+    spool: Option<shellmate_core::ai_output::Spool>,
+    ordinary: Vec<u8>,
+    skip_echo: bool,
+    ended: bool,
 }
 impl MarkerScanner {
     pub fn new(nonce: &str) -> (Self, CaptureHandle) {
@@ -33,6 +39,10 @@ impl MarkerScanner {
                 prefix: format!("\x1b]6973;{nonce};").into_bytes(),
                 pending: Vec::new(),
                 data: data.clone(),
+                spool: None,
+                ordinary: Vec::new(),
+                skip_echo: false,
+                ended: false,
             },
             CaptureHandle {
                 nonce: nonce.into(),
@@ -40,15 +50,45 @@ impl MarkerScanner {
             },
         )
     }
-    fn ordinary(&self, bytes: &[u8], render: &mut Vec<u8>) {
+    pub fn spooled(nonce: &str, spool: shellmate_core::ai_output::Spool) -> (Self, CaptureHandle) {
+        let (mut scanner, handle) = Self::new(nonce);
+        scanner.spool = Some(spool);
+        scanner.skip_echo = true;
+        (scanner, handle)
+    }
+    fn ordinary(&mut self, bytes: &[u8], render: &mut Vec<u8>) {
         render.extend_from_slice(bytes);
-        let mut data = self.data.lock();
-        if data.exit_code.is_none() {
-            let room = CAP.saturating_sub(data.bytes.len());
-            data.truncated |= bytes.len() > room;
-            data.bytes
-                .extend_from_slice(&bytes[..room.min(bytes.len())]);
+        if !self.ended {
+            self.ordinary.extend_from_slice(bytes);
         }
+    }
+    fn capture(&mut self) {
+        let mut bytes = self.ordinary.as_slice();
+        if self.skip_echo {
+            match bytes.iter().position(|b| *b == b'\n') {
+                Some(i) => {
+                    bytes = &bytes[i + 1..];
+                    self.skip_echo = false;
+                }
+                None => {
+                    self.ordinary.clear();
+                    return;
+                }
+            }
+        }
+        let mut data = self.data.lock();
+        if let Some(spool) = &self.spool {
+            if data.error.is_none() && !bytes.is_empty() {
+                match spool.write(bytes, false) {
+                    Ok(true) => {}
+                    Ok(false) => data.error = Some("输出超过 5 GB，命令已停止".into()),
+                    Err(e) => data.error = Some(format!("保存输出失败：{e}")),
+                }
+            }
+        } else {
+            data.bytes.extend_from_slice(bytes);
+        }
+        self.ordinary.clear();
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut render = Vec::with_capacity(bytes.len());
@@ -66,6 +106,8 @@ impl MarkerScanner {
                     if let Some(rc) = terminated
                         && let Ok(rc) = std::str::from_utf8(rc).unwrap_or("").parse::<i32>()
                     {
+                        self.capture();
+                        self.ended = true;
                         self.data.lock().exit_code = Some(rc);
                         self.pending.clear();
                         break;
@@ -88,6 +130,7 @@ impl MarkerScanner {
                 }
             }
         }
+        self.capture();
         render
     }
     pub fn running(&self) -> bool {
@@ -97,6 +140,7 @@ impl MarkerScanner {
         let bytes = std::mem::take(&mut self.pending);
         let mut render = Vec::new();
         self.ordinary(&bytes, &mut render);
+        self.capture();
         render
     }
 }
@@ -162,13 +206,13 @@ mod tests {
         assert_eq!(handle.snapshot().exit_code, None);
     }
     #[test]
-    fn capture_cap_does_not_truncate_render_or_lose_marker() {
+    fn large_capture_does_not_truncate_render_or_lose_marker() {
         let (mut scanner, handle) = MarkerScanner::new("aB3dE6gH9jK2");
         assert_eq!(scanner.feed(&vec![b'x'; CAP + 30]).len(), CAP + 30);
         assert!(scanner.feed(b"\x1b]6973;aB3dE6gH9jK2;3\x07").is_empty());
         let data = handle.snapshot();
-        assert_eq!(data.bytes.len(), CAP);
-        assert!(data.truncated);
+        assert_eq!(data.bytes.len(), CAP + 30);
+        assert!(!data.truncated);
         assert_eq!(data.exit_code, Some(3));
     }
     #[test]

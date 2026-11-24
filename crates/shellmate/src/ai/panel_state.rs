@@ -172,6 +172,8 @@ mod tests {
             purpose: "查看目录".into(),
             target: Target::Background,
             timeout: Duration::from_secs(30),
+            run_in_background: false,
+            exec_limits: shellmate_ai::agent::ExecLimits::default(),
             class: Class::ReadOnly,
         })
     }

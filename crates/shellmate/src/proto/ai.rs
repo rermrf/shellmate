@@ -180,7 +180,7 @@ mod tests {
     fn ai_fixtures_have_both_themes_and_requested_sizes() {
         assert_eq!(super::super::default_window_size("ai-new-confirm"), (1440, 900));
         for scene in ["ai", "ai-chat", "ai-agent-run", "ai-new-confirm", "ai-markdown", "ai-markdown-wide"]
-            .into_iter().chain(super::COMPACTION_SCENES.iter().copied())
+            .into_iter().chain(super::COMPACTION_SCENES.iter().copied()).chain(super::EXECUTION_SCENES.iter().copied())
         {
             assert!(super::super::SCENES.contains(&scene));
             assert_eq!(super::super::default_window_size(scene), super::super::default_window_size("ai-chat"));
@@ -241,4 +241,150 @@ mod tests {
         }
     }
 
+}
+
+pub const EXECUTION_SCENES: &[&str] = &["ai-tasks", "ai-output-large"];
+pub struct ExecutionScene {
+    pub model: crate::ai::model::DrawerModel,
+    pub tasks: Vec<crate::ai::tasks::TaskInfo>,
+}
+pub fn execution_scene(scene: &str) -> Option<ExecutionScene> {
+    use crate::ai::tasks::{Status, TaskInfo};
+    use shellmate_ai::{
+        ContextSnapshot, Entry, LoggedCall, LoggedResult, Step, StepDisplay, StepStatus, Target,
+        UserTurn, policy::Class,
+    };
+    if !EXECUTION_SCENES.contains(&scene) {
+        return None;
+    }
+    let mut model = crate::ai::model::DrawerModel::default();
+    model.conversation.push_user(UserTurn::new(
+        if scene == "ai-tasks" {
+            "构建服务并在终端运行集成测试。"
+        } else {
+            "检查构建日志，找出失败原因。"
+        },
+        ContextSnapshot {
+            label: "prod-web-01".into(),
+            protocol: "SSH".into(),
+            text: String::new(),
+        },
+    ));
+    let step = |n, command: &str, output: &str, code: Option<i32>| {
+        Entry::Step(Step {
+            message_id: n,
+            call: LoggedCall {
+                id: format!("fixture_exec_{n}"),
+                name: "run_command".into(),
+                args_json: serde_json::json!({"command":command,"target":"background"}),
+            },
+            result: LoggedResult {
+                inline: output.into(),
+                output_id: Some(format!("output-{n}")),
+                cleared: false,
+                is_error: code.is_some_and(|n: i32| n != 0),
+            },
+            display: Some(StepDisplay {
+                command: command.into(),
+                target: Target::Background,
+                purpose: "检查构建与测试输出".into(),
+                class: Class::Other,
+                status: if code.is_none() {
+                    StepStatus::Background
+                } else {
+                    StepStatus::Completed
+                },
+                exit_code: code,
+                duration_ms: 120000,
+                automatic: false,
+                output: output.into(),
+            }),
+        })
+    };
+    let mut tasks = Vec::new();
+    if scene == "ai-tasks" {
+        model.conversation.append(step(1, "cd /srv/app && cargo build --release", "命令在 120 秒内未完成，已转到后台继续运行 · 任务 #1 · 输出 id output-1 · 其中的 cd 不会影响后续命令", None));
+        model
+            .conversation
+            .push_text("构建和集成测试仍在运行，输出已保存，可以随时查看。  ");
+        for (id, command, target, elapsed) in [
+            (
+                "1",
+                "cd /srv/app && cargo build --release",
+                Target::Background,
+                147,
+            ),
+            (
+                "2",
+                "cargo test --test integration -- --nocapture",
+                Target::Terminal,
+                36,
+            ),
+        ] {
+            tasks.push(TaskInfo {
+                call_id: format!("fixture-{id}"),
+                id: id.into(),
+                command: command.into(),
+                target,
+                started: std::time::Instant::now() - std::time::Duration::from_secs(elapsed),
+                status: Status::Running,
+                output_id: format!("output-{id}"),
+                background: true,
+            });
+        }
+    } else {
+        model.conversation.append(step(1, "cat /srv/app/build.log", "输出 id output-1 · 总计 1048576 字节 · 退出码 0\n[build] Compiling api v2.8.1\n[build] Checking dependencies…\n[build] Running release build…\n完整输出已保存，用 read_output 查看或搜索", Some(0)));
+        model.conversation.append(Entry::Step(Step {
+            message_id: 2,
+            call: LoggedCall {
+                id: "fixture_read".into(),
+                name: "read_output".into(),
+                args_json: serde_json::json!({"id":"output-1","grep":"error"}),
+            },
+            result: LoggedResult {
+                inline: "error: connection refused".into(),
+                output_id: Some("output-1".into()),
+                cleared: false,
+                is_error: false,
+            },
+            display: None,
+        }));
+        model.conversation.append(step(3, "cargo test --test integration", "输出 id output-3 · 总计 86024 字节 · 退出码 101\nrunning 42 tests\ntest health_check ... ok\n[省略中间输出]\n[stderr] error: connection refused at localhost:5432\ntest database_connection ... FAILED\ntest result: FAILED. 41 passed; 1 failed", Some(101)));
+    }
+    Some(ExecutionScene { model, tasks })
+}
+
+#[cfg(test)]
+mod execution_tests {
+    #[test]
+    fn scenes_use_real_steps_and_quiet_output_projection() {
+        use shellmate_ai::{AnswerItem, Entry};
+        let tasks = super::execution_scene("ai-tasks").unwrap();
+        assert_eq!(tasks.tasks.len(), 2);
+        assert_ne!(tasks.tasks[0].target, tasks.tasks[1].target);
+        assert!(
+            tasks
+                .tasks
+                .iter()
+                .all(|t| t.background && t.status == crate::ai::tasks::Status::Running)
+        );
+        assert!(
+            tasks
+                .model
+                .conversation
+                .entries()
+                .iter()
+                .any(|e| matches!(e, Entry::Step(s) if s.result.inline.contains("已转到后台")))
+        );
+        let output = super::execution_scene("ai-output-large").unwrap();
+        let items = &output.model.conversation.turns()[0]
+            .answer
+            .as_ref()
+            .unwrap()
+            .items;
+        assert!(matches!(&items[1], AnswerItem::Notice(text) if text.contains("读取输出")));
+        assert!(
+            matches!(&items[2], AnswerItem::Step { output, exit_code: Some(101), .. } if output.contains("省略中间输出") && output.contains("FAILED"))
+        );
+    }
 }

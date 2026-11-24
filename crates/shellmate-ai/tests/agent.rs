@@ -204,7 +204,7 @@ async fn both_wires_complete_with_real_tool_results_and_parallel_disabled() {
                 AgentEvent::TextDelta(s) => order.push(s),
                 AgentEvent::StepProposed(call) => {
                     assert_eq!(call.class, Class::ReadOnly);
-                    assert_eq!(call.timeout, Duration::from_secs(120));
+                    assert_eq!(call.timeout, Duration::from_secs(600));
                     order.push("proposed".into());
                     assert!(host.calls.lock().unwrap().is_empty());
                 }
@@ -633,9 +633,9 @@ async fn output_no_longer_stops_and_capabilities_reject_unavailable_targets() {
     }
     assert_eq!(
         Target::Terminal.timeout(Some(999)),
-        Duration::from_secs(300)
+        Duration::from_secs(600)
     );
-    assert_eq!(Target::Background.timeout(None), Duration::from_secs(30));
+    assert_eq!(Target::Background.timeout(None), Duration::from_secs(120));
     assert_eq!(Target::Background.timeout(Some(0)), Duration::from_secs(1));
 }
 #[tokio::test]
@@ -802,16 +802,16 @@ async fn lenient_arguments_on_both_wires() {
                     "检查状态",
                     60,
                 ),
-                (json!({"command":"docker ps"}), "（未说明用途）", 30),
+                (json!({"command":"docker ps"}), "（未说明用途）", 120),
                 (
                     json!({"command":"docker ps", "purpose":" \n ", "timeout_secs":"invalid"}),
                     "（未说明用途）",
-                    30,
+                    120,
                 ),
                 (
                     json!({"command":"docker ps", "timeout_secs":{"unexpected":true}}),
                     "（未说明用途）",
-                    30,
+                    120,
                 ),
             ] {
                 let http = SequencedHttpClient::new([
@@ -2136,3 +2136,6 @@ async fn anthropic_finished_refusal_stays_invalid_response() {
 
 #[path = "agent/context.rs"]
 mod context_tests;
+
+#[path = "agent/execution.rs"]
+mod execution_tests;

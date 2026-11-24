@@ -43,13 +43,7 @@ impl Target {
         }
     }
     pub fn timeout(self, requested: Option<u64>) -> Duration {
-        Duration::from_secs(requested.unwrap_or(30).clamp(
-            1,
-            match self {
-                Self::Terminal => 300,
-                Self::Background => 120,
-            },
-        ))
+        ExecLimits::default().timeout(requested)
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -138,6 +132,8 @@ pub struct ToolCall {
     pub purpose: String,
     pub target: Target,
     pub timeout: Duration,
+    pub run_in_background: bool,
+    pub exec_limits: ExecLimits,
     pub class: Class,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,7 +172,11 @@ impl ToolOutcome {
     pub fn item(&self, call: &ToolCall) -> AnswerItem {
         let (status, exit_code, duration_ms, output) = match self {
             Self::Completed(out) => (
-                if out.timed_out {
+                if out.disconnected {
+                    StepStatus::Disconnected
+                } else if out.task_id.is_some() {
+                    StepStatus::Background
+                } else if out.timed_out {
                     StepStatus::TimedOut
                 } else {
                     StepStatus::Completed
@@ -212,9 +212,92 @@ impl ToolOutcome {
         item
     }
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(crate = "rig_core::serde", deny_unknown_fields)]
+pub struct ReadOutput {
+    pub id: String,
+    #[serde(default)]
+    pub offset_line: usize,
+    pub limit_lines: Option<usize>,
+    pub grep: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub enum LocalTool {
+    ReadOutput(ReadOutput),
+    StopTask { id: String },
+}
+#[derive(Clone, Debug)]
+pub struct LocalResult {
+    pub inline: String,
+    pub output_id: Option<String>,
+    pub is_error: bool,
+}
+impl LocalResult {
+    pub fn text(inline: impl Into<String>) -> Self {
+        Self {
+            inline: inline.into(),
+            output_id: None,
+            is_error: false,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecLimits {
+    pub default_timeout_secs: u64,
+    pub max_timeout_secs: u64,
+    pub tool_output_chars: usize,
+}
+impl Default for ExecLimits {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 120,
+            max_timeout_secs: 600,
+            tool_output_chars: 30_000,
+        }
+    }
+}
+impl ExecLimits {
+    pub fn timeout(self, requested: Option<u64>) -> Duration {
+        let max = if self.max_timeout_secs == 0 {
+            600
+        } else {
+            self.max_timeout_secs.min(600)
+        };
+        let default = if self.default_timeout_secs == 0 {
+            120
+        } else {
+            self.default_timeout_secs
+        };
+        Duration::from_secs(requested.unwrap_or(default).clamp(1, max))
+    }
+    pub fn output_chars(self) -> usize {
+        if (1_000..=150_000).contains(&self.tool_output_chars) {
+            self.tool_output_chars
+        } else {
+            30_000
+        }
+    }
+}
 pub trait ToolHost: Send + Sync {
-    /// Approval and execution belong to the host. Do not detach work: cancellation
-    /// of this future must cancel the operation. The core never spawns host tasks.
+    fn local_tool(&self, _tool: LocalTool, _limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
+        Box::pin(async {
+            LocalResult {
+                inline: "此主机不支持输出工具".into(),
+                output_id: None,
+                is_error: true,
+            }
+        })
+    }
+    /// Atomically drain completion notices at each request boundary (also used by idle UI).
+    fn take_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn task_state(&self) -> (Vec<String>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
+    /// Approval and execution belong to the host. Dropping a foreground future
+    /// cancels it; explicitly returned background tasks belong to the host registry.
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
     /// The approved command may have been edited or retargeted by the user.
     /// Fresh host snapshot at a compaction boundary. None uses the last sent snapshot.
@@ -223,6 +306,9 @@ pub trait ToolHost: Send + Sync {
     }
     fn permission_mode(&self) -> PermissionMode {
         PermissionMode::Ask
+    }
+    fn output_id(&self, _call: &ToolCall) -> Option<String> {
+        None
     }
     fn automatic(&self, _call: &ToolCall) -> bool {
         false
@@ -235,6 +321,7 @@ pub trait ToolHost: Send + Sync {
 pub struct Limits {
     /// Tool steps per run/resume; None means unlimited.
     pub max_steps: Option<usize>,
+    pub exec: ExecLimits,
     /// Delay after the nth failed attempt (1-based); injectable for offline tests.
     pub backoff: fn(u32) -> Duration,
 }
@@ -242,6 +329,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_steps: None,
+            exec: ExecLimits::default(),
             backoff: retry_backoff,
         }
     }
@@ -294,6 +382,7 @@ pub enum AgentEvent {
     Error(AiError),
 }
 enum Pending {
+    Local(Box<RigCall>, LocalTool),
     Call(Box<RigCall>, ToolCall),
     Invalid(Box<RigCall>, String),
     Text(String),
@@ -665,6 +754,7 @@ impl State<'_> {
             after_tokens: 0,
             trigger: work.trigger,
         };
+        (c.state.running_tasks, c.state.readable_output_ids) = self.host.task_state();
         let mut preview = self.conversation.clone();
         preview.append(Entry::Compaction(c.clone()));
         c.after_tokens = request_tokens(&preview.prepare(&caps)?);
@@ -761,7 +851,12 @@ fn stream<'a>(
             if let Some((raw, call)) = s.active.take() {
                 let outcome = s.host.run(call.clone()).await.cap_stored();
                 let resolved = s.host.resolved_call(&call);
-                let wire = if resolved != call {
+                let output_id = match &outcome {
+                    ToolOutcome::Completed(out) => out.output_id.clone(),
+                    _ => None,
+                }
+                .or_else(|| s.host.output_id(&resolved));
+                let mut wire = if resolved != call {
                     format!(
                         "用户批准的实际命令：{}\n执行目标：{}\n{}",
                         crate::output::stored_text(&resolved.command),
@@ -771,6 +866,11 @@ fn stream<'a>(
                 } else {
                     outcome.wire_text()
                 };
+                if !matches!(&outcome, ToolOutcome::Completed(_))
+                    && let Some(id) = &output_id
+                {
+                    wire.push_str(&format!("\n输出 id {id} · 用 read_output 查看输出"));
+                }
                 let call = resolved;
                 let turn = s.turn.as_mut().unwrap();
                 turn.steps += 1;
@@ -786,13 +886,18 @@ fn stream<'a>(
                     },
                     result: crate::LoggedResult {
                         inline: wire,
-                        output_id: None,
+                        output_id,
                         cleared: false,
-                        is_error: !matches!(outcome, ToolOutcome::Completed(_)),
+                        is_error: match &outcome {
+                            ToolOutcome::Completed(out) => !out.successful,
+                            _ => true,
+                        },
                     },
                     display: Some(display),
                 }));
-                if matches!(outcome, ToolOutcome::Disconnected) {
+                if matches!(&outcome, ToolOutcome::Disconnected)
+                    || matches!(&outcome, ToolOutcome::Completed(out) if out.disconnected)
+                {
                     s.error = Some(AiError::Disconnected);
                 }
                 return Some((AgentEvent::StepFinished { call, outcome }, s));
@@ -802,6 +907,28 @@ fn stream<'a>(
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
                 match pending {
+                    Pending::Local(raw, tool) => {
+                        let result = s.host.local_tool(tool, s.limits.exec).await;
+                        s.entry(Entry::Step(crate::Step {
+                            message_id: s.message_id,
+                            call: crate::LoggedCall {
+                                id: raw.id.to_string(),
+                                name: raw.function.name.to_string(),
+                                args_json: serde_json::Value::Object(raw.function.arguments),
+                            },
+                            result: crate::LoggedResult {
+                                inline: result.inline,
+                                output_id: result.output_id,
+                                cleared: false,
+                                is_error: result.is_error,
+                            },
+                            display: None,
+                        }));
+                        s.steps += 1;
+                        s.turn.as_mut().unwrap().steps += 1;
+                        s.turn.as_mut().unwrap().invalid_calls = 0;
+                        continue;
+                    }
                     Pending::Call(raw, call) => {
                         s.turn.as_mut().unwrap().invalid_calls = 0;
                         s.active = Some((*raw, call.clone()));
@@ -850,6 +977,12 @@ fn stream<'a>(
                 }
             }
             if s.model.is_none() {
+                for text in s.host.take_notices() {
+                    s.entry(Entry::Notice {
+                        kind: "task".into(),
+                        text,
+                    });
+                }
                 let request = match s.request() {
                     Ok(r) => r,
                     Err(e) => return Some((s.fail(e), s)),
@@ -1065,12 +1198,18 @@ fn stream<'a>(
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
-                                pending.push_back(
-                                    match parse_call(&raw, &s.turn.as_ref().unwrap().capabilities) {
+                                pending.push_back(match parse_local(&raw) {
+                                    Ok(Some(tool)) => Pending::Local(raw, tool),
+                                    Err(error) => Pending::Invalid(raw, error),
+                                    Ok(None) => match parse_call(
+                                        &raw,
+                                        &s.turn.as_ref().unwrap().capabilities,
+                                        s.limits.exec,
+                                    ) {
                                         Ok(call) => Pending::Call(raw, call),
                                         Err(error) => Pending::Invalid(raw, error),
                                     },
-                                );
+                                });
                             }
                             AssistantContent::Text(text) if after_call => {
                                 pending.push_back(Pending::Text(text.text.clone()))
@@ -1176,7 +1315,11 @@ fn stream<'a>(
         updates,
     }
 }
-fn parse_call(raw: &RigCall, capabilities: &Capabilities) -> Result<ToolCall, String> {
+fn parse_call(
+    raw: &RigCall,
+    capabilities: &Capabilities,
+    limits: ExecLimits,
+) -> Result<ToolCall, String> {
     #[derive(Deserialize)]
     #[serde(crate = "rig_core::serde")]
     struct Arguments {
@@ -1184,6 +1327,8 @@ fn parse_call(raw: &RigCall, capabilities: &Capabilities) -> Result<ToolCall, St
         purpose: Option<String>,
         target: Option<String>,
         timeout_secs: Option<serde_json::Value>,
+        #[serde(default)]
+        run_in_background: bool,
     }
     if raw.function.name.as_str() != "run_command" {
         return Err("未知工具，请使用 run_command".into());
@@ -1242,8 +1387,45 @@ fn parse_call(raw: &RigCall, capabilities: &Capabilities) -> Result<ToolCall, St
         }
         .into(),
         target,
-        timeout: target.timeout(timeout),
+        timeout: limits.timeout(timeout),
+        run_in_background: a.run_in_background,
+        exec_limits: limits,
     })
+}
+
+fn parse_local(raw: &RigCall) -> Result<Option<LocalTool>, String> {
+    let name = raw.function.name.as_str();
+    if !matches!(name, "read_output" | "stop_task") {
+        return Ok(None);
+    }
+    if raw.function.invalid_arguments.is_some() {
+        return Err("工具参数无效：需要 JSON 对象".into());
+    }
+    let args = serde_json::Value::Object(raw.function.arguments.clone());
+    if name == "read_output" {
+        let a: ReadOutput = serde_json::from_value(args).map_err(|_| "read_output 参数无效")?;
+        if a.id.is_empty()
+            || a.id.len() > 160
+            || a.limit_lines.is_some_and(|n| n == 0 || n > 2000)
+            || a.grep.as_ref().is_some_and(|s| s.len() > 4096)
+        {
+            return Err(
+                "read_output：id 不能为空，limit_lines 为 1–2000，grep 最长 4096 字节".into(),
+            );
+        }
+        Ok(Some(LocalTool::ReadOutput(a)))
+    } else {
+        #[derive(Deserialize)]
+        #[serde(crate = "rig_core::serde", deny_unknown_fields)]
+        struct Stop {
+            id: String,
+        }
+        let a: Stop = serde_json::from_value(args).map_err(|_| "stop_task 参数无效")?;
+        if a.id.is_empty() || a.id.len() > 160 {
+            return Err("stop_task：无效的任务 id".into());
+        }
+        Ok(Some(LocalTool::StopTask { id: a.id }))
+    }
 }
 
 #[cfg(test)]

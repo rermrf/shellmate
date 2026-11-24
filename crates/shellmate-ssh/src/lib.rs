@@ -27,7 +27,7 @@ mod watchdog;
 pub use config::{ConnectEvent, ConnectOptions, EventCallback, HostSecrets, Route, SshHost};
 pub use connection::{Connection, HopInfo, WeakConnection};
 pub use error::{SshError, TcpipFailure};
-pub use exec::{DEFAULT_MAX_LINE, DEFAULT_MAX_OUTPUT, ExecOptions, ExecOutput, ExecStatus, ExecStream, StreamOptions};
+pub use exec::{DEFAULT_MAX_LINE, DEFAULT_MAX_OUTPUT, ExecChunk, ExecSpool, ExecOptions, ExecOutput, ExecStatus, ExecStream, StreamOptions};
 pub use forward::{ForwardedStream, RemoteForward, TcpipStream};
 pub use interact::{
     ChallengePrompt, ChallengeRequest, HostKeyDecision, HostKeyInfo, HostKeyRequest, HostKeyVerifier, NoInteraction, PassphraseRequest,

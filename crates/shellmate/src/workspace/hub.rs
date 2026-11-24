@@ -171,10 +171,28 @@ impl Hub {
             }
         });
         let timer = cx.spawn(async |cx| {
+            let mut swept = None::<std::time::Instant>;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 cx.update(|cx| {
                     let hub = cx.global::<Self>();
+                    if swept.is_none_or(|last| last.elapsed() >= Duration::from_secs(86400)) {
+                        let root = hub.services.data_root.borrow().clone();
+                        // Demo/temp libraries never inspect the production app directory.
+                        if !hub.services.library_is_temporary
+                            && let Some(runtime) = crate::runtime::get(cx)
+                        {
+                            runtime.spawn(async move {
+                                if let Err(e) = shellmate_core::ai_output::sweep(
+                                    &root,
+                                    std::time::SystemTime::now(),
+                                ) {
+                                    log::warn!("AI output retention: {e}");
+                                }
+                            });
+                        }
+                        swept = Some(std::time::Instant::now());
+                    }
                     let locked = hub.services.secrets.tick();
                     for (ix, entry) in hub.windows.clone().into_iter().enumerate() {
                         entry.update(cx, |s, w, cx| {
@@ -196,7 +214,13 @@ impl Hub {
         // The record of the session is written once more as the app quits.
         cx.on_app_quit(|cx| {
             Self::save_snapshot_at_quit(cx);
-            async {}
+            Self::update(cx, |s, _, cx| {
+                if let Some(drawer) = &s.ai_drawer {
+                    drawer.update(cx, |d, cx| d.stop(cx));
+                }
+            });
+            // Let runtime cancellation reap local process groups and close channels.
+            cx.background_executor().timer(Duration::from_millis(100))
         })
         .detach();
         #[cfg(target_os = "macos")]

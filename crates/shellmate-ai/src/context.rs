@@ -175,11 +175,11 @@ impl Conversation {
             crate::conversation::command_tool()
         };
         let offered = if summarizing {
-            ""
+            &[][..]
         } else if caps.available() {
-            "run_command"
+            &["run_command", "read_output", "stop_task"][..]
         } else {
-            "propose_command"
+            &["propose_command"][..]
         };
         let mut messages = Vec::new();
         let entries = &self.entries()[start..];
@@ -211,7 +211,7 @@ impl Conversation {
                             if summarizing {
                                 result_text = char_excerpt(&result_text, 4000);
                             }
-                            if s.call.name == offered {
+                            if offered.contains(&s.call.name.as_str()) {
                                 let call = ToolCall::from_wire(
                                     &s.call.id,
                                     ToolFunction::new(
@@ -249,7 +249,7 @@ impl Conversation {
                     // If a tool is no longer offered, its pair is ordinary text.
                     for e in batch {
                         if let Entry::Step(s) = e
-                            && s.call.name != offered
+                            && !offered.contains(&s.call.name.as_str())
                         {
                             a.content.push(AssistantContent::text(s.plain_text()));
                         }
@@ -314,6 +314,11 @@ impl Conversation {
             .preamble(system);
         if !summarizing {
             request = request.tool(tool);
+            if caps.available() {
+                for tool in crate::conversation::output_tools() {
+                    request = request.tool(tool);
+                }
+            }
         }
         Ok(request)
     }

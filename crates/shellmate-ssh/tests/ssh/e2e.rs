@@ -225,3 +225,110 @@ async fn e2e_a_session_killed_on_the_server_is_reported_and_a_new_connection_wor
     let again = Connection::connect(Route::direct(target()), env.trusting()).await.expect("reconnect");
     run_and_exit(&again, "echo back-$((50+8))-again", "back-58-again").await;
 }
+
+#[tokio::test]
+#[ignore = "needs shellmate-e2e Docker OpenSSH on 127.0.0.1:2222; never run in sandbox"]
+async fn e2e_spooled_megabyte_timeout_keeps_channel_and_drop_stops_writer() {
+    use std::time::Duration;
+    let env = Env::new();
+    let target = host(AuthMethod::Password).with_password(Secret::new(password()));
+    let connection = Connection::connect(Route::direct(target), env.trusting())
+        .await
+        .unwrap();
+    let mut stream = connection
+        .exec_spooled("printf HEAD; head -c 1048576 /dev/zero; printf TAIL; printf problem >&2")
+        .await
+        .unwrap();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    while let Some(chunk) = stream.next_chunk().await.unwrap() {
+        if chunk.stderr {
+            stderr.extend(chunk.bytes);
+        } else {
+            stdout.extend(chunk.bytes);
+        }
+    }
+    assert_eq!(stdout.len(), 1048584);
+    assert!(stdout.starts_with(b"HEAD") && stdout.ends_with(b"TAIL"));
+    assert_eq!(stderr, b"problem");
+    assert_eq!(stream.status(), Some(shellmate_ssh::ExecStatus::Code(0)));
+    let mut stream = connection
+        .exec_spooled("sleep 1; printf completed")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next_chunk())
+            .await
+            .is_err()
+    );
+    // The caller can move the same still-open handle into its background task registry.
+    assert_eq!(
+        stream.next_chunk().await.unwrap().unwrap().bytes,
+        b"completed"
+    );
+    while stream.next_chunk().await.unwrap().is_some() {}
+    assert_eq!(stream.status(), Some(shellmate_ssh::ExecStatus::Code(0)));
+    let mut stream = connection
+        .exec_spooled("echo $$; while :; do printf tick; sleep 0.1; done")
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    while !first.contains(&b'\n') {
+        first.extend(stream.next_chunk().await.unwrap().unwrap().bytes);
+    }
+    let pid: u32 = std::str::from_utf8(first.split(|b| *b == b'\n').next().unwrap())
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // stop_task and caller drop both release this handle, closing the channel.
+    drop(stream);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = connection
+            .exec(&format!("kill -0 {pid} 2>/dev/null"))
+            .await
+            .unwrap()
+            .status
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "channel drop left remote writer running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut stream = connection
+        .exec_spooled("echo $$; exec sleep 30")
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    while !first.contains(&b'\n') {
+        first.extend(stream.next_chunk().await.unwrap().unwrap().bytes);
+    }
+    let pid: u32 = std::str::from_utf8(first.split(|b| *b == b'\n').next().unwrap())
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // stop_task and caller drop both release this handle, closing the channel.
+    drop(stream);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = connection
+            .exec(&format!("kill -0 {pid} 2>/dev/null"))
+            .await
+            .unwrap()
+            .status
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "channel drop left silent remote command running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

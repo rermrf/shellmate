@@ -10,7 +10,13 @@ pub struct ToolOutput {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    pub disconnected: bool,
     pub truncated: bool,
+    pub output_id: Option<String>,
+    pub task_id: Option<String>,
+    pub message: Option<String>,
+    pub successful: bool,
+    pub total_bytes: u64,
 }
 impl ToolOutput {
     pub fn stdout(&self) -> &str {
@@ -20,6 +26,19 @@ impl ToolOutput {
         &self.stderr
     }
     pub fn wire_text(&self) -> String {
+        if let Some(id) = &self.output_id {
+            if let Some(message) = &self.message {
+                return message.clone();
+            }
+            return format!(
+                "输出 id {id} · 总计 {} 字节 · 退出码 {} · {} ms\n{}",
+                self.total_bytes,
+                self.exit_code
+                    .map_or_else(|| "未知".into(), |n| n.to_string()),
+                self.duration_ms,
+                self.stdout
+            );
+        }
         format!(
             "退出码：{}\n耗时：{} ms\n超时：{}\n截断：{}\n<不可信标准输出>\n{}\n</不可信标准输出>\n<不可信标准错误>\n{}\n</不可信标准错误>",
             self.exit_code
@@ -33,6 +52,9 @@ impl ToolOutput {
     }
     /// Hard byte cap includes labels and the omission marker.
     pub fn stored(&self) -> String {
+        if self.output_id.is_some() {
+            return stored_text(&self.wire_text());
+        }
         stored_text(&format!(
             "标准输出：\n{}\n标准错误：\n{}",
             self.stdout, self.stderr
@@ -56,8 +78,83 @@ pub fn shape(
         exit_code: exit,
         duration_ms: duration.as_millis().min(u64::MAX as u128) as u64,
         timed_out,
+        disconnected: false,
         truncated: truncated || clipped,
+        output_id: None,
+        task_id: None,
+        message: None,
+        successful: exit == Some(0) && !timed_out,
+        total_bytes: (stdout.len() + stderr.len()) as u64,
     }
+}
+/// Model output uses character ceilings; the persisted UI excerpt keeps its 8 KiB cap.
+#[allow(clippy::too_many_arguments)]
+pub fn spooled(
+    id: &str,
+    command: &str,
+    bytes: &[u8],
+    total: u64,
+    exit: Option<i32>,
+    duration: Duration,
+    limits: crate::agent::ExecLimits,
+) -> ToolOutput {
+    let text = clean(bytes);
+    let success = successful(command, exit);
+    let ceiling = limits.output_chars().min(128_000);
+    let truncated = text.chars().count() > ceiling || total > bytes.len() as u64;
+    let stdout = if success {
+        if truncated {
+            format!(
+                "{}\n完整输出已保存，用 read_output 查看或搜索",
+                text.chars().take(2000).collect::<String>()
+            )
+        } else {
+            text
+        }
+    } else {
+        char_excerpt(&char_excerpt(&text, limits.output_chars()), 10_000)
+    };
+    ToolOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code: exit,
+        duration_ms: duration.as_millis().min(u64::MAX as u128) as u64,
+        timed_out: false,
+        disconnected: false,
+        truncated,
+        output_id: Some(id.into()),
+        task_id: None,
+        message: None,
+        successful: success,
+        total_bytes: total,
+    }
+}
+pub fn char_excerpt(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.into();
+    }
+    let marker = "\n[省略中间输出]\n";
+    let keep = max.saturating_sub(marker.chars().count());
+    let head: String = text.chars().take(keep / 2).collect();
+    let tail: String = text.chars().skip(count - (keep - keep / 2)).collect();
+    format!("{head}{marker}{tail}")
+}
+pub fn successful(command: &str, exit: Option<i32>) -> bool {
+    if exit == Some(0) {
+        return true;
+    }
+    if exit != Some(1) {
+        return false;
+    }
+    let words = crate::policy::command_words(command);
+    matches!(
+        words.first().map(String::as_str),
+        Some("grep" | "rg" | "egrep" | "fgrep" | "find" | "diff" | "test" | "[")
+    ) || (words.first().is_some_and(|s| s == "git")
+        && words
+            .get(1)
+            .is_some_and(|s| matches!(s.as_str(), "diff" | "grep")))
 }
 /// Also used at the store boundary, which must never trust caller-created Step strings.
 pub fn stored_text(text: &str) -> String {
@@ -94,7 +191,7 @@ fn clip(text: &str, head: usize, tail: usize) -> String {
         &text[end..]
     )
 }
-fn clean(bytes: &[u8]) -> String {
+pub fn clean(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut chars = text.chars().peekable();
     let mut plain = String::new();

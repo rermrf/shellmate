@@ -40,40 +40,44 @@ impl Workspace {
             },
         })
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ai_terminal_start(
         &mut self,
         id: usize,
         command: &str,
         nonce: &str,
         lease: &Arc<std::sync::atomic::AtomicBool>,
+        spool: shellmate_core::ai_output::Spool,
         cx: &mut Context<Self>,
-    ) -> Result<shellmate_term::agent::CaptureHandle, shellmate_ai::agent::ToolOutcome> {
+    ) -> Result<shellmate_term::agent::CaptureHandle, Box<shellmate_ai::agent::ToolOutcome>> {
         use shellmate_ai::agent::ToolOutcome;
         if !self
             .ai_binding(Some(id), cx)
             .is_some_and(|b| b.capabilities.terminal)
         {
-            return Err(ToolOutcome::Disconnected);
+            return Err(Box::new(ToolOutcome::Disconnected));
         }
         let session = self
             .sessions
             .iter()
             .find(|s| s.id == id)
-            .ok_or(ToolOutcome::Disconnected)?;
+            .ok_or_else(|| Box::new(ToolOutcome::Disconnected))?;
         if !Arc::ptr_eq(lease, &session.terminal.read(cx).agent_liveness())
             || !lease.load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(ToolOutcome::Disconnected);
+            return Err(Box::new(ToolOutcome::Disconnected));
         }
         session
             .terminal
-            .update(cx, |t, _| t.agent_start(command, nonce))
+            .update(cx, |t, _| t.agent_start_spooled(command, nonce, spool))
             .map_err(|e| {
-                if e == "busy" {
-                    ToolOutcome::Busy
-                } else {
-                    ToolOutcome::Disconnected
-                }
+                Box::new({
+                    if e == "busy" {
+                        ToolOutcome::Busy
+                    } else {
+                        ToolOutcome::Disconnected
+                    }
+                })
             })
     }
     pub(crate) fn ai_terminal_finish(
@@ -131,8 +135,10 @@ impl Workspace {
             let workspace = cx.entity().downgrade();
             let db = self.hub.store.clone();
             let credentials = self.hub.secrets.clone();
-            self.ai_drawer =
-                Some(cx.new(|cx| crate::ai::panel::Drawer::new(workspace, db, credentials, w, cx)));
+            let data_root = self.hub.data_root.borrow().clone();
+            self.ai_drawer = Some(cx.new(|cx| {
+                crate::ai::panel::Drawer::new(workspace, db, credentials, data_root, w, cx)
+            }));
         }
         self.ai_open = true;
         self.commands_open = false;
@@ -143,10 +149,20 @@ impl Workspace {
         if let Some(drawer) = &self.ai_drawer {
             drawer.update(cx, |d, cx| d.clear(cx));
         }
+        // The existing clear-all action deletes the entire conversation library.
+        let outputs = self.hub.data_root.borrow().join("ai-outputs");
+        if let Err(e) = std::fs::remove_dir_all(outputs)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("remove AI output library: {e}");
+        }
     }
     pub(crate) fn close_ai(&mut self, cx: &mut Context<Self>) {
         self.end_drawer_drag(cx);
         self.ai_open = false;
+        if let Some(drawer) = &self.ai_drawer {
+            drawer.update(cx, |d, cx| d.close(cx));
+        }
         cx.notify();
     }
     pub(super) fn explain_ai(&mut self, w: &mut Window, cx: &mut Context<Self>) {

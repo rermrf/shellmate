@@ -34,12 +34,9 @@ pub enum Ui {
         session: usize,
         command: String,
         nonce: String,
+        spool: shellmate_core::ai_output::Spool,
         lease: Arc<AtomicBool>,
-        reply: oneshot::Sender<Result<shellmate_term::agent::CaptureHandle, ToolOutcome>>,
-    },
-    TerminalInterrupt {
-        session: usize,
-        nonce: String,
+        reply: oneshot::Sender<Result<shellmate_term::agent::CaptureHandle, Box<ToolOutcome>>>,
     },
     TerminalFinish {
         session: usize,
@@ -47,6 +44,23 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn output_id(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+    fn local_tool(
+        &self,
+        _tool: shellmate_ai::agent::LocalTool,
+        _limits: shellmate_ai::agent::ExecLimits,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        Box::pin(async { shellmate_ai::agent::LocalResult::text("工具不可用") })
+    }
+    fn take_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn task_state(&self) -> (Vec<String>, Vec<String>) {
+        (Vec::new(), Vec::new())
+    }
+
     fn execute(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
 }
 pub struct Host {
@@ -69,6 +83,23 @@ impl Drop for PendingGuard {
     }
 }
 impl ToolHost for Host {
+    fn output_id(&self, call: &ToolCall) -> Option<String> {
+        self.executor.output_id(call)
+    }
+    fn local_tool(
+        &self,
+        tool: shellmate_ai::agent::LocalTool,
+        limits: shellmate_ai::agent::ExecLimits,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        self.executor.local_tool(tool, limits)
+    }
+    fn take_notices(&self) -> Vec<String> {
+        self.executor.take_notices()
+    }
+    fn task_state(&self) -> (Vec<String>, Vec<String>) {
+        self.executor.task_state()
+    }
+
     fn permission_mode(&self) -> PermissionMode {
         *self.mode.lock().unwrap()
     }
@@ -105,7 +136,7 @@ impl ToolHost for Host {
                                 if command.trim().is_empty() { return ToolOutcome::Failed("命令不能为空".into()); }
                                 call.command = command;
                                 call.target = target;
-                                call.timeout = target.timeout(Some(call.timeout.as_secs()));
+                                call.timeout = call.exec_limits.timeout(Some(call.timeout.as_secs()));
                                 call.class = classify(&call.command);
                             }
                             Ok(Approval::Deny { reason }) => return ToolOutcome::Denied { reason },

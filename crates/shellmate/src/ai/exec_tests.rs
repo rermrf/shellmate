@@ -27,8 +27,46 @@ fn call(command: &str, target: Target, timeout: Duration) -> ToolCall {
         purpose: "测试".into(),
         target,
         timeout,
+        run_in_background: false,
+        exec_limits: shellmate_ai::agent::ExecLimits::default(),
         class: classify(command),
     }
+}
+async fn local(
+    call: &ToolCall,
+    cwd: PathBuf,
+    shell: &str,
+    home: Option<&std::path::Path>,
+) -> ToolOutcome {
+    let tasks = super::super::tasks::Tasks::new(cwd.clone(), "test".into());
+    run_local(&tasks, call.clone(), cwd, shell, home).await
+}
+async fn run_local(
+    tasks: &super::super::tasks::Tasks,
+    call: ToolCall,
+    cwd: PathBuf,
+    shell: &str,
+    home: Option<&std::path::Path>,
+) -> ToolOutcome {
+    let shell = shell.to_owned();
+    let home = home.map(std::path::Path::to_path_buf);
+    let work = call.clone();
+    tasks
+        .run(call, None, move |spool| {
+            Box::pin(async move { super::local(&work, cwd, &shell, home.as_deref(), &spool).await })
+        })
+        .await
+}
+async fn ssh(connection: &Connection, call: &ToolCall) -> ToolOutcome {
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "test".into());
+    let connection = connection.clone();
+    let work = call.clone();
+    tasks
+        .run(call.clone(), None, move |spool| {
+            Box::pin(async move { super::ssh(&connection, &work, &spool).await })
+        })
+        .await
 }
 fn completed(out: ToolOutcome) -> ToolOutput {
     match out {
@@ -52,8 +90,7 @@ async fn local_stdout_stderr_exit_stdin_pager_and_cwd() {
         )
         .await,
     );
-    assert_eq!(out.stdout(), "out");
-    assert_eq!(out.stderr(), "err");
+    assert_eq!(out.stdout(), "out\n[stderr] err");
     assert_eq!(out.exit_code, Some(3));
     let out = completed(
         local(
@@ -122,11 +159,13 @@ fn group_command() -> &'static str {
     "echo $$ > pids; sleep 60 & echo $! >> pids; sleep 60 & echo $! >> pids; wait"
 }
 #[tokio::test]
-async fn local_timeout_kills_entire_process_group() {
+async fn local_timeout_promotes_then_stop_kills_entire_process_group() {
     let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "test".into());
     let out = completed(
-        local(
-            &call(
+        run_local(
+            &tasks,
+            call(
                 group_command(),
                 Target::Background,
                 Duration::from_millis(200),
@@ -137,7 +176,18 @@ async fn local_timeout_kills_entire_process_group() {
         )
         .await,
     );
-    assert!(out.timed_out);
+    assert!(out.task_id.is_some());
+    let ids = pids(&temp.0.join("pids")).await;
+    assert!(ids.iter().all(|id| process_exists(*id)));
+    let stopped = tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::StopTask {
+                id: out.task_id.unwrap(),
+            },
+            Default::default(),
+        )
+        .await;
+    assert!(stopped.inline.contains("已停止任务"));
     assert_gone(&pids(&temp.0.join("pids")).await).await;
 }
 #[tokio::test]
@@ -168,7 +218,10 @@ async fn local_output_cap_drains_and_preserves_content() {
     );
     assert!(out.truncated);
     assert!(out.stdout().contains("TOKEN=hidden"));
-    assert!(out.stdout().len() < 9000);
+    assert!(out.stdout().chars().count() < 2100);
+    let path =
+        shellmate_core::ai_output::path(&temp.0, "test", out.output_id.as_ref().unwrap()).unwrap();
+    assert!(std::fs::metadata(path).unwrap().len() > 300000);
     assert_eq!(out.exit_code, Some(0));
 }
 struct PtyHarness {
@@ -176,6 +229,7 @@ struct PtyHarness {
     pty: Arc<Mutex<LocalPty>>,
     scan: Arc<Mutex<Option<(String, MarkerScanner)>>>,
     output: Arc<Mutex<Vec<u8>>>,
+    typed: Arc<Mutex<Vec<Vec<u8>>>>,
     _temp: Temp,
     pump: tokio::task::JoinHandle<()>,
 }
@@ -236,12 +290,15 @@ impl PtyHarness {
         }
         let (ui, rx) = async_channel::unbounded();
         let (p, s) = (pty.clone(), scan.clone());
+        let typed = Arc::new(Mutex::new(Vec::new()));
+        let sent = typed.clone();
         let pump = tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
                     Ui::TerminalStart {
                         command,
                         nonce,
+                        spool,
                         reply,
                         ..
                     } => {
@@ -250,19 +307,19 @@ impl PtyHarness {
                         }
                         assert_eq!(nonce.len(), 12);
                         assert!(nonce.bytes().all(|b| b.is_ascii_alphanumeric()));
-                        let (scanner, handle) = MarkerScanner::new(&nonce);
+                        if s.lock().unwrap().is_some() {
+                            let _ = reply.send(Err(Box::new(ToolOutcome::Busy)));
+                            continue;
+                        }
+                        let (scanner, handle) = MarkerScanner::spooled(&nonce, spool);
                         *s.lock().unwrap() = Some((nonce.clone(), scanner));
-                        p.lock()
-                            .unwrap()
-                            .write(&shellmate_term::agent::command_line(&command, &nonce))
-                            .unwrap();
+                        let line = shellmate_term::agent::command_line(&command, &nonce);
+                        sent.lock().unwrap().push(line.clone());
+                        p.lock().unwrap().write(&line).unwrap();
                         if reply.send(Ok(handle)).is_err() {
                             p.lock().unwrap().write(b"\x03").unwrap();
                             *s.lock().unwrap() = None;
                         }
-                    }
-                    Ui::TerminalInterrupt { .. } => {
-                        p.lock().unwrap().write(b"\x03").unwrap();
                     }
                     Ui::TerminalFinish { nonce, .. } => {
                         let mut s = s.lock().unwrap();
@@ -281,6 +338,7 @@ impl PtyHarness {
         });
         Self {
             executor: AppExecutor {
+                tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),
                 binding: Binding {
                     session: 1,
                     capabilities: shellmate_ai::agent::Capabilities {
@@ -296,6 +354,7 @@ impl PtyHarness {
             pty,
             scan,
             output,
+            typed,
             _temp: temp,
             pump,
         }
@@ -306,6 +365,8 @@ impl PtyHarness {
             assert!(start.elapsed() < Duration::from_secs(3));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // The real terminal also enforces its 300 ms recent-output busy cooldown.
+        tokio::time::sleep(Duration::from_millis(350)).await;
     }
 }
 #[tokio::test]
@@ -342,9 +403,6 @@ async fn terminal_real_pty_timeout_interrupts_and_shell_remains_usable() {
     );
     assert!(out.timed_out);
     h.settled().await;
-    if out.exit_code.is_none() {
-        assert!(out.stderr().contains("未检测到命令结束标记"));
-    }
     let out = completed(
         h.executor
             .execute(call(
@@ -447,7 +505,7 @@ async fn ssh_background_docker_uname_nonzero_timeout_stderr() {
         )
         .await,
     );
-    assert_eq!(out.stderr(), "problem");
+    assert_eq!(out.stdout(), "[stderr] problem");
     assert_eq!(out.exit_code, Some(3));
     let out = completed(
         ssh(
@@ -457,6 +515,78 @@ async fn ssh_background_docker_uname_nonzero_timeout_stderr() {
         .await,
     );
     assert!(out.timed_out);
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "docker".into());
+    for (command, timeout, expected) in [
+        (
+            "printf HEAD; head -c 1048576 /dev/zero | tr '\\000' x; printf TAIL",
+            Duration::from_secs(10),
+            false,
+        ),
+        (
+            "printf start; sleep 1; printf done",
+            Duration::from_millis(50),
+            true,
+        ),
+    ] {
+        let c = call(command, Target::Background, timeout);
+        let work = c.clone();
+        let connection = connection.clone();
+        let out = completed(
+            tasks
+                .run(c, None, move |spool| {
+                    Box::pin(async move { super::ssh(&connection, &work, &spool).await })
+                })
+                .await,
+        );
+        assert_eq!(out.task_id.is_some(), expected);
+        if expected {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                tasks.list().last().unwrap().status,
+                super::super::tasks::Status::Exited(Some(0))
+            );
+            assert!(!tasks.take_notices().is_empty());
+        } else {
+            assert_eq!(
+                std::fs::metadata(
+                    shellmate_core::ai_output::path(
+                        &temp.0,
+                        "docker",
+                        out.output_id.as_ref().unwrap()
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+                .len(),
+                1048584
+            );
+        }
+    }
+    let mut c = call(
+        "while :; do printf tick; sleep 0.1; done",
+        Target::Background,
+        Duration::from_secs(10),
+    );
+    c.run_in_background = true;
+    let work = c.clone();
+    let link = connection.clone();
+    let out = completed(
+        tasks
+            .run(c, None, move |spool| {
+                Box::pin(async move { super::ssh(&link, &work, &spool).await })
+            })
+            .await,
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped = tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::StopTask {
+                id: out.task_id.unwrap(),
+            },
+            Default::default(),
+        )
+        .await;
+    assert!(stopped.inline.contains("已停止任务"));
 }
 
 #[tokio::test]
@@ -470,13 +600,19 @@ async fn terminal_bound_session_disconnect_removes_capture() {
         h.executor.binding.alive.store(false, Ordering::Release);
     };
     let (out, ()) = tokio::join!(run, disconnect);
-    assert_eq!(out, ToolOutcome::Disconnected);
+    assert!(!completed(out).successful);
+    assert_eq!(
+        h.executor.tasks.list()[0].status,
+        super::super::tasks::Status::Disconnected
+    );
     h.settled().await;
 }
 #[tokio::test]
 async fn terminal_cancel_before_start_reply_cleans_up_registration() {
     let (ui, rx) = async_channel::unbounded();
+    let temp = Temp::new();
     let executor = AppExecutor {
+        tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),
         binding: Binding {
             session: 17,
             capabilities: shellmate_ai::Capabilities {
@@ -502,6 +638,7 @@ async fn terminal_cancel_before_start_reply_cleans_up_registration() {
     };
     assert_eq!(session, 17);
     drop(run);
+    tokio::time::sleep(Duration::from_millis(25)).await;
     assert!(reply.is_closed());
     let Ui::TerminalFinish {
         session,
@@ -515,7 +652,7 @@ async fn terminal_cancel_before_start_reply_cleans_up_registration() {
 }
 
 #[tokio::test]
-async fn terminal_missing_marker_reports_partial_output_after_grace() {
+async fn terminal_missing_marker_stays_busy_until_explicit_stop() {
     let h = PtyHarness::new().await;
     let out = completed(
         h.executor
@@ -526,12 +663,345 @@ async fn terminal_missing_marker_reports_partial_output_after_grace() {
             ))
             .await,
     );
-    assert!(out.timed_out);
-    assert!(out.stdout().contains("partial"));
-    assert!(
-        out.stderr()
-            .contains("未检测到命令结束标记（可能是不支持的 shell）")
+    assert!(out.message.as_ref().unwrap().contains("已转到后台"));
+    assert!(h.scan.lock().unwrap().is_some());
+    let read = h
+        .executor
+        .tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::ReadOutput(shellmate_ai::agent::ReadOutput {
+                id: out.output_id.clone().unwrap(),
+                offset_line: 0,
+                limit_lines: None,
+                grep: None,
+            }),
+            Default::default(),
+        )
+        .await;
+    assert!(read.inline.contains("partial"));
+    assert_eq!(
+        h.executor
+            .execute(call(
+                "printf busy",
+                Target::Terminal,
+                Duration::from_secs(1)
+            ))
+            .await,
+        ToolOutcome::Busy
     );
-    assert!(out.duration_ms >= 2100);
+    h.executor
+        .tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::StopTask {
+                id: out.task_id.unwrap(),
+            },
+            Default::default(),
+        )
+        .await;
     h.settled().await;
+}
+
+#[tokio::test]
+async fn local_megabyte_and_disk_ring_preserve_head_tail_and_failure() {
+    for (size, code) in [(1_048_576, 0), (1_048_576, 3), (65 * 1024 * 1024, 0)] {
+        let temp = Temp::new();
+        let command = format!(
+            "printf 'HEAD\\n'; head -c {size} /dev/zero | tr '\\000' x; printf '\\nTAIL\\n'; exit {code}"
+        );
+        let out = completed(
+            local(
+                &call(&command, Target::Background, Duration::from_secs(60)),
+                temp.0.clone(),
+                "/bin/sh",
+                Some(&temp.0),
+            )
+            .await,
+        );
+        assert_eq!(out.exit_code, Some(code));
+        assert_eq!(out.successful, code == 0);
+        assert!(out.stdout().contains("HEAD"));
+        if code != 0 {
+            assert!(out.stdout().contains("TAIL"));
+            assert!(out.stdout().chars().count() <= 10000);
+        } else {
+            assert!(out.stdout().contains("完整输出已保存"));
+        }
+        let path =
+            shellmate_core::ai_output::path(&temp.0, "test", out.output_id.as_ref().unwrap())
+                .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.starts_with(b"HEAD\n"));
+        assert!(bytes.ends_with(b"\nTAIL\n"));
+        if size < 64 * 1024 * 1024 {
+            assert_eq!(bytes.len(), size + 11);
+        } else {
+            assert!(bytes.len() < 64 * 1024 * 1024 + 256);
+            assert!(
+                bytes
+                    .windows("省略中间输出".len())
+                    .any(|w| w == "省略中间输出".as_bytes())
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn terminal_megabyte_success_and_failure_spool_is_complete() {
+    let h = PtyHarness::new().await;
+    for code in [0, 3] {
+        let cmd = format!(
+            "printf 'HEAD\\n'; head -c 1048576 /dev/zero | tr '\\000' x; printf '\\nTAIL\\n'; (exit {code})"
+        );
+        let out = completed(
+            h.executor
+                .execute(call(&cmd, Target::Terminal, Duration::from_secs(15)))
+                .await,
+        );
+        assert_eq!(out.exit_code, Some(code));
+        assert!(out.stdout().contains("HEAD"));
+        assert!(out.stdout().chars().count() <= if code == 0 { 2100 } else { 10000 });
+        if code != 0 {
+            assert!(out.stdout().contains("TAIL"));
+        }
+        let path =
+            shellmate_core::ai_output::path(&h._temp.0, "pty", out.output_id.as_ref().unwrap())
+                .unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() >= 1_048_576);
+        assert!(bytes.starts_with(b"HEAD\r\n"));
+        assert!(bytes.ends_with(b"TAIL\r\n"));
+        assert!(!bytes.windows(5).any(|w| w == b"6973;"));
+        h.settled().await;
+    }
+}
+#[tokio::test]
+async fn local_background_returns_immediately_read_running_then_notice_and_retained_inventory() {
+    use shellmate_ai::agent::{LocalTool, ReadOutput};
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "test".into());
+    let mut c = call(
+        "cd .; printf 'zero\none\nmatch-a\n'; while [ ! -f release ]; do sleep 0.02; done; printf 'match-b\nend\n'",
+        Target::Background,
+        Duration::from_secs(30),
+    );
+    c.run_in_background = true;
+    let now = Instant::now();
+    let out = completed(run_local(&tasks, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
+    assert!(now.elapsed() < Duration::from_secs(1));
+    let message = out.message.unwrap();
+    assert!(message.contains("后台启动"));
+    assert!(message.contains("其中的 cd 不会影响后续命令"));
+    assert!(!message.contains("命令仍在终端中运行"));
+    let id = out.task_id.unwrap();
+    let read = |offset, limit, grep: Option<&str>| {
+        LocalTool::ReadOutput(ReadOutput {
+            id: id.clone(),
+            offset_line: offset,
+            limit_lines: Some(limit),
+            grep: grep.map(str::to_owned),
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let filtered = tasks
+            .local_tool(read(0, 2000, Some("match")), Default::default())
+            .await;
+        if filtered.inline.contains("match-a") {
+            assert!(!filtered.inline.contains("match-b"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "initial output never arrived");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let running = tasks.local_tool(read(1, 1, None), Default::default()).await;
+    assert!(running.inline.ends_with("one\n"));
+    let (active, outputs) = tasks.state();
+    assert_eq!(active.len(), 1);
+    assert!(outputs[0].contains(out.output_id.as_ref().unwrap()));
+    std::fs::write(temp.0.join("release"), []).unwrap();
+    while tasks.has_running() {
+        assert!(
+            Instant::now() < deadline,
+            "task did not finish after release"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        tasks.take_notices(),
+        ["后台任务 #1 已结束 · 退出码 0 · 用 read_output 查看输出"]
+    );
+    assert!(tasks.take_notices().is_empty());
+    assert!(tasks.state().0.is_empty());
+    let filtered = tasks
+        .local_tool(read(0, 2000, Some("match")), Default::default())
+        .await;
+    assert!(filtered.inline.contains("match-a\nmatch-b\n"));
+    shellmate_core::ai_output::delete_conversation(&temp.0, "test").unwrap();
+    assert_eq!(
+        tasks
+            .local_tool(read(0, 2000, None), Default::default())
+            .await
+            .inline,
+        shellmate_core::ai_output::CLEARED
+    );
+}
+#[tokio::test]
+async fn timeout_finishes_later_sleep_is_stopped_and_cd_hint_is_present() {
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "test".into());
+    let out = completed(
+        run_local(
+            &tasks,
+            call(
+                "cd .; sleep 0.3; printf done",
+                Target::Background,
+                Duration::from_millis(50),
+            ),
+            temp.0.clone(),
+            "/bin/sh",
+            Some(&temp.0),
+        )
+        .await,
+    );
+    let message = out.message.unwrap();
+    assert!(message.contains("其中的 cd 不会影响后续命令"));
+    assert!(!message.contains("命令仍在终端中运行"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        tasks.list()[0].status,
+        super::super::tasks::Status::Exited(Some(0))
+    );
+    assert_eq!(tasks.take_notices().len(), 1);
+    let start = Instant::now();
+    let out = completed(
+        run_local(
+            &tasks,
+            call(
+                "TOKEN=x sleep 30",
+                Target::Background,
+                Duration::from_millis(50),
+            ),
+            temp.0.clone(),
+            "/bin/sh",
+            Some(&temp.0),
+        )
+        .await,
+    );
+    assert!(out.timed_out && !out.successful);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(tasks.list()[1].status, super::super::tasks::Status::Stopped);
+}
+#[tokio::test]
+async fn terminal_timeout_keeps_capture_busy_stop_task_interrupts_and_shell_recovers() {
+    let h = PtyHarness::new().await;
+    let out = completed(
+        h.executor
+            .execute(call(
+                "printf 'started\\n'; sleep 30",
+                Target::Terminal,
+                Duration::from_millis(100),
+            ))
+            .await,
+    );
+    assert!(out.message.unwrap().contains("已转到后台"));
+    assert!(h.scan.lock().unwrap().is_some());
+    let read = h
+        .executor
+        .tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::ReadOutput(shellmate_ai::agent::ReadOutput {
+                id: out.output_id.unwrap(),
+                offset_line: 0,
+                limit_lines: None,
+                grep: None,
+            }),
+            Default::default(),
+        )
+        .await;
+    assert!(read.inline.contains("started"));
+    assert_eq!(
+        h.executor
+            .execute(call("echo busy", Target::Terminal, Duration::from_secs(1)))
+            .await,
+        ToolOutcome::Busy
+    );
+    let mut busy = call("echo still-busy", Target::Terminal, Duration::from_secs(1));
+    busy.run_in_background = true;
+    assert_eq!(h.executor.execute(busy).await, ToolOutcome::Busy);
+    let stopped = h
+        .executor
+        .tasks
+        .local_tool(
+            shellmate_ai::agent::LocalTool::StopTask {
+                id: out.task_id.unwrap(),
+            },
+            Default::default(),
+        )
+        .await;
+    assert!(stopped.inline.contains("已停止任务"));
+    h.settled().await;
+    let out = completed(
+        h.executor
+            .execute(call(
+                "printf usable",
+                Target::Terminal,
+                Duration::from_secs(3),
+            ))
+            .await,
+    );
+    assert_eq!(out.stdout().trim(), "usable");
+}
+#[tokio::test]
+async fn dropping_registry_stops_background_process_groups() {
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "test".into());
+    let mut c = call(group_command(), Target::Background, Duration::from_secs(60));
+    c.run_in_background = true;
+    run_local(&tasks, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await;
+    let ids = pids(&temp.0.join("pids")).await;
+    drop(tasks);
+    assert_gone(&ids).await;
+}
+
+#[tokio::test]
+async fn terminal_directory_change_persists_after_timeout_or_background() {
+    for run_in_background in [false, true] {
+        let h = PtyHarness::new().await;
+        let command = "cd /; printf 'directory changed\\n'; sleep 0.3; pwd";
+        let mut c = call(command, Target::Terminal, Duration::from_millis(50));
+        c.run_in_background = run_in_background;
+        let out = completed(h.executor.execute(c).await);
+        let message = out.message.unwrap();
+        assert!(message.contains(if run_in_background {
+            "后台启动"
+        } else {
+            "已转到后台"
+        }));
+        assert!(message.contains("命令仍在终端中运行"));
+        assert!(message.contains("结束后终端状态（包括目录变化）会保留"));
+        assert!(message.contains("在此之前终端处于占用状态"));
+        assert!(!message.contains("其中的 cd 不会影响后续命令"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.executor.tasks.has_running() {
+            assert!(Instant::now() < deadline, "terminal command did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        h.settled().await;
+        {
+            let typed = h.typed.lock().unwrap();
+            assert_eq!(typed.len(), 1);
+            // Preserve the pre-M3 input envelope and marker, with the approved
+            // command itself typed verbatim, including its original quotes.
+            let line = String::from_utf8_lossy(&typed[0]);
+            assert!(line.starts_with(&format!("\x15 {command}; printf '\\033]6973;")));
+            assert!(!line.contains("eval"));
+        }
+        let out = completed(
+            h.executor
+                .execute(call("pwd", Target::Terminal, Duration::from_secs(5)))
+                .await,
+        );
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout().trim(), "/");
+    }
 }

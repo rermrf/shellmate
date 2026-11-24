@@ -38,6 +38,76 @@ impl ActiveStep {
     }
 }
 impl Drawer {
+    pub(super) fn task_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let tasks = if self.fixture {
+            self.fixture_tasks.clone()
+        } else {
+            self.tasks.as_ref().map(|t| t.running()).unwrap_or_default()
+        };
+        let running: Vec<_> = tasks
+            .into_iter()
+            .filter(|t| t.status == crate::ai::tasks::Status::Running && t.background)
+            .collect();
+        if running.is_empty() {
+            return None;
+        }
+        let p = cx.palette();
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .pb(px(6.))
+            .mb(px(2.))
+            .border_b_1()
+            .border_color(p.line);
+        for task in running {
+            let id = task.id.clone();
+            let stop_id = id.clone();
+            strip = strip.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(11.5))
+                    .text_color(p.tx2)
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(5.))
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .bg(p.card3)
+                            .child(format!("#{} {}", id, task.target.label())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(task.command),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .child(format!("{}s", task.started.elapsed().as_secs())),
+                    )
+                    .child(
+                        step_action(SharedString::from(format!("task-stop-{id}")), "停止", cx)
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                if s.fixture {
+                                    s.fixture_tasks.retain(|t| t.id != stop_id);
+                                } else if let Some(tasks) = &s.tasks {
+                                    tasks.stop(&stop_id);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        Some(strip)
+    }
     pub(super) fn permission_key(&self) -> &str {
         self.host.as_deref().unwrap_or("local")
     }
@@ -45,6 +115,7 @@ impl Drawer {
         if !self.state.model.busy
             && !self.state.pending
             && self.state.continuation.is_none()
+            && !self.has_running_tasks()
             && let Some(context) = self.next_context.take()
         {
             self.sync_context(context, cx);
@@ -114,8 +185,7 @@ impl Drawer {
                         let _ = reply.send(snapshot);
                     }
                     // Cleanup survives drawer cancellation/destruction and ignores the UI epoch.
-                    Ui::TerminalFinish { session, nonce }
-                    | Ui::TerminalInterrupt { session, nonce } => {
+                    Ui::TerminalFinish { session, nonce } => {
                         workspace
                             .update_in(cx, |s, _, cx| {
                                 s.ai_terminal_finish(session, &nonce, finish, cx)
@@ -138,6 +208,7 @@ impl Drawer {
                         session,
                         command,
                         nonce,
+                        spool,
                         lease,
                         reply,
                     } => {
@@ -149,9 +220,9 @@ impl Drawer {
                         }
                         let result = workspace
                             .update_in(cx, |s, _, cx| {
-                                s.ai_terminal_start(session, &command, &nonce, &lease, cx)
+                                s.ai_terminal_start(session, &command, &nonce, &lease, spool, cx)
                             })
-                            .unwrap_or(Err(ToolOutcome::Disconnected));
+                            .unwrap_or(Err(Box::new(ToolOutcome::Disconnected)));
                         if reply.send(result).is_err() {
                             workspace
                                 .update_in(cx, |s, _, cx| {
@@ -532,13 +603,18 @@ impl Drawer {
                 exit_code.map_or_else(|| "未知".into(), |n| n.to_string()),
                 *duration_ms as f64 / 1000.
             ),
+            StepStatus::Background => "已转后台".into(),
             StepStatus::TimedOut => "超时".into(),
             StepStatus::Denied { .. } => "已拒绝".into(),
             StepStatus::Busy => "终端正忙".into(),
             StepStatus::Disconnected => "会话已断开".into(),
             StepStatus::Failed(_) => "失败".into(),
         };
-        let color = if *status == StepStatus::Completed && *exit_code == Some(0) {
+        let color = if *status == StepStatus::Background {
+            p.acc
+        } else if *status == StepStatus::Completed
+            && shellmate_ai::output::successful(command, *exit_code)
+        {
             p.ok
         } else {
             p.err
@@ -998,6 +1074,8 @@ impl Drawer {
                 .into(),
                 target: Target::Background,
                 timeout: Duration::from_secs(30),
+                run_in_background: false,
+                exec_limits: shellmate_ai::agent::ExecLimits::default(),
                 class: classify(command),
             }));
         }

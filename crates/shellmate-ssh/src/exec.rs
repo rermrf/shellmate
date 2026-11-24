@@ -223,6 +223,21 @@ impl Connection {
         Ok(ExecStream { rx, ending, _connection: self.clone() })
     }
 
+    /// Lossless byte chunks, with no output or execution-time limit. The caller
+    /// owns the channel lifetime: dropping this handle closes it even while idle.
+    /// Backpressure is direct (no detached reader or unbounded queue).
+    pub async fn exec_spooled(&self, command: &str) -> Result<ExecSpool, SshError> {
+        let (read, closing, backlog) = self.open_exec(command).await?;
+        Ok(ExecSpool {
+            read,
+            _closing: closing,
+            queue: backlog.into(),
+            connection: self.clone(),
+            status: None,
+            done: false,
+        })
+    }
+
     /// Opens a session channel and starts `command` on it. Returns what reads the channel, what closes
     /// it when dropped, and what arrived before the server answered the request.
     async fn open_exec(&self, command: &str) -> Result<(ChannelReadHalf, CloseOnDrop, Vec<ChannelMsg>), SshError> {
@@ -262,6 +277,84 @@ impl Drop for CloseOnDrop {
                 // Nothing to do if the server closed it first or the connection is gone.
                 let _ = tokio::time::timeout(CLOSE_LIMIT, write.close()).await;
             });
+        }
+    }
+}
+
+/// An untruncated stdout/stderr fragment in SSH channel arrival order.
+pub struct ExecChunk {
+    /// Unmodified channel bytes.
+    pub bytes: Vec<u8>,
+    /// True for SSH extended-data stream 1.
+    pub stderr: bool,
+}
+/// Lossless channel reader; early drop requests KILL and closes its channel.
+pub struct ExecSpool {
+    read: ChannelReadHalf,
+    _closing: CloseOnDrop,
+    queue: std::collections::VecDeque<ChannelMsg>,
+    connection: Connection,
+    status: Option<ExecStatus>,
+    done: bool,
+}
+impl Drop for ExecSpool {
+    fn drop(&mut self) {
+        // A non-writing remote command may survive pipe closure. This ownership
+        // rule is specific to the AI spool handle; legacy exec/line streams keep
+        // their existing CloseOnDrop behavior.
+        if !self.done && self.status.is_none() && let Some(write) = self._closing.write.take() {
+            self._closing.runtime.spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_LIMIT, async {
+                    let _ = write.signal(russh::Sig::KILL).await;
+                    let _ = write.close().await;
+                }).await;
+            });
+        }
+    }
+}
+impl ExecSpool {
+    /// Exit status once supplied by the server.
+    pub fn status(&self) -> Option<ExecStatus> {
+        self.status.clone()
+    }
+    /// Next stdout/stderr chunk; None means the channel finished.
+    pub async fn next_chunk(&mut self) -> Result<Option<ExecChunk>, SshError> {
+        while !self.done {
+            let msg = match self.queue.pop_front() {
+                Some(msg) => Some(msg),
+                None => self.read.wait().await,
+            };
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    return Ok(Some(ExecChunk {
+                        bytes: data.to_vec(),
+                        stderr: false,
+                    }));
+                }
+                Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    return Ok(Some(ExecChunk {
+                        bytes: data.to_vec(),
+                        stderr: true,
+                    }));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    self.status = Some(ExecStatus::Code(exit_status))
+                }
+                Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                    self.status = Some(ExecStatus::Signal(format!("{signal_name:?}")))
+                }
+                Some(ChannelMsg::Close) | None => self.done = true,
+                _ => {}
+            }
+        }
+        if self.connection.is_closed() && self.status.is_none() {
+            Err(SshError::Disconnected(
+                self.connection
+                    .disconnect_reason()
+                    .unwrap_or_else(|| "连接已断开".into()),
+            ))
+        } else {
+            Ok(None)
         }
     }
 }

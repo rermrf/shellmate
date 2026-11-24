@@ -40,6 +40,9 @@ pub struct SessionContext {
 }
 pub struct Drawer {
     state: state::ConversationState,
+    data_root: std::path::PathBuf,
+    tasks: Option<super::tasks::Tasks>,
+    fixture_tasks: Vec<super::tasks::TaskInfo>,
     save_conversations: bool,
     workspace: WeakEntity<Workspace>,
     db: SharedStore,
@@ -70,6 +73,7 @@ impl Drawer {
         workspace: WeakEntity<Workspace>,
         db: SharedStore,
         credentials: Arc<CredentialStore>,
+        data_root: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -87,7 +91,47 @@ impl Drawer {
         );
         let configured = db.borrow().ai_settings().is_ok_and(|s| s.configured());
         let save_conversations = saving_enabled(&db);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                if this
+                    .update_in(cx, |s, _, cx| {
+                        if !s.state.model.busy
+                            && let Some(tasks) = &s.tasks
+                        {
+                            let notices = tasks.take_notices();
+                            let changed = !notices.is_empty();
+                            for text in notices {
+                                s.state
+                                    .model
+                                    .conversation
+                                    .append(shellmate_ai::Entry::Notice {
+                                        kind: "task".into(),
+                                        text,
+                                    });
+                            }
+                            if changed {
+                                s.persist();
+                            }
+                        }
+                        if s.tasks.is_some() {
+                            s.release_context(cx);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
+            data_root,
+            tasks: None,
+            fixture_tasks: Vec::new(),
             state: state::ConversationState::default(),
             save_conversations,
             workspace,
@@ -122,9 +166,12 @@ impl Drawer {
         if self.fixture {
             return;
         }
-        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() {
+        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks() {
             self.next_context = Some(context);
             return;
+        }
+        if self.session != context.session {
+            self.retire_tasks();
         }
         self.session = context.session;
         self.host = context.host;
@@ -305,6 +352,18 @@ impl Drawer {
             cx.notify();
             return;
         };
+        self.ensure_tasks();
+        if let Some(tasks) = &self.tasks {
+            for text in tasks.take_notices() {
+                self.state
+                    .model
+                    .conversation
+                    .append(shellmate_ai::Entry::Notice {
+                        kind: "task".into(),
+                        text,
+                    });
+            }
+        }
         let mut conversation = self.state.model.conversation.clone();
         let (tx, rx) = async_channel::bounded(64);
         let epoch = self.epoch;
@@ -320,6 +379,7 @@ impl Drawer {
             .map(|b| b.alive.clone())
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let executor = super::exec::AppExecutor {
+            tasks: self.tasks.as_ref().unwrap().clone(),
             binding: binding.unwrap_or(super::exec::Binding {
                 session: usize::MAX,
                 capabilities: Capabilities::default(),
@@ -393,6 +453,7 @@ impl Drawer {
                                 s.persist();
                             }
                             Worker::Event(event, updates, ready) => {
+                                let event = *event;
                                 let durable = matches!(&event, AgentEvent::Context { .. }) || updates.iter().any(|u| !matches!(u, shellmate_ai::LogUpdate::Append(e) if matches!(&**e, shellmate_ai::Entry::Assistant { .. })));
                                 for update in updates { s.state.model.conversation.apply(update); }
                                 s.agent_event(event);
@@ -419,6 +480,43 @@ impl Drawer {
         .detach();
         cx.notify();
     }
+    pub(super) fn has_running_tasks(&self) -> bool {
+        self.tasks.as_ref().is_some_and(|tasks| tasks.has_running())
+    }
+    fn ensure_tasks(&mut self) {
+        if self.tasks.is_none() {
+            self.tasks = Some(super::tasks::Tasks::new(
+                self.data_root.clone(),
+                self.state.id.clone(),
+            ));
+        }
+        self.tasks
+            .as_ref()
+            .unwrap()
+            .remember_outputs(&self.state.model.conversation);
+    }
+    fn retire_tasks(&mut self) {
+        if let Some(tasks) = self.tasks.take() {
+            tasks.stop_all();
+        }
+    }
+    fn close_outputs(&mut self) {
+        self.retire_tasks();
+        if !self.fixture
+            && let Err(e) = shellmate_core::ai_output::close_conversation(
+                &self.data_root,
+                &self.state.id,
+                saving_enabled(&self.db),
+            )
+        {
+            log::warn!("remove AI outputs: {e}");
+        }
+    }
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+        if !saving_enabled(&self.db) {
+            self.clear(cx);
+        }
+    }
     fn persist(&mut self) {
         if self.fixture {
             return;
@@ -430,7 +528,10 @@ impl Drawer {
             &self.model_id,
         );
     }
-    fn stop(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(tasks) = &self.tasks {
+            tasks.stop_all();
+        }
         if let Some(abort) = self.abort.take() {
             abort.abort();
         }
@@ -438,7 +539,24 @@ impl Drawer {
         self.state.continuation = None;
         self.state.run_config = None;
         if let Some(step) = self.state.active_step.take() {
-            self.state.model.conversation.push_item(shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call));
+            let display = shellmate_ai::StepDisplay::from_item(
+                shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call),
+            );
+            let output_id = step.started.and_then(|_| {
+                self.tasks
+                    .as_ref()
+                    .and_then(|t| t.output_id_for(&step.call.id))
+            });
+            let inline = output_id.as_ref().map_or_else(
+                || "已停止".into(),
+                |id| format!("已停止 · 输出 id {id} · 用 read_output 查看输出"),
+            );
+            self.state.model.conversation.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
+                message_id: self.state.model.conversation.entries().len(),
+                call: shellmate_ai::LoggedCall { id: step.call.id, name: "run_command".into(), args_json: serde_json::json!({"command":step.call.command,"target":step.call.target.id(),"run_in_background":step.call.run_in_background}) },
+                result: shellmate_ai::LoggedResult { inline, output_id, cleared: false, is_error: true },
+                display,
+            }));
         }
         self.state.pending = false;
         self.binding = None;
@@ -451,6 +569,7 @@ impl Drawer {
     }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.stop(cx);
+        self.close_outputs();
         self.state.reset_conversation();
         self.permission_menu = false;
         self.history_rows.clear();
@@ -498,6 +617,7 @@ impl Drawer {
         match loaded {
             Ok(Some(c)) => {
                 self.stop(cx);
+                self.close_outputs();
                 self.state.reset_conversation();
                 self.state.id = c.id;
                 self.state.created = c.created_at;
@@ -519,8 +639,16 @@ impl Drawer {
         if self.state.id == id {
             self.stop(cx);
         }
-        match self.state.delete(&mut self.db.borrow_mut(), id) {
+        let deleted = self.state.delete(&mut self.db.borrow_mut(), id);
+        match deleted {
             Ok(current) => {
+                if current {
+                    self.retire_tasks();
+                }
+                if let Err(e) = shellmate_core::ai_output::delete_conversation(&self.data_root, id)
+                {
+                    self.state.save_error = Some(format!("无法删除输出：{e}"));
+                }
                 self.history_rows.retain(|r| r.id != id);
                 if current {
                     self.permission_menu = false;
@@ -592,7 +720,21 @@ impl Drawer {
         self.state.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
-        if let Some(fixture) = crate::proto::ai::compaction_scene(scene) {
+        self.fixture_tasks.clear();
+        if let Some(fixture) = crate::proto::ai::execution_scene(scene) {
+            self.state.model = fixture.model;
+            self.fixture_tasks = fixture.tasks;
+            self.label = "prod-web-01".into();
+            self.protocol = "SSH".into();
+            self.history = false;
+            self.state.readonly = false;
+            self.state.active_step = None;
+            self.capabilities = Capabilities {
+                terminal: true,
+                background: true,
+                ..Default::default()
+            };
+        } else if let Some(fixture) = crate::proto::ai::compaction_scene(scene) {
             self.state.model = fixture.model;
             self.label = "prod-web-01".into();
             self.protocol = "SSH".into();
@@ -709,10 +851,15 @@ fn saving_enabled(db: &SharedStore) -> bool {
 }
 enum Worker {
     Started,
-    Event(AgentEvent, Vec<shellmate_ai::LogUpdate>, tokio::sync::oneshot::Sender<()>),
+    Event(
+        Box<AgentEvent>,
+        Vec<shellmate_ai::LogUpdate>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
+        self.close_outputs();
         if let Some(abort) = self.abort.take() {
             abort.abort();
         }
@@ -1205,6 +1352,7 @@ impl Render for Drawer {
             .flex()
             .flex_col()
             .gap(px(6.))
+            .children(self.task_strip(cx))
             .child(self.permission_chip(cx))
             .child(
                 div()
@@ -1277,6 +1425,8 @@ async fn worker_event(tx: &async_channel::Sender<Worker>, event: AgentEvent) -> 
 }
 async fn worker_update(tx: &async_channel::Sender<Worker>, event: AgentEvent, updates: Vec<shellmate_ai::LogUpdate>) -> Result<(), ()> {
     let (ready, receive) = tokio::sync::oneshot::channel();
-    tx.send(Worker::Event(event, updates, ready)).await.map_err(|_| ())?;
+    tx.send(Worker::Event(Box::new(event), updates, ready))
+        .await
+        .map_err(|_| ())?;
     receive.await.map_err(|_| ())
 }

@@ -689,10 +689,37 @@ impl Terminal {
     pub fn agent_liveness(&self) -> Arc<AtomicBool> { self.alive.lock().clone() }
     pub fn agent_connected(&self) -> bool { self.alive.lock().load(Ordering::Acquire) && self.backend.is_some() && !self.replay }
     pub fn agent_busy(&self) -> bool { self.agent.lock().busy(self.mode().contains(TermMode::ALT_SCREEN)) || self.capture.lock().running() }
-    pub fn agent_start(&mut self, command: &str, nonce: &str) -> Result<crate::agent::CaptureHandle, &'static str> {
-        if !self.agent_connected() { return Err("disconnected"); }
-        if self.capture.lock().running() { return Err("busy"); }
-        let (scanner, handle) = crate::agent::MarkerScanner::new(nonce);
+    pub fn agent_start(
+        &mut self,
+        command: &str,
+        nonce: &str,
+    ) -> Result<crate::agent::CaptureHandle, &'static str> {
+        self.agent_start_capture(command, nonce, None)
+    }
+    pub fn agent_start_spooled(
+        &mut self,
+        command: &str,
+        nonce: &str,
+        spool: shellmate_core::ai_output::Spool,
+    ) -> Result<crate::agent::CaptureHandle, &'static str> {
+        self.agent_start_capture(command, nonce, Some(spool))
+    }
+    fn agent_start_capture(
+        &mut self,
+        command: &str,
+        nonce: &str,
+        spool: Option<shellmate_core::ai_output::Spool>,
+    ) -> Result<crate::agent::CaptureHandle, &'static str> {
+        if !self.agent_connected() {
+            return Err("disconnected");
+        }
+        if self.capture.lock().running() {
+            return Err("busy");
+        }
+        let (scanner, handle) = match spool {
+            Some(spool) => crate::agent::MarkerScanner::spooled(nonce, spool),
+            None => crate::agent::MarkerScanner::new(nonce),
+        };
         {
             let mut agent = self.agent.lock();
             if agent.busy(self.mode().contains(TermMode::ALT_SCREEN)) { return Err("busy"); }

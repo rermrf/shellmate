@@ -1,5 +1,6 @@
 //! Shellmate domain logic that does not depend on the UI toolkit.
 
+pub mod ai_output;
 pub mod filter;
 pub mod host;
 pub mod import;

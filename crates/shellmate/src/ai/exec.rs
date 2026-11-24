@@ -4,7 +4,8 @@ use shellmate_ai::{
     agent::{Target, ToolCall, ToolOutcome},
     output::shape,
 };
-use shellmate_ssh::{Connection, ExecOptions, ExecStatus, SshError};
+use shellmate_core::ai_output::Spool;
+use shellmate_ssh::{Connection, ExecStatus, SshError};
 use std::{
     io::{ErrorKind, Read},
     os::{fd::AsRawFd, unix::process::CommandExt},
@@ -17,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
-pub const CAP: usize = 256 * 1024;
 fn terminal_nonce() -> String {
     const ALPHANUMERIC: &[u8; 62] =
         b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -39,36 +39,35 @@ pub fn wrapped(command: &str) -> String {
         "export PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER= SYSTEMD_COLORS=0 TERM=dumb LC_ALL=C.UTF-8; {command}"
     )
 }
-pub async fn ssh(connection: &Connection, call: &ToolCall) -> ToolOutcome {
+pub async fn ssh(connection: &Connection, call: &ToolCall, spool: &Spool) -> ToolOutcome {
     let started = Instant::now();
-    match connection
-        .exec_with(
-            &wrapped(&call.command),
-            ExecOptions {
-                timeout: call.timeout,
-                max_output: CAP,
-            },
-        )
-        .await
-    {
-        Ok(out) => {
-            let code = match out.status {
-                ExecStatus::Code(n) => i32::try_from(n).ok(),
-                ExecStatus::Signal(signal) => signal_code(&signal),
-                ExecStatus::Unknown => None,
-            };
-            ToolOutcome::Completed(shape(
-                out.stdout,
-                out.stderr,
-                code,
-                started.elapsed(),
-                false,
-                out.truncated,
-            ))
+    let result = async {
+        let mut stream = connection.exec_spooled(&wrapped(&call.command)).await?;
+        while let Some(chunk) = stream.next_chunk().await? {
+            if !spool
+                .write(&chunk.bytes, chunk.stderr)
+                .map_err(|e| SshError::Channel(e.to_string()))?
+            {
+                return Ok(ToolOutcome::Failed("输出超过 5 GB，命令已停止".into()));
+            }
         }
-        Err(SshError::ExecTimeout { .. }) => {
-            ToolOutcome::Completed(shape([], [], None, started.elapsed(), true, false))
-        }
+        let code = match stream.status() {
+            Some(ExecStatus::Code(n)) => i32::try_from(n).ok(),
+            Some(ExecStatus::Signal(signal)) => signal_code(&signal),
+            _ => None,
+        };
+        Ok(ToolOutcome::Completed(shape(
+            [],
+            [],
+            code,
+            started.elapsed(),
+            false,
+            false,
+        )))
+    }
+    .await;
+    match result {
+        Ok(out) => out,
         Err(SshError::Disconnected(_)) => ToolOutcome::Disconnected,
         Err(_) if connection.is_closed() => ToolOutcome::Disconnected,
         Err(e) => ToolOutcome::Failed(e.to_string()),
@@ -112,29 +111,30 @@ fn nonblocking(fd: &impl AsRawFd) -> std::io::Result<()> {
     }
     Ok(())
 }
-fn drain(pipe: &mut impl Read, kept: &mut Vec<u8>, truncated: &mut bool) -> std::io::Result<()> {
+fn drain(pipe: &mut impl Read, spool: &Spool, stderr: bool) -> std::io::Result<bool> {
     let mut buf = [0; 8192];
-    // Bound each poll even for an endless writer, so cancel/timeout stay responsive.
-    for _ in 0..32 {
+    // One chunk per pipe per poll, preserving observed interleaving and cancellation.
+    loop {
         match pipe.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return Ok(true),
             Ok(n) => {
-                let room = CAP.saturating_sub(kept.len());
-                *truncated |= n > room;
-                kept.extend_from_slice(&buf[..n.min(room)]);
+                if !spool.write(&buf[..n], stderr)? {
+                    return Err(std::io::Error::other("输出超过 5 GB，命令已停止"));
+                }
+                return Ok(false);
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock) => break,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    Ok(())
 }
 pub async fn local(
     call: &ToolCall,
     cwd: PathBuf,
     shell: &str,
     home: Option<&std::path::Path>,
+    spool: &Spool,
 ) -> ToolOutcome {
     let started = Instant::now();
     let result = async {
@@ -155,32 +155,33 @@ pub async fn local(
         let mut stderr = child.0.stderr.take().unwrap();
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
-        let (mut out, mut err, mut truncated) = (Vec::new(), Vec::new(), false);
-        let (code, timed_out) = loop {
-            drain(&mut stdout, &mut out, &mut truncated)?;
-            drain(&mut stderr, &mut err, &mut truncated)?;
-            if let Some(status) = child.0.try_wait()? {
-                drain(&mut stdout, &mut out, &mut truncated)?;
-                drain(&mut stderr, &mut err, &mut truncated)?;
-                use std::os::unix::process::ExitStatusExt;
-                break (
-                    status.code().or_else(|| status.signal().map(|n| 128 + n)),
-                    false,
-                );
+        let mut status = None;
+        let mut eof = (false, false);
+        loop {
+            if !eof.0 {
+                eof.0 = drain(&mut stdout, spool, false)?;
             }
-            if started.elapsed() >= call.timeout {
-                break (None, true);
+            if !eof.1 {
+                eof.1 = drain(&mut stderr, spool, true)?;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+            if status.is_none() {
+                status = child.0.try_wait()?;
+            }
+            if status.is_some() && eof.0 && eof.1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let code = status.and_then(|s| s.code().or_else(|| s.signal().map(|n| 128 + n)));
         drop(child);
         Ok::<_, std::io::Error>(ToolOutcome::Completed(shape(
-            out,
-            err,
+            [],
+            [],
             code,
             started.elapsed(),
-            timed_out,
-            truncated,
+            false,
+            false,
         )))
     }
     .await;
@@ -199,36 +200,69 @@ pub async fn disconnected(alive: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+#[derive(Clone)]
 pub struct AppExecutor {
     pub binding: Binding,
+    pub tasks: super::tasks::Tasks,
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn output_id(&self, call: &ToolCall) -> Option<String> {
+        self.tasks.output_id_for(&call.id)
+    }
+    fn local_tool(
+        &self,
+        tool: shellmate_ai::agent::LocalTool,
+        limits: shellmate_ai::agent::ExecLimits,
+    ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        Box::pin(self.tasks.local_tool(tool, limits))
+    }
+    fn take_notices(&self) -> Vec<String> {
+        self.tasks.take_notices()
+    }
+    fn task_state(&self) -> (Vec<String>, Vec<String>) {
+        self.tasks.state()
+    }
     fn execute(&self, call: ToolCall) -> futures::future::BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
             if !self.binding.capabilities.offers(call.target) {
                 return ToolOutcome::Failed("此会话不支持该执行目标".into());
             }
-            tokio::select! {
-                biased;
-                () = disconnected(&self.binding.alive) => ToolOutcome::Disconnected,
-                out = async {
-                    match call.target {
-                        Target::Terminal => self.terminal(&call).await,
-                        Target::Background if self.binding.local => {
-                            let (reply, receive) = oneshot::channel();
-                            if self.ui.send(Ui::LocalCwd { session: self.binding.session, reply }).await.is_err() { return ToolOutcome::Disconnected; }
-                            let directory = match receive.await { Ok(path) => path, Err(_) => return ToolOutcome::Disconnected };
-                            if !self.binding.alive.load(Ordering::Acquire) { return ToolOutcome::Disconnected; }
-                            let cwd = directory.map(PathBuf::from).or_else(||std::env::var_os("HOME").map(PathBuf::from));
-                            let Some(cwd) = cwd else { return ToolOutcome::Failed("无法确定本机工作目录".into()); };
-                            let shell = std::env::var("SHELL").ok().filter(|s|!s.is_empty()).unwrap_or_else(||"/bin/zsh".into());
-                            local(&call, cwd, &shell, None).await
-                        }
-                        Target::Background => match &self.binding.connection { Some(c) => ssh(c, &call).await, None => ToolOutcome::Disconnected },
-                    }
-                } => out,
+            if !self.binding.alive.load(Ordering::Acquire) {
+                return ToolOutcome::Disconnected;
             }
+            // Workers own the binding and bridge, but never a strong registry reference.
+            let binding = self.binding.clone();
+            let ui = self.ui.clone();
+            let worker_call = call.clone();
+            let (ready_tx, ready_rx) = if call.target == Target::Terminal && call.run_in_background
+            {
+                let (tx, rx) = oneshot::channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            self.tasks.run(call, ready_rx, move |spool| Box::pin(async move {
+                tokio::select! {
+                    biased;
+                    () = disconnected(&binding.alive) => ToolOutcome::Disconnected,
+                    out = async {
+                        match worker_call.target {
+                            Target::Terminal => terminal(&binding, &ui, &worker_call, spool, ready_tx).await,
+                            Target::Background if binding.local => {
+                                let (reply, receive) = oneshot::channel();
+                                if ui.send(Ui::LocalCwd { session: binding.session, reply }).await.is_err() { return ToolOutcome::Disconnected; }
+                                let directory = match receive.await { Ok(path) => path, Err(_) => return ToolOutcome::Disconnected };
+                                let cwd = directory.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+                                let Some(cwd) = cwd else { return ToolOutcome::Failed("无法确定本机工作目录".into()); };
+                                let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+                                local(&worker_call, cwd, &shell, None, &spool).await
+                            }
+                            Target::Background => match &binding.connection { Some(c) => ssh(c, &worker_call, &spool).await, None => ToolOutcome::Disconnected },
+                        }
+                    } => out,
+                }
+            })).await
         })
     }
 }
@@ -245,71 +279,63 @@ impl Drop for TerminalGuard {
         });
     }
 }
-impl AppExecutor {
-    async fn terminal(&self, call: &ToolCall) -> ToolOutcome {
-        // Literal terminal input must never contain Enter/escape/control injection.
-        if call.command.chars().any(char::is_control) {
-            return ToolOutcome::Failed("终端命令须为单行且不能含控制字符，请改用后台执行".into());
+async fn terminal(
+    binding: &Binding,
+    ui: &async_channel::Sender<Ui>,
+    call: &ToolCall,
+    spool: Spool,
+    ready: Option<oneshot::Sender<()>>,
+) -> ToolOutcome {
+    // Literal terminal input must never contain Enter/escape/control injection.
+    if call.command.chars().any(char::is_control) {
+        return ToolOutcome::Failed("终端命令须为单行且不能含控制字符，请改用后台执行".into());
+    }
+    let started = Instant::now();
+    let nonce = terminal_nonce();
+    let _guard = TerminalGuard {
+        ui: ui.clone(),
+        session: binding.session,
+        nonce: nonce.clone(),
+    };
+    let (reply, receive) = oneshot::channel();
+    if ui
+        .send(Ui::TerminalStart {
+            session: binding.session,
+            command: call.command.clone(),
+            nonce,
+            spool,
+            lease: binding.alive.clone(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return ToolOutcome::Disconnected;
+    }
+    let handle = match receive.await {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(out)) => return *out,
+        Err(_) => return ToolOutcome::Disconnected,
+    };
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
+    loop {
+        let data = handle.snapshot();
+        if let Some(error) = data.error {
+            return ToolOutcome::Failed(error);
         }
-        let started = Instant::now();
-        let nonce = terminal_nonce();
-        let _guard = TerminalGuard {
-            ui: self.ui.clone(),
-            session: self.binding.session,
-            nonce: nonce.clone(),
-        };
-        let (reply, receive) = oneshot::channel();
-        if self
-            .ui
-            .send(Ui::TerminalStart {
-                session: self.binding.session,
-                command: call.command.clone(),
-                nonce,
-                lease: self.binding.alive.clone(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return ToolOutcome::Disconnected;
+        if data.exit_code.is_some() {
+            return ToolOutcome::Completed(shape(
+                [],
+                [],
+                data.exit_code,
+                started.elapsed(),
+                false,
+                false,
+            ));
         }
-        let handle = match receive.await {
-            Ok(Ok(handle)) => handle,
-            Ok(Err(out)) => return out,
-            Err(_) => return ToolOutcome::Disconnected,
-        };
-        let mut timed_out = false;
-        loop {
-            let data = handle.snapshot();
-            if data.exit_code.is_some()
-                || (timed_out && started.elapsed() >= call.timeout + Duration::from_secs(2))
-            {
-                let missing = if data.exit_code.is_none() {
-                    "未检测到命令结束标记（可能是不支持的 shell）"
-                } else {
-                    ""
-                };
-                return ToolOutcome::Completed(shape(
-                    shellmate_term::agent::strip_echo(&data.bytes),
-                    missing,
-                    data.exit_code,
-                    started.elapsed(),
-                    timed_out,
-                    data.truncated,
-                ));
-            }
-            if !timed_out && started.elapsed() >= call.timeout {
-                timed_out = true;
-                let _ = self
-                    .ui
-                    .send(Ui::TerminalInterrupt {
-                        session: self.binding.session,
-                        nonce: handle.nonce.clone(),
-                    })
-                    .await;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

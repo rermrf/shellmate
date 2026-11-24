@@ -18,7 +18,7 @@ pub struct LoggedCall {
 #[serde(crate = "rig_core::serde")]
 pub struct LoggedResult {
     pub inline: String,
-    /// Reserved for M3's spool; None means there is no read_output link.
+    /// Local spool id; absent for calls that never executed.
     pub output_id: Option<String>,
     pub cleared: bool,
     pub is_error: bool,
@@ -125,7 +125,10 @@ impl Step {
         let text = self.wire_text();
         if self.result.cleared
             && let Some(display) = &self.display
-            && !matches!(display.status, StepStatus::Completed | StepStatus::TimedOut)
+            && !matches!(
+                display.status,
+                StepStatus::Completed | StepStatus::TimedOut | StepStatus::Background
+            )
         {
             return format!("{}\n{text}", display.item().wire_text());
         }
@@ -317,7 +320,10 @@ impl Conversation {
                         inline,
                         output_id: None,
                         cleared: true,
-                        is_error: !matches!(display.status, StepStatus::Completed),
+                        is_error: !matches!(
+                            display.status,
+                            StepStatus::Completed | StepStatus::Background
+                        ),
                     },
                     display: Some(display),
                 })
@@ -381,6 +387,26 @@ impl Conversation {
                         Entry::Step(s) => {
                             if let Some(display) = &s.display {
                                 answer.items.push(display.item());
+                            } else if matches!(s.call.name.as_str(), "read_output" | "stop_task") {
+                                let label = if s.call.name == "read_output" {
+                                    "读取输出"
+                                } else {
+                                    "已停止任务"
+                                };
+                                let id = s
+                                    .call
+                                    .args_json
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let status = if s.result.is_error {
+                                    " · 未完成"
+                                } else {
+                                    ""
+                                };
+                                answer
+                                    .items
+                                    .push(AnswerItem::Notice(format!("{label} · {id}{status}")));
                             }
                         }
                         Entry::Compaction(c) => {
