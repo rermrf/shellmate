@@ -407,6 +407,15 @@ impl Drawer {
         });
         cx.notify();
     }
+    pub(super) fn open_memory(&mut self, action: Option<shellmate_ai::memory::Action>, w: &mut Window, cx: &mut Context<Self>) {
+        let key = if action.is_some() && self.state.readonly { self.state.history_memory_host.clone() }
+            else { self.memory_files().has_host().then(||self.permission_key().to_owned()) };
+        let focus = match action { Some(action)=>super::memory_model::Focus::from_action(&action,key.as_deref()), None=>Some(super::memory_model::Focus::current(key.as_deref())) };
+        let Some(focus)=focus else { return; };
+        if let Err(e)=super::memory_manager::MemoryManager::open(self.data_root.clone(),self.db.clone(),key.as_deref(),focus,w,cx) {
+            self.local(slash_ui::LocalBody::Hint(e),cx);
+        }
+    }
     pub(super) fn memory_files(&self) -> shellmate_core::memory::Memory {
         let saved = self.host.as_deref().filter(|id| self.db.borrow().host(&shellmate_core::HostId::from_raw(*id)).ok().flatten().is_some());
         let key = if self.binding.as_ref().is_some_and(|b| b.local) { Some(self.permission_key()) } else { saved };
@@ -703,6 +712,8 @@ impl Drawer {
                 self.state.reset_conversation();
                 self.state.id = c.id;
                 self.state.created = c.created_at;
+                self.state.history_memory_host = c.host_id.clone().filter(|id|self.db.borrow().host(&shellmate_core::HostId::from_raw(id.as_str())).ok().flatten().is_some())
+                    .or_else(||c.conversation.latest_user().filter(|u|u.context.protocol=="本机终端").map(|_|"local".into()));
                 self.provider = c.provider;
                 self.model_id = c.model;
                 self.state.model.conversation = c.conversation;
@@ -804,6 +815,10 @@ impl Drawer {
         self.configured = scene != "ai-unconfigured";
         self.fixture_tasks.clear();
         self.fixture_copy = Default::default();
+        if scene=="ai-memory-chip" {
+            self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
+            self.state.model.clear();self.state.model.conversation=crate::proto::memory::conversation();
+        }
         if crate::proto::remote::SCENES.contains(&scene) {
             self.label = "prod-web-01".into();
             self.protocol = "SSH".into();
@@ -1282,7 +1297,11 @@ impl Render for Drawer {
                                 continue;
                             }
                             shellmate_ai::AnswerItem::Notice(text) => {
-                                reply = reply.child(div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(text.clone()));
+                                let action = self.state.model.conversation.memory_action(index,n).cloned();
+                                let line = div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(text.clone());
+                                reply = reply.child(if let Some(action)=action {
+                                    line.flex().items_center().flex_wrap().gap(px(5.)).child("·").child(agent_ui::step_action(("ai-memory-view",index*1000+n),"查看",cx).on_click(cx.listener(move|s,_,w,cx|s.open_memory(Some(action.clone()),w,cx))))
+                                } else { line });
                                 continue;
                             }
                             item @ shellmate_ai::AnswerItem::Step { .. } => {

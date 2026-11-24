@@ -236,3 +236,47 @@ impl Workspace {
         );
     }
 }
+
+impl Workspace {
+    pub(crate) fn memory_root(&self) -> std::path::PathBuf {
+        self.hub.data_root.borrow().clone()
+    }
+    pub(crate) fn memory_host(&self) -> Option<String> {
+        let session = self.focused_session()?;
+        if matches!(session.kind, SessionKind::Local) {
+            return Some("local".into());
+        }
+        let host = session.host()?;
+        self.hub
+            .book
+            .borrow()
+            .host(&host.id)
+            .map(|h| h.id.to_string())
+    }
+    pub(crate) fn open_memory_manager(
+        &self,
+        focus: Option<crate::ai::memory_model::Focus>,
+        w: &mut Window,
+        cx: &mut App,
+    ) -> Result<Entity<crate::ai::memory_manager::MemoryManager>, String> {
+        let current = self.memory_host();
+        let focus =
+            focus.unwrap_or_else(|| crate::ai::memory_model::Focus::current(current.as_deref()));
+        crate::ai::memory_manager::MemoryManager::open(
+            self.memory_root(),
+            self.hub.store.clone(),
+            current.as_deref(),
+            focus,
+            w,
+            cx,
+        )
+    }
+    pub(crate) fn save_ai_host_note(&self, id: &HostId, text: &str) -> Result<(), String> {
+        crate::ai::memory_model::save_host_note(
+            &self.memory_root(),
+            &self.hub.store.borrow(),
+            id,
+            text,
+        )
+    }
+}

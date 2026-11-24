@@ -25,6 +25,46 @@ impl HostStore {
         Ok(())
     }
 }
+
+impl HostStore {
+    pub fn remote_docs(&self, host: &str) -> Result<Vec<(String, bool)>> {
+        let prefix = format!("ai_remote_doc_trust:{host}:");
+        let mut statement = self
+            .conn
+            .prepare("SELECT key,value FROM settings WHERE substr(key,1,?1)=?2 ORDER BY key")?;
+        let rows = statement
+            .query_map(params![prefix.chars().count() as i64, prefix], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(key, value)| match value.as_str() {
+                "trust" => Some((key[prefix.len()..].into(), true)),
+                "ignore" => Some((key[prefix.len()..].into(), false)),
+                _ => None,
+            })
+            .collect())
+    }
+    pub fn remove_remote_doc_trust(&mut self, host: &str, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM settings WHERE key=?1",
+            params![key(host, path)],
+        )?;
+        Ok(())
+    }
+    pub fn clear_remote_doc_trust(&mut self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM settings WHERE substr(key,1,20)='ai_remote_doc_trust:'",
+            [],
+        )?;
+        Ok(())
+    }
+    pub fn set_auto_memory(&mut self, enabled: bool) -> Result<()> {
+        self.set_setting("ai_auto_memory", if enabled { "true" } else { "false" })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

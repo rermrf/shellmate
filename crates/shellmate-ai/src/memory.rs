@@ -185,6 +185,28 @@ pub(crate) fn notice(args: &serde_json::Value, error: bool) -> String {
     format!("{verb} · {path}")
 }
 
+/// UI routing derived only from a successful persisted tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    pub path: String,
+    pub scope_only: bool,
+}
+pub fn action(args: &serde_json::Value, is_error: bool) -> Option<Action> {
+    if is_error {
+        return None;
+    }
+    let command = args["command"].as_str()?;
+    let field = match command {
+        "rename" => "new_path",
+        "create" | "str_replace" | "insert" | "delete" => "path",
+        _ => return None,
+    };
+    Some(Action {
+        path: args[field].as_str()?.into(),
+        scope_only: command == "delete",
+    })
+}
+
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;

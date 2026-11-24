@@ -54,6 +54,7 @@ impl Drawer {
                         self.compact_context((!args.is_empty()).then_some(args), w, cx);
                     }
                 }
+                "memory" => self.open_memory(None, w, cx),
                 "clear" => self.new_conversation(w, cx),
                 "tasks" => self.local(LocalBody::Tasks, cx),
                 "help" => self.local(LocalBody::Help, cx),

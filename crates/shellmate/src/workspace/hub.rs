@@ -22,6 +22,7 @@ pub(super) struct Services {
     pub book: RefCell<Rc<HostBook>>,
     pub preferences: RefCell<shellmate_store::Preferences>,
     pub data_root: RefCell<PathBuf>,
+    _memory_fixture: Option<tempfile::TempDir>,
     pub log_root: RefCell<PathBuf>,
     pub library_is_temporary: bool,
     pub user_host: RefCell<SharedString>,
@@ -225,6 +226,8 @@ impl Hub {
         .detach();
         #[cfg(target_os = "macos")]
         let status_bar = status_item::StatusBar::new(cx).into();
+        let memory_fixture = crate::prototype_fixture().then(|| tempfile::tempdir().expect("prototype memory root"));
+        let data_root = memory_fixture.as_ref().map_or_else(shellmate_term::archive::data_root, |d| d.path().to_path_buf());
         cx.set_global(Self {
             services: Rc::new(Services {
                 store,
@@ -233,7 +236,8 @@ impl Hub {
                 book: Default::default(),
                 library_is_temporary: temporary,
                 user_host: RefCell::new(user_at_host().into()),
-                data_root: shellmate_term::archive::data_root().into(),
+                data_root: data_root.into(),
+                _memory_fixture: memory_fixture,
                 log_root: shellmate_term::archive::log_root().into(),
                 groups: Default::default(),
                 pending_forms: Default::default(),

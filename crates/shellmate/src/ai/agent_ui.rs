@@ -872,7 +872,7 @@ fn step_actions() -> Div {
         .gap(px(12.))
 }
 
-fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &App) -> Button {
+pub(super) fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &App) -> Button {
     let p = cx.palette();
     Button::new(id)
         .text()
@@ -974,7 +974,7 @@ fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::s
         bg,
     ).selection(selection))
 }
-fn command_surface(cx: &App) -> Div {
+pub(super) fn command_surface(cx: &App) -> Div {
     div()
         .min_w_0()
         .p(px(11.))

@@ -59,6 +59,13 @@ pub const COMMANDS: &[Command] = &[
         while_busy: WhileBusy::Refuse,
     },
     Command {
+        name: "memory",
+        args_hint: "",
+        description: "查看和编辑 AI 说明与记忆",
+        kind: Kind::Local,
+        while_busy: WhileBusy::Run,
+    },
+    Command {
         name: "help",
         args_hint: "",
         description: "查看全部命令与用法",
@@ -314,7 +321,7 @@ mod tests {
                 Dispatch::Hint(STOP_FIRST.into())
             );
         }
-        for text in ["/tasks", "/help"] {
+        for text in ["/tasks", "/help", "/memory"] {
             assert!(matches!(
                 dispatch(text, true, COMMANDS),
                 Dispatch::Run { .. }
@@ -349,7 +356,7 @@ mod tests {
     fn popup_filter_wrap_completion_escape() {
         let mut p = Popup::default();
         p.changed("/");
-        assert_eq!(p.matches().len(), 6);
+        assert_eq!(p.matches().len(), 7);
         assert_eq!(p.selected, 0);
         p.navigate(false);
         assert_eq!(p.complete().as_deref(), Some("/help"));

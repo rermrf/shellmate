@@ -1,5 +1,5 @@
 //! Blocking project-document trust card in the existing drawer approval surface.
-use super::{Drawer, MONO_FONT};
+use super::{Drawer, agent_ui};
 use crate::{ai::remote::TrustBatch, theme::ActivePalette};
 use gpui::{
     component::{
@@ -95,16 +95,12 @@ impl Drawer {
             .unknown
             .iter()
             .all(|i| pending.batch.choices[*i].is_some());
-        let mut card = div()
+        let mut card = agent_ui::step_surface(p)
             .id("ai-remote-trust-card")
-            .p(px(12.))
-            .rounded(px(12.))
-            .border_1()
-            .border_color(p.line)
-            .bg(p.card)
+            .flex_none()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(8.))
             .text_size(px(12.))
             .text_color(p.tx);
         for &index in &pending.batch.unknown {
@@ -124,14 +120,16 @@ impl Drawer {
                 .child(div().whitespace_normal().child(title))
                 .child(div().text_color(p.tx3).text_size(px(11.)).child(size));
             row = row.child(
-                Button::new(SharedString::from(format!("remote-preview-{index}")))
-                    .label(if expanded {
-                        "收起预览"
-                    } else {
-                        "预览前几行"
-                    })
-                    .h(px(24.))
-                    .text_size(px(11.))
+                div().flex().justify_end().child(
+                    agent_ui::step_action(
+                        SharedString::from(format!("remote-preview-{index}")),
+                        if expanded {
+                            "收起预览"
+                        } else {
+                            "预览前几行"
+                        },
+                        cx,
+                    )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(p) = &mut s.state.remote_trust
                             && !p.expanded.remove(&index)
@@ -140,6 +138,7 @@ impl Drawer {
                         }
                         cx.notify();
                     })),
+                ),
             );
             if expanded {
                 let preview: String = doc
@@ -151,16 +150,7 @@ impl Drawer {
                     .chars()
                     .take(1200)
                     .collect();
-                row = row.child(
-                    div()
-                        .p(px(8.))
-                        .rounded(px(8.))
-                        .bg(p.card3)
-                        .font_family(MONO_FONT)
-                        .text_size(px(11.))
-                        .whitespace_normal()
-                        .child(preview),
-                );
+                row = row.child(agent_ui::command_surface(cx).child(preview));
             }
             let actions = div()
                 .flex()

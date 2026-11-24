@@ -130,7 +130,7 @@ impl DialogBody for Disclosure {
 impl Render for Disclosure {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = dialogs::palette(cx);
-        dialogs::stack().child(dialogs::hint(format!("将把最近 40 行终端显示文本、你的问题、本次对话的历史，以及 AI 执行的命令和输出原样发送到 {}。Shellmate 保存的登录凭据不会发送。首次同意后，会记住此地址；测试连接也会向该地址发送一句测试问题。",self.destination),&p)).children(self.error.clone().map(|e|dialogs::notice(dialogs::Notice::Error,e,&p))).child(dialogs::actions(vec![dialogs::button("ai-disclosure-cancel","取消",Tone::Plain,true).on_click(cx.listener(|s,_,w,cx|s.dismiss(w,cx))),dialogs::button("ai-disclosure-ok","同意并继续",Tone::Primary,true).on_click(cx.listener(|s,_,w,cx|s.submit(w,cx)))]))
+        dialogs::stack().child(dialogs::hint(format!("将把最近 40 行终端显示文本、你的问题、本次对话的历史，以及 AI 执行的命令和输出原样发送到 {}。Shellmate 保存的登录凭据不会发送。AI 说明与记忆也会随请求发送。首次同意后，会记住此地址；测试连接也会向该地址发送一句测试问题。",self.destination),&p)).children(self.error.clone().map(|e|dialogs::notice(dialogs::Notice::Error,e,&p))).child(dialogs::actions(vec![dialogs::button("ai-disclosure-cancel","取消",Tone::Plain,true).on_click(cx.listener(|s,_,w,cx|s.dismiss(w,cx))),dialogs::button("ai-disclosure-ok","同意并继续",Tone::Primary,true).on_click(cx.listener(|s,_,w,cx|s.submit(w,cx)))]))
     }
 }
 impl Drop for Disclosure {
@@ -148,3 +148,5 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 mod remote;
+pub(crate) mod memory_model;
+pub(crate) mod memory_manager;

@@ -410,6 +410,10 @@ fn local_time(time: SystemTime) -> String {
     }
 }
 
+#[path = "memory_catalog.rs"]
+mod catalog;
+pub use catalog::FileInfo;
+
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;

@@ -5,7 +5,7 @@ mod protocols;
 use crate::connect::{self, Answer, FormCredential, UiMsg};
 use gpui::assets::IconName as Lucide;
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::input::{InputEvent, InputState};
+use gpui::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui::component::Icon;
 use gpui::prelude::*;
@@ -64,6 +64,8 @@ fn focus_scroll_delta(top: f32, bottom: f32, field_top: f32, field_bottom: f32) 
 
 /// The form for one host.
 pub struct HostEditor {
+    ai_note: Entity<TextareaState>,
+    ai_note_load_error: Option<String>,
     workspace: WeakEntity<Workspace>,
     /// The saved host being edited (`None` for new hosts and copies).
     original: Option<Host>,
@@ -103,6 +105,7 @@ impl HostEditor {
         workspace: WeakEntity<Workspace>,
         mode: EditorMode,
         book: &HostBook,
+        data_root: &std::path::Path,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -134,7 +137,11 @@ impl HostEditor {
         } else {
             group_name
         };
+        let note = source.as_ref().map_or(Ok(String::new()), |host| match shellmate_core::memory::Memory::new(data_root,Some(host.id.as_str())).read("/memories/host/AGENTS.md") {
+            Ok(text)=>Ok(text), Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(String::new()),Err(e)=>Err(e.to_string()),
+        });
         let body = cx.new(|cx| {
+            let ai_note=cx.new(|cx|{let mut input=TextareaState::new(window,cx).auto_grow(3,6).soft_wrap(true);input.set_value(note.as_ref().cloned().unwrap_or_default(),window,cx);input});
             let mut text = |value: String, placeholder: &'static str, cx: &mut Context<Self>| {
                 cx.new(|cx| {
                     InputState::new(window, cx)
@@ -199,7 +206,7 @@ impl HostEditor {
             if crate::prototype_fixture() {
                 passphrase.update(cx, |s, cx| s.set_value("fixture-only", window, cx));
             }
-            let mut subscriptions = Vec::new();
+            let mut subscriptions = vec![cx.subscribe(&ai_note,|s: &mut Self,_,event: &InputEvent,cx|{if matches!(event,InputEvent::Change){s.ai_note_load_error=None;}cx.notify();})];
             for input in [&name, &addr, &port, &user, &group, &identity, &password, &passphrase, &baud] {
                 let input = input.clone();
                 let focus = input.focus_handle(cx);
@@ -261,6 +268,8 @@ impl HostEditor {
                 },
             ));
             Self {
+                ai_note,
+                ai_note_load_error: note.as_ref().err().cloned(),
                 base: original.clone().unwrap_or_else(|| {
                     let mut host = Host::new("", "");
                     // Copies retain compatibility data that the form no longer exposes.
@@ -295,7 +304,7 @@ impl HostEditor {
                 jumps: source.map(|h| h.jump.clone()).unwrap_or_default(),
                 choices,
                 groups,
-                error: None,
+                error: note.err().map(Into::into),
                 _subscriptions: subscriptions,
             }
         });
@@ -304,6 +313,8 @@ impl HostEditor {
             let scene = std::env::var("SHELLMATE_DEMO").unwrap_or_default();
             if crate::proto::request(&scene).0 == "proto:host-new-focus" {
                 crate::proto::focus_after_layout(body.name.focus_handle(cx), window);
+            } else if scene.starts_with("proto:host-editor-ai-note") {
+                crate::proto::scroll_after_layout(body.form_scroll.clone(), |handle| f32::from(handle.max_offset().y), window);
             } else if scene.starts_with("proto:host-serial") {
                 body.change_protocol(Protocol::Serial, window, cx);
                 body.set_text(&body.addr, "/dev/cu.usbserial-0001", window, cx);
@@ -803,6 +814,10 @@ impl DialogBody for HostEditor {
         if self.test_abort.is_some() {
             return false;
         }
+        if let Some(error)=&self.ai_note_load_error {self.error=Some(error.clone().into());cx.notify();return false;}
+        let ai_note=self.ai_note.read(cx).value().to_string();
+        if ai_note.len()>shellmate_core::memory::FILE_BYTES {self.error=Some("AI 说明最多 64 KB".into());cx.notify();return false;}
+        let id=draft.host.id.clone();
         let credential = self.credential(&draft.host, cx);
         if credential.as_ref().is_some_and(|c|c.answer.save) && let Ok(manager)=self.workspace.update(cx,|w,_|w.credentials()) && shellmate_store::SecretStore::is_locked(manager.as_ref()) {
             let this=cx.entity().downgrade();
@@ -810,7 +825,8 @@ impl DialogBody for HostEditor {
             return false;
         }
         let saved = self.workspace.update(cx, |workspace, cx| {
-            workspace.save_host_draft(draft, credential, window, cx)
+            workspace.save_host_draft(draft, credential, window, cx)?;
+            workspace.save_ai_host_note(&id,&ai_note)
         });
         match saved {
             Ok(Ok(())) => true,
@@ -1047,6 +1063,10 @@ impl Render for HostEditor {
 )
                     .when(matches!(self.protocol,Protocol::Ssh|Protocol::Mosh),|d|d.child(self.render_jumps(&p,cx)))
                     .when(self.protocol==Protocol::Mosh,|d|d.child(div().flex_none().text_size(px(12.5)).line_height(px(20.)).text_color(p.tx2).child("需要服务器开放 UDP 60000–61000")))
+                    .child(div().flex_none().flex().flex_col().gap(px(6.))
+                        .child(div().text_size(px(13.5)).font_weight(FontWeight::SEMIBOLD).child("AI 说明"))
+                        .child(div().text_size(px(12.)).text_color(p.tx2).child("仅对此主机生效，会随 AI 请求发送"))
+                        .child(Textarea::new(&self.ai_note).bordered(false).font_family(crate::theme::MONO_FONT).text_size(px(13.)).bg(p.card2).rounded(px(11.))))
                     .children(self.error.clone().map(|e| notice(Notice::Error, e, &p)))
                     .children(
                         self.test_result

@@ -14,14 +14,14 @@ use crate::library::{self, HostDraft};
 impl Workspace {
     /// Opens the editor for a new host.
     pub(super) fn new_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        HostEditor::open(cx.entity().downgrade(), EditorMode::New, &self.hub.book.borrow(), window, cx);
+        HostEditor::open(cx.entity().downgrade(), EditorMode::New, &self.hub.book.borrow(), &self.memory_root(), window, cx);
     }
 
     /// Opens the editor for a saved host, or a new host prefilled from it.
     pub(super) fn edit_host(&mut self, id: &HostId, duplicate: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hub.book.borrow().host(id).cloned() else { return };
         let mode = if duplicate { EditorMode::Duplicate(host) } else { EditorMode::Edit(host) };
-        HostEditor::open(cx.entity().downgrade(), mode, &self.hub.book.borrow(), window, cx);
+        HostEditor::open(cx.entity().downgrade(), mode, &self.hub.book.borrow(), &self.memory_root(), window, cx);
     }
 
     /// Asks before deleting a host.

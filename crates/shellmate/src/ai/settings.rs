@@ -1,3 +1,5 @@
+#[path = "settings_memory.rs"]
+mod memory;
 #[path = "settings_limits.rs"]
 mod limits;
 use crate::{security::password::PasswordInput, theme::ActivePalette};
@@ -125,6 +127,7 @@ impl AiSettings {
             model: self.model.read(cx).value().trim().into(),
             reasoning: self.reasoning,
             save_conversations: self.save,
+            auto_memory: self.db.borrow().ai_settings().unwrap_or_default().auto_memory,
             ..Default::default()
         }, cx)
     }
@@ -504,6 +507,7 @@ impl Render for AiSettings {
                     .on_click(cx.listener(|s, _, w, cx| s.clear_all(w, cx))),
                 ),
             )
+            .child(self.memory_card(cx))
             .children(
                 self.result
                     .clone()

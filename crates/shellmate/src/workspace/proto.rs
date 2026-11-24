@@ -17,7 +17,7 @@ impl TerminalBackend for Inert {
 impl Workspace {
     pub(crate) fn proto_scene(&mut self, scene: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (scene,_) = proto::request(scene);
-        if !proto::SCENES.contains(&scene) && !proto::monitor::PORT_SCENES.contains(&scene) && !proto::monitor::SERVICE_SCENES.contains(&scene) {
+        if !proto::SCENES.contains(&scene) && !proto::memory::SCENES.contains(&scene) && !proto::monitor::PORT_SCENES.contains(&scene) && !proto::monitor::SERVICE_SCENES.contains(&scene) {
             log::warn!("unknown prototype scene");
             return;
         }
@@ -361,14 +361,22 @@ impl Workspace {
                 }
                 *self.hub.records_window.borrow_mut() = Some(panel);
             }
+            "memory-manager" | "host-editor-ai-note" => {
+                let host=self.hub.book.borrow().hosts.iter().find(|h|h.id.as_str()=="h1").unwrap().clone();
+                crate::proto::memory::seed(&self.memory_root(),&mut self.hub.store.borrow_mut(),host.id.as_str());
+                if scene=="memory-manager" {
+                    self.open_memory_manager(Some(crate::ai::memory_model::Focus {host:Some(host.id.to_string()),path:Some("/memories/host/deploy.md".into())}),window,cx).unwrap();
+                } else {crate::dialogs::host_editor::HostEditor::open(cx.weak_entity(),crate::dialogs::host_editor::EditorMode::Edit(host),&self.hub.book.borrow(),&self.memory_root(),window,cx);}
+            }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "ai-agent" | "ai-agent-run" | "ai-new-confirm" | "ai-agent-redline"
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
             | "ai-tasks" | "ai-output-large" | "ai-input-multiline" | "ai-code-copy" | "ai-code-copied" | "ai-code-select" | "ai-context-popover" | "ai-context-amber" | "ai-compacted" | "ai-compacted-open"
             | "ai-compacting" | "ai-compacted-tier1" | "ai-history" | "ai-error"
-            | "ai-remote-trust" | "ai-remote-loaded"
+            | "ai-remote-trust" | "ai-remote-loaded" | "ai-memory-chip"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
+                if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),&mut self.hub.store.borrow_mut(),"h1");}
                 self.open_ai(window, cx);
                 if let Some(drawer) = &self.ai_drawer {
                     drawer.update(cx, |d, cx| {
@@ -387,7 +395,7 @@ impl Workspace {
                 if s == "settings-update" { self.open_settings(6, window, cx); }
                 if s.starts_with("update-") { crate::updater::open(window, cx); }
             }
-            "set-ai" | "set-ai-replace" | "set-ai-advanced" => {
+            "set-ai" | "set-ai-replace" | "set-ai-advanced" | "set-ai-memory" => {
                 let fixture = crate::proto::slash::settings_scene(scene).unwrap();
                 self.hub.store.borrow_mut().save_ai_settings(&fixture.settings).unwrap();
                 let view = settings(5, window, cx);

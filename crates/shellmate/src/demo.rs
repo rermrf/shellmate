@@ -511,12 +511,12 @@ pub fn run(name: &str, workspace: &Entity<Workspace>, window: &mut Window, cx: &
         }
         "host-editor" => {
             let book = workspace.read(cx).book();
-            HostEditor::open(workspace.downgrade(), EditorMode::New, &book, window, cx);
+            HostEditor::open(workspace.downgrade(), EditorMode::New, &book, &workspace.read(cx).memory_root(), window, cx);
         }
         "host-editor-edit" => {
             let book = workspace.read(cx).book();
             if let Some(host) = book.hosts.iter().find(|h| h.name == "prod-db-01").cloned() {
-                HostEditor::open(workspace.downgrade(), EditorMode::Edit(host), &book, window, cx);
+                HostEditor::open(workspace.downgrade(), EditorMode::Edit(host), &book, &workspace.read(cx).memory_root(), window, cx);
             }
         }
         "import" => {

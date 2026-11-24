@@ -22,7 +22,10 @@ pub struct SettingsScene {
     pub scroll_to_bottom: bool,
 }
 pub fn settings_scene(scene: &str) -> Option<SettingsScene> {
-    if !matches!(scene, "set-ai" | "set-ai-replace" | "set-ai-advanced") {
+    if !matches!(
+        scene,
+        "set-ai" | "set-ai-replace" | "set-ai-advanced" | "set-ai-memory"
+    ) {
         return None;
     }
     let advanced = scene == "set-ai-advanced";
@@ -38,7 +41,7 @@ pub fn settings_scene(scene: &str) -> Option<SettingsScene> {
             ..Default::default()
         },
         advanced,
-        scroll_to_bottom: advanced,
+        scroll_to_bottom: advanced || scene == "set-ai-memory",
     })
 }
 pub struct Fixture {
@@ -185,7 +188,7 @@ mod tests {
         popup.changed(scene("ai-slash").unwrap().input);
         assert!(popup.open);
         assert_eq!(popup.selected, 0);
-        assert_eq!(popup.matches().len(), 6);
+        assert_eq!(popup.matches().len(), 7);
         popup.changed(scene("ai-slash-filter").unwrap().input);
         assert_eq!(popup.matches().len(), 2);
         let f = scene("ai-slash-context").unwrap();

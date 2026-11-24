@@ -235,6 +235,7 @@ pub(crate) struct Accounting {
 }
 #[derive(Clone, Default)]
 pub struct Conversation {
+    memory_actions: std::collections::BTreeMap<(usize, usize), crate::memory::Action>,
     pub(crate) remote: Option<crate::remote::State>,
     pub(crate) memory: Option<crate::memory::Snapshot>,
     entries: Vec<Entry>,
@@ -248,6 +249,9 @@ impl PartialEq for Conversation {
 }
 impl Eq for Conversation {}
 impl Conversation {
+    pub fn memory_action(&self, turn: usize, item: usize) -> Option<&crate::memory::Action> {
+        self.memory_actions.get(&(turn, item))
+    }
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -362,6 +366,7 @@ impl Conversation {
                 }
                 entries.splice(position..position, context);
                 self.turns.clear();
+                self.memory_actions.clear();
                 self.accounting.usage = None;
                 for entry in entries {
                     self.append(entry);
@@ -412,6 +417,7 @@ impl Conversation {
                 answer: None,
             }),
             _ => {
+                let turn_index = self.turns.len().saturating_sub(1);
                 if let Some(turn) = self.turns.last_mut() {
                     let answer = turn.answer.get_or_insert_with(Answer::default);
                     match &entry {
@@ -423,6 +429,12 @@ impl Conversation {
                             if let Some(display) = &s.display {
                                 answer.items.push(display.item());
                             } else if s.call.name == "memory" {
+                                if let Some(action) =
+                                    crate::memory::action(&s.call.args_json, s.result.is_error)
+                                {
+                                    self.memory_actions
+                                        .insert((turn_index, answer.items.len()), action);
+                                }
                                 answer.items.push(AnswerItem::Notice(crate::memory::notice(
                                     &s.call.args_json,
                                     s.result.is_error,
