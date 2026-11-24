@@ -4,6 +4,7 @@ pub mod prompt_plain;
 pub mod replay;
 pub mod ai;
 pub mod slash;
+pub mod remote;
 pub mod stress;
 pub use data::DATA;
 use std::ops::Index;
@@ -66,6 +67,7 @@ pub const SCENES: &[&str] = &[
     "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
     "ai-agent", "ai-agent-run", "ai-new-confirm", "ai-agent-redline", "ai-agent-full",
     "ai-tasks", "ai-output-large", "ai-input-multiline", "ai-context-popover", "ai-context-amber", "ai-code-copy", "ai-code-copied", "ai-code-select",
+    "ai-remote-trust", "ai-remote-loaded",
     "ai-slash", "ai-slash-filter", "ai-slash-context", "ai-slash-tasks", "set-ai-advanced",
     "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
@@ -300,7 +302,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 117 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 119 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

@@ -25,3 +25,4 @@ pub use secret::Secret;
 pub use ssh_config::{ConfigForward, ForwardDirective, ParsedConfig, SshConfigEntry, parse_ssh_config};
 
 pub mod memory;
+pub mod remote_instructions;

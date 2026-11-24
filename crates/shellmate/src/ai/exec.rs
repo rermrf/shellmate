@@ -208,6 +208,19 @@ pub struct AppExecutor {
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn discover_instructions(
+        &self,
+        cwd: Option<String>,
+        refresh: bool,
+    ) -> futures::future::BoxFuture<'_, Option<shellmate_core::remote_instructions::Discovery>>
+    {
+        Box::pin(super::remote::discover(
+            &self.binding,
+            &self.ui,
+            cwd,
+            refresh,
+        ))
+    }
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
         self.memory.as_ref().map_or_else(
             || shellmate_ai::memory::Snapshot {
@@ -364,3 +377,57 @@ async fn terminal(
 #[cfg(test)]
 #[path = "exec_tests.rs"]
 mod tests;
+
+/// Bounded, cancellable non-TTY process for internal instruction discovery.
+pub(super) async fn discovery_local(
+    script: &str,
+    directory: Option<&std::path::Path>,
+) -> Result<Vec<u8>, String> {
+    let work = async {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        // Match the local background channel's default directory, then let the script cd.
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        } else if let Some(home) = std::env::var_os("HOME") {
+            command.current_dir(home);
+        }
+        let mut child = ProcessGroup(command.spawn().map_err(|e| e.to_string())?);
+        let mut stdout = child.0.stdout.take().unwrap();
+        nonblocking(&stdout).map_err(|e| e.to_string())?;
+        let mut output = Vec::new();
+        let mut eof = false;
+        loop {
+            let mut bytes = [0; 8192];
+            match stdout.read(&mut bytes) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    if output.len() + n > shellmate_core::remote_instructions::WIRE_BYTES {
+                        return Err("discovery output limit".into());
+                    }
+                    output.extend_from_slice(&bytes[..n]);
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+                if !status.success() {
+                    return Err("instruction discovery exited unsuccessfully".into());
+                }
+                if eof {
+                    return Ok(output);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(shellmate_core::remote_instructions::TIMEOUT, work)
+        .await
+        .map_err(|_| "instruction discovery timeout".to_string())?
+}

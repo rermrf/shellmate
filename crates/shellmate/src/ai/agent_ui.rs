@@ -244,6 +244,8 @@ impl Drawer {
                                 return;
                             }
                             match event {
+                                Ui::RemoteTrust { id, discovery, reply } => s.ask_remote_trust(id, discovery, reply),
+                                Ui::CancelRemoteTrust(id) if s.state.remote_trust.as_ref().is_some_and(|p| p.id == id) => { s.state.remote_trust = None; }
                                 Ui::Approval {
                                     call,
                                     redline,

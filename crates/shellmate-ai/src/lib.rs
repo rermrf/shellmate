@@ -80,3 +80,4 @@ pub use output::{ToolOutput, shape};
 pub use policy::PermissionMode;
 
 pub mod memory;
+pub mod remote;

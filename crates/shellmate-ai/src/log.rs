@@ -222,6 +222,8 @@ impl Entry {
 }
 #[derive(Clone, Debug)]
 pub enum LogUpdate {
+    Remote(crate::remote::State),
+    BeforeUser(Vec<Entry>),
     Memory(crate::memory::Snapshot),
     Append(Box<Entry>),
     ClearResults(Vec<usize>),
@@ -233,6 +235,7 @@ pub(crate) struct Accounting {
 }
 #[derive(Clone, Default)]
 pub struct Conversation {
+    pub(crate) remote: Option<crate::remote::State>,
     pub(crate) memory: Option<crate::memory::Snapshot>,
     entries: Vec<Entry>,
     turns: Vec<Turn>,
@@ -335,6 +338,35 @@ impl Conversation {
     }
     pub fn apply(&mut self, update: LogUpdate) {
         match update {
+            LogUpdate::Remote(state) => self.remote = Some(state),
+            LogUpdate::BeforeUser(context) => {
+                let position = self
+                    .entries
+                    .iter()
+                    .rposition(|e| matches!(e, Entry::User { .. }))
+                    .unwrap_or(self.entries.len());
+                let count = context.len();
+                let mut entries = std::mem::take(&mut self.entries);
+                for entry in &mut entries[position..] {
+                    let id = match entry {
+                        Entry::Assistant { message_id, .. }
+                        | Entry::CommandCard { message_id, .. } => Some(message_id),
+                        Entry::Step(step) => Some(&mut step.message_id),
+                        _ => None,
+                    };
+                    if let Some(id) = id
+                        && *id >= position
+                    {
+                        *id += count;
+                    }
+                }
+                entries.splice(position..position, context);
+                self.turns.clear();
+                self.accounting.usage = None;
+                for entry in entries {
+                    self.append(entry);
+                }
+            }
             LogUpdate::Memory(snapshot) => self.memory = Some(snapshot),
             LogUpdate::Append(e) => self.append(*e),
             LogUpdate::ClearResults(positions) => {
@@ -420,8 +452,15 @@ impl Conversation {
                         Entry::Compaction(c) => {
                             answer.items.push(AnswerItem::Compaction(c.clone()))
                         }
-                        Entry::Notice { text, .. } => {
-                            answer.items.push(AnswerItem::Notice(text.clone()))
+                        Entry::Notice { kind, .. } if kind == "remote_cwd" => {}
+                        Entry::Notice { kind, text } => {
+                            let text = if kind == shellmate_core::remote_instructions::CONTEXT_KIND
+                            {
+                                shellmate_core::remote_instructions::notice(text)
+                            } else {
+                                text.clone()
+                            };
+                            answer.items.push(AnswerItem::Notice(text))
                         }
                         Entry::User { .. } => unreachable!(),
                     }

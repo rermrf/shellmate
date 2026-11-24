@@ -280,6 +280,14 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    /// Only trusted documents may be returned. Discovery failures are nonfatal.
+    fn remote_instructions(
+        &self,
+        _cwd: Option<String>,
+        _refresh: bool,
+    ) -> BoxFuture<'_, Option<shellmate_core::remote_instructions::Discovery>> {
+        Box::pin(async { None })
+    }
     fn memory_snapshot(&self, auto_memory: bool) -> crate::memory::Snapshot {
         crate::memory::Snapshot {
             auto_memory,
@@ -405,6 +413,7 @@ enum Pending {
 /// Opaque, memory-only continuation. Deliberately neither Debug nor serializable:
 /// it owns signed reasoning and real tool messages for this turn only.
 pub struct Resume {
+    discover_on_start: bool,
     native: NativeMessages,
     model_steps: usize,
     guard: ThrashGuard,
@@ -450,6 +459,7 @@ pub fn run<'a>(
     let capabilities = capabilities.for_question(&user.question);
     conversation.prepare(&capabilities)?;
     let state = Resume {
+        discover_on_start: true,
         native: NativeMessages::new(),
         model_steps: 0,
         guard: ThrashGuard::default(),
@@ -514,6 +524,7 @@ pub fn compact_with_limits<'a>(
         .ok_or(AiError::InvalidConfig)?
         .clone();
     let state = Resume {
+        discover_on_start: true,
         native: NativeMessages::new(),
         model_steps: 0,
         guard: ThrashGuard::default(),
@@ -544,6 +555,7 @@ struct State<'a> {
     model: Option<CompletionStream>,
     active: Option<(RigCall, ToolCall)>,
     first: bool,
+    initialize_remote: bool,
     retry_wait: Option<Duration>,
     failures: u32,
     received: bool,
@@ -697,6 +709,91 @@ struct CompactWork {
     tier: u8,
 }
 impl State<'_> {
+    async fn rebuild_memory(&mut self) {
+        self.record(LogUpdate::Memory(
+            self.host.memory_snapshot(self.limits.auto_memory),
+        ));
+        self.load_remote(true).await;
+    }
+    async fn load_remote(&mut self, rebuild: bool) {
+        let cwd = self.turn.as_ref().unwrap().capabilities.cwd.clone();
+        let first = self.conversation.remote.is_none();
+        if !rebuild
+            && self
+                .conversation
+                .remote
+                .as_ref()
+                .is_some_and(|r| !r.retry_trust && r.requested_cwd == cwd)
+        {
+            return;
+        }
+        let discovery = self.host.remote_instructions(cwd.clone(), rebuild).await;
+        let mut state = if rebuild {
+            crate::remote::State::default()
+        } else {
+            self.conversation.remote.clone().unwrap_or_default()
+        };
+        let cwd_changed = state.requested_cwd != cwd;
+        state.requested_cwd = cwd.clone();
+        state.retry_trust = false;
+        if first || rebuild {
+            state.prompt_cwd = cwd;
+        }
+        if let Some(discovery) = discovery {
+            state.retry_trust = discovery.cancelled;
+            state.cwd = discovery.cwd;
+            if rebuild && state.requested_cwd.is_some() {
+                state.requested_cwd = Some(state.cwd.clone());
+            }
+            if first || rebuild {
+                state.prompt_cwd = Some(state.cwd.clone());
+                let mut snapshot = self.conversation.memory.clone().unwrap_or_default();
+                snapshot.remote_instructions =
+                    discovery.files.iter().map(|f| f.wrapped()).collect();
+                state.snapshot_texts = discovery.files.iter().map(|f| f.wrapped()).collect();
+                // Tier-1 compaction retains the log: suppress old copies of refreshed paths.
+                let notices: std::collections::HashSet<_> = discovery
+                    .files
+                    .iter()
+                    .map(|f| shellmate_core::remote_instructions::notice(&f.wrapped()))
+                    .collect();
+                for entry in self.conversation.entries() {
+                    if let Entry::Notice { kind, text } = entry
+                        && kind == shellmate_core::remote_instructions::CONTEXT_KIND
+                        && notices.contains(&shellmate_core::remote_instructions::notice(text))
+                    {
+                        state.snapshot_texts.insert(text.clone());
+                    }
+                }
+                state.loaded_paths = discovery.files.iter().map(|f| f.path.clone()).collect();
+                self.record(LogUpdate::Memory(snapshot));
+            } else {
+                let mut entries = Vec::new();
+                if cwd_changed {
+                    entries.push(Entry::Notice {
+                        kind: "remote_cwd".into(),
+                        text: format!(
+                            "会话当前目录已变化：{}。以此目录为准。",
+                            serde_json::to_string(&state.cwd).unwrap()
+                        ),
+                    });
+                }
+                entries.extend(discovery.files.into_iter().filter_map(|file| {
+                    if !state.loaded_paths.insert(file.path.clone()) {
+                        return None;
+                    }
+                    Some(Entry::Notice {
+                        kind: shellmate_core::remote_instructions::CONTEXT_KIND.into(),
+                        text: file.wrapped(),
+                    })
+                }));
+                if !entries.is_empty() {
+                    self.record(LogUpdate::BeforeUser(entries));
+                }
+            }
+        }
+        self.record(LogUpdate::Remote(state));
+    }
     fn begin_compaction(
         &mut self,
         trigger: CompactTrigger,
@@ -726,9 +823,7 @@ impl State<'_> {
                 && changed
                 && after <= self.client.context_budget().auto as usize / 2
             {
-                self.record(LogUpdate::Memory(
-                    self.host.memory_snapshot(self.limits.auto_memory),
-                ));
+                self.rebuild_memory().await;
                 let after = request_tokens(&self.request()?);
                 let c = Compaction {
                     summary: None,
@@ -780,9 +875,7 @@ impl State<'_> {
                 Err(e) => return Err(e),
             }
         };
-        self.record(LogUpdate::Memory(
-            self.host.memory_snapshot(self.limits.auto_memory),
-        ));
+        self.rebuild_memory().await;
         let mut snapshot = self
             .host
             .context_snapshot()
@@ -831,16 +924,23 @@ fn stream<'a>(
     conversation: &'a mut Conversation,
     host: &'a dyn ToolHost,
     limits: Limits,
-    turn: Resume,
+    mut turn: Resume,
     manual_focus: Option<Option<String>>,
 ) -> AgentStream<'a> {
+    let initialize_remote = turn.discover_on_start;
+    turn.discover_on_start = false;
     let mut initial_updates = Vec::new();
     if conversation
         .memory
         .as_ref()
         .is_none_or(|m| m.auto_memory != limits.auto_memory)
     {
-        let snapshot = host.memory_snapshot(limits.auto_memory);
+        let mut snapshot = host.memory_snapshot(limits.auto_memory);
+        if let Some(previous) = &conversation.memory {
+            snapshot
+                .remote_instructions
+                .clone_from(&previous.remote_instructions);
+        }
         conversation.memory = Some(snapshot.clone());
         initial_updates.push(LogUpdate::Memory(snapshot));
     }
@@ -855,6 +955,7 @@ fn stream<'a>(
         model: None,
         active: None,
         first: true,
+        initialize_remote,
         retry_wait: None,
         failures: 0,
         received: false,
@@ -881,6 +982,10 @@ fn stream<'a>(
     }
     let inner = futures::stream::unfold(state, |mut s| async move {
         loop {
+            if s.initialize_remote {
+                s.initialize_remote = false;
+                s.load_remote(false).await;
+            }
             if let Some(event) = s.queue.pop_front() {
                 if matches!(event, AgentEvent::Done(_))
                     && let Some(focus) = s.host.take_compaction()

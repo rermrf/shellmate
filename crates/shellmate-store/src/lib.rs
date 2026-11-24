@@ -26,3 +26,4 @@ mod keychain_inventory;
 pub use vault::LoginDeviceKeyStore;
 
 pub mod ai;
+mod remote_trust;

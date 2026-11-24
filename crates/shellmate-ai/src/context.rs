@@ -263,6 +263,13 @@ pub(crate) fn char_excerpt(text: &str, limit: usize) -> String {
 pub(crate) type NativeMessages = BTreeMap<usize, AssistantMessage>;
 
 impl Conversation {
+    fn remote_in_snapshot(&self, kind: &str, text: &str) -> bool {
+        kind == shellmate_core::remote_instructions::CONTEXT_KIND
+            && self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.snapshot_texts.contains(text))
+    }
     pub fn prepare(&self, capabilities: &Capabilities) -> Result<CompletionRequest, AiError> {
         self.request(
             capabilities,
@@ -282,8 +289,13 @@ impl Conversation {
         if newest.question.trim().is_empty() {
             return Err(AiError::InvalidConfig);
         }
+        // Cwd changes are context entries; keep the system's cwd stable until compaction.
+        let mut prompt_caps = caps.clone();
+        if let Some(remote) = &self.remote {
+            prompt_caps.cwd.clone_from(&remote.prompt_cwd);
+        }
         let system = if caps.available() {
-            crate::conversation::execution_prompt(&newest.context, caps)
+            crate::conversation::execution_prompt(&newest.context, &prompt_caps)
         } else {
             crate::conversation::system_prompt(&newest.context)
         };
@@ -419,7 +431,9 @@ impl Conversation {
                         ),
                     );
                 }
-                Entry::Notice { text, .. } => push_message(&mut messages, Message::user(text)),
+                Entry::Notice { kind, text } if !self.remote_in_snapshot(kind, text) => {
+                    push_message(&mut messages, Message::user(text))
+                }
                 _ => {}
             }
             i += 1;
@@ -493,7 +507,7 @@ impl Conversation {
             .iter()
             .map(|t| estimate_tokens(&serde_json::to_string(t).unwrap()))
             .sum::<usize>();
-        let instructions_memory = self
+        let mut instructions_memory = self
             .memory
             .as_ref()
             .map_or(0, |m| estimate_tokens(&m.text()));
@@ -527,6 +541,15 @@ impl Conversation {
                     terminal_context += estimate_tokens(
                         &crate::UserTurn::new("最新终端上下文", c.context.clone()).wire_text(),
                     );
+                }
+                Entry::Notice { kind, text }
+                    if kind == shellmate_core::remote_instructions::CONTEXT_KIND
+                        && !self.remote_in_snapshot(kind, text) =>
+                {
+                    instructions_memory += estimate_tokens(text);
+                }
+                Entry::Notice { kind, text } if kind == "remote_cwd" => {
+                    terminal_context += estimate_tokens(text);
                 }
                 Entry::Step(s) => {
                     let offered = request.tools.iter().any(|t| t.name.as_str() == s.call.name);
