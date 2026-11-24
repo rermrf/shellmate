@@ -8,15 +8,7 @@ impl AiSettings {
             .ai_settings()
             .unwrap_or_default()
             .auto_memory;
-        settings_card(cx)
-            .child(
-                div()
-                    .pt(px(14.))
-                    .pb(px(4.))
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("记忆"),
-            )
+        let card = settings_card(cx)
             .child(settings_row(
                 "自动记忆",
                 "AI 会把偏好、纠正和主机背景记成笔记，下次对话自动参考",
@@ -79,9 +71,15 @@ impl AiSettings {
                         }
                     })),
                 cx,
-            ))
+            ));
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(card)
             .child(
-                div().py(px(10.)).flex().justify_end().child(
+                div().flex().justify_end().child(
                     crate::dialogs::button(
                         "ai-memory-clear",
                         "清除所有记忆",

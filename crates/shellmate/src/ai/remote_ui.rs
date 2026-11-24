@@ -103,7 +103,11 @@ impl Drawer {
             .gap(px(8.))
             .text_size(px(12.))
             .text_color(p.tx);
-        for &index in &pending.batch.unknown {
+        for (position, &index) in pending.batch.unknown.iter().enumerate() {
+            if position > 0 {
+                // The card's 8 px gap plus 4 px margin gives 12 px on each side.
+                card = card.child(div().flex_none().h(px(1.)).my(px(4.)).bg(p.line));
+            }
             let doc = &pending.batch.discovery.files[index];
             let expanded = pending.expanded.contains(&index);
             let choice = pending.batch.choices[index];
@@ -118,28 +122,41 @@ impl Drawer {
                 .flex_col()
                 .gap(px(7.))
                 .child(div().whitespace_normal().child(title))
-                .child(div().text_color(p.tx3).text_size(px(11.)).child(size));
-            row = row.child(
-                div().flex().justify_end().child(
-                    agent_ui::step_action(
-                        SharedString::from(format!("remote-preview-{index}")),
-                        if expanded {
-                            "收起预览"
-                        } else {
-                            "预览前几行"
-                        },
-                        cx,
-                    )
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        if let Some(p) = &mut s.state.remote_trust
-                            && !p.expanded.remove(&index)
-                        {
-                            p.expanded.insert(index);
-                        }
-                        cx.notify();
-                    })),
-                ),
-            );
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(p.tx3)
+                                .text_size(px(11.))
+                                .child(size),
+                        )
+                        .child(
+                            agent_ui::step_action(
+                                SharedString::from(format!("remote-preview-{index}")),
+                                if expanded {
+                                    "收起预览"
+                                } else {
+                                    "预览前几行"
+                                },
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |s, _, _, cx| {
+                                    if let Some(p) = &mut s.state.remote_trust
+                                        && !p.expanded.remove(&index)
+                                    {
+                                        p.expanded.insert(index);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                );
             if expanded {
                 let preview: String = doc
                     .text
@@ -154,15 +171,11 @@ impl Drawer {
             }
             let actions = div()
                 .flex()
-                .gap(px(6.))
+                .gap(px(4.))
                 .child(
                     Button::new(SharedString::from(format!("remote-trust-{index}")))
-                        .label(if choice == Some(true) {
-                            "✓ 信任"
-                        } else {
-                            "信任"
-                        })
-                        .when(single || choice == Some(true), |button| button.primary())
+                        .label("信任")
+                        .when(choice == Some(true), |button| button.primary())
                         .h(px(26.))
                         .on_click(cx.listener(move |s, _, _, cx| {
                             if let Some(p) = &mut s.state.remote_trust {
@@ -177,11 +190,7 @@ impl Drawer {
                 )
                 .child(
                     Button::new(SharedString::from(format!("remote-ignore-{index}")))
-                        .label(if choice == Some(false) {
-                            "✓ 忽略"
-                        } else {
-                            "忽略"
-                        })
+                        .label("忽略")
                         .when(choice == Some(false), |button| button.primary())
                         .h(px(26.))
                         .on_click(cx.listener(move |s, _, _, cx| {
@@ -197,12 +206,7 @@ impl Drawer {
                 );
             card = card.child(row.child(actions));
         }
-        let mut actions = div().flex().justify_end().gap(px(6.)).child(
-            Button::new("remote-cancel")
-                .label("本次忽略")
-                .h(px(27.))
-                .on_click(cx.listener(|s, _, _, cx| s.finish_remote_trust(true, cx))),
-        );
+        let mut actions = div().flex().gap(px(6.));
         if !single {
             actions = actions.child(
                 Button::new("remote-confirm")
@@ -213,6 +217,12 @@ impl Drawer {
                     .on_click(cx.listener(|s, _, _, cx| s.finish_remote_trust(false, cx))),
             );
         }
+        actions = actions.child(
+            Button::new("remote-cancel")
+                .label("本次忽略")
+                .h(px(27.))
+                .on_click(cx.listener(|s, _, _, cx| s.finish_remote_trust(true, cx))),
+        );
         card.child(actions)
     }
 }

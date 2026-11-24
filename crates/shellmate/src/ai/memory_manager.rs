@@ -7,7 +7,7 @@ use crate::{
 };
 use gpui::{
     component::{
-        button::{Button, ButtonVariants},
+        button::Button,
         input::{InputState, Textarea, TextareaState},
     },
     prelude::*,
@@ -198,13 +198,18 @@ impl MemoryManager {
         let active = self.path.as_ref() == Some(&path);
         div()
             .id(SharedString::from(format!("memory-file-{path}")))
-            .px(px(10.))
-            .py(px(8.))
-            .rounded(px(10.))
+            .flex_none()
+            .min_h(px(56.))
+            // The card's 18 px inset leaves a 6 px gutter around this neutral selection.
+            .mx(px(-12.))
+            .my(px(2.))
+            .px(px(12.))
+            .py(px(12.))
+            .rounded(px(12.))
             .min_w_0()
-            .bg(if active { p.accs } else { p.card2 })
+            .when(active, |d| d.bg(p.card2))
             .cursor_pointer()
-            .hover(|d| d.bg(p.card3))
+            .when(!active, |d| d.hover(|d| d.bg(p.card2.opacity(0.55))))
             .child(
                 div()
                     .flex()
@@ -215,27 +220,20 @@ impl MemoryManager {
                             .flex_1()
                             .min_w_0()
                             .text_ellipsis()
-                            .text_size(px(12.5))
+                            .text_size(px(13.5))
+                            .line_height(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                    .children(kind.map(|kind| {
-                        div()
-                            .flex_none()
-                            .px(px(5.))
-                            .py(px(2.))
-                            .rounded(px(5.))
-                            .bg(p.card3)
-                            .text_size(px(10.))
-                            .text_color(p.tx2)
-                            .child(kind)
-                    })),
+                    .children(kind.map(|kind| neutral_chip(kind, p))),
             )
             .when(!detail.is_empty(), |d| {
                 d.child(
                     div()
-                        .mt(px(3.))
+                        .mt(px(4.))
                         .whitespace_normal()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
+                        .line_height(px(18.))
                         .text_color(p.tx2)
                         .child(detail),
                 )
@@ -293,22 +291,27 @@ impl Render for MemoryManager {
             &p,
             cx.listener(|s, _, w, cx| s.dismiss(w, cx)),
         );
-        let mut scopes = div().flex().flex_col().gap(px(5.));
+        let mut scopes = div().flex().flex_col().gap(px(4.));
         for (index, scope) in self.model.scopes.iter().enumerate() {
             scopes = scopes.child(
                 div()
                     .id(("memory-scope", index))
-                    .px(px(10.))
-                    .py(px(9.))
-                    .rounded(px(10.))
-                    .text_size(px(12.5))
-                    .bg(if index == self.model.selected {
-                        p.accs
-                    } else {
-                        p.win
-                    })
+                    .px(px(12.))
+                    .h(px(38.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(12.))
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.card2))
+                    .text_size(px(13.5))
+                    .line_height(px(16.))
+                    .text_color(if index == self.model.selected {
+                        p.tx
+                    } else {
+                        p.tx2
+                    })
+                    .when(index == self.model.selected, |d| {
+                        d.bg(p.card).font_weight(FontWeight::SEMIBOLD)
+                    })
                     .child(ui::ellipsis(
                         ("memory-scope-name", index),
                         scope.label.clone(),
@@ -322,13 +325,13 @@ impl Render for MemoryManager {
             .flex_col()
             .gap(px(7.))
             .child(section("说明", &p))
-            .child(self.file_row(
+            .child(grouped_card(&p).child(self.file_row(
                 format!("{prefix}/AGENTS.md"),
                 "AGENTS.md".into(),
                 "随 AI 请求发送的说明".into(),
                 None,
                 cx,
-            ))
+            )))
             .child(
                 div()
                     .mt(px(8.))
@@ -338,12 +341,11 @@ impl Render for MemoryManager {
                     .child(section("记忆", &p))
                     .child(
                         Button::new("memory-new")
-                            .text()
                             .label("新建记忆")
-                            .text_size(px(11.))
                             .on_click(cx.listener(|s, _, w, cx| s.new_file(w, cx))),
                     ),
             );
+        let mut memories = grouped_card(&p);
         let mut has_index = false;
         for file in &self.model.files {
             if file.path == format!("{prefix}/AGENTS.md") {
@@ -357,7 +359,7 @@ impl Render for MemoryManager {
             } else {
                 format!("{} · {modified}", file.description)
             };
-            files = files.child(
+            memories = memories.child(
                 self.file_row(
                     file.path.clone(),
                     if index {
@@ -366,18 +368,18 @@ impl Render for MemoryManager {
                         file.name.clone()
                     },
                     description,
-                    Some(if index {
-                        "索引".into()
+                    if index {
+                        Some("索引")
                     } else {
-                        file.kind.clone()
-                    })
-                    .filter(|s| !s.is_empty()),
+                        type_label(&file.kind)
+                    }
+                    .map(str::to_owned),
                     cx,
                 ),
             );
         }
         if !has_index {
-            files = files.child(self.file_row(
+            memories = memories.child(self.file_row(
                 format!("{prefix}/MEMORY.md"),
                 "MEMORY.md".into(),
                 "尚未创建".into(),
@@ -385,12 +387,20 @@ impl Render for MemoryManager {
                 cx,
             ));
         }
+        files = files.child(memories);
         if self.model.scopes[self.model.selected].key.is_some() {
             files = files.child(div().mt(px(8.)).child(section("远端说明", &p)));
+            let mut remote = grouped_card(&p);
             if self.model.remote.is_empty() {
-                files = files.child(
+                remote = remote.child(
                     div()
-                        .text_size(px(11.))
+                        .flex_none()
+                        .min_h(px(56.))
+                        .py(px(12.))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.))
+                        .line_height(px(18.))
                         .text_color(p.tx3)
                         .child("暂无远端说明信任记录"),
                 );
@@ -399,42 +409,52 @@ impl Render for MemoryManager {
                 let toggle = path.clone();
                 let remove = path.clone();
                 let next = !*trust;
-                files = files.child(
+                remote = remote.child(
                     div()
-                        .px(px(10.))
-                        .py(px(7.))
-                        .rounded(px(10.))
-                        .bg(p.card2)
+                        .flex_none()
+                        .min_w_0()
+                        .min_h(px(56.))
+                        .py(px(12.))
                         .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(div().whitespace_normal().text_size(px(11.5)).child(format!(
-                            "{path} · {}",
-                            if *trust { "已信任" } else { "已忽略" }
-                        )))
+                        .items_center()
+                        .gap(px(8.))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
-                                .justify_end()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    ui::ellipsis(("memory-remote-path", index), path.clone())
+                                        .min_w_0()
+                                        .text_size(px(13.5))
+                                        .line_height(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD),
+                                )
+                                .child(neutral_chip(if *trust { "已信任" } else { "已忽略" }, &p)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
                                 .gap(px(8.))
                                 .child(
                                     Button::new(("memory-trust-toggle", index))
-                                        .text()
                                         .label(if *trust {
                                             "改为忽略"
                                         } else {
                                             "改为信任"
                                         })
-                                        .text_size(px(11.))
                                         .on_click(cx.listener(move |s, _, _, cx| {
                                             s.set_trust(&toggle, Some(next), cx)
                                         })),
                                 )
                                 .child(
                                     Button::new(("memory-trust-remove", index))
-                                        .text()
                                         .label("移除")
-                                        .text_size(px(11.))
+                                        .text_color(p.err)
                                         .on_click(cx.listener(move |s, _, _, cx| {
                                             s.set_trust(&remove, None, cx)
                                         })),
@@ -442,6 +462,7 @@ impl Render for MemoryManager {
                         ),
                 );
             }
+            files = files.child(remote);
         }
         let mut right = div()
             .flex_1()
@@ -486,9 +507,7 @@ impl Render for MemoryManager {
                         .justify_between()
                         .items_center()
                         .child(
-                            Button::new("memory-delete")
-                                .text()
-                                .label("删除")
+                            dialogs::button("memory-delete", "删除", Tone::Plain, true)
                                 .text_color(p.err)
                                 .when(self.creating, |b| b.invisible())
                                 .on_click(cx.listener(|s, _, w, cx| s.delete(w, cx))),
@@ -545,4 +564,53 @@ fn section(text: &str, p: &crate::theme::Palette) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.tx)
         .child(text.to_owned())
+}
+
+fn grouped_card(p: &crate::theme::Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(18.))
+        .py(px(4.))
+        .rounded(px(18.))
+        .bg(p.card)
+        .flex()
+        .flex_col()
+}
+fn neutral_chip(label: impl Into<SharedString>, p: &crate::theme::Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .py(px(2.))
+        .rounded(px(5.))
+        .bg(p.card3)
+        .text_size(px(10.))
+        .text_color(p.tx2)
+        .child(label.into())
+}
+fn type_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "user" => Some("用户"),
+        "feedback" => Some("反馈"),
+        "project" => Some("项目"),
+        "reference" => Some("参考"),
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod style_tests {
+    use super::type_label;
+    #[test]
+    fn memory_type_labels_are_chinese_and_unknown_types_have_no_chip() {
+        for (kind, label) in [
+            ("user", "用户"),
+            ("feedback", "反馈"),
+            ("project", "项目"),
+            ("reference", "参考"),
+        ] {
+            assert_eq!(type_label(kind), Some(label));
+        }
+        for kind in ["", "unknown", "User", "项目"] {
+            assert_eq!(type_label(kind), None);
+        }
+    }
 }
