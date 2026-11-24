@@ -216,12 +216,12 @@ mod tests {
             let meter = model.meter.unwrap();
             if *scene == "ai-compacting" {
                 assert!(model.busy && model.compacting && meter.amber());
-                assert_eq!(meter.label(), "已用 93K / 128K");
+                assert_eq!((meter.used,meter.window), (93_000,128_000));
                 assert_eq!(model.status(false), "正在压缩上下文…");
                 assert!(!entries.iter().any(|e| matches!(e, Entry::Compaction(_))));
             } else {
                 assert!(!model.busy && !model.compacting && !meter.amber());
-                assert_eq!(meter.label(), "已用 41K / 1M");
+                assert_eq!((meter.used,meter.window), (41_000,1_000_000));
                 assert!(matches!(&entries[3..], [Entry::Compaction(_), Entry::User { .. }, Entry::Assistant { .. }]));
                 let answer = model.conversation.turns()[0].answer.as_ref().unwrap();
                 let [AnswerItem::Step { .. }, AnswerItem::Step { .. }, AnswerItem::Compaction(c)] = &answer.items[..] else { panic!("expected steps then divider"); };
@@ -382,6 +382,13 @@ mod execution_tests {
             .as_ref()
             .unwrap()
             .items;
+        if let AnswerItem::Step { output, .. } = &items[0] {
+            let view = crate::ai::output_view::display(output);
+            assert_eq!(view.saved.as_deref(), Some("完整输出 1.0 MB 已保存 · output-1"));
+            assert!(!view.preview.contains("输出 id"));
+            assert!(!view.preview.contains("read_output"));
+            assert!(output.starts_with("输出 id output-1 · 总计 1048576 字节"));
+        } else { panic!("large-output step"); }
         assert!(matches!(&items[1], AnswerItem::Notice(text) if text.contains("读取输出")));
         assert!(
             matches!(&items[2], AnswerItem::Step { output, exit_code: Some(101), .. } if output.contains("省略中间输出") && output.contains("FAILED"))

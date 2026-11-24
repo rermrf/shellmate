@@ -83,8 +83,7 @@ pub struct DrawerModel {
 impl DrawerModel {
     pub fn context_hint(&self, session_bound: bool) -> &'static str {
         if !session_bound { "无会话" }
-        else if self.meter.is_none() { " · 最近 40 行输出" }
-        else { " · 已用 " }
+        else { " · 最近 40 行输出" }
     }
     pub fn status(&self, pending: bool) -> &str {
         if self.compacting { "正在压缩上下文…" }
@@ -159,8 +158,7 @@ impl DrawerModel {
 pub struct ContextMeter { pub used: usize, pub window: u32, pub trigger: u32 }
 impl ContextMeter {
     pub fn amber(self) -> bool { self.used as u128 * 10 >= u128::from(self.trigger) * 9 }
-    #[cfg(test)]
-    pub fn label(self) -> String { format!("已用 {} / {}", tokens(self.used), tokens(self.window as usize)) }
+
 }
 pub fn tokens(n: usize) -> String {
     if n >= 1_000_000 && n.is_multiple_of(1_000_000) { format!("{}M", n / 1_000_000) }
@@ -395,24 +393,24 @@ mod capability_tests {
 mod context_tests {
     use super::*;
     #[test]
-    fn header_keeps_recent_output_until_usage_and_unbound_text_stays_unchanged() {
+    fn header_keeps_m1_text_before_and_after_usage() {
         let mut model = DrawerModel::default();
         assert_eq!(format!("上下文：prod-web-01{}", model.context_hint(true)), "上下文：prod-web-01 · 最近 40 行输出");
         assert_eq!(format!("上下文：{}", model.context_hint(false)), "上下文：无会话");
         model.event(Event::Context { used: 37_000, window: 1_000_000, trigger: 967_000 });
         let meter = model.meter.unwrap();
-        assert_eq!(format!("上下文：prod-web-01{}{} / {}", model.context_hint(true), tokens(meter.used), tokens(meter.window as usize)), "上下文：prod-web-01 · 已用 37K / 1M");
+        assert_eq!(format!("上下文：prod-web-01{}", model.context_hint(true)), "上下文：prod-web-01 · 最近 40 行输出");
         assert_eq!(model.context_hint(false), "无会话");
         assert!(!meter.amber());
         model.clear();
         assert_eq!(model.context_hint(true), " · 最近 40 行输出");
     }
     #[test]
-    fn meter_is_hidden_until_usage_and_amber_at_ninety_percent_of_trigger() {
+    fn indicator_uses_context_events_and_amber_at_ninety_percent_of_trigger() {
         let mut model=DrawerModel::default();
         assert!(model.meter.is_none());
         model.event(Event::Context { used:37_000,window:1_000_000,trigger:967_000 });
-        assert_eq!(model.meter.unwrap().label(),"已用 37K / 1M");
+        assert_eq!(crate::ai::context_view::percent(model.meter.unwrap().used, model.meter.unwrap().window), "4%");
         assert!(!model.meter.unwrap().amber());
         model.event(Event::Context {used:85_499,window:128_000,trigger:95_000});
         assert!(!model.meter.unwrap().amber());

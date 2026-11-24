@@ -1,4 +1,6 @@
+pub(crate) mod context_view;
 pub(crate) mod commands;
+pub(crate) mod output_view;
 pub mod exec;
 pub mod host;
 pub(crate) mod markdown;

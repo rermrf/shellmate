@@ -77,12 +77,41 @@ pub fn mode(args: &str) -> Option<PermissionMode> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Dispatch {
     Question(String),
+    OpenContext,
     Run { name: &'static str, args: String },
     QueueCompact(Option<String>),
     Hint(String),
 }
 pub const STOP_FIRST: &str = "请先停止当前任务";
 pub const QUEUED: &str = "已排队：将在当前步骤结束后压缩";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerKey {
+    Native,
+    Previous,
+    Next,
+    Complete,
+    Submit,
+    Dismiss,
+}
+/// Native IME and Shift+Enter always retain their editing semantics. Only the
+/// open command menu intercepts navigation; closed-menu Enter uses PressEnter.
+pub fn composer_key(popup: bool, key: &str, shift: bool, composing: bool) -> ComposerKey {
+    if composing || !popup {
+        return ComposerKey::Native;
+    }
+    match key {
+        "up" => ComposerKey::Previous,
+        "down" => ComposerKey::Next,
+        "tab" => ComposerKey::Complete,
+        "enter" if !shift => ComposerKey::Submit,
+        "escape" => ComposerKey::Dismiss,
+        _ => ComposerKey::Native,
+    }
+}
+pub fn submits_enter(shift: bool, composing: bool) -> bool {
+    !shift && !composing
+}
 pub fn dispatch(text: &str, busy: bool, registry: &[Command]) -> Dispatch {
     let (token, args) = text
         .split_once(char::is_whitespace)
@@ -108,6 +137,9 @@ pub fn dispatch(text: &str, busy: bool, registry: &[Command]) -> Dispatch {
                 .trim_end()
                 .into(),
         );
+    }
+    if c.name == "context" {
+        return Dispatch::OpenContext;
     }
     match c.kind {
         Kind::Prompt(template) => {
@@ -179,6 +211,32 @@ impl Popup {
 mod tests {
     use super::*;
     #[test]
+    fn textarea_keys_preserve_newlines_and_ime_but_menu_owns_navigation() {
+        for key in ["up", "down", "tab", "enter", "escape"] {
+            for shift in [false, true] {
+                assert_eq!(composer_key(true, key, shift, true), ComposerKey::Native);
+                assert_eq!(composer_key(false, key, shift, false), ComposerKey::Native);
+            }
+        }
+        for (key, action) in [
+            ("up", ComposerKey::Previous),
+            ("down", ComposerKey::Next),
+            ("tab", ComposerKey::Complete),
+            ("enter", ComposerKey::Submit),
+            ("escape", ComposerKey::Dismiss),
+        ] {
+            assert_eq!(composer_key(true, key, false, false), action);
+        }
+        assert_eq!(
+            composer_key(true, "enter", true, false),
+            ComposerKey::Native
+        );
+        assert!(submits_enter(false, false));
+        for (shift, composing) in [(true, false), (false, true), (true, true)] {
+            assert!(!submits_enter(shift, composing));
+        }
+    }
+    #[test]
     fn exact_only_and_args() {
         for text in [
             "/etc/nginx/nginx.conf 有什么问题",
@@ -227,6 +285,13 @@ mod tests {
     }
     #[test]
     fn busy_policy() {
+        for busy in [false, true] {
+            assert_eq!(dispatch("/context", busy, COMMANDS), Dispatch::OpenContext);
+        }
+        assert!(matches!(
+            dispatch("/context extra", false, COMMANDS),
+            Dispatch::Hint(_)
+        ));
         assert_eq!(
             dispatch("/compact 任务重点", true, COMMANDS),
             Dispatch::QueueCompact(Some("任务重点".into()))
@@ -237,7 +302,7 @@ mod tests {
                 Dispatch::Hint(STOP_FIRST.into())
             );
         }
-        for text in ["/tasks", "/context", "/help"] {
+        for text in ["/tasks", "/help"] {
             assert!(matches!(
                 dispatch(text, true, COMMANDS),
                 Dispatch::Run { .. }

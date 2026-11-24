@@ -5,7 +5,6 @@ use crate::ui::{Surface, field_input};
 use futures::StreamExt;
 use gpui::{
     component::{
-        Disableable as _,
         button::Button,
         input::InputState,
     },
@@ -85,6 +84,23 @@ impl AiSettings {
     pub(crate) fn replace_key(&mut self, cx: &mut Context<Self>) {
         self.replace = true;
         cx.notify();
+    }
+    fn select_provider(&mut self, anthropic: bool, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.provider == anthropic { return; }
+        self.provider = anthropic;
+        let saved = self.db.borrow().ai_settings_for_provider(anthropic);
+        let (base, reasoning) = saved.map(|saved| (saved.provider.base_url().to_owned(), saved.reasoning))
+            .unwrap_or_else(|_| (base_placeholder(anthropic).into(), ReasoningLevel::Default));
+        self.reasoning = reasoning;
+        self.base.update(cx, |i, cx| {
+            i.set_value(base, w, cx);
+            i.set_placeholder(base_placeholder(anthropic), w, cx);
+        });
+        self.key.update(cx, |i, cx| { i.take(cx); });
+        self.replace = false;
+        self.model.update(cx, |i, cx| i.set_value("", w, cx));
+        self.reload_model_limits(w, cx);
+        self.refresh_key(cx);
     }
     fn reload_model_limits(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let values = self.values(cx);
@@ -369,93 +385,18 @@ impl Drop for AiSettings {
 impl Render for AiSettings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
-        let card = div()
-            .p(px(18.))
-            .rounded(px(18.))
-            .bg(p.card)
-            .flex()
-            .flex_col()
-            .gap(px(14.));
-        let mut form = card.child(crate::dialogs::field(
-            "服务商",
-            &p,
-            div().flex().gap(px(8.)).children(
-                [(false, "OpenAI 兼容"), (true, "Anthropic")]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (anthropic, label))| {
-                        Button::new(("ai-provider", i))
-                            .label(label)
-                            .disabled(self.busy)
-                            .when(self.provider == anthropic, |b| {
-                                b.bg(p.accs).text_color(p.acc)
-                            })
-                            .on_click(cx.listener(move |s, _, w, cx| {
-                                if s.provider == anthropic {
-                                    return;
-                                }
-                                s.provider = anthropic;
-                                let saved = s.db.borrow().ai_settings_for_provider(anthropic);
-                                let (base, reasoning) = saved
-                                    .map(|saved| {
-                                        (saved.provider.base_url().to_owned(), saved.reasoning)
-                                    })
-                                    .unwrap_or_else(|_| {
-                                        (
-                                            base_placeholder(anthropic).into(),
-                                            ReasoningLevel::Default,
-                                        )
-                                    });
-                                s.reasoning = reasoning;
-                                s.base.update(cx, |i, cx| {
-                                    i.set_value(base, w, cx);
-                                    i.set_placeholder(base_placeholder(anthropic), w, cx);
-                                });
-                                s.key.update(cx, |i, cx| {
-                                    i.take(cx);
-                                });
-                                s.replace = false;
-                                s.model.update(cx, |i, cx| i.set_value("", w, cx));
-                                s.reload_model_limits(w, cx);
-                                s.refresh_key(cx);
-                            }))
-                    }),
-            ),
-        ));
-        form = form.child(crate::dialogs::field(
-            "Base URL",
-            &p,
-            field_input(&self.base, Surface::Card, true),
-        ));
-        form = form
-            .child(crate::dialogs::field("模型", &p, field_input(&self.model, Surface::Card, true)))
-            .child(crate::dialogs::field(
-                "思考等级",
-                &p,
-                div().flex().flex_wrap().gap(px(8.)).children(
-                    ReasoningLevel::options(&self.values(cx).provider)
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .map(|(index, level)| {
-                            Button::new(("ai-reasoning", index))
-                                .label(level.label())
-                                .disabled(self.busy)
-                                .when(self.reasoning == level, |b| b.bg(p.accs).text_color(p.acc))
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    s.reasoning = level;
-                                    cx.notify();
-                                }))
-                        }),
-                ),
-            ))
-            .child(div().text_size(px(12.)).text_color(p.tx2).child(
-                "等级越高，回答越慢、越耗 token",
-            ));
-        form = form.child(self.limit_fields(cx));
+        let this = cx.weak_entity();
+        let provider = crate::ui::segmented("ai-provider", [(false, "OpenAI 兼容"), (true, "Anthropic")]
+            .into_iter().map(|(value, label)| segment(label, self.provider == value, self.busy)).collect(),
+            move |index, w, cx| { this.update(cx, |s, cx| s.select_provider(index == 1, w, cx)).ok(); }, cx);
+        let mut form = settings_card(cx)
+            .child(settings_row("服务商", "选择 API 协议", provider, cx))
+            .child(div().py(px(12.)).child(crate::dialogs::field("Base URL", &p, field_input(&self.base, Surface::Card, true))))
+            .child(div().py(px(12.)).child(crate::dialogs::field("模型", &p, field_input(&self.model, Surface::Card, true))));
         if self.key_saved && !self.replace {
             form = form.child(
                 div()
+                    .py(px(12.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -472,10 +413,18 @@ impl Render for AiSettings {
                     ),
             );
         } else {
-            form = form.child(crate::dialogs::field("API Key", &p, self.key.clone()));
+            form = form.child(div().py(px(12.)).child(crate::dialogs::field("API Key", &p, self.key.clone())));
         }
+        let levels = ReasoningLevel::options(&self.values(cx).provider).to_vec();
+        let items = levels.iter().map(|level| segment(level.label(), self.reasoning == *level, self.busy)).collect();
+        let this = cx.weak_entity();
+        let reasoning = crate::ui::segmented("ai-reasoning", items, move |index, _, cx| {
+            this.update(cx, |s, cx| { if !s.busy { s.reasoning = levels[index]; cx.notify(); } }).ok();
+        }, cx).max_w_full().flex_wrap();
+        form = form.child(settings_row("思考等级", "等级越高，回答越慢、越耗 token", reasoning, cx));
         form = form.child(
             div()
+                .py(px(12.))
                 .flex()
                 .justify_end()
                 .gap(px(8.))
@@ -507,6 +456,7 @@ impl Render for AiSettings {
             .flex_col()
             .gap(px(12.))
             .child(form)
+            .child(self.limit_fields(cx))
             .child(
                 div()
                     .p(px(18.))
@@ -560,4 +510,22 @@ impl Render for AiSettings {
                     .map(|text| crate::dialogs::hint(text, &p)),
             )
     }
+}
+
+fn segment(label: impl Into<SharedString>, active: bool, busy: bool) -> crate::ui::SegmentItem {
+    let item = crate::ui::SegmentItem::new(label, active);
+    if busy { item.disabled("正在处理，请稍候") } else { item }
+}
+fn settings_card(cx: &App) -> Div {
+    div().flex_none().px(px(18.)).py(px(4.)).rounded(px(18.)).bg(cx.palette().card).flex().flex_col()
+}
+/// Same label/description typography as the other settings pages. Each complete
+/// control moves below its label if the row cannot fit both at the current width.
+fn settings_row(label: &'static str, hint: impl Into<SharedString>, control: impl IntoElement, cx: &App) -> Div {
+    let p = cx.palette();
+    div().min_h(px(56.)).flex_none().py(px(12.)).flex().flex_wrap().items_center().gap(px(12.))
+        .child(div().flex_1().min_w(px(180.)).max_w_full().whitespace_normal()
+            .text_size(px(13.5)).line_height(px(16.)).font_weight(FontWeight::SEMIBOLD).child(label)
+            .child(div().mt(px(4.)).text_size(px(12.)).line_height(px(18.)).font_weight(FontWeight::NORMAL).text_color(p.tx2).child(hint.into())))
+        .child(div().flex_none().min_w_0().max_w_full().child(control))
 }

@@ -6,6 +6,10 @@ use super::model::SUGGESTIONS;
 mod state;
 #[path = "slash_ui.rs"]
 mod slash_ui;
+#[path = "context_ui.rs"]
+mod context_ui;
+#[path = "composer_layout.rs"]
+mod composer_layout;
 use crate::{
     theme::{ActivePalette, MONO_FONT},
     workspace::Workspace,
@@ -13,9 +17,9 @@ use crate::{
 use futures::StreamExt;
 use gpui::{
     component::{
-        Disableable,
+        Disableable, Sizable, Size,
         button::Button,
-        input::{Input, InputEvent, InputState},
+        input::{InputEvent, InputState, Textarea, TextareaState},
     },
     prelude::*,
     *,
@@ -43,6 +47,7 @@ pub struct SessionContext {
 pub struct Drawer {
     state: state::ConversationState,
     popup: super::commands::Popup,
+    context_focus: FocusHandle,
     compact_queue: Arc<Mutex<Option<Option<String>>>>,
     data_root: std::path::PathBuf,
     tasks: Option<super::tasks::Tasks>,
@@ -51,8 +56,9 @@ pub struct Drawer {
     workspace: WeakEntity<Workspace>,
     db: SharedStore,
     credentials: Arc<CredentialStore>,
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     _subscription: Subscription,
+    _input_layout_subscription: Subscription,
     pub label: String,
     pub protocol: String,
     pub host: Option<String>,
@@ -82,19 +88,26 @@ impl Drawer {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("描述要做的事，例如：找出最占内存的 5 个进程")
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .soft_wrap(true)
+                .submit_on_enter(true)
+                .placeholder("描述要做的事，例如：找出最占内存的 5 个进程")
         });
         let subscription = cx.subscribe_in(
             &input,
             window,
             |s: &mut Self, _, event: &InputEvent, w, cx| {
                 match event {
-                    InputEvent::PressEnter { .. } => s.send_input(w, cx),
+                    InputEvent::PressEnter { shift, .. } => {
+                        if super::commands::submits_enter(*shift, s.input_composing(w, cx)) { s.send_input(w, cx); }
+                    }
                     InputEvent::Change => { s.popup.changed(&s.input.read(cx).value()); cx.notify(); }
                     _ => {}
                 }
             },
         );
+        let input_layout_subscription = cx.observe(&input, |_, _, cx| cx.notify());
         let configured = db.borrow().ai_settings().is_ok_and(|s| s.configured());
         let save_conversations = saving_enabled(&db);
         cx.spawn_in(window, async move |this, cx| {
@@ -136,6 +149,7 @@ impl Drawer {
         .detach();
         Self {
             popup: Default::default(),
+            context_focus: cx.focus_handle(),
             compact_queue: Default::default(),
             data_root,
             tasks: None,
@@ -147,6 +161,7 @@ impl Drawer {
             credentials,
             input,
             _subscription: subscription,
+            _input_layout_subscription: input_layout_subscription,
             label: "无会话".into(),
             protocol: String::new(),
             host: None,
@@ -179,6 +194,7 @@ impl Drawer {
             return;
         }
         if self.session != context.session {
+            self.state.context_popover.close();
             self.retire_tasks();
         }
         self.session = context.session;
@@ -200,6 +216,9 @@ impl Drawer {
             self.configured = self.db.borrow().ai_settings().is_ok_and(|s| s.configured());
         }
         cx.notify();
+    }
+    fn input_composing(&self, w: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.input.update(cx, |input, cx| input.marked_text_range(w, cx).is_some())
     }
     fn send_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
@@ -741,7 +760,11 @@ impl Drawer {
             self.capabilities = Capabilities { terminal:true,background:true,..Default::default() };
             self.input.update(cx, |i,cx|i.set_value(fixture.input,w,cx));
             self.popup.changed(fixture.input);
-            if let Some(context)=fixture.context { self.local(slash_ui::LocalBody::Context(context,shellmate_ai::WindowSource::Catalog),cx); }
+            if let Some(context)=fixture.context {
+                self.state.run_budget = Some((context.budget,shellmate_ai::WindowSource::Catalog));
+                self.state.model.meter = Some(super::model::ContextMeter { used:context.total,window:context.budget.window,trigger:context.budget.trigger });
+            }
+            if fixture.context_open { self.dispatch_input("/context",w,cx); }
             if scene=="ai-slash-tasks" { self.local(slash_ui::LocalBody::Tasks,cx); }
         }
         if let Some(fixture) = crate::proto::ai::execution_scene(scene) {
@@ -942,14 +965,7 @@ impl Render for Drawer {
                         .text_ellipsis()
                         .child(self.label.clone()),
                 )
-                .when(self.state.model.meter.is_none(), |d| {
-                    d.child(div().flex_none().child(self.state.model.context_hint(true)))
-                })
-                .when_some(self.state.model.meter, |d, meter| {
-                    d.child(div().id("ai-context-meter").flex_none().flex().items_center().child(self.state.model.context_hint(true))
-                        .child(div().text_color(if meter.amber() { p.warn } else { p.tx2 }).child(super::model::tokens(meter.used)))
-                        .child(format!(" / {}", super::model::tokens(meter.window as usize))))
-                })
+                .child(div().flex_none().child(self.state.model.context_hint(true)))
             })
             .when(self.session.is_none(), |d| d.child(self.state.model.context_hint(false)));
         let header = div()
@@ -1186,13 +1202,13 @@ impl Render for Drawer {
                                             .label(if expanded { "收起摘要" } else { "查看摘要" }).h(px(24.)).text_size(px(11.5))
                                             .on_click(cx.listener(move |s, _, _, cx| { s.state.toggle_summary(key); cx.notify(); })) )));
                                 if expanded && let Some(summary) = &c.summary {
-                                    divider = divider.child(div().p(px(10.)).rounded(px(12.)).bg(p.card2).text_size(px(12.)).text_color(p.tx2).whitespace_normal().child(summary.clone()));
+                                    divider = divider.child(agent_ui::step_surface(&p).text_size(px(12.)).text_color(p.tx2).whitespace_normal().child(summary.clone()));
                                 }
                                 reply = reply.child(divider);
                                 continue;
                             }
                             shellmate_ai::AnswerItem::Notice(text) => {
-                                reply = reply.child(div().text_size(px(11.)).text_color(p.tx3).child(text.clone()));
+                                reply = reply.child(div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(text.clone()));
                                 continue;
                             }
                             item @ shellmate_ai::AnswerItem::Step { .. } => {
@@ -1367,6 +1383,18 @@ impl Render for Drawer {
         if !self.history && self.state.active_step.is_some() {
             body = body.child(self.active_card(cx));
         }
+        // M1's single-line Input ignores h(32); the 30px action determines the row.
+        // Clip the expanded inner editor at the field edge, before the button gap.
+        let line_height = (window.rem_size() * 1.25).round();
+        let rows = self.input.read(cx).display_map().wrap_row_count();
+        let layout = composer_layout::layout(rows, window.rem_size().into(), line_height.into());
+        let field_height = px(layout.viewport_height);
+        let inset = px(layout.text_inset);
+        let composer = div().relative().w_full().h(field_height).overflow_hidden().child(
+            div().absolute().left(-Size::XSmall.input_px()).right(-Size::XSmall.input_px()).top(inset).bottom(inset)
+                .child(Textarea::new(&self.input).xsmall().appearance(false).p_0()
+                    .h(field_height - inset * 2.).min_h_0().max_h(field_height - inset * 2.).text_size(px(13.)))
+        );
         let footer = div()
             .relative()
             .flex_none()
@@ -1379,25 +1407,25 @@ impl Render for Drawer {
             .flex_col()
             .gap(px(6.))
             .children(self.task_strip(cx))
-            .child(self.permission_chip(cx))
+            .child(div().flex().items_start().justify_between().gap(px(8.))
+                .child(div().flex_1().min_w_0().when(!self.capabilities.available(), |d| d.whitespace_nowrap().overflow_hidden()).child(self.permission_chip(cx)))
+                .children(self.context_indicator(cx)))
             .children(self.slash_popup(cx))
             .child(
                 div()
                     .flex()
-                    .items_center()
+                    .flex_none()
+                    .h(px(layout.height))
+                    .items_end()
                     .gap(px(8.))
                     .pl(px(12.))
                     .pr(px(4.))
-                    .py(px(4.))
+                    .py(px(composer_layout::VERTICAL_PADDING))
                     .rounded(px(13.))
                     .bg(p.card2)
                     .child(
                         div().flex_1().min_w_0().child(
-                            Input::new(&self.input)
-                                .appearance(false)
-                                .p_0()
-                                .h(px(32.))
-                                .text_size(px(13.)),
+                            composer,
                         ),
                     )
                     .child(
@@ -1411,7 +1439,7 @@ impl Render for Drawer {
                             crate::dialogs::Tone::Primary,
                             true,
                         )
-                        .h(px(30.))
+                        .h(px(composer_layout::ACTION_HEIGHT))
                         .on_click(cx.listener(|s, _, w, cx| {
                             if s.state.model.busy || s.state.pending {
                                 s.stop(cx)

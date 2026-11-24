@@ -365,7 +365,7 @@ impl Workspace {
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
             "ai-agent" | "ai-agent-run" | "ai-new-confirm" | "ai-agent-redline"
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
-            | "ai-tasks" | "ai-output-large" | "ai-compacted" | "ai-compacted-open"
+            | "ai-tasks" | "ai-output-large" | "ai-input-multiline" | "ai-context-popover" | "ai-context-amber" | "ai-compacted" | "ai-compacted-open"
             | "ai-compacting" | "ai-compacted-tier1" | "ai-history" | "ai-error"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
                 self.open_ai(window, cx);

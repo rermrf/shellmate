@@ -13,6 +13,12 @@ pub struct Reading {
     pub docker_cpu: &'static [(&'static str, f64)],
 }
 pub const READINGS: &[Reading] = &[
+Reading {scene:"ai-context-popover",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-context-popover",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-context-amber",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-context-amber",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-input-multiline",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-input-multiline",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-slash",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-slash",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-slash-filter",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},

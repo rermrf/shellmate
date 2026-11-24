@@ -223,6 +223,13 @@ async fn queued_compaction_waits_for_tool_boundary_then_run_continues() {
 async fn local_cards_never_enter_request_or_persistence_and_reload_clears_them() {
     let (mut db, s, config) = saved();
     let mut state = state();
+    assert_eq!(dispatch("/context", false, COMMANDS), Dispatch::OpenContext);
+    state.context_popover.show();
+    assert!(state.context_popover.open);
+    assert!(
+        state.local_cards.is_empty(),
+        "/context never inserts a local card"
+    );
     state.local_cards.push(LocalCard {
         after_turn: 1,
         body: LocalBody::Hint("LOCAL-ONLY-SENTINEL".into()),
@@ -244,15 +251,33 @@ async fn local_cards_never_enter_request_or_persistence_and_reload_clears_them()
         None,
     )
     .unwrap();
+    let mut context_used = None;
     while let Some(e) = stream.next().await {
-        if let AgentEvent::Error(e) = e {
-            panic!("{e}");
+        match e {
+            AgentEvent::Context { used, .. } => context_used = Some(used),
+            AgentEvent::Error(e) => panic!("{e}"),
+            _ => {}
         }
     }
     drop(stream);
+    let breakdown = state
+        .model
+        .conversation
+        .breakdown_with_limits(client.context_budget(), &caps(), s.exec)
+        .unwrap();
+    assert_eq!(
+        Some(breakdown.total),
+        context_used,
+        "popover and agent Context event use the same total"
+    );
+    assert_eq!(
+        breakdown.categories().iter().map(|(_, n)| n).sum::<usize>(),
+        breakdown.total
+    );
     let request = String::from_utf8(http.requests()[0].body.to_vec()).unwrap();
     assert!(!request.contains("LOCAL-ONLY-SENTINEL"));
     assert!(!request.contains("/help"));
+    assert!(!request.contains("/context"));
     state.persist(&mut db, None, "openai", "fixture");
     let loaded = db.ai_conversation(&state.id).unwrap().unwrap();
     assert!(
@@ -263,6 +288,7 @@ async fn local_cards_never_enter_request_or_persistence_and_reload_clears_them()
     state.reset_conversation();
     state.model.conversation = loaded.conversation;
     assert!(state.local_cards.is_empty());
+    assert!(!state.context_popover.open);
 }
 
 #[test]

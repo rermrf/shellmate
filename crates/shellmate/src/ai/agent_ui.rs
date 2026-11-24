@@ -94,7 +94,7 @@ impl Drawer {
                             .child(format!("{}s", task.started.elapsed().as_secs())),
                     )
                     .child(
-                        step_action(SharedString::from(format!("task-stop-{id}")), "停止", cx)
+                        Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止").h(px(24.)).text_size(px(11.5))
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 if s.fixture {
                                     s.fixture_tasks.retain(|t| t.id != stop_id);
@@ -443,10 +443,8 @@ impl Drawer {
             .as_ref()
             .map(|i| classify(&i.read(cx).value()) == Class::RedLine)
             .unwrap_or(step.redline);
-        let mut card = div()
+        let mut card = step_surface(&p)
             .flex_none()
-            .rounded(px(12.))
-            .p(px(10.))
             .bg(if red { p.errs } else { p.card2 })
             .flex()
             .flex_col()
@@ -621,11 +619,8 @@ impl Drawer {
         } else {
             p.err
         };
-        let mut card = div()
+        let mut card = step_surface(&p)
             .flex_none()
-            .p(px(10.))
-            .rounded(px(12.))
-            .bg(p.card2)
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -646,7 +641,8 @@ impl Drawer {
             _ => {}
         }
         if !output.is_empty() || matches!(status, StepStatus::Completed | StepStatus::TimedOut) {
-            let (stdout, stderr) = output_sections(output);
+            let output_view = crate::ai::output_view::display_step(output, !matches!(status, StepStatus::Completed | StepStatus::TimedOut));
+            let (stdout, stderr) = output_sections(output_view.preview);
             let has_output = !stdout.is_empty() || !stderr.is_empty();
             let expanded = self.state.expanded.contains(&key);
             let overflowing = self.state.overflowing_output.contains(&key);
@@ -672,6 +668,10 @@ impl Drawer {
                     )
                 })
                 .when(!has_output, |d| d.child("（无输出）"));
+            if output_view.prose {
+                card = card.child(div().w_full().min_w_0().text_size(px(12.)).line_height(px(18.))
+                    .text_color(p.tx2).whitespace_normal().child(output_view.preview.to_owned()));
+            } else {
             // Measure the complete content, including section labels and gaps. The cap
             // clips by rendered height; it never slices or reflows command output.
             let measured =
@@ -721,7 +721,11 @@ impl Drawer {
                 )
                 .height_limit(if expanded { 320. } else { 8. * 18. }, expanded),
             );
-            if has_output && !self.state.readonly {
+            }
+            if let Some(saved) = output_view.saved {
+                card = card.child(div().text_size(px(11.)).text_color(p.tx3).child(saved));
+            }
+            if has_output && !self.state.readonly && !output_view.prose {
                 let copy = output.clone();
                 let mut actions = step_actions();
                 if overflowing {
@@ -848,6 +852,10 @@ impl Drawer {
         }
         block
     }
+}
+
+pub(super) fn step_surface(p: &crate::theme::Palette) -> Div {
+    div().p(px(10.)).rounded(px(12.)).bg(p.card2)
 }
 
 fn step_actions() -> Div {

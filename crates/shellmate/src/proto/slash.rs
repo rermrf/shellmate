@@ -4,11 +4,15 @@ use crate::ai::{
     tasks::{Status, TaskInfo},
 };
 use shellmate_ai::{ContextBreakdown, ContextBudget, ContextSnapshot, ContextWindow, UserTurn};
+pub const MULTILINE_INPUT: &str = "请检查这个页面的连接问题：https://portwatch-vi.xyz/https://portwatch-vi.xyz/api/status?region=cn&service=web 并对照终端日志解释超时原因。";
 pub const SCENES: &[&str] = &[
     "ai-slash",
     "ai-slash-filter",
     "ai-slash-context",
     "ai-slash-tasks",
+    "ai-input-multiline",
+    "ai-context-popover",
+    "ai-context-amber",
     "set-ai",
     "set-ai-advanced",
 ];
@@ -41,10 +45,11 @@ pub struct Fixture {
     pub input: &'static str,
     pub model: DrawerModel,
     pub context: Option<ContextBreakdown>,
+    pub context_open: bool,
     pub tasks: Vec<TaskInfo>,
 }
 pub fn scene(scene: &str) -> Option<Fixture> {
-    if !SCENES[..4].contains(&scene) {
+    if !SCENES[..7].contains(&scene) {
         return None;
     }
     let mut model = DrawerModel::default();
@@ -63,11 +68,32 @@ pub fn scene(scene: &str) -> Option<Fixture> {
             .conversation
             .push_text("服务运行正常，构建仍在后台继续。你可以查看上下文用量或管理后台任务。");
     }
-    if scene == "ai-slash-context" {
+    let context_scene = matches!(
+        scene,
+        "ai-slash-context" | "ai-context-popover" | "ai-context-amber"
+    );
+    if context_scene {
+        model = super::ai::execution_scene("ai-output-large").unwrap().model;
+        let mut entries = model.conversation.entries().to_vec();
+        if let shellmate_ai::Entry::User { context, .. } = &mut entries[0] {
+            context.text = (1..=40)
+                .map(|n| format!("10:42:{n:02} health check /api/status returned 200"))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        model.conversation = shellmate_ai::Conversation::from_entries(entries);
+        model.conversation.push_text(
+            "构建失败来自数据库连接，服务本身仍正常运行。下一步检查测试环境的连接配置。",
+        );
+        let used = if scene == "ai-context-amber" {
+            155_000
+        } else {
+            73_600
+        };
         model
             .conversation
             .apply(shellmate_ai::LogUpdate::Usage(shellmate_ai::Usage {
-                input_tokens: Some(36000),
+                input_tokens: Some(used - 1000),
                 output_tokens: Some(1000),
             }));
         context = Some(
@@ -92,10 +118,12 @@ pub fn scene(scene: &str) -> Option<Fixture> {
         input: match scene {
             "ai-slash" => "/",
             "ai-slash-filter" => "/co",
+            "ai-input-multiline" => MULTILINE_INPUT,
             _ => "",
         },
         model,
         context,
+        context_open: context_scene && scene != "ai-context-amber",
         tasks,
     })
 }
@@ -140,6 +168,19 @@ mod tests {
     }
     #[test]
     fn fixtures_open_filter_context_and_finished_tasks() {
+        let multiline = scene("ai-input-multiline").unwrap();
+        assert_eq!(multiline.input, MULTILINE_INPUT);
+        assert!(multiline.input.contains("请检查"));
+        assert!(
+            multiline
+                .input
+                .contains("https://portwatch-vi.xyz/https://")
+        );
+        assert!(
+            !multiline.input.contains('\n'),
+            "fixture exercises soft wrapping of a URL"
+        );
+        assert!(multiline.model.conversation.entries().is_empty());
         let mut popup = crate::ai::commands::Popup::default();
         popup.changed(scene("ai-slash").unwrap().input);
         assert!(popup.open);
@@ -150,9 +191,35 @@ mod tests {
         let f = scene("ai-slash-context").unwrap();
         let b = f.context.unwrap();
         assert!(!f.model.conversation.entries().is_empty());
-        assert_eq!(b.total, 37000);
+        assert_eq!(b.total, 73600);
+        assert!(f.context_open);
+        assert!(b.terminal_context > 0 && b.tool_results > 0 && b.tool_definitions > 0);
         assert!(b.provider_usage);
         assert_eq!(b.budget.trigger, 167000);
+        let amber = scene("ai-context-amber").unwrap();
+        assert!(!amber.context_open);
+        let b = amber.context.unwrap();
+        assert!(
+            crate::ai::model::ContextMeter {
+                used: b.total,
+                window: b.budget.window,
+                trigger: b.budget.trigger
+            }
+            .amber()
+        );
+        let normal = scene("ai-context-popover").unwrap().context.unwrap();
+        assert_eq!(
+            crate::ai::context_view::percent(normal.total, normal.budget.window),
+            "37%"
+        );
+        assert!(
+            !crate::ai::model::ContextMeter {
+                used: normal.total,
+                window: normal.budget.window,
+                trigger: normal.budget.trigger
+            }
+            .amber()
+        );
         let tasks = scene("ai-slash-tasks").unwrap().tasks;
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].status, Status::Running);

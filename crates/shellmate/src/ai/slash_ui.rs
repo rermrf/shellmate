@@ -2,13 +2,11 @@ use super::Drawer;
 use crate::{
     ai::{
         commands::{self, COMMANDS, Dispatch},
-        model::tokens,
         tasks::Status,
     },
     theme::ActivePalette,
 };
 use gpui::{component::button::Button, prelude::*, *};
-use shellmate_ai::{ContextBreakdown, ContextBudget, WindowSource, resolve_window};
 
 pub(super) struct LocalCard {
     pub after_turn: usize,
@@ -17,7 +15,6 @@ pub(super) struct LocalCard {
 pub(super) enum LocalBody {
     Hint(String),
     Help,
-    Context(ContextBreakdown, WindowSource),
     Tasks,
 }
 impl Drawer {
@@ -41,6 +38,7 @@ impl Drawer {
             self.popup.escape();
         }
         match action {
+            Dispatch::OpenContext => self.open_context(w, cx),
             Dispatch::Question(question) => self.ask(question, w, cx),
             Dispatch::Hint(text) => self.local(LocalBody::Hint(text), cx),
             Dispatch::QueueCompact(focus) => self.compact_context(focus, w, cx),
@@ -53,45 +51,6 @@ impl Drawer {
                     }
                 }
                 "clear" => self.new_conversation(w, cx),
-                "context" => {
-                    let s = self.db.borrow().ai_settings().unwrap_or_default();
-                    let (budget, source) = self.state.run_config.as_ref().map_or_else(
-                        || {
-                            (
-                                s.context_budget(),
-                                resolve_window(&s.provider, &s.model, s.context_window).1,
-                            )
-                        },
-                        |c| {
-                            let (window, source) =
-                                resolve_window(&c.provider, &c.model, c.context_window);
-                            (
-                                ContextBudget::new(
-                                    window,
-                                    c.autocompact_window,
-                                    c.max_output_tokens.resolve(&c.provider, &c.model),
-                                ),
-                                source,
-                            )
-                        },
-                    );
-                    let (budget, source) = self.state.run_budget.unwrap_or((budget, source));
-                    let mut log = self.state.model.conversation.clone();
-                    if log.entries().is_empty() {
-                        log.push_user(shellmate_ai::UserTurn::new(
-                            "",
-                            shellmate_ai::ContextSnapshot {
-                                label: self.label.clone(),
-                                protocol: self.protocol.clone(),
-                                text: String::new(),
-                            },
-                        ));
-                    }
-                    match log.breakdown_for_budget(budget, &self.capabilities) {
-                        Ok(b) => self.local(LocalBody::Context(b, source), cx),
-                        Err(e) => self.local(LocalBody::Hint(e.to_string()), cx),
-                    }
-                }
                 "tasks" => self.local(LocalBody::Tasks, cx),
                 "help" => self.local(LocalBody::Help, cx),
                 "mode" => {
@@ -123,19 +82,36 @@ impl Drawer {
         }
     }
     pub(super) fn slash_key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
-        if !self.input.focus_handle(cx).contains_focused(w, cx) || !self.popup.open {
+        if e.keystroke.key == "escape"
+            && self.state.context_popover.open
+            && !self.input_composing(w, cx)
+        {
+            self.state.context_popover.close();
+            self.input.focus_handle(cx).focus(w, cx);
+            cx.stop_propagation();
+            w.prevent_default();
+            cx.notify();
             return;
         }
-        match e.keystroke.key.as_str() {
-            "up" => self.popup.navigate(false),
-            "down" => self.popup.navigate(true),
-            "escape" => self.popup.escape(),
-            "tab" => {
+        if !self.input.focus_handle(cx).contains_focused(w, cx) {
+            return;
+        }
+        use crate::ai::commands::ComposerKey;
+        match commands::composer_key(
+            self.popup.open,
+            &e.keystroke.key,
+            e.keystroke.modifiers.shift,
+            self.input_composing(w, cx),
+        ) {
+            ComposerKey::Previous => self.popup.navigate(false),
+            ComposerKey::Next => self.popup.navigate(true),
+            ComposerKey::Dismiss => self.popup.escape(),
+            ComposerKey::Complete => {
                 if let Some(text) = self.popup.complete() {
                     self.input.update(cx, |i, cx| i.set_value(text, w, cx));
                 }
             }
-            "enter" => {
+            ComposerKey::Submit => {
                 let text = self.input.read(cx).value().to_string();
                 // Enter submits literal input; arrow selection explicitly chooses a completion.
                 let name = text.split_whitespace().next().unwrap_or("");
@@ -148,7 +124,7 @@ impl Drawer {
                 };
                 self.dispatch_input(&text, w, cx);
             }
-            _ => return,
+            ComposerKey::Native => return,
         }
         cx.stop_propagation();
         w.prevent_default();
@@ -233,17 +209,11 @@ impl Drawer {
                 let title = match &c.body {
                     LocalBody::Hint(_) => "本地提示",
                     LocalBody::Help => "/help · 命令",
-                    LocalBody::Context(..) => "/context · 上下文",
                     LocalBody::Tasks => "/tasks · 后台任务",
                 };
-                let mut card = div()
+                let mut card = super::agent_ui::step_surface(&p)
                     .flex_none()
                     .min_w_0()
-                    .rounded(px(14.))
-                    .border_1()
-                    .border_color(p.line)
-                    .bg(p.card2)
-                    .p(px(12.))
                     .flex()
                     .flex_col()
                     .gap(px(9.))
@@ -263,7 +233,7 @@ impl Drawer {
                                     .flex_none()
                                     .w(px(22.))
                                     .h(px(22.))
-                                    .rounded(px(7.))
+                                    .rounded(px(6.))
                                     .tooltip("关闭本地卡片")
                                     .on_click(cx.listener(move |s, _, _, cx| {
                                         s.state.local_cards.remove(i);
@@ -285,50 +255,6 @@ impl Drawer {
                                 ),
                             );
                         }
-                    }
-                    LocalBody::Context(b, source) => {
-                        let source = match source {
-                            WindowSource::Setting => "手动设置",
-                            WindowSource::Catalog => "模型目录",
-                            WindowSource::Fallback => "128K 回退",
-                        };
-                        card = card
-                            .child(div().text_size(px(18.)).text_color(p.tx).child(format!(
-                                "{} / {}",
-                                tokens(b.total),
-                                tokens(b.budget.window as usize)
-                            )))
-                            .child(format!(
-                                "上下文窗口　{}（{source}）",
-                                tokens(b.budget.window as usize)
-                            ))
-                            .child(format!("自动压缩窗口　{}", tokens(b.budget.auto as usize)))
-                            .child(format!(
-                                "自动压缩阈值　{}",
-                                tokens(b.budget.trigger as usize)
-                            ))
-                            .child(div().h(px(1.)).bg(p.line));
-                        for (name, n) in [
-                            ("系统提示", b.system_prompt),
-                            ("压缩摘要", b.summary),
-                            ("消息", b.messages),
-                            ("工具结果", b.tool_results),
-                        ] {
-                            card = card.child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .child(format!("{name}（估算）"))
-                                    .child(tokens(n)),
-                            );
-                        }
-                        card = card.child(div().text_size(px(10.5)).text_color(p.tx3).child(
-                            if b.provider_usage {
-                                "总量：服务商用量 + 新增估算；各项为估算"
-                            } else {
-                                "总量及各项均为估算"
-                            },
-                        ));
                     }
                     LocalBody::Tasks => {
                         let tasks = if self.fixture {

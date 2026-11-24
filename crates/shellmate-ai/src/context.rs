@@ -70,13 +70,106 @@ impl ContextBudget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextBreakdown {
     pub system_prompt: usize,
+    pub tool_definitions: usize,
+    pub tool_count: usize,
+    pub terminal_context: usize,
     pub summary: usize,
     pub messages: usize,
     pub tool_results: usize,
-    /// Provider usage + appended estimates when available; components are estimates.
+    /// Provider usage + appended estimates when available; components are scaled to this total.
     pub total: usize,
     pub provider_usage: bool,
     pub budget: ContextBudget,
+}
+/// Stable semantic categories; presentation can add future categories without
+/// relying on display labels or on the ordering of Conversation entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextCategory {
+    System,
+    Tools,
+    Terminal,
+    Messages,
+    Results,
+    Summary,
+}
+impl ContextBreakdown {
+    pub fn categories(&self) -> [(ContextCategory, usize); 6] {
+        [
+            (ContextCategory::System, self.system_prompt),
+            (ContextCategory::Tools, self.tool_definitions),
+            (ContextCategory::Terminal, self.terminal_context),
+            (ContextCategory::Messages, self.messages),
+            (ContextCategory::Results, self.tool_results),
+            (ContextCategory::Summary, self.summary),
+        ]
+    }
+    /// Integer cumulative apportionment preserves zero categories and makes the
+    /// sum exact, including the rounding remainder, without floating-point loss.
+    pub fn scale_to(&mut self, total: usize) {
+        let values = self.categories().map(|(_, n)| n);
+        let sum = values.iter().map(|n| *n as u128).sum::<u128>();
+        let mut cumulative = 0u128;
+        let mut allocated = 0usize;
+        let scaled = values.map(|n| {
+            cumulative += n as u128;
+            let next = (cumulative * total as u128).checked_div(sum).unwrap_or(0) as usize;
+            let value = next - allocated;
+            allocated = next;
+            value
+        });
+        [
+            self.system_prompt,
+            self.tool_definitions,
+            self.terminal_context,
+            self.messages,
+            self.tool_results,
+            self.summary,
+        ] = scaled;
+        self.total = total;
+    }
+    pub fn remaining(&self) -> usize {
+        (self.budget.window as usize).saturating_sub(self.total)
+    }
+    /// Initial estimate before the first question, with no artificial user entry.
+    pub fn for_session(
+        budget: ContextBudget,
+        caps: &Capabilities,
+        context: &crate::ContextSnapshot,
+        limits: crate::agent::ExecLimits,
+    ) -> Self {
+        let system = if caps.available() {
+            crate::conversation::execution_prompt(context, caps)
+        } else {
+            crate::conversation::system_prompt(context)
+        };
+        let mut tools = if caps.available() {
+            crate::conversation::output_tools()
+        } else {
+            Vec::new()
+        };
+        tools.push(if caps.available() {
+            crate::conversation::run_command_tool_with_limits(caps, limits)
+        } else {
+            crate::conversation::command_tool()
+        });
+        let system_prompt = estimate_tokens(&system) + 8;
+        let tool_definitions = tools
+            .iter()
+            .map(|t| estimate_tokens(&serde_json::to_string(t).unwrap()))
+            .sum::<usize>();
+        Self {
+            system_prompt,
+            tool_definitions,
+            tool_count: tools.len(),
+            terminal_context: 0,
+            summary: 0,
+            messages: 0,
+            tool_results: 0,
+            total: system_prompt + tool_definitions,
+            provider_usage: false,
+            budget,
+        }
+    }
 }
 pub const SUMMARY_PREFIX: &str = "本会话延续自之前的对话，此前的上下文已压缩。以下是之前对话的摘要。你仍可看到工具的当前状态；请在已完成的工作基础上继续，避免重复。";
 pub const SUMMARY_PROMPT: &str = "你正在执行上下文检查点压缩：为将接手这项任务的另一个模型写一份交接摘要，使它能无缝继续工作。\n先在 <analysis> 中按时间顺序梳理整段对话：用户的每个请求、你采取的做法、关键决定、遇到的错误及如何解决、用户的纠正与反馈。\n然后在 <summary> 中按以下部分输出：\n1. 主要请求与意图：用户明确提出的所有要求，尽量保留原意\n2. 关键概念与背景：涉及的技术、环境与事实\n3. 涉及的文件与内容：查看、修改或新建过的文件，及必要的关键片段\n4. 错误与修复：遇到的错误、处理方式，以及用户的纠正\n5. 解决过程：已解决的问题与仍在进行的排查\n6. 用户消息：按顺序列出用户的全部消息要点（不含工具结果）\n7. 待办事项：明确尚未完成的工作\n8. 当前工作：压缩前正在做的事，尽量具体\n9. 下一步：与最近请求直接相关的下一步；如有必要引用原话，避免偏离用户意图\n要求：简洁、结构化，保留继续工作所需的关键数据和引用。";
@@ -335,34 +428,107 @@ impl Conversation {
         budget: ContextBudget,
         caps: &Capabilities,
     ) -> Result<ContextBreakdown, AiError> {
-        let request = self.prepare(caps)?;
-        let system_prompt = system_tokens(&request);
+        self.breakdown_with_limits(budget, caps, crate::agent::ExecLimits::default())
+    }
+    pub fn breakdown_with_limits(
+        &self,
+        budget: ContextBudget,
+        caps: &Capabilities,
+        limits: crate::agent::ExecLimits,
+    ) -> Result<ContextBreakdown, AiError> {
+        let narrowed = caps
+            .clone()
+            .for_question(&self.latest_user().ok_or(AiError::InvalidConfig)?.question);
+        let caps = &narrowed;
+        let mut request = self.prepare(caps)?;
+        if request
+            .chat_history
+            .last()
+            .is_some_and(|m| matches!(&**m, Message::Assistant(_)))
+        {
+            add_prompt(&mut request, "请继续。".into());
+        }
+        if let Some(tool) = request
+            .tools
+            .iter_mut()
+            .find(|t| t.name.as_str() == "run_command")
+        {
+            *tool = Arc::new(crate::conversation::run_command_tool_with_limits(
+                caps, limits,
+            ));
+        }
+        let tool_definitions = request
+            .tools
+            .iter()
+            .map(|t| estimate_tokens(&serde_json::to_string(t).unwrap()))
+            .sum::<usize>();
+        let system_prompt = system_tokens(&request) - tool_definitions;
         let mut summary = 0;
+        let mut terminal_context = 0;
         let mut tool_results = 0;
         for entry in &self.entries()[self.view_start()..] {
             match entry {
-                Entry::Compaction(c) if c.summary.is_some() => {
-                    summary += estimate_tokens(SUMMARY_PREFIX)
-                        + estimate_tokens(c.summary.as_deref().unwrap())
-                        + 8;
+                Entry::User { text, context } => {
+                    // Count this snapshot once. Assign the question and protocol
+                    // message overhead to Messages, without re-counting the wire.
+                    let wire = crate::UserTurn::new(text, context.clone()).wire_text();
+                    terminal_context += estimate_tokens(&wire)
+                        .saturating_sub(estimate_tokens(&format!("问题：{text}")));
                 }
-                Entry::Step(s) => tool_results += estimate_tokens(&s.result_text()) + 8,
+                Entry::Compaction(c) if c.summary.is_some() => {
+                    summary += estimate_tokens(&format!(
+                        "{SUMMARY_PREFIX}\n{}",
+                        c.summary.as_deref().unwrap()
+                    ));
+                    summary += c
+                        .retained_user
+                        .iter()
+                        .map(|text| estimate_tokens(text))
+                        .sum::<usize>();
+                    summary += estimate_tokens(&format!(
+                        "工具的当前状态：{}",
+                        serde_json::to_string(&c.state).unwrap()
+                    ));
+                    terminal_context += estimate_tokens(
+                        &crate::UserTurn::new("最新终端上下文", c.context.clone()).wire_text(),
+                    );
+                }
+                Entry::Step(s) => {
+                    let offered = request.tools.iter().any(|t| t.name.as_str() == s.call.name);
+                    tool_results += if offered {
+                        estimate_tokens(&s.call.name)
+                            + estimate_tokens(&s.call.args_json.to_string())
+                            + estimate_tokens(&s.result_text())
+                    } else {
+                        estimate_tokens(&s.plain_text())
+                    };
+                }
                 _ => {}
             }
         }
         let estimated = request_tokens(&request);
-        Ok(ContextBreakdown {
+        let provider_usage = self
+            .accounting
+            .usage
+            .is_some_and(|(_, pos)| pos >= self.view_start());
+        let mut breakdown = ContextBreakdown {
             system_prompt,
+            tool_definitions,
+            tool_count: request.tools.len(),
+            terminal_context,
             summary,
             tool_results,
-            messages: estimated.saturating_sub(system_prompt + summary + tool_results),
-            total: self.used(&request, caps),
-            provider_usage: self
-                .accounting
-                .usage
-                .is_some_and(|(_, pos)| pos >= self.view_start()),
+            messages: estimated.saturating_sub(
+                system_prompt + tool_definitions + terminal_context + summary + tool_results,
+            ),
+            total: estimated,
+            provider_usage,
             budget,
-        })
+        };
+        if provider_usage {
+            breakdown.scale_to(self.used(&request, caps));
+        }
+        Ok(breakdown)
     }
     pub(crate) fn used(&self, request: &CompletionRequest, caps: &Capabilities) -> usize {
         match self.accounting.usage {
@@ -663,10 +829,13 @@ mod tests {
         let b = log.breakdown(&client, &caps).unwrap();
         assert_eq!(b.total, request_tokens(&request));
         assert_eq!(
-            b.system_prompt + b.summary + b.messages + b.tool_results,
+            b.categories().iter().map(|(_, n)| n).sum::<usize>(),
             b.total
         );
-        assert!(b.system_prompt > 100, "system text and tool schema count");
+        assert!(
+            b.system_prompt > 100,
+            "system text counts separately from tools"
+        );
         log.apply(LogUpdate::Usage(Usage {
             input_tokens: Some(1000),
             output_tokens: Some(100),
@@ -745,3 +914,7 @@ mod tests {
         assert_eq!(seen.len(), 5);
     }
 }
+
+#[cfg(test)]
+#[path = "context_breakdown_tests.rs"]
+mod breakdown_tests;

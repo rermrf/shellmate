@@ -1,13 +1,9 @@
-use super::AiSettings;
+use super::{AiSettings, segment, settings_card, settings_row};
 use crate::{
     theme::ActivePalette,
     ui::{Surface, field_input},
 };
-use gpui::{
-    component::{Disableable, button::Button, input::InputState},
-    prelude::*,
-    *,
-};
+use gpui::{component::input::InputState, prelude::*, *};
 use shellmate_ai::{ContextWindow, OutputTokens, WindowSource, resolve_window};
 use shellmate_store::ai::Settings;
 
@@ -137,6 +133,29 @@ pub(super) fn compact_hint(s: &Settings) -> String {
         crate::ai::model::tokens(s.context_budget().trigger as usize)
     )
 }
+/// Steppers use the same persisted validation as typed values, including the
+/// coupled default/max timeout constraint when the maximum is lowered.
+fn stepped(settings: &Settings, index: usize, direction: i8) -> Settings {
+    let mut s = settings.normalized();
+    match index {
+        4 => {
+            s.exec.tool_output_chars = (s.exec.tool_output_chars as i64
+                + i64::from(direction) * 5000)
+                .clamp(1000, 150000) as usize
+        }
+        5 => {
+            s.exec.default_timeout_secs =
+                (s.exec.default_timeout_secs as i64 + i64::from(direction) * 30)
+                    .clamp(1, s.exec.max_timeout_secs as i64) as u64
+        }
+        6 => {
+            s.exec.max_timeout_secs =
+                (s.exec.max_timeout_secs as i64 + i64::from(direction) * 30).clamp(1, 600) as u64
+        }
+        _ => unreachable!("numeric stepper index"),
+    }
+    s.normalized()
+}
 impl AiSettings {
     fn limit_row(
         &self,
@@ -147,54 +166,103 @@ impl AiSettings {
         hint: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let p = cx.palette().clone();
+        let choices = options.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+        let items = options
+            .iter()
+            .map(|(value, label)| segment(*label, self.limits.choices[index] == *value, self.busy))
+            .collect();
+        let this = cx.weak_entity();
+        let segmented = crate::ui::segmented(
+            SharedString::from(format!("ai-limit-{index}")),
+            items,
+            move |i, _, cx| {
+                this.update(cx, |s, cx| {
+                    if !s.busy {
+                        s.limits.choices[index] = choices[i];
+                        cx.notify();
+                    }
+                })
+                .ok();
+            },
+            cx,
+        )
+        .max_w_full()
+        .flex_wrap();
         let controls = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(8.))
-            .children(options.iter().enumerate().map(|(i, (choice, label))| {
-                let choice = *choice;
-                Button::new((SharedString::from(format!("ai-limit-{index}")), i))
-                    .label(*label)
-                    .disabled(self.busy)
-                    .when(self.limits.choices[index] == choice, |b| {
-                        b.bg(p.accs).text_color(p.acc)
-                    })
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.limits.choices[index] = choice;
-                        cx.notify();
-                    }))
-            }))
+            .child(segmented)
             .when(self.limits.choices[index] == Choice::Custom, |d| {
-                d.child(div().w(px(100.)).child(field_input(
+                d.child(div().flex_none().w(px(100.)).child(field_input(
                     &self.limits.inputs[index],
                     Surface::Card,
                     true,
                 )))
-                .child(div().text_size(px(12.)).text_color(p.tx2).child(unit))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(cx.palette().tx2)
+                        .child(unit),
+                )
             });
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(7.))
-            .child(crate::dialogs::field(label, &p, controls))
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .line_height(px(18.))
-                    .text_color(p.tx2)
-                    .child(hint),
-            )
-            .into_any_element()
+        settings_row(label, hint, controls, cx).into_any_element()
+    }
+    fn numeric_row(
+        &self,
+        index: usize,
+        label: &'static str,
+        hint: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let s = self.values(cx);
+        let (value, min, max, unit) = match index {
+            4 => (s.exec.tool_output_chars as u64, 1000, 150000, "字符"),
+            5 => (
+                s.exec.default_timeout_secs,
+                1,
+                s.exec.max_timeout_secs,
+                "秒",
+            ),
+            6 => (s.exec.max_timeout_secs, 1, 600, "秒"),
+            _ => unreachable!("numeric stepper index"),
+        };
+        let this = cx.weak_entity();
+        let control = crate::ui::stepper(
+            SharedString::from(format!("ai-number-{index}")),
+            format!("{value} {unit}"),
+            !self.busy && value > min,
+            !self.busy && value < max,
+            move |direction, w, cx| {
+                this.update(cx, |s, cx| {
+                    if s.busy {
+                        return;
+                    }
+                    let values = numbers(&stepped(&s.values(cx), index, direction));
+                    for (i, value) in values.into_iter().enumerate().skip(4) {
+                        s.limits.inputs[i].update(cx, |input, cx| input.set_value(value, w, cx));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            },
+            cx,
+        );
+        settings_row(label, hint, control, cx).into_any_element()
     }
     pub(super) fn limit_fields(&self, cx: &mut Context<Self>) -> AnyElement {
         let s = self.values(cx);
         let p = cx.palette().clone();
-        let mut form = div()
-            .flex()
-            .flex_col()
-            .gap(px(14.))
+        let context = settings_card(cx)
+            .child(
+                div()
+                    .pt(px(12.))
+                    .pb(px(4.))
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("上下文与执行"),
+            )
             .child(self.limit_row(
                 0,
                 "上下文窗口",
@@ -207,17 +275,18 @@ impl AiSettings {
                     (Choice::Fixed(1000000), "1M"),
                     (Choice::Custom, "自定义"),
                 ],
-                "K · 8–10000",
-                window_hint(&s),
+                "K",
+                if self.limits.choices[0] == Choice::Custom {
+                    format!("{}；自定义 8–10000K", window_hint(&s))
+                } else {
+                    window_hint(&s)
+                },
                 cx,
             ))
             .child(self.limit_row(
                 1,
                 "自动压缩窗口",
-                &[
-                    (Choice::Auto, "自动（= 上下文窗口）"),
-                    (Choice::Custom, "自定义"),
-                ],
+                &[(Choice::Auto, "自动"), (Choice::Custom, "自定义")],
                 "K",
                 compact_hint(&s),
                 cx,
@@ -232,17 +301,29 @@ impl AiSettings {
                     (Choice::Fixed(200), "200"),
                     (Choice::Custom, "自定义"),
                 ],
-                "步 · 1–10000",
-                "达到上限后暂停，可继续任务".into(),
+                "步",
+                "达到上限后暂停，可继续任务；自定义 1–10000".into(),
                 cx,
-            ))
-            .child(
-                Button::new("ai-advanced")
-                    .label(if self.limits.advanced {
-                        "▾ 高级"
-                    } else {
-                        "▸ 高级"
-                    })
+            ));
+        let mut advanced =
+            settings_card(cx).child(
+                div()
+                    .id("ai-advanced")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .py(px(12.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .line_height(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.tx2)
+                    .child(
+                        div().w(px(10.)).h(px(15.)).flex_none().child(
+                            crate::icons::group_chevron(self.limits.advanced).text_color(p.tx2),
+                        ),
+                    )
+                    .child("高级")
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.limits.advanced = !s.limits.advanced;
                         cx.notify();
@@ -250,61 +331,58 @@ impl AiSettings {
             );
         if self.limits.advanced {
             let output = s.max_output_tokens.resolve(&s.provider, &s.model);
-            form = form.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.))
-                    .pt(px(12.))
-                    .border_t_1()
-                    .border_color(p.line)
-                    .child(self.limit_row(
-                        3,
-                        "单次输出 token",
-                        &[(Choice::Auto, "自动"), (Choice::Custom, "自定义")],
-                        "1024–128000",
-                        format!(
-                            "{}：{output}",
-                            if self.limits.choices[3] == Choice::Auto {
-                                "自动"
-                            } else {
-                                "实际使用"
-                            }
-                        ),
-                        cx,
-                    ))
-                    .children(
-                        [
-                            (4, "工具输出长度", "字符 · 1000–150000"),
-                            (5, "命令默认超时", "秒 · 不超过最长超时"),
-                            (6, "命令最长超时", "秒 · 1–600"),
-                        ]
-                        .map(|(i, label, unit)| {
-                            crate::dialogs::field(
-                                label,
-                                &p,
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .child(div().w(px(120.)).child(field_input(
-                                        &self.limits.inputs[i],
-                                        Surface::Card,
-                                        true,
-                                    )))
-                                    .child(div().text_size(px(11.5)).text_color(p.tx2).child(unit)),
-                            )
-                        }),
-                    ),
-            );
+            advanced = advanced
+                .child(self.limit_row(
+                    3,
+                    "单次输出 token",
+                    &[(Choice::Auto, "自动"), (Choice::Custom, "自定义")],
+                    "token",
+                    if self.limits.choices[3] == Choice::Auto {
+                        format!("自动：{output}")
+                    } else {
+                        format!("实际使用：{output}；自定义 1024–128000")
+                    },
+                    cx,
+                ))
+                .child(self.numeric_row(4, "工具输出长度", "1000–150000 字符".into(), cx))
+                .child(self.numeric_row(
+                    5,
+                    "命令默认超时",
+                    format!("1–{} 秒，不超过最长超时", s.exec.max_timeout_secs),
+                    cx,
+                ))
+                .child(self.numeric_row(6, "命令最长超时", "1–600 秒".into(), cx));
         }
-        form.into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(context)
+            .child(advanced)
+            .into_any_element()
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::{Choice, ContextWindow, Settings, choices, compact_hint, window_hint};
+    use super::{Choice, ContextWindow, Settings, choices, compact_hint, stepped, window_hint};
+    #[test]
+    fn numeric_steppers_keep_bounds_and_default_below_maximum() {
+        let mut s = Settings::default();
+        assert_eq!(stepped(&s, 4, 1).exec.tool_output_chars, 35000);
+        assert_eq!(stepped(&s, 5, 1).exec.default_timeout_secs, 150);
+        assert_eq!(stepped(&s, 6, 1).exec.max_timeout_secs, 600);
+        s.exec.tool_output_chars = 1000;
+        assert_eq!(stepped(&s, 4, -1).exec.tool_output_chars, 1000);
+        s.exec.tool_output_chars = 149000;
+        assert_eq!(stepped(&s, 4, 1).exec.tool_output_chars, 150000);
+        s.exec.max_timeout_secs = 31;
+        s.exec.default_timeout_secs = 31;
+        let s = stepped(&s, 6, -1);
+        assert_eq!(s.exec.max_timeout_secs, 1);
+        assert_eq!(s.exec.default_timeout_secs, 1);
+        assert_eq!(stepped(&s, 5, -1).exec.default_timeout_secs, 1);
+        assert_eq!(stepped(&s, 5, 1).exec.default_timeout_secs, 1);
+    }
     #[test]
     fn hints_setting_catalog_fallback_and_trigger() {
         let s = Settings::default();
