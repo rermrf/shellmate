@@ -30,13 +30,14 @@ fn config(a: bool) -> Config {
         .into(),
         api_key: ApiKey::new("fixture-only"),
         reasoning: ReasoningLevel::Default,
+        max_output_tokens: Default::default(),
         timeouts: Timeouts::default(),
     }
 }
 fn conversation() -> Conversation {
     Conversation {
         turns: vec![Turn {
-            user: UserTurn::redacted("检查容器", ContextSnapshot::default()),
+            user: UserTurn::new("检查容器", ContextSnapshot::default()),
             answer: None,
         }],
     }
@@ -229,7 +230,7 @@ async fn both_wires_complete_with_real_tool_results_and_parallel_disabled() {
         assert_eq!(bodies.len(), 2);
         let result = tool_result(&bodies[1], a, "call-1");
         assert!(result.contains("web"));
-        assert!(!result.contains("hidden"));
+        assert!(result.contains("hidden"));
         if a {
             assert_eq!(bodies[0]["tool_choice"]["disable_parallel_tool_use"], true);
         } else {
@@ -244,7 +245,7 @@ async fn both_wires_complete_with_real_tool_results_and_parallel_disabled() {
                 AnswerItem::Text(_)
             ]
         ));
-        assert!(!answer.wire_text().contains("hidden"));
+        assert!(answer.wire_text().contains("hidden"));
     }
 }
 #[tokio::test]
@@ -292,7 +293,7 @@ async fn denied_busy_failed_and_disconnected() {
             } else {
                 let result = tool_result(&body[1], a, "call-1");
                 assert!(result.contains(expected));
-                assert!(!result.contains("private"));
+                assert_eq!(result.contains("private"), expected != "终端正忙");
                 assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
             }
             assert!(
@@ -309,7 +310,7 @@ async fn denied_busy_failed_and_disconnected() {
 #[tokio::test]
 async fn step_limit_resume_and_sequential_calls_preserve_pending_work() {
     for a in [false, true] {
-        let calls: Vec<_> = (0..16)
+        let calls: Vec<_> = (0..51)
             .map(|i| (format!("call-{i}"), args(&format!("echo {i}"))))
             .collect();
         let borrowed: Vec<_> = calls
@@ -321,14 +322,27 @@ async fn step_limit_resume_and_sequential_calls_preserve_pending_work() {
             response(a, &[], "完成", false),
         ]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
-        let host = Host::new((0..16).map(|_| completed("ok")));
+        let host = Host::new((0..51).map(|_| completed("ok")));
         let mut c = conversation();
-        let mut stream =
-            agent::run(&client, &mut c, capabilities(), &host, Limits::default()).unwrap();
+        let mut stream = agent::run(
+            &client,
+            &mut c,
+            capabilities(),
+            &host,
+            Limits {
+                max_steps: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let resume = loop {
             match stream.next().await.unwrap() {
-                AgentEvent::StepLimit { steps, resume } => {
-                    assert_eq!(steps, 15);
+                AgentEvent::Paused {
+                    reason: PauseReason::StepLimit,
+                    steps,
+                    resume,
+                } => {
+                    assert_eq!(steps, 50);
                     break resume;
                 }
                 AgentEvent::Error(e) => panic!("{e}"),
@@ -337,7 +351,7 @@ async fn step_limit_resume_and_sequential_calls_preserve_pending_work() {
         };
         assert!(stream.next().await.is_none());
         drop(stream);
-        assert_eq!(host.calls.lock().unwrap().len(), 15);
+        assert_eq!(host.calls.lock().unwrap().len(), 50);
         assert_eq!(http.requests().len(), 1);
         let events = agent::resume(&client, &mut c, &host, *resume, Limits::default())
             .unwrap()
@@ -351,10 +365,10 @@ async fn step_limit_resume_and_sequential_calls_preserve_pending_work() {
                 .iter()
                 .map(|c| c.command.clone())
                 .collect::<Vec<_>>(),
-            (0..16).map(|i| format!("echo {i}")).collect::<Vec<_>>()
+            (0..51).map(|i| format!("echo {i}")).collect::<Vec<_>>()
         );
         let b = bodies(&http);
-        for i in 0..16 {
+        for i in 0..51 {
             assert!(tool_result(&b[1], a, &format!("call-{i}")).contains("ok"));
         }
     }
@@ -399,7 +413,7 @@ async fn anthropic_signed_thinking_replays_only_in_current_turn() {
         && v["signature"] == "signature-fixture"));
     assert!(!format!("{:?}", c.turns[0].answer).contains("PRIVATE"));
     c.turns.push(Turn {
-        user: UserTurn::redacted("继续说明", ContextSnapshot::default()),
+        user: UserTurn::new("继续说明", ContextSnapshot::default()),
         answer: None,
     });
     agent::run(&client, &mut c, capabilities(), &host, Limits::default())
@@ -541,10 +555,10 @@ async fn old_steps_are_plain_text_and_count_toward_history_budget() {
             ],
         });
         c.turns.push(Turn {
-            user: UserTurn::redacted("为什么", ContextSnapshot::default()),
+            user: UserTurn::new("为什么", ContextSnapshot::default()),
             answer: None,
         });
-        assert_eq!(c.prepare(1).unwrap().dropped_turns, 1);
+        assert_eq!(c.prepare(250).unwrap().dropped_turns, 1);
         agent::run(&client, &mut c, capabilities(), &host, Limits::default())
             .unwrap()
             .collect::<Vec<_>>()
@@ -559,35 +573,26 @@ async fn old_steps_are_plain_text_and_count_toward_history_budget() {
     }
 }
 #[tokio::test]
-async fn output_budget_stops_and_capabilities_reject_unavailable_targets() {
+async fn output_no_longer_stops_and_capabilities_reject_unavailable_targets() {
     for a in [false, true] {
-        let http = SequencedHttpClient::new([response(
-            a,
-            &[("call-1", "run_command", args("docker ps"))],
-            "",
-            false,
-        )]);
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[("call-1", "run_command", args("docker ps"))],
+                "",
+                false,
+            ),
+            response(a, &[], "done", false),
+        ]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let host = Host::new([completed("x".repeat(1000).as_str())]);
         let mut c = conversation();
-        let events = agent::run(
-            &client,
-            &mut c,
-            capabilities(),
-            &host,
-            Limits {
-                output_chars: 100,
-                ..Limits::default()
-            },
-        )
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::Error(AiError::ToolOutputLimit))
-        ));
-        assert_eq!(http.requests().len(), 1);
+        let events = agent::run(&client, &mut c, capabilities(), &host, Limits::default())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(http.requests().len(), 2);
         let http = SequencedHttpClient::new([
             response(
                 a,
@@ -655,7 +660,7 @@ async fn unsupported_parallel_gateway_retries_once_and_keeps_reasoning() {
             assert!(b[1]["parallel_tool_calls"].is_null());
             assert_eq!(b[1]["reasoning_effort"], "high");
         }
-        let http = SequencedHttpClient::new([rejected(), rejected()]);
+        let http = SequencedHttpClient::new(vec![rejected(); if a { 3 } else { 2 }]);
         let client = RigClient::with_http(&cfg, http.clone()).unwrap();
         let mut c = conversation();
         let events = agent::run(&client, &mut c, capabilities(), &host, Limits::default())
@@ -663,7 +668,12 @@ async fn unsupported_parallel_gateway_retries_once_and_keeps_reasoning() {
             .collect::<Vec<_>>()
             .await;
         assert!(matches!(events.last(), Some(AgentEvent::Error(_))));
-        assert_eq!(http.requests().len(), 2);
+        let b = bodies(&http);
+        assert_eq!(b.len(), if a { 3 } else { 2 });
+        if a {
+            assert_eq!(b[1]["cache_control"], json!({"type":"ephemeral"}));
+            assert!(b[2].get("cache_control").is_none());
+        }
     }
 }
 
@@ -716,9 +726,8 @@ async fn anthropic_text_after_a_call_stays_after_its_step() {
 }
 
 #[tokio::test]
-async fn default_output_budget_is_cumulative_across_resume() {
+async fn tool_output_over_64k_continues_across_resume() {
     for a in [false, true] {
-        // Distinct commands: an identical consecutive repeat is refused without running.
         let calls: Vec<_> = (0..5)
             .map(|i| (format!("call-{i}"), args(&format!("ls /tmp/d{i}"))))
             .collect();
@@ -726,7 +735,10 @@ async fn default_output_budget_is_cumulative_across_resume() {
             .iter()
             .map(|(id, args)| (id.as_str(), "run_command", args.clone()))
             .collect();
-        let http = SequencedHttpClient::new([response(a, &borrowed, "", false)]);
+        let http = SequencedHttpClient::new([
+            response(a, &borrowed, "", false),
+            response(a, &[], "done", false),
+        ]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let host = Host::new((0..5).map(|_| {
             ToolOutcome::Completed(shape(
@@ -745,14 +757,18 @@ async fn default_output_budget_is_cumulative_across_resume() {
             capabilities(),
             &host,
             Limits {
-                steps: 2,
+                max_steps: Some(2),
                 ..Default::default()
             },
         )
         .unwrap();
         let resume = loop {
             match stream.next().await.unwrap() {
-                AgentEvent::StepLimit { resume, .. } => break resume,
+                AgentEvent::Paused {
+                    reason: PauseReason::StepLimit,
+                    resume,
+                    ..
+                } => break resume,
                 AgentEvent::Error(e) => panic!("{e}"),
                 _ => {}
             }
@@ -762,12 +778,9 @@ async fn default_output_budget_is_cumulative_across_resume() {
             .unwrap()
             .collect::<Vec<_>>()
             .await;
-        assert!(matches!(
-            events.last(),
-            Some(AgentEvent::Error(AiError::ToolOutputLimit))
-        ));
-        assert_eq!(host.calls.lock().unwrap().len(), 4);
-        assert_eq!(http.requests().len(), 1);
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(host.calls.lock().unwrap().len(), 5);
+        assert_eq!(http.requests().len(), 2);
     }
 }
 
@@ -1021,7 +1034,7 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
                 capabilities(),
                 &host,
                 Limits {
-                    steps: 2,
+                    max_steps: Some(2),
                     ..Default::default()
                 },
             )
@@ -1029,7 +1042,11 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
             .collect::<Vec<_>>()
             .await;
             let resume = match events.into_iter().last().unwrap() {
-                AgentEvent::StepLimit { steps, resume } => {
+                AgentEvent::Paused {
+                    reason: PauseReason::StepLimit,
+                    steps,
+                    resume,
+                } => {
                     assert_eq!(steps, 2);
                     resume
                 }
@@ -1049,7 +1066,10 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
             } else {
                 assert!(matches!(
                     events.last(),
-                    Some(AgentEvent::Error(AiError::InvalidResponse))
+                    Some(AgentEvent::Paused {
+                        reason: PauseReason::InvalidCalls,
+                        ..
+                    })
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
                 assert!(c.turns[0].answer.as_ref().unwrap().items.is_empty());
@@ -1118,7 +1138,10 @@ async fn queued_invalid_calls_follow_the_same_recovery_and_streak_rules() {
             } else {
                 assert!(matches!(
                     events.last(),
-                    Some(AgentEvent::Error(AiError::InvalidResponse))
+                    Some(AgentEvent::Paused {
+                        reason: PauseReason::InvalidCalls,
+                        ..
+                    })
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
                 assert_eq!(http.requests().len(), 1);
@@ -1307,7 +1330,7 @@ async fn continuation_keeps_question_before_tool_results_on_both_wires() {
     }
 }
 #[tokio::test]
-async fn identical_consecutive_command_is_not_rerun_on_both_wires() {
+async fn identical_consecutive_command_is_rerun_on_both_wires() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([
             response(
@@ -1325,8 +1348,7 @@ async fn identical_consecutive_command_is_not_rerun_on_both_wires() {
             response(a, &[], "完成。", false),
         ]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
-        // Only one outcome: a second host call would panic.
-        let host = Host::new([completed("web")]);
+        let host = Host::new([completed("web"), completed("web again")]);
         let mut c = conversation();
         let mut stream =
             agent::run(&client, &mut c, capabilities(), &host, Limits::default()).unwrap();
@@ -1336,10 +1358,10 @@ async fn identical_consecutive_command_is_not_rerun_on_both_wires() {
             }
         }
         drop(stream);
-        assert_eq!(host.calls.lock().unwrap().len(), 1);
+        assert_eq!(host.calls.lock().unwrap().len(), 2);
         let bodies = bodies(&http);
         assert_eq!(bodies.len(), 3);
-        assert!(tool_result(&bodies[2], a, "call-2").contains("刚刚已经执行过"));
+        assert!(tool_result(&bodies[2], a, "call-2").contains("web again"));
     }
 }
 #[test]
@@ -1368,4 +1390,738 @@ fn explicit_target_words_narrow_the_offered_targets() {
     };
     // Asking for an unavailable target leaves what exists.
     assert!(only_bg.clone().for_question("在终端里执行").background);
+}
+
+fn fast_limits() -> Limits {
+    Limits {
+        backoff: |_| Duration::ZERO,
+        ..Default::default()
+    }
+}
+fn http_error(status: u16, message: &str) -> MockHttpResponse {
+    MockHttpResponse::error(
+        rig_core::http_client::StatusCode::from_u16(status).unwrap(),
+        json!({"error":{"message":message,"type":"fixture_error"}}).to_string(),
+    )
+}
+#[tokio::test]
+async fn unlimited_runs_120_sequential_calls_and_explicit_50_resumes() {
+    for a in [false, true] {
+        for limit in [None, Some(50)] {
+            let mut responses: Vec<_> = (0..120)
+                .map(|i| {
+                    response(
+                        a,
+                        &[(&format!("call-{i}"), "run_command", args("pwd"))],
+                        "",
+                        false,
+                    )
+                })
+                .collect();
+            responses.push(response(a, &[], "done", false));
+            let http = SequencedHttpClient::new(responses);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            let host = Host::new((0..120).map(|_| completed("ok")));
+            let mut c = conversation();
+            let events = agent::run(
+                &client,
+                &mut c,
+                capabilities(),
+                &host,
+                Limits {
+                    max_steps: limit,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+            let last = events.into_iter().last().unwrap();
+            if limit.is_some() {
+                let AgentEvent::Paused {
+                    reason: PauseReason::StepLimit,
+                    steps: 50,
+                    resume,
+                } = last
+                else {
+                    panic!("expected 50-step pause")
+                };
+                assert_eq!(host.calls.lock().unwrap().len(), 50);
+                let events = agent::resume(&client, &mut c, &host, *resume, Limits::default())
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+            } else {
+                assert!(matches!(last, AgentEvent::Done(_)));
+            }
+            assert_eq!(host.calls.lock().unwrap().len(), 120);
+            assert_eq!(http.requests().len(), 121);
+        }
+    }
+}
+#[tokio::test]
+async fn rate_limit_retries_and_ten_outages_pause_then_resume_the_same_request() {
+    for a in [false, true] {
+        for (status, failures) in [(429, 1), (503, 10)] {
+            let mut responses = vec![http_error(status, "unavailable"); failures];
+            responses.push(response(a, &[], "recovered", false));
+            let http = SequencedHttpClient::new(responses);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            let host = Host::new([]);
+            let mut c = conversation();
+            let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+                    .count(),
+                failures.min(9)
+            );
+            for (i, event) in events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+                .enumerate()
+            {
+                assert!(
+                    matches!(event, AgentEvent::Retrying { attempt, max: 10, delay, .. } if *attempt == i as u32 + 1 && delay.is_zero())
+                );
+            }
+            if failures == 10 {
+                let AgentEvent::Paused {
+                    reason: PauseReason::Error(AiError::Unavailable),
+                    resume,
+                    ..
+                } = events.into_iter().last().unwrap()
+                else {
+                    panic!("expected outage pause")
+                };
+                let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+            } else {
+                assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+            }
+            let bodies = bodies(&http);
+            assert_eq!(bodies.len(), failures + 1);
+            assert!(bodies.iter().all(|b| b == &bodies[0]));
+        }
+    }
+}
+#[tokio::test]
+async fn authentication_is_terminal_without_retry() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([http_error(401, "bad key")]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([]);
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::Error(AiError::Authentication)]
+        ));
+        assert_eq!(http.requests().len(), 1);
+    }
+}
+#[tokio::test]
+async fn transient_after_text_pauses_without_retry_and_preserves_partial_answer() {
+    use rig_core::{
+        http_client::{Bytes, Error},
+        test_utils::SequencedStreamingHttpClient,
+    };
+    for a in [false, true] {
+        let full = wire(a, &[], "partial", false);
+        let marker = if a {
+            "event: content_block_stop"
+        } else {
+            "data: {\"choices\":[{\"delta\":{},"
+        };
+        let prefix = full.split(marker).next().unwrap().to_owned();
+        let client = RigClient::with_http(
+            &config(a),
+            SequencedStreamingHttpClient::new(vec![
+                Ok(Bytes::from(prefix)),
+                Err(Error::Instance(Box::new(std::io::Error::other(
+                    "fixture disconnect",
+                )))),
+            ]),
+        )
+        .unwrap();
+        let host = Host::new([]);
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Retrying { .. }))
+        );
+        let AgentEvent::Paused {
+            reason: PauseReason::Error(AiError::Network),
+            resume,
+            ..
+        } = events.into_iter().last().unwrap()
+        else {
+            panic!("expected network pause")
+        };
+        assert_eq!(c.turns[0].answer.as_ref().unwrap().text(), "partial");
+        let http = SequencedHttpClient::new([response(a, &[], "recovered", false)]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert!(!bodies(&http)[0]["messages"].to_string().contains("partial"));
+        assert_eq!(
+            c.turns[0].answer.as_ref().unwrap().text(),
+            "partialrecovered"
+        );
+    }
+}
+#[tokio::test]
+async fn invalid_call_pause_resumes_pending_work() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[
+                    ("b1", "run_command", json!({})),
+                    ("b2", "run_command", json!({})),
+                    ("b3", "run_command", json!({})),
+                    ("good", "run_command", args("pwd")),
+                ],
+                "",
+                false,
+            ),
+            response(a, &[], "done", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([completed("ok")]);
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let AgentEvent::Paused {
+            reason: PauseReason::InvalidCalls,
+            steps: 3,
+            resume,
+        } = events.into_iter().last().unwrap()
+        else {
+            panic!("expected invalid-call pause")
+        };
+        assert!(host.calls.lock().unwrap().is_empty());
+        let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(host.calls.lock().unwrap().len(), 1);
+        assert!(tool_result(&bodies(&http)[1], a, "b3").contains("缺少 command"));
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn retry_after_is_capped_and_dropping_stream_cancels_wait() {
+    use rig_core::http_client::{HeaderMap, HeaderValue, StatusCode};
+    for seconds in [7, 90] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_str(&seconds.to_string()).unwrap(),
+        );
+        let http = SequencedHttpClient::new([
+            MockHttpResponse::error_with_headers(StatusCode::TOO_MANY_REQUESTS, "busy", headers),
+            response(false, &[], "done", false),
+        ]);
+        let client = RigClient::with_http(&config(false), http.clone()).unwrap();
+        let host = Host::new([]);
+        let mut c = conversation();
+        let mut stream =
+            agent::run(&client, &mut c, capabilities(), &host, Limits::default()).unwrap();
+        assert!(
+            matches!(stream.next().await, Some(AgentEvent::Retrying { delay, .. }) if delay == Duration::from_secs(seconds.min(60)))
+        );
+        assert!(futures::poll!(stream.next()).is_pending());
+        drop(stream);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(http.requests().len(), 1);
+    }
+    assert_eq!(
+        (1..=10)
+            .map(agent::retry_backoff)
+            .map(|d| d.as_secs())
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]
+    );
+}
+
+/// A length stop with a tool whose JSON never finished. Anthropic's other blocks are closed.
+fn length_response(a: bool, rich: bool) -> MockHttpResponse {
+    let input = wire(
+        a,
+        &[("cut", "run_command", args("must never execute"))],
+        if rich { "kept text" } else { "" },
+        rich && a,
+    );
+    let body: String = input
+        .split_inclusive('\n')
+        .filter_map(|line| {
+            let Some(data) = line.strip_prefix("data: ") else {
+                return Some(line.to_owned());
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+                return Some(line.to_owned());
+            };
+            if a {
+                if value["type"] == "content_block_stop"
+                    && value["index"] == if rich { 2 } else { 0 }
+                {
+                    return None;
+                }
+                if value["delta"]["partial_json"].is_string() {
+                    value["delta"]["partial_json"] = json!("{\"command\":\"partial");
+                }
+                if value["type"] == "message_delta" {
+                    value["delta"]["stop_reason"] = json!("max_tokens");
+                }
+            } else {
+                if value["choices"][0]["delta"]["tool_calls"].is_array() {
+                    value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
+                        json!("{\"command\":\"partial");
+                }
+                if value["choices"][0]["finish_reason"] == "tool_calls" {
+                    value["choices"][0]["finish_reason"] = json!("length");
+                }
+            }
+            Some(format!("data: {value}\n"))
+        })
+        .collect();
+    // Drop dangling SSE event labels as well as their data for the missing stop.
+    let body = if a {
+        body.replace("event: content_block_stop\n\n", "")
+    } else {
+        body
+    };
+    MockHttpResponse::success_typed(body, "text/event-stream")
+}
+#[tokio::test]
+async fn truncated_calls_never_execute_and_continue_with_notice_and_signed_thinking() {
+    for a in [false, true] {
+        for rich in [false, true] {
+            let http = SequencedHttpClient::new([
+                length_response(a, rich),
+                response(a, &[], "done", false),
+            ]);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            let host = Host::new([]);
+            let mut c = conversation();
+            let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+            assert!(host.calls.lock().unwrap().is_empty());
+            let followup = &bodies(&http)[1];
+            let text = followup.to_string();
+            assert!(text.contains("上一次工具调用因达到单次输出上限（32000）被截断，未执行。请拆成更小的步骤（例如分多次写入文件）或缩短命令后重试。"), "a={a} rich={rich}: {text}");
+            assert!(!text.contains("must never execute"));
+            assert!(!text.contains("\"id\":\"cut\""));
+            if rich {
+                assert!(text.contains("kept text"));
+                if a {
+                    assert!(text.contains("signature-fixture"));
+                    assert!(text.contains("PRIVATE-THINKING"));
+                }
+            } else {
+                assert!(
+                    !followup["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "assistant")
+                );
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn three_truncations_pause_and_text_only_length_stops_normally() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            length_response(a, false),
+            length_response(a, false),
+            length_response(a, false),
+            response(a, &[], "done", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([]);
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let AgentEvent::Paused {
+            reason: PauseReason::InvalidCalls,
+            steps: 3,
+            resume,
+        } = events.into_iter().last().unwrap()
+        else {
+            panic!("expected invalid pause")
+        };
+        let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        let body = wire(a, &[], &"x".repeat(300_000), false)
+            .replace("\"end_turn\"", "\"max_tokens\"")
+            .replace("\"stop\"", "\"length\"");
+        let client = RigClient::with_http(
+            &config(a),
+            SequencedHttpClient::new([MockHttpResponse::success_typed(body, "text/event-stream")]),
+        )
+        .unwrap();
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(c.turns[0].answer.as_ref().unwrap().text().len(), 300_000);
+    }
+}
+#[tokio::test]
+async fn agent_option_fallbacks_and_credentials_reach_requests_and_answer_verbatim() {
+    const RAW: &str = "PASSWORD=hunter2 sk-123456789abcdef";
+    for a in [false, true] {
+        let mut responses = vec![
+            http_error(400, "unsupported max_tokens"),
+            http_error(400, "unsupported max_output_tokens"),
+        ];
+        if a {
+            responses.push(http_error(400, "unsupported cache_control"));
+        }
+        responses.extend([
+            response(a, &[("call", "run_command", args("printf ok"))], RAW, false),
+            response(a, &[], RAW, false),
+        ]);
+        let http = SequencedHttpClient::new(responses);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([completed(RAW)]);
+        let mut c = conversation();
+        c.turns[0].user = UserTurn::new(
+            RAW,
+            ContextSnapshot {
+                text: RAW.into(),
+                ..Default::default()
+            },
+        );
+        let events = agent::run(
+            &client,
+            &mut c,
+            Capabilities {
+                cwd: Some(RAW.into()),
+                ..capabilities()
+            },
+            &host,
+            fast_limits(),
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        let bodies = bodies(&http);
+        assert_eq!(bodies[0]["max_tokens"], 32000);
+        assert_eq!(bodies[1]["max_tokens"], 8192);
+        assert!(bodies[2..].iter().all(|b| b["max_tokens"] == 4096));
+        assert!(bodies[0].to_string().matches(RAW).count() >= 3);
+        assert!(tool_result(bodies.last().unwrap(), a, "call").contains(RAW));
+        assert!(
+            c.turns[0]
+                .answer
+                .as_ref()
+                .unwrap()
+                .wire_text()
+                .matches(RAW)
+                .count()
+                >= 3
+        );
+        if a {
+            assert_eq!(bodies[0]["cache_control"], json!({"type":"ephemeral"}));
+            assert!(bodies[3].get("cache_control").is_none());
+        } else {
+            assert!(!bodies[0].to_string().contains("cache"));
+        }
+    }
+}
+
+mod support;
+#[tokio::test(start_paused = true)]
+async fn agent_stream_has_no_total_cap_but_first_and_idle_still_pause() {
+    use rig_core::test_utils::SilentStreamingClient;
+    for a in [false, true] {
+        let input = wire(a, &[], "done", true);
+        let chunks = input.split_inclusive("\n\n").map(str::to_owned).collect();
+        let client = RigClient::with_http(
+            &config(a),
+            support::TimedStream {
+                chunks,
+                gap: Duration::from_secs(100),
+            },
+        )
+        .unwrap();
+        let host = Host::new([]);
+        let mut c = conversation();
+        let start = tokio::time::Instant::now();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert!(start.elapsed() > Duration::from_secs(195));
+        let client = RigClient::with_http(&config(a), SilentStreamingClient).unwrap();
+        let mut c = conversation();
+        let start = tokio::time::Instant::now();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Paused {
+                reason: PauseReason::Error(AiError::Timeout),
+                ..
+            })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+                .count(),
+            9
+        );
+        assert!(start.elapsed() >= Duration::from_secs(6000));
+        let prefix = wire(a, &[], "partial", false)
+            .split(if a {
+                "event: content_block_stop"
+            } else {
+                "data: {\"choices\":[{\"delta\":{},"
+            })
+            .next()
+            .unwrap()
+            .to_owned();
+        let client = RigClient::with_http(
+            &config(a),
+            support::TimedStream {
+                chunks: vec![prefix],
+                gap: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let mut c = conversation();
+        let mut stream = agent::run(&client, &mut c, capabilities(), &host, fast_limits()).unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(AgentEvent::TextDelta(_))
+        ));
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            stream.next().await,
+            Some(AgentEvent::Paused {
+                reason: PauseReason::Error(AiError::Timeout),
+                ..
+            })
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(300));
+    }
+}
+
+#[tokio::test]
+async fn a_finished_call_beside_a_truncated_call_still_runs() {
+    for a in [false, true] {
+        let input = wire(
+            a,
+            &[
+                ("good", "run_command", args("pwd")),
+                ("cut", "run_command", args("never run")),
+            ],
+            "kept text",
+            a,
+        );
+        let cut_index = if a { 3 } else { 1 };
+        let mut blocks = Vec::new();
+        for block in input.split("\n\n").filter(|b| !b.is_empty()) {
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+                blocks.push(format!("{block}\n\n"));
+                continue;
+            };
+            if a {
+                if value["type"] == "content_block_stop" && value["index"] == cut_index {
+                    continue;
+                }
+                if value["type"] == "content_block_delta" && value["index"] == cut_index {
+                    value["delta"]["partial_json"] = json!("{\"command\":\"cut");
+                }
+                if value["type"] == "message_delta" {
+                    value["delta"]["stop_reason"] = json!("max_tokens");
+                }
+                blocks.push(format!(
+                    "event: {}\ndata: {value}\n\n",
+                    value["type"].as_str().unwrap()
+                ));
+            } else {
+                if value["choices"][0]["delta"]["tool_calls"][0]["index"] == cut_index {
+                    value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] =
+                        json!("{\"command\":\"cut");
+                }
+                if value["choices"][0]["finish_reason"] == "tool_calls" {
+                    value["choices"][0]["finish_reason"] = json!("length");
+                }
+                blocks.push(format!("data: {value}\n\n"));
+            }
+        }
+        let http = SequencedHttpClient::new([
+            MockHttpResponse::success_typed(blocks.concat(), "text/event-stream"),
+            response(a, &[], "done", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([completed("/tmp")]);
+        let mut c = conversation();
+        let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(host.calls.lock().unwrap().len(), 1);
+        assert_eq!(host.calls.lock().unwrap()[0].command, "pwd");
+        let body = &bodies(&http)[1];
+        assert!(tool_result(body, a, "good").contains("/tmp"));
+        assert!(body.to_string().contains("被截断，未执行"));
+        assert!(!body.to_string().contains("\"id\":\"cut\""));
+        if a {
+            assert!(body.to_string().contains("signature-fixture"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_in_band_provider_errors_pause_after_text_and_retry_before_content() {
+    for (code, expected) in [
+        ("overloaded_error", AiError::Unavailable),
+        ("api_error", AiError::Unavailable),
+        ("rate_limit_error", AiError::RateLimited),
+    ] {
+        for partial in [false, true] {
+            let prefix = if partial {
+                wire(true, &[], "partial", false)
+                    .split("event: content_block_stop")
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            } else {
+                String::new()
+            };
+            let error = json!({"type":"error","error":{"type":code,"message":"private provider diagnostic"}});
+            let http = SequencedHttpClient::new([
+                MockHttpResponse::success_typed(
+                    format!("{prefix}event: error\ndata: {error}\n\n"),
+                    "text/event-stream",
+                ),
+                response(true, &[], "recovered", false),
+            ]);
+            let client = RigClient::with_http(&config(true), http.clone()).unwrap();
+            let host = Host::new([]);
+            let mut c = conversation();
+            let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            if partial {
+                assert!(
+                    matches!(&events[..], [AgentEvent::TextDelta(text), AgentEvent::Paused { reason: PauseReason::Error(error), .. }] if text == "partial" && *error == expected)
+                );
+                assert_eq!(http.requests().len(), 1);
+                assert_eq!(c.turns[0].answer.as_ref().unwrap().text(), "partial");
+                let AgentEvent::Paused { resume, .. } = events.into_iter().last().unwrap() else {
+                    unreachable!()
+                };
+                let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
+                    .unwrap()
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+                assert_eq!(
+                    c.turns[0].answer.as_ref().unwrap().text(),
+                    "partialrecovered"
+                );
+            } else {
+                assert!(
+                    matches!(events.first(), Some(AgentEvent::Retrying { attempt: 1, max: 10, error, .. }) if *error == expected)
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+                        .count(),
+                    1
+                );
+                assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+            }
+            let bodies = bodies(&http);
+            assert_eq!(bodies.len(), 2);
+            assert_eq!(
+                bodies[0], bodies[1],
+                "failed partial response must not enter request history"
+            );
+            assert!(
+                !c.turns[0]
+                    .answer
+                    .as_ref()
+                    .unwrap()
+                    .text()
+                    .contains("private provider diagnostic")
+            );
+            assert!(host.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_finished_refusal_stays_invalid_response() {
+    let body = wire(true, &[], "partial", false).replace(
+        "\"stop_reason\":\"end_turn\"",
+        "\"stop_reason\":\"refusal\",\"stop_details\":{\"explanation\":\"overloaded_error\"}",
+    );
+    let http =
+        SequencedHttpClient::new([MockHttpResponse::success_typed(body, "text/event-stream")]);
+    let client = RigClient::with_http(&config(true), http.clone()).unwrap();
+    let host = Host::new([]);
+    let mut c = conversation();
+    let events = agent::run(&client, &mut c, capabilities(), &host, fast_limits())
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(matches!(
+        &events[..],
+        [
+            AgentEvent::TextDelta(_),
+            AgentEvent::Error(AiError::InvalidResponse)
+        ]
+    ));
+    assert_eq!(http.requests().len(), 1);
 }

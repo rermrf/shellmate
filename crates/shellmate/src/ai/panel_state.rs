@@ -215,7 +215,7 @@ mod tests {
         for flags in 0..16 {
             let mut state = ConversationState::<()> {
                 queued: (flags & 2 != 0)
-                    .then(|| UserTurn::redacted("queued", ContextSnapshot::default())),
+                    .then(|| UserTurn::new("queued", ContextSnapshot::default())),
                 save_error: (flags & 8 != 0).then(|| "save failed".into()),
                 ..Default::default()
             };
@@ -281,7 +281,7 @@ mod tests {
             readonly: true,
             continuation: Some(ResumeMarker(dropped.clone())),
             resume_steps: 20,
-            queued: Some(UserTurn::redacted("queued", ContextSnapshot::default())),
+            queued: Some(UserTurn::new("queued", ContextSnapshot::default())),
             active_step: Some(step()),
             pending: true,
             follow_bottom: false,
@@ -388,7 +388,10 @@ mod tests {
 
     #[test]
     fn save_disabled_and_failed_save_recovery() {
-        let mut db = HostStore::open_in_memory().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.db");
+        let moved = temp.path().join("moved.db");
+        let mut db = HostStore::open(&path).unwrap();
         let mut state = ConversationState::<()>::default();
         state.model.start("question", ContextSnapshot::default());
         db.set_setting(shellmate_store::ai::SAVE_CONVERSATIONS, "0")
@@ -399,12 +402,26 @@ mod tests {
         db.set_setting(shellmate_store::ai::SAVE_CONVERSATIONS, "1")
             .unwrap();
         state.model.conversation.turns[0].user.question = "TOKEN=fixture-sensitive".into();
+        // SQLite refuses writes after its backing file is moved. This exercises
+        // a real save failure without relying on the removed redaction policy.
+        std::fs::rename(&path, &moved).unwrap();
         state.persist(&mut db, None, "openai", "fixture");
         assert!(state.save_error.is_some());
-        state.model.conversation.turns[0].user =
-            UserTurn::redacted("question", ContextSnapshot::default());
+        drop(db);
+        std::fs::rename(&moved, &path).unwrap();
+        let mut db = HostStore::open(&path).unwrap();
         state.persist(&mut db, None, "openai", "fixture");
         assert!(state.save_error.is_none());
         assert_eq!(db.ai_conversations().unwrap().len(), 1);
+        assert_eq!(
+            db.ai_conversation(&state.id)
+                .unwrap()
+                .unwrap()
+                .conversation
+                .turns[0]
+                .user
+                .question,
+            "TOKEN=fixture-sensitive"
+        );
     }
 }

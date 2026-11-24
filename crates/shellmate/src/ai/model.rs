@@ -1,5 +1,5 @@
 //! gpui-free policies for the drawer, disclosure, retries and settings.
-use shellmate_ai::{AiError, Answer, AnswerItem, Conversation, Event};
+use shellmate_ai::{AiError, Answer, AnswerItem, Conversation, Event, PauseReason};
 #[cfg(any(test, debug_assertions))]
 use shellmate_ai::{ContextSnapshot, Turn, UserTurn};
 use shellmate_store::{SecretKey, SecretStore, ai::Settings};
@@ -47,6 +47,7 @@ pub fn load_config(
         model: settings.model.clone(),
         api_key: shellmate_ai::ApiKey::new(secret.expose()),
         reasoning: settings.reasoning,
+        max_output_tokens: Default::default(),
         timeouts: settings.reasoning.timeouts(),
     };
     config.validate()?;
@@ -70,22 +71,45 @@ pub struct DrawerModel {
     pub conversation: Conversation,
     pub busy: bool,
     pub thinking: bool,
+    pub retrying: Option<String>,
+    pub pause_reason: Option<PauseReason>,
     pub error: Option<AiError>,
     pub dropped: usize,
 }
 impl DrawerModel {
+    pub fn pause(&mut self, reason: PauseReason) {
+        self.busy = false;
+        self.thinking = false;
+        self.retrying = None;
+        self.pause_reason = Some(reason);
+        self.error = match reason {
+            PauseReason::StepLimit => None,
+            PauseReason::Error(error) => Some(error),
+            PauseReason::InvalidCalls => Some(AiError::InvalidResponse),
+        };
+    }
+    pub fn continuation_label(&self, steps: usize) -> String {
+        match self.pause_reason {
+            Some(PauseReason::Error(_)) => "重试".into(),
+            Some(PauseReason::InvalidCalls) => "继续".into(),
+            _ => format!("已执行 {steps} 步 · 继续"),
+        }
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn start(&mut self, question: &str, context: ContextSnapshot) -> bool {
         if self.busy || question.trim().is_empty() {
             return false;
         }
         self.conversation.turns.push(Turn {
-            user: UserTurn::redacted(question.trim(), context),
+            user: UserTurn::new(question.trim(), context),
             answer: None,
         });
         self.busy = true;
         self.thinking = false;
         self.error = None;
+        self.retrying = None;
+        self.pause_reason = None;
         true
     }
     pub fn retry(&mut self) -> bool {
@@ -94,11 +118,15 @@ impl DrawerModel {
         }
         self.conversation.turns.last_mut().unwrap().answer = None;
         self.error = None;
+        self.retrying = None;
+        self.pause_reason = None;
         self.busy = true;
         self.thinking = false;
         true
     }
     pub fn event(&mut self, event: Event) {
+        self.retrying = None;
+        self.pause_reason = None;
         let Some(turn) = self.conversation.turns.last_mut() else {
             return;
         };
@@ -197,7 +225,7 @@ mod tests {
         assert!(matches!(load_config(&s, &Locked), Err(AiError::Cancelled)));
     }
     #[test]
-    fn drawer_stream_retry_clear_and_redaction() {
+    fn drawer_stream_retry_clear_and_verbatim_input() {
         let mut d = DrawerModel::default();
         assert!(d.start("TOKEN=hidden", ContextSnapshot::default()));
         assert!(!d.start("duplicate", ContextSnapshot::default()));
@@ -215,9 +243,33 @@ mod tests {
         d.event(Event::Error(AiError::Timeout));
         assert!(!d.thinking && !d.busy);
         assert!(d.conversation.turns[0].answer.is_none());
-        assert_eq!(d.conversation.turns[0].user.redactions, 1);
+        assert_eq!(d.conversation.turns[0].user.question, "TOKEN=hidden");
         d.clear();
         assert!(d.conversation.turns.is_empty());
+    }
+    #[test]
+    fn pause_notices_labels_and_retry_status_preserve_the_answer() {
+        let mut model = DrawerModel::default();
+        model.start("question", ContextSnapshot::default());
+        model.event(Event::TextDelta("partial".into()));
+        for (reason, error, label) in [
+            (PauseReason::StepLimit, None, "已执行 50 步 · 继续"),
+            (PauseReason::Error(AiError::Unavailable), Some(AiError::Unavailable), "重试"),
+            (PauseReason::InvalidCalls, Some(AiError::InvalidResponse), "继续"),
+        ] {
+            model.busy = true;
+            model.retrying = Some("retry status".into());
+            model.pause(reason);
+            assert!(!model.busy && !model.thinking && model.retrying.is_none());
+            assert_eq!(model.error, error);
+            assert_eq!(model.continuation_label(50), label);
+            assert_eq!(model.conversation.turns[0].answer.as_ref().unwrap().text(), "partial");
+        }
+        for event in [Event::Thinking, Event::TextDelta("more".into()), Event::Done(None), Event::Error(AiError::Authentication)] {
+            model.retrying = Some("retry status".into());
+            model.event(event);
+            assert!(model.retrying.is_none());
+        }
     }
     #[test]
     fn unsaved_settings_config_uses_reasoning_timeouts_and_provider_key() {

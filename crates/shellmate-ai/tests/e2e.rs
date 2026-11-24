@@ -33,6 +33,7 @@ fn config() -> Result<Config, &'static str> {
         model,
         api_key: ApiKey::new(key.trim()),
         reasoning,
+        max_output_tokens: Default::default(),
         timeouts: reasoning.timeouts(),
     })
 }
@@ -61,7 +62,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     let client = RigClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}"));
     let mut c = Conversation::default();
     c.turns.push(Turn {
-        user: UserTurn::redacted(
+        user: UserTurn::new(
             "给我一个列出进程的命令。先用一句中文解释用途，再通过 propose_command 提出命令，不要执行。",
             ContextSnapshot {
                 label: "temporary-ai-e2e".into(),
@@ -81,7 +82,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     );
     c.turns[0].answer = Some(a);
     c.turns.push(Turn {
-        user: UserTurn::redacted("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
+        user: UserTurn::new("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
         answer: None,
     });
     let (a, _) = answer(&client, &c)
@@ -101,7 +102,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     println!("PASS: two-turn continuity and streamed answer");
     c.turns.last_mut().unwrap().answer = Some(a);
     c.turns.push(Turn {
-        user: UserTurn::redacted("找出占用 3000 端口的进程", ContextSnapshot::default()),
+        user: UserTurn::new("找出占用 3000 端口的进程", ContextSnapshot::default()),
         answer: None,
     });
     let (a, _) = answer(&client, &c)
@@ -150,7 +151,7 @@ async fn real_agent_uses_canned_docker_output_without_execution() {
     let host = FakeHost(Mutex::new(Vec::new()));
     let mut c = Conversation {
         turns: vec![Turn {
-            user: UserTurn::redacted(
+            user: UserTurn::new(
                 "这台机器上运行了哪些 docker 容器？",
                 ContextSnapshot {
                     label: "fake-host-only".into(),
@@ -177,7 +178,8 @@ async fn real_agent_uses_canned_docker_output_without_execution() {
         match event {
             AgentEvent::Done(_) => done = true,
             AgentEvent::Error(e) => panic!("agent: {e}"),
-            AgentEvent::StepLimit { .. } => panic!("agent did not finish within 15 steps"),
+            AgentEvent::Paused { reason, .. } => panic!("agent paused: {reason:?}"),
+            AgentEvent::Retrying { .. } => {}
             _ => {}
         }
     }

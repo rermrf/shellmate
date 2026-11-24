@@ -99,11 +99,10 @@ impl Workspace {
             |s| shellmate_ai::ContextSnapshot {
                 label: s.title.to_string(),
                 protocol: s.host().map_or("本机终端", |h| h.protocol.label()).into(),
-                text: shellmate_ai::redact::recent_context(
+                text: shellmate_ai::recent_context(
                     &s.terminal.read(cx).recent_displayed_text(usize::MAX),
                     40,
-                )
-                .text,
+                ),
             },
         )
     }

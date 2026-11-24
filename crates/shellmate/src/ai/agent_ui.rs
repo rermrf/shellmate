@@ -52,7 +52,13 @@ impl Drawer {
     }
 
     pub(super) fn agent_event(&mut self, event: AgentEvent) {
+        if !matches!(event, AgentEvent::Retrying { .. }) {
+            self.state.model.retrying = None;
+        }
         match event {
+            AgentEvent::Retrying { attempt, max, delay, error } => {
+                self.state.model.retrying = Some(format!("{error}，{} 秒后重试（第 {attempt}/{max} 次）", delay.as_secs()));
+            }
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
             AgentEvent::TextDelta(t) => self.state.model.event(Event::TextDelta(t)),
             AgentEvent::Command(c) => self.state.model.event(Event::Command(c)),
@@ -77,9 +83,8 @@ impl Drawer {
                 }
                 self.state.active_step = None;
             }
-            AgentEvent::StepLimit { steps, resume } => {
-                self.state.model.busy = false;
-                self.state.model.thinking = false;
+            AgentEvent::Paused { reason, steps, resume } => {
+                self.state.model.pause(reason);
                 self.state.continuation = Some(resume);
                 self.state.resume_steps = steps;
             }
@@ -91,6 +96,8 @@ impl Drawer {
         }
         if let Some(config) = self.state.run_config.clone() {
             self.state.model.busy = true;
+            self.state.model.error = None;
+            self.state.model.pause_reason = None;
             self.start(config, w, cx);
         }
     }

@@ -1,16 +1,14 @@
-//! Pure AI boundary: redacted conversations in, text and proposed commands out.
-//! There is no command execution facility in this crate.
+//! AI model and agent boundary; command execution is delegated to the host.
 pub mod agent;
 mod client;
 mod config;
 mod conversation;
 pub mod output;
 pub mod policy;
-pub mod redact;
 pub use client::{Event, ProviderClient, ResponseStream, RigClient, Usage};
-pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts};
+pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts, OutputTokens, catalog_spec};
 pub use conversation::{
-    Answer, AnswerItem, ContextSnapshot, Conversation, DEFAULT_BUDGET, Prepared, StepStatus, Turn,
+    Answer, AnswerItem, ContextSnapshot, Conversation, estimate_tokens, history_budget, recent_context, Prepared, StepStatus, Turn,
     UserTurn,
 };
 use rig_core::serde::{Deserialize, Serialize};
@@ -63,8 +61,6 @@ pub enum AiError {
     Unavailable,
     #[error("服务返回了无法识别的回答，请重试")]
     InvalidResponse,
-    #[error("本轮工具输出已达到 64 K 字符上限，请开始新的对话轮次")]
-    ToolOutputLimit,
     #[error("会话已断开")]
     Disconnected,
     #[error("已停止生成")]
@@ -72,7 +68,7 @@ pub enum AiError {
 }
 
 pub use agent::{
-    AgentEvent, AgentStream, Capabilities, Limits, Resume, Target, ToolCall, ToolHost, ToolOutcome,
+    AgentEvent, PauseReason, AgentStream, Capabilities, Limits, Resume, Target, ToolCall, ToolHost, ToolOutcome,
 };
 pub use output::{ToolOutput, shape};
 pub use policy::PermissionMode;

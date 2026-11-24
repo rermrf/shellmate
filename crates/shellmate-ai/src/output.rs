@@ -1,4 +1,4 @@
-//! Output is sanitized before it can cross the event, model or persistence boundary.
+//! Terminal control cleanup and bounded head/tail excerpts; content is not redacted.
 use std::time::Duration;
 
 pub const STORED_LIMIT: usize = 8 * 1024;
@@ -169,7 +169,7 @@ fn clean(bytes: &[u8]) -> String {
         }
     }
     normalized.extend(line);
-    crate::redact::redact(&normalized).text
+    normalized
 }
 #[cfg(test)]
 mod tests {
@@ -178,11 +178,11 @@ mod tests {
         shape(s, [], Some(0), Duration::from_millis(42), false, false)
     }
     #[test]
-    fn ansi_osc_cr_redaction_and_invalid_utf8() {
+    fn ansi_osc_cr_cleanup_and_invalid_utf8() {
         let o = output(b"\x1b[31mred\x1b[0m\x1b]0;title\x07\x1b]8;;url\x1b\\link\x1b]8;;\x1b\\\n100%\r20%\r9\nPASSWORD=hidden\n\xff");
-        assert_eq!(o.stdout(), "redlink\n90%%\nPASSWORD=[已去除:凭据]\n�");
-        assert!(!o.wire_text().contains("hidden"));
-        assert!(!o.stored().contains("hidden"));
+        assert_eq!(o.stdout(), "redlink\n90%%\nPASSWORD=hidden\n�");
+        assert!(o.wire_text().contains("hidden"));
+        assert!(o.stored().contains("hidden"));
         assert_eq!(output(b"a\r\nb").stdout(), "a\nb");
     }
     #[test]

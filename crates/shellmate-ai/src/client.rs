@@ -1,12 +1,8 @@
-use crate::{
-    AiError, CommandCard, Config, Conversation, DEFAULT_BUDGET, Provider, ReasoningLevel, Risk,
-    Timeouts,
-};
+use crate::{AiError, CommandCard, Config, Conversation, Provider, ReasoningLevel, Risk, Timeouts};
 use futures::{Stream, StreamExt};
 use rig_core::{
     DynModel,
-    catalog::ModelFacts,
-    completion::{CompletionRequest, Effort, GenerationOptions, Reasoning},
+    completion::{CacheRetention, CompletionRequest, Effort, Reasoning},
     http_client::HttpClientExt,
     message::AssistantContent,
     operation::Completion,
@@ -16,8 +12,11 @@ use rig_core::{
 use std::{
     collections::VecDeque,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     task::{Context, Poll},
-    time::Instant,
 };
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -34,12 +33,16 @@ pub enum Event {
 pub trait ProviderClient: Send + Sync {
     fn start(&self, conversation: &Conversation) -> Result<ResponseStream, AiError>;
 }
+#[derive(Clone)]
 pub struct RigClient {
-    model: DynModel<Completion>,
+    model: Arc<DynModel<Completion>>,
     timeouts: Timeouts,
     reasoning: Option<Reasoning>,
-    max_tokens: u64,
-    pub character_budget: usize,
+    options: Arc<ClientOptions>,
+}
+struct ClientOptions {
+    output_tokens: AtomicU32,
+    cache: AtomicBool,
 }
 impl RigClient {
     pub fn new(config: &Config) -> Result<Self, AiError> {
@@ -64,31 +67,77 @@ impl RigClient {
                 .with_base_url(base_url.trim_end_matches('/'))
                 .connect(http)
                 .chat(&config.model)
+                // Shellmate times first event and idle separately; rig otherwise
+                // imposes a 300 s first-frame deadline as well.
+                .with_idle_timeout(None)
                 .erase(),
             Provider::Anthropic { base_url } => AnthropicConfig::new("shellmate-placeholder")
                 .with_base_url(base_url)
                 .connect(http)
                 .completion(&config.model)
+                .with_idle_timeout(None)
                 .erase(),
         };
         let (reasoning, max_tokens) = reasoning_options(config)?;
         Ok(Self {
-            model,
+            model: Arc::new(model),
             timeouts: config.timeouts.clone(),
             reasoning,
-            max_tokens,
-            character_budget: DEFAULT_BUDGET,
+            options: Arc::new(ClientOptions {
+                output_tokens: AtomicU32::new(max_tokens),
+                cache: AtomicBool::new(matches!(config.provider, Provider::Anthropic { .. })),
+            }),
         })
     }
     pub(crate) fn agent_open(
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionStream, Box<rig_core::ProviderError>> {
-        let mut request = request.max_tokens(self.max_tokens);
-        if let Some(reasoning) = self.reasoning {
-            request.options.reasoning = Some(reasoning);
-        }
+        let output = self.output_tokens();
+        let mut request = request.max_tokens(u64::from(output));
+        request.options.reasoning = self.reasoning;
+        request.options.cache = self
+            .options
+            .cache
+            .load(Ordering::Relaxed)
+            .then_some(CacheRetention::Short);
         self.model.stream(request).map_err(Box::new)
+    }
+    /// Effective per-call allowance, including budget thinking and learned fallbacks.
+    pub fn output_tokens(&self) -> u32 {
+        self.options.output_tokens.load(Ordering::Relaxed)
+    }
+    pub fn input_budget(&self) -> usize {
+        crate::history_budget(self.output_tokens())
+    }
+    /// Before content, try specific option fixes before a one-shot cache-free 400 retry.
+    pub(crate) fn option_fallback(&self, error: &rig_core::ProviderError) -> bool {
+        if cache_refusal(error) && self.options.cache.swap(false, Ordering::Relaxed) {
+            return true;
+        }
+        if option_refusal(
+            error,
+            &["max_tokens", "max_completion_tokens", "max_output_tokens"],
+        ) {
+            let current = self.output_tokens();
+            if current > 4096 {
+                let next = if current > 8192 { 8192 } else { 4096 };
+                self.options
+                    .output_tokens
+                    .fetch_min(next, Ordering::Relaxed);
+                return true;
+            }
+        }
+        error.report().http_status == Some(400) && self.options.cache.swap(false, Ordering::Relaxed)
+    }
+    fn open_with_fallback(&self, request: &CompletionRequest) -> Result<CompletionStream, AiError> {
+        loop {
+            match self.agent_open(request.clone()) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if self.option_fallback(&error) => {}
+                Err(error) => return Err(map_error(*error)),
+            }
+        }
     }
     pub(crate) fn timeouts(&self) -> Timeouts {
         self.timeouts.clone()
@@ -98,19 +147,23 @@ impl RigClient {
         self.open(request, 0)
     }
     fn open(&self, request: CompletionRequest, dropped: usize) -> Result<ResponseStream, AiError> {
-        let mut request = request.max_tokens(self.max_tokens);
-        if let Some(reasoning) = self.reasoning {
-            request = request.options(GenerationOptions::default().reasoning(reasoning));
-        }
-        let stream = self.model.stream(request).map_err(map_error)?;
-        Ok(ResponseStream::new(stream, self.timeouts.clone(), dropped))
+        let stream = self.open_with_fallback(&request)?;
+        Ok(ResponseStream::new(
+            stream,
+            self.timeouts.clone(),
+            dropped,
+            Some((self.clone(), request)),
+        ))
     }
 }
-fn reasoning_options(config: &Config) -> Result<(Option<Reasoning>, u64), AiError> {
+fn reasoning_options(config: &Config) -> Result<(Option<Reasoning>, u32), AiError> {
+    let output = config
+        .max_output_tokens
+        .resolve(&config.provider, &config.model);
     let level = config.reasoning;
     let effort = match level {
-        ReasoningLevel::Default => return Ok((None, level.max_tokens())),
-        ReasoningLevel::Off => return Ok((Some(Reasoning::Off), level.max_tokens())),
+        ReasoningLevel::Default => return Ok((None, output)),
+        ReasoningLevel::Off => return Ok((Some(Reasoning::Off), output)),
         ReasoningLevel::Minimal => Effort::Minimal,
         ReasoningLevel::Low => Effort::Low,
         ReasoningLevel::Medium => Effort::Medium,
@@ -119,9 +172,8 @@ fn reasoning_options(config: &Config) -> Result<(Option<Reasoning>, u64), AiErro
         ReasoningLevel::Max => Effort::Max,
     };
     // Use the same built-in facts and dated-model lookup as the Messages wire.
-    let facts = ModelFacts::default();
     if matches!(config.provider, Provider::Anthropic { .. })
-        && let Some(spec) = facts.for_model("anthropic", &config.model)
+        && let Some(spec) = crate::catalog_spec(&config.provider, &config.model)
         && spec.reasoning.levels().is_some_and(<[Effort]>::is_empty)
         && let Some(range) = spec.reasoning.budget()
     {
@@ -140,10 +192,10 @@ fn reasoning_options(config: &Config) -> Result<(Option<Reasoning>, u64), AiErro
         let tokens = tokens.clamp(min, max);
         return Ok((
             Some(Reasoning::Budget { tokens }),
-            level.max_tokens().max(u64::from(tokens) + 4096),
+            output.max(tokens + 4096),
         ));
     }
-    Ok((Some(Reasoning::Effort(effort)), level.max_tokens()))
+    Ok((Some(Reasoning::Effort(effort)), output))
 }
 struct AuthHeader {
     key: crate::ApiKey,
@@ -177,7 +229,7 @@ impl rig_core::http_client::HttpMiddleware for AuthHeader {
 }
 impl ProviderClient for RigClient {
     fn start(&self, c: &Conversation) -> Result<ResponseStream, AiError> {
-        let p = c.prepare(self.character_budget)?;
+        let p = c.prepare(self.input_budget())?;
         self.open(p.request, p.dropped_turns)
     }
 }
@@ -197,19 +249,46 @@ struct Reading {
     cards: usize,
     first: bool,
     thinking: bool,
-    start: Instant,
+    fallback: Option<(RigClient, CompletionRequest)>,
+    received: bool,
     timeouts: Timeouts,
     queue: VecDeque<Event>,
 }
+impl Reading {
+    fn retry_option(&mut self, error: &rig_core::ProviderError) -> bool {
+        if self.received {
+            return false;
+        }
+        let Some((client, request)) = &self.fallback else {
+            return false;
+        };
+        if !client.option_fallback(error) {
+            return false;
+        }
+        self.stream = None;
+        self.first = true;
+        match client.open_with_fallback(request) {
+            Ok(stream) => self.stream = Some(stream),
+            Err(error) => self.queue.push_back(Event::Error(error)),
+        }
+        true
+    }
+}
 impl ResponseStream {
-    fn new(stream: CompletionStream, timeouts: Timeouts, dropped_turns: usize) -> Self {
+    fn new(
+        stream: CompletionStream,
+        timeouts: Timeouts,
+        dropped_turns: usize,
+        fallback: Option<(RigClient, CompletionRequest)>,
+    ) -> Self {
         let state = Reading {
             stream: Some(stream),
             text: String::new(),
             cards: 0,
             first: true,
             thinking: false,
-            start: Instant::now(),
+            fallback,
+            received: false,
             timeouts,
             queue: VecDeque::new(),
         };
@@ -219,12 +298,11 @@ impl ResponseStream {
                     return Some((event, s));
                 }
                 let stream = s.stream.as_mut()?;
-                let remaining = s.timeouts.total.saturating_sub(s.start.elapsed());
-                let wait = remaining.min(if s.first {
+                let wait = if s.first {
                     s.timeouts.first
                 } else {
                     s.timeouts.idle
-                });
+                };
                 let next = tokio::time::timeout(wait, stream.next()).await;
                 match next {
                     Err(_) => {
@@ -232,6 +310,9 @@ impl ResponseStream {
                         return Some((Event::Error(AiError::Timeout), s));
                     }
                     Ok(Some(Err(e))) => {
+                        if s.retry_option(&e) {
+                            continue;
+                        }
                         s.stream = None;
                         return Some((Event::Error(map_error(e)), s));
                     }
@@ -247,6 +328,7 @@ impl ResponseStream {
                         },
                     )))) => {
                         s.first = false;
+                        s.received = true;
                         // Discard all reasoning payloads; only expose progress before answer text.
                         if !s.thinking && s.text.is_empty() {
                             s.thinking = true;
@@ -255,10 +337,7 @@ impl ResponseStream {
                     }
                     Ok(Some(Ok(Item::Event(StreamEvent::Text { text, .. })))) => {
                         s.first = false;
-                        if s.text.len() + text.len() > 256 * 1024 {
-                            s.stream = None;
-                            return Some((Event::Error(AiError::ContextTooLong), s));
-                        }
+                        s.received = true;
                         s.text.push_str(&text);
                         return Some((Event::TextDelta(text), s));
                     }
@@ -267,6 +346,7 @@ impl ResponseStream {
                         ..
                     })))) => {
                         s.first = false;
+                        s.received = true;
                         if call.function.name.as_str() == "propose_command" {
                             let card = serde_json::from_value::<CommandCard>(
                                 serde_json::Value::Object(call.function.arguments),
@@ -289,10 +369,13 @@ impl ResponseStream {
                             }
                         }
                     }
-                    Ok(Some(Ok(_))) => s.first = false,
+                    Ok(Some(Ok(item))) => {
+                        s.first = false;
+                        s.received |= matches!(item, Item::Event(_));
+                    }
                     Ok(None) => {
                         let stream = s.stream.take().unwrap();
-                        let result = tokio::time::timeout(remaining, stream.finish()).await;
+                        let result = tokio::time::timeout(s.timeouts.idle, stream.finish()).await;
                         match result {
                             Ok(Ok(response)) => {
                                 if s.cards == 0 {
@@ -308,6 +391,7 @@ impl ResponseStream {
                                     });
                                 s.queue.push_back(Event::Done(usage));
                             }
+                            Ok(Err(e)) if s.retry_option(&e) => continue,
                             Ok(Err(e)) => s.queue.push_back(Event::Error(map_error(e))),
                             Err(_) => s.queue.push_back(Event::Error(AiError::Timeout)),
                         }
@@ -357,6 +441,26 @@ pub fn fenced_commands(text: &str) -> Vec<CommandCard> {
     }
     cards
 }
+fn cache_refusal(error: &rig_core::ProviderError) -> bool {
+    match error {
+        rig_core::ProviderError::UnsupportedOption(option) => {
+            matches!(option.option.as_ref(), "cache" | "cache_control")
+        }
+        _ => option_refusal(error, &["cache_control"]),
+    }
+}
+/// Match complete option names, never substrings of unrelated fields.
+pub(crate) fn option_refusal(error: &rig_core::ProviderError, fields: &[&str]) -> bool {
+    if let rig_core::ProviderError::UnsupportedOption(option) = error {
+        return fields.contains(&option.option.as_ref());
+    }
+    let report = error.report();
+    report.http_status == Some(400)
+        && report.provider_response_body().is_some_and(|body| {
+            body.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| fields.contains(&word))
+        })
+}
 pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
     // Never format or forward the provider's diagnostic: it may echo the key or prompt.
     if matches!(error, rig_core::ProviderError::UnsupportedOption(_)) {
@@ -403,6 +507,10 @@ pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
         Some(404) => AiError::ModelNotFound,
         Some(429) => AiError::RateLimited,
         Some(500..=599) => AiError::Unavailable,
+        _ if report.retryable && code == "rate_limit_error" => AiError::RateLimited,
+        _ if report.retryable && matches!(code.as_str(), "overloaded_error" | "api_error") => {
+            AiError::Unavailable
+        }
         _ => match report.kind {
             rig_core::ErrorKind::Timeout => AiError::Timeout,
             rig_core::ErrorKind::Http => AiError::Network,
@@ -421,6 +529,40 @@ mod tests {
         test_utils::{MockCompletionModel, MockFrame, MockScript, MockStreamEvent},
     };
 
+    #[test]
+    fn typed_option_rejections_are_scoped_and_cache_disables_once() {
+        let config = Config {
+            provider: Provider::Anthropic {
+                base_url: "https://api.anthropic.com".into(),
+            },
+            model: "claude-sonnet-4-6".into(),
+            api_key: crate::ApiKey::new("fixture"),
+            reasoning: ReasoningLevel::Default,
+            max_output_tokens: Default::default(),
+            timeouts: Timeouts::default(),
+        };
+        let client =
+            RigClient::with_http(&config, rig_core::test_utils::SequencedHttpClient::new([]))
+                .unwrap();
+        let unsupported = |name: &'static str| {
+            rig_core::ProviderError::UnsupportedOption(UnsupportedOption::new(
+                name,
+                "fixture",
+                "model",
+                "private diagnostic",
+            ))
+        };
+        assert!(!client.option_fallback(&unsupported("reasoning")));
+        assert!(!client.option_fallback(&unsupported("other_max_tokens")));
+        assert!(client.option_fallback(&unsupported("cache")));
+        assert!(!client.option_fallback(&unsupported("cache")));
+        assert!(client.option_fallback(&unsupported("max_tokens")));
+        assert_eq!(client.output_tokens(), 8192);
+        assert!(client.option_fallback(&unsupported("max_output_tokens")));
+        assert_eq!(client.output_tokens(), 4096);
+        assert!(!client.option_fallback(&unsupported("max_completion_tokens")));
+    }
+
     #[tokio::test]
     async fn streamed_unsupported_option_is_sanitized() {
         #[derive(Clone)]
@@ -435,7 +577,7 @@ mod tests {
         let stream = Model::new(MockScript::new("fixture"), Refused)
             .stream(CompletionRequest::new("test"))
             .unwrap();
-        let mut stream = ResponseStream::new(stream, Timeouts::default(), 0);
+        let mut stream = ResponseStream::new(stream, Timeouts::default(), 0, None);
         assert!(matches!(
             stream.next().await,
             Some(Event::Error(AiError::UnsupportedReasoning))
@@ -466,7 +608,7 @@ mod tests {
             events.push(MockStreamEvent::FinalResponse(Default::default()));
             let model = MockCompletionModel::from_stream_turns([events]);
             let stream = model.stream(CompletionRequest::new("test")).unwrap();
-            let events = ResponseStream::new(stream, Timeouts::default(), 0)
+            let events = ResponseStream::new(stream, Timeouts::default(), 0, None)
                 .collect::<Vec<_>>()
                 .await;
             assert_eq!(

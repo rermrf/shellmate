@@ -27,13 +27,14 @@ fn config(anthropic: bool) -> Config {
         .into(),
         api_key: ApiKey::new("fixture-api-key"),
         reasoning: ReasoningLevel::Default,
+        max_output_tokens: Default::default(),
         timeouts: Timeouts::default(),
     }
 }
 fn conversation() -> Conversation {
     Conversation {
         turns: vec![Turn {
-            user: UserTurn::redacted(
+            user: UserTurn::new(
                 "找出占用 3000 端口的进程",
                 ContextSnapshot {
                     label: "prod-web-01".into(),
@@ -161,7 +162,7 @@ async fn both_wires_stream_tools_and_use_exact_request_shape() {
         assert_eq!(b["stream"], true);
         assert_eq!(b["model"], config(a).model);
         let serialized = b.to_string();
-        assert!(!serialized.contains("secret-context"));
+        assert!(serialized.contains("secret-context"));
         assert!(serialized.contains("Shellmate"));
         assert!(serialized.contains("prod-web-01"));
         assert!(serialized.contains("propose_command"));
@@ -199,7 +200,7 @@ async fn fallback_code_blocks_and_multiturn_roles() {
             ],
         });
         c.turns.push(Turn {
-            user: UserTurn::redacted("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
+            user: UserTurn::new("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
             answer: None,
         });
         let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
@@ -238,7 +239,9 @@ async fn errors_are_chinese_and_never_echo_payloads() {
             (400, "context_length_exceeded", AiError::ContextTooLong),
             (500, "server_error", AiError::Unavailable),
         ] {
-            let http=SequencedHttpClient::new([MockHttpResponse::error(StatusCode::from_u16(status).unwrap(),json!({"error":{"code":code,"type":code,"message":"fixture-api-key SECRET REQUEST AND ANSWER"}}).to_string())]);
+            let rejected = MockHttpResponse::error(StatusCode::from_u16(status).unwrap(), json!({"error":{"code":code,"type":code,"message":"fixture-api-key SECRET REQUEST AND ANSWER"}}).to_string());
+            let http =
+                SequencedHttpClient::new(vec![rejected; if a && status == 400 { 2 } else { 1 }]);
             let client = RigClient::with_http(&config(a), http).unwrap();
             let e = client.start(&conversation()).unwrap().next().await.unwrap();
             assert!(
@@ -441,14 +444,14 @@ async fn request_body(cfg: &Config, connection_test: bool) -> Value {
 }
 
 #[tokio::test]
-async fn openai_reasoning_and_connection_test_use_level_output_caps() {
+async fn openai_reasoning_and_connection_test_use_independent_output_caps() {
     for (level, effort, cap) in [
-        (ReasoningLevel::Default, None, 2048),
-        (ReasoningLevel::Off, Some("none"), 2048),
-        (ReasoningLevel::Minimal, Some("minimal"), 4096),
-        (ReasoningLevel::Low, Some("low"), 4096),
-        (ReasoningLevel::Medium, Some("medium"), 8192),
-        (ReasoningLevel::High, Some("high"), 16384),
+        (ReasoningLevel::Default, None, 32000),
+        (ReasoningLevel::Off, Some("none"), 32000),
+        (ReasoningLevel::Minimal, Some("minimal"), 32000),
+        (ReasoningLevel::Low, Some("low"), 32000),
+        (ReasoningLevel::Medium, Some("medium"), 32000),
+        (ReasoningLevel::High, Some("high"), 32000),
         (ReasoningLevel::XHigh, Some("xhigh"), 32000),
     ] {
         let mut cfg = config(false);
@@ -504,14 +507,14 @@ async fn anthropic_reasoning_uses_catalog_effort_budget_and_off_shapes() {
         let body = request_body(&cfg, connection_test).await;
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
-        assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["max_tokens"], 32000);
         for model in ["claude-sonnet-4-6", "unlisted-proxy-model"] {
             cfg.model = model.into();
             cfg.reasoning = ReasoningLevel::High;
             let body = request_body(&cfg, connection_test).await;
             assert_eq!(body["thinking"], json!({"type":"adaptive"}));
             assert_eq!(body["output_config"]["effort"], "high");
-            assert_eq!(body["max_tokens"], 16384);
+            assert_eq!(body["max_tokens"], 32000);
         }
         cfg.model = "claude-opus-4-6".into();
         cfg.reasoning = ReasoningLevel::Max;
@@ -522,9 +525,9 @@ async fn anthropic_reasoning_uses_catalog_effort_budget_and_off_shapes() {
         // Dated ids must resolve with the same rule as rig's Messages wire.
         cfg.model = "claude-haiku-4-5-20251001".into();
         for (level, budget, cap) in [
-            (ReasoningLevel::Low, 2048, 6144),
-            (ReasoningLevel::Medium, 6144, 10240),
-            (ReasoningLevel::High, 14336, 18432),
+            (ReasoningLevel::Low, 2048, 32000),
+            (ReasoningLevel::Medium, 6144, 32000),
+            (ReasoningLevel::High, 14336, 32000),
             (ReasoningLevel::Max, 30000, 34096),
         ] {
             cfg.reasoning = level;
@@ -550,7 +553,7 @@ async fn anthropic_reasoning_uses_catalog_effort_budget_and_off_shapes() {
             cfg.reasoning = ReasoningLevel::Off;
             let body = request_body(&cfg, connection_test).await;
             assert_eq!(body["thinking"], json!({"type":"disabled"}));
-            assert_eq!(body["max_tokens"], 2048);
+            assert_eq!(body["max_tokens"], 32000);
         }
     }
 }
@@ -573,10 +576,11 @@ async fn unsupported_reasoning_is_safe_for_encoding_and_http_errors() {
             "budget_tokens",
             "output_config",
         ] {
-            let http = SequencedHttpClient::new([MockHttpResponse::error(
+            let rejected = MockHttpResponse::error(
                 StatusCode::BAD_REQUEST,
                 json!({"error":{"type":"invalid_request_error","message":format!("SECRET {field} rejected")}}).to_string(),
-            )]);
+            );
+            let http = SequencedHttpClient::new(vec![rejected; if a { 2 } else { 1 }]);
             let client = RigClient::with_http(&config(a), http).unwrap();
             let event = client.test_connection().unwrap().next().await;
             assert!(matches!(
@@ -651,7 +655,7 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
         assert!(answer.commands().next().is_none());
         c.turns[0].answer = Some(answer);
         c.turns.push(Turn {
-            user: UserTurn::redacted("继续", ContextSnapshot::default()),
+            user: UserTurn::new("继续", ContextSnapshot::default()),
             answer: None,
         });
         let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
@@ -685,4 +689,321 @@ async fn reasoning_activity_resets_idle_timeout() {
         stream.next().await,
         Some(Event::Error(AiError::Timeout))
     ));
+}
+
+#[tokio::test]
+async fn output_tokens_resolve_catalog_and_clamp_on_both_protocols() {
+    for a in [false, true] {
+        let mut cfg = config(a);
+        let known = catalog_spec(&cfg.provider, &cfg.model);
+        if a {
+            assert!(known.is_some());
+        } else {
+            assert!(known.is_none());
+        }
+        assert_eq!(
+            request_body(&cfg, true).await["max_tokens"],
+            known
+                .and_then(|s| s.max_output_tokens)
+                .unwrap_or(32000)
+                .min(32000)
+        );
+        for (value, expected) in [(0, 1024), (1023, 1024), (12345, 12345), (u32::MAX, 128000)] {
+            cfg.max_output_tokens = OutputTokens::Tokens(value);
+            let maximum = catalog_spec(&cfg.provider, &cfg.model)
+                .and_then(|s| s.max_output_tokens)
+                .unwrap_or(u32::MAX);
+            assert_eq!(
+                request_body(&cfg, true).await["max_tokens"],
+                expected.min(maximum)
+            );
+        }
+    }
+    let spec = rig_core::catalog::Catalog::builtin()
+        .iter()
+        .find(|s| {
+            s.provider.vendor() != "openai"
+                && s.max_output_tokens
+                    .is_some_and(|n| (1024..32000).contains(&n))
+        })
+        .unwrap();
+    let mut cfg = config(false);
+    cfg.model = spec.id.clone();
+    assert_eq!(catalog_spec(&cfg.provider, &cfg.model).unwrap().id, spec.id);
+    assert_eq!(
+        request_body(&cfg, true).await["max_tokens"],
+        spec.max_output_tokens.unwrap()
+    );
+    cfg.max_output_tokens = OutputTokens::Tokens(128000);
+    assert_eq!(
+        request_body(&cfg, true).await["max_tokens"],
+        spec.max_output_tokens.unwrap()
+    );
+}
+fn rejection(message: &str) -> MockHttpResponse {
+    MockHttpResponse::error(
+        StatusCode::BAD_REQUEST,
+        json!({"error":{"message":message,"type":"invalid_request_error"}}).to_string(),
+    )
+}
+#[tokio::test]
+async fn output_fallback_32000_8192_4096_is_scoped_and_remembered() {
+    for a in [false, true] {
+        for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            let http = SequencedHttpClient::new([
+                rejection(&format!("unsupported {field}")),
+                rejection(&format!("unsupported {field}")),
+                MockHttpResponse::success_typed(sse(a, "ok", false), "text/event-stream"),
+                MockHttpResponse::success_typed(sse(a, "again", false), "text/event-stream"),
+            ]);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            for _ in 0..2 {
+                let events = client.test_connection().unwrap().collect::<Vec<_>>().await;
+                assert!(matches!(events.last(), Some(Event::Done(_))));
+            }
+            let caps: Vec<_> = http
+                .requests()
+                .iter()
+                .map(|r| {
+                    serde_json::from_slice::<Value>(&r.body).unwrap()["max_tokens"]
+                        .as_u64()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(caps, [32000, 8192, 4096, 4096]);
+            assert_eq!(client.output_tokens(), 4096);
+        }
+        for message in [
+            "bad request",
+            "unsupported other_max_tokens_field",
+            "unsupported cache_control_extra",
+        ] {
+            let http = SequencedHttpClient::new(vec![rejection(message); if a { 2 } else { 1 }]);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            assert!(matches!(
+                client.test_connection().unwrap().next().await,
+                Some(Event::Error(AiError::InvalidResponse))
+            ));
+            let requests = http.requests();
+            assert_eq!(requests.len(), if a { 2 } else { 1 });
+            for request in requests {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body["max_tokens"], 32000,
+                    "an unrelated 400 must not lower the cap"
+                );
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn cache_is_anthropic_only_and_rejection_disables_it_for_this_client() {
+    for a in [false, true] {
+        let body = request_body(&config(a), false).await;
+        if a {
+            assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
+        } else {
+            assert!(!body.to_string().contains("cache"));
+        }
+    }
+    let http = SequencedHttpClient::new([
+        rejection("unsupported cache_control"),
+        MockHttpResponse::success_typed(anthropic("ok", false), "text/event-stream"),
+        MockHttpResponse::success_typed(anthropic("again", false), "text/event-stream"),
+    ]);
+    let client = RigClient::with_http(&config(true), http.clone()).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            client
+                .start(&conversation())
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+                .last(),
+            Some(Event::Done(_))
+        ));
+    }
+    let bodies: Vec<Value> = http
+        .requests()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(bodies[0]["cache_control"], json!({"type":"ephemeral"}));
+    assert!(bodies[1].get("cache_control").is_none());
+    assert!(bodies[2].get("cache_control").is_none());
+}
+
+mod support;
+#[tokio::test(start_paused = true)]
+async fn active_stream_has_no_total_cap_and_first_and_idle_deadlines_still_apply() {
+    for a in [false, true] {
+        let mut cfg = config(a);
+        cfg.reasoning = ReasoningLevel::High;
+        let input = reasoning_sse(a);
+        let chunks = input.split_inclusive("\n\n").map(str::to_owned).collect();
+        let client = RigClient::with_http(
+            &cfg,
+            support::TimedStream {
+                chunks,
+                gap: Duration::from_secs(100),
+            },
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let events = client
+            .start(&conversation())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(Event::Done(_))));
+        assert!(started.elapsed() > Duration::from_secs(390));
+        let client = RigClient::with_http(&cfg, SilentStreamingClient).unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            client.start(&conversation()).unwrap().next().await,
+            Some(Event::Error(AiError::Timeout))
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(600));
+        // A partial answer arrives, then the body stays open forever.
+        let prefix = sse(a, "partial", false)
+            .split(if a {
+                "event: content_block_stop"
+            } else {
+                "data: {\"choices\":[{\"delta\":{},"
+            })
+            .next()
+            .unwrap()
+            .to_owned();
+        let client = RigClient::with_http(
+            &cfg,
+            support::TimedStream {
+                chunks: vec![prefix],
+                gap: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let mut stream = client.start(&conversation()).unwrap();
+        assert!(matches!(stream.next().await, Some(Event::TextDelta(_))));
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            stream.next().await,
+            Some(Event::Error(AiError::Timeout))
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(300));
+    }
+}
+
+#[tokio::test]
+async fn openai_reasoning_models_send_max_completion_tokens() {
+    let mut cfg = config(false);
+    cfg.model = "gpt-5".into();
+    let body = request_body(&cfg, false).await;
+    assert_eq!(body["max_completion_tokens"], 32000);
+    assert!(body.get("max_tokens").is_none());
+}
+
+#[tokio::test]
+async fn generic_400_disables_anthropic_cache_once_but_never_retries_openai() {
+    for message in ["Extra inputs are not permitted", "invalid request"] {
+        for a in [false, true] {
+            let http = SequencedHttpClient::new([
+                rejection(message),
+                MockHttpResponse::success_typed(sse(a, "ok", false), "text/event-stream"),
+                MockHttpResponse::success_typed(sse(a, "again", false), "text/event-stream"),
+            ]);
+            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+            let events = client
+                .start(&conversation())
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            if a {
+                assert!(matches!(events.last(), Some(Event::Done(_))));
+                assert!(matches!(
+                    client
+                        .test_connection()
+                        .unwrap()
+                        .collect::<Vec<_>>()
+                        .await
+                        .last(),
+                    Some(Event::Done(_))
+                ));
+            } else {
+                assert!(matches!(
+                    &events[..],
+                    [Event::Error(AiError::InvalidResponse)]
+                ));
+            }
+            let bodies: Vec<Value> = http
+                .requests()
+                .iter()
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            assert_eq!(bodies.len(), if a { 3 } else { 1 });
+            if a {
+                assert_eq!(bodies[0]["cache_control"], json!({"type":"ephemeral"}));
+                assert!(bodies[1..].iter().all(|b| b.get("cache_control").is_none()));
+            } else {
+                assert!(bodies[0].get("cache_control").is_none());
+            }
+            assert!(bodies.iter().all(|b| b["max_tokens"] == 32000));
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_generic_400s_remain_terminal_after_one_cache_retry() {
+    let http =
+        SequencedHttpClient::new([rejection("invalid request"), rejection("invalid request")]);
+    let client = RigClient::with_http(&config(true), http.clone()).unwrap();
+    let events = client.test_connection().unwrap().collect::<Vec<_>>().await;
+    assert!(matches!(
+        &events[..],
+        [Event::Error(AiError::InvalidResponse)]
+    ));
+    let bodies: Vec<Value> = http
+        .requests()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["cache_control"], json!({"type":"ephemeral"}));
+    assert!(bodies[1].get("cache_control").is_none());
+}
+
+#[tokio::test]
+async fn token_fallback_precedes_generic_cache_fallback() {
+    for failures in [1, 3] {
+        let mut responses = vec![rejection("max_tokens rejected"); failures];
+        responses.push(MockHttpResponse::success_typed(
+            anthropic("ok", false),
+            "text/event-stream",
+        ));
+        let http = SequencedHttpClient::new(responses);
+        let client = RigClient::with_http(&config(true), http.clone()).unwrap();
+        let events = client
+            .start(&conversation())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(events.last(), Some(Event::Done(_))));
+        let bodies: Vec<Value> = http
+            .requests()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), failures + 1);
+        assert_eq!(bodies[0]["max_tokens"], 32000);
+        assert_eq!(bodies[1]["max_tokens"], 8192);
+        assert!(
+            bodies[..bodies.len().min(3)]
+                .iter()
+                .all(|b| b["cache_control"] == json!({"type":"ephemeral"}))
+        );
+        if failures == 3 {
+            assert_eq!(bodies[2]["max_tokens"], 4096);
+            assert_eq!(bodies[3]["max_tokens"], 4096);
+            assert!(bodies[3].get("cache_control").is_none());
+        }
+    }
 }

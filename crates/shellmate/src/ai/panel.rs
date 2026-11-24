@@ -163,7 +163,7 @@ impl Drawer {
             .workspace
             .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
-        let user = UserTurn::redacted(&question, context);
+        let user = UserTurn::new(&question, context);
         if user.question.trim().is_empty() {
             return;
         }
@@ -631,7 +631,7 @@ impl Drawer {
                     updated_at: row.updated_at,
                     conversation: shellmate_ai::Conversation {
                         turns: vec![Turn {
-                            user: UserTurn::redacted(
+                            user: UserTurn::new(
                                 &row.title,
                                 ContextSnapshot {
                                     label: row.label.clone(),
@@ -932,19 +932,7 @@ impl Render for Drawer {
                                 .line_height(px(20.8))
                                 .whitespace_normal()
                                 .child(turn.user.question.clone()),
-                        )
-                        .when(turn.user.redactions > 0, |d| {
-                            d.child(
-                                div()
-                                    .px(px(8.))
-                                    .py(px(3.))
-                                    .rounded(px(8.))
-                                    .bg(p.card2)
-                                    .text_color(p.tx2)
-                                    .text_size(px(11.))
-                                    .child(format!("已去除 {} 处敏感内容", turn.user.redactions)),
-                            )
-                        }),
+                        ),
                 );
                 if let Some(answer) = &turn.answer {
                     let commands: Vec<String> = answer
@@ -1075,7 +1063,7 @@ impl Render for Drawer {
                 body = body.child(
                     crate::dialogs::button(
                         "ai-continue",
-                        format!("已执行 {} 步 · 继续", self.state.resume_steps),
+                        self.state.model.continuation_label(self.state.resume_steps),
                         crate::dialogs::Tone::Primary,
                         true,
                     )
@@ -1092,16 +1080,19 @@ impl Render for Drawer {
                         .turns
                         .last()
                         .and_then(|t| t.answer.as_ref())
-                        .is_none_or(|a| a.text().is_empty()))
+                        .is_none_or(|a| a.text().is_empty())
+                        || self.state.model.busy && self.state.model.retrying.is_some())
             {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(
-                    if self.state.pending {
+                    (if self.state.pending {
                         "正在准备请求…"
+                    } else if let Some(retrying) = &self.state.model.retrying {
+                        retrying.as_str()
                     } else if self.state.model.thinking {
                         "正在思考…"
                     } else {
                         "正在分析当前会话输出…"
-                    },
+                    }).to_owned(),
                 ));
             }
             if self.state.model.dropped > 0 {
@@ -1130,7 +1121,7 @@ impl Render for Drawer {
                                 .line_height(px(19.))
                                 .child(error.to_string()),
                         )
-                        .child(
+                        .when(self.state.continuation.is_none(), |d| d.child(
                             Button::new("ai-retry")
                                 .label("重试")
                                 .flex_none()
@@ -1138,7 +1129,7 @@ impl Render for Drawer {
                                 .px(px(12.))
                                 .rounded(px(10.))
                                 .on_click(cx.listener(|s, _, w, cx| s.begin(None, w, cx))),
-                        ),
+                        )),
                 );
             }
         }

@@ -151,7 +151,7 @@ async fn local_drop_kills_entire_process_group() {
     assert_gone(&ids).await;
 }
 #[tokio::test]
-async fn local_output_cap_drains_and_redacts() {
+async fn local_output_cap_drains_and_preserves_content() {
     let temp = Temp::new();
     let out = completed(
         local(
@@ -167,7 +167,7 @@ async fn local_output_cap_drains_and_redacts() {
         .await,
     );
     assert!(out.truncated);
-    assert!(!out.stdout().contains("hidden"));
+    assert!(out.stdout().contains("TOKEN=hidden"));
     assert!(out.stdout().len() < 9000);
     assert_eq!(out.exit_code, Some(0));
 }

@@ -3,21 +3,21 @@
 use crate::{
     AiError, Answer, AnswerItem, CommandCard, Conversation, Event, ProviderClient, RigClient,
     StepStatus, ToolOutput, Usage, UserTurn,
-    client::map_error,
+    client::{map_error, option_refusal},
     policy::{self, Class},
 };
 use futures::{Stream, StreamExt, future::BoxFuture};
 use rig_core::{
-    completion::CompletionRequest,
+    completion::{CompletionRequest, FinishReason},
     message::{AssistantContent, Message, ToolCall as RigCall, ToolResultContent},
     serde::{Deserialize, Serialize},
-    streaming::{CompletionStream, Item, StreamEvent},
+    streaming::{CompletionStream, Item, PartKind, StreamEvent},
 };
 use std::{
     collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,7 +146,7 @@ pub enum ToolOutcome {
     Failed(String),
 }
 impl ToolOutcome {
-    fn sanitize(self) -> Self {
+    fn cap_stored(self) -> Self {
         match self {
             Self::Denied { reason } => Self::Denied {
                 reason: reason.map(|s| crate::output::stored_text(&s)),
@@ -205,7 +205,7 @@ impl ToolOutcome {
             automatic: false,
             output,
         };
-        item.sanitize();
+        item.cap_stored();
         item
     }
 }
@@ -220,16 +220,28 @@ pub trait ToolHost: Send + Sync {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    pub steps: usize,
-    pub output_chars: usize,
+    /// Tool steps per run/resume; None means unlimited.
+    pub max_steps: Option<usize>,
+    /// Delay after the nth failed attempt (1-based); injectable for offline tests.
+    pub backoff: fn(u32) -> Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            steps: 15,
-            output_chars: 64_000,
+            max_steps: None,
+            backoff: retry_backoff,
         }
     }
+}
+pub fn retry_backoff(attempt: u32) -> Duration {
+    Duration::from_secs((1u64 << attempt.saturating_sub(1).min(6)).min(60))
+}
+const MAX_ATTEMPTS: u32 = 10;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseReason {
+    StepLimit,
+    Error(AiError),
+    InvalidCalls,
 }
 
 pub enum AgentEvent {
@@ -241,9 +253,16 @@ pub enum AgentEvent {
         call: ToolCall,
         outcome: ToolOutcome,
     },
-    StepLimit {
+    Paused {
+        reason: PauseReason,
         steps: usize,
         resume: Box<Resume>,
+    },
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay: Duration,
+        error: AiError,
     },
     Done(Option<Usage>),
     Error(AiError),
@@ -252,6 +271,7 @@ enum Pending {
     Call(Box<RigCall>, ToolCall),
     Invalid(Box<RigCall>, String),
     Text(String),
+    Truncated(u32),
 }
 /// Opaque, memory-only continuation. Deliberately neither Debug nor serializable:
 /// it owns signed reasoning and real tool messages for this turn only.
@@ -259,11 +279,8 @@ pub struct Resume {
     request: CompletionRequest,
     pending: VecDeque<Pending>,
     capabilities: Capabilities,
-    output_chars: usize,
     steps: usize,
     invalid_calls: usize,
-    /// The last command that completed in this turn, to refuse an immediate identical repeat.
-    last_run: Option<(String, Target)>,
     turn: UserTurn,
     turns: usize,
     parallel_disabled: bool,
@@ -306,11 +323,11 @@ pub fn run<'a>(
                     AgentEvent::Command(card)
                 }
                 Event::Done(u) => {
-                    answer.sanitize();
+                    answer.cap_stored();
                     AgentEvent::Done(u)
                 }
                 Event::Error(e) => {
-                    answer.sanitize();
+                    answer.cap_stored();
                     AgentEvent::Error(e)
                 }
             }
@@ -321,17 +338,14 @@ pub fn run<'a>(
         });
     }
     let capabilities = capabilities.for_question(&conversation.turns.last().unwrap().user.question);
-    let prepared =
-        conversation.prepare_with_capabilities(client.character_budget, &capabilities)?;
+    let prepared = conversation.prepare_with_capabilities(client.input_budget(), &capabilities)?;
     conversation.turns.last_mut().unwrap().answer = Some(Answer::default());
     let state = Resume {
         request: prepared.request.parallel_tool_calls(false),
         pending: VecDeque::new(),
         capabilities,
-        output_chars: 0,
         steps: 0,
         invalid_calls: 0,
-        last_run: None,
         turn: conversation.turns.last().unwrap().user.clone(),
         turns: conversation.turns.len(),
         parallel_disabled: false,
@@ -371,11 +385,12 @@ struct State<'a> {
     model: Option<CompletionStream>,
     active: Option<(RigCall, ToolCall)>,
     first: bool,
-    started: Instant,
+    retry_wait: Option<Duration>,
+    failures: u32,
     received: bool,
     defer_text: bool,
     thinking: bool,
-    text_bytes: usize,
+    retry_notice: bool,
     steps: usize,
     done: bool,
     error: Option<AiError>,
@@ -393,30 +408,76 @@ impl State<'_> {
         self.done = true;
         self.model = None;
         self.turn = None;
-        self.answer().sanitize();
+        self.answer().cap_stored();
         AgentEvent::Error(error)
     }
-    fn retry(&mut self, error: &rig_core::ProviderError) -> bool {
-        let turn = self.turn.as_mut().unwrap();
-        if self.received || turn.parallel_disabled || !parallel_refusal(error) {
+    fn pause(&mut self, reason: PauseReason) -> AgentEvent {
+        self.done = true;
+        self.model = None;
+        let mut resume = self.turn.take().unwrap();
+        if reason == PauseReason::InvalidCalls {
+            resume.invalid_calls = 0;
+        }
+        self.answer().cap_stored();
+        AgentEvent::Paused {
+            reason,
+            steps: resume.steps,
+            resume: Box::new(resume),
+        }
+    }
+    fn failure(&mut self, error: AiError, retry_after: Option<Duration>) -> AgentEvent {
+        self.model = None;
+        let transient = matches!(
+            error,
+            AiError::RateLimited | AiError::Unavailable | AiError::Network | AiError::Timeout
+        );
+        self.failures += 1;
+        if transient
+            && !self.received
+            && (error != AiError::Timeout || self.first)
+            && self.failures < MAX_ATTEMPTS
+        {
+            let delay = retry_after
+                .unwrap_or_else(|| (self.limits.backoff)(self.failures))
+                .min(Duration::from_secs(60));
+            self.retry_wait = Some(delay);
+            self.retry_notice = true;
+            return AgentEvent::Retrying {
+                attempt: self.failures,
+                max: MAX_ATTEMPTS,
+                delay,
+                error,
+            };
+        }
+        if transient {
+            self.pause(PauseReason::Error(error))
+        } else {
+            self.fail(error)
+        }
+    }
+    fn provider_failure(&mut self, error: rig_core::ProviderError) -> AgentEvent {
+        let retry_after = error.report().retry_after(SystemTime::now());
+        self.failure(map_error(error), retry_after)
+    }
+    fn retry_option(&mut self, error: &rig_core::ProviderError) -> bool {
+        if self.received {
             return false;
         }
-        turn.parallel_disabled = true;
-        turn.request.options.parallel_tool_calls = None;
+        let turn = self.turn.as_mut().unwrap();
+        if !turn.parallel_disabled && parallel_refusal(error) {
+            turn.parallel_disabled = true;
+            turn.request.options.parallel_tool_calls = None;
+        } else if !self.client.option_fallback(error) {
+            return false;
+        }
         self.model = None;
         true
     }
 }
 fn parallel_refusal(e: &rig_core::ProviderError) -> bool {
-    if let rig_core::ProviderError::UnsupportedOption(o) = e {
-        return o.option == "parallel_tool_calls";
-    }
-    let r = e.report();
-    r.http_status == Some(400)
-        && r.provider_response_body().is_some_and(|b| {
-            b.contains("parallel_tool_calls") || b.contains("disable_parallel_tool_use")
-        })
+    option_refusal(e, &["parallel_tool_calls", "disable_parallel_tool_use"])
 }
+
 fn stream<'a>(
     client: &'a RigClient,
     conversation: &'a mut Conversation,
@@ -434,11 +495,12 @@ fn stream<'a>(
         model: None,
         active: None,
         first: true,
-        started: Instant::now(),
+        retry_wait: None,
+        failures: 0,
         received: false,
         defer_text: false,
         thinking: false,
-        text_bytes: 0,
+        retry_notice: false,
         steps: 0,
         done: false,
         error: None,
@@ -448,11 +510,15 @@ fn stream<'a>(
             if s.done {
                 return None;
             }
+            if let Some(delay) = s.retry_wait.take() {
+                // Owned by this stream: dropping it cancels the backoff future.
+                tokio::time::sleep(delay).await;
+            }
             if let Some(e) = s.error.take() {
                 return Some((s.fail(e), s));
             }
             if let Some((raw, call)) = s.active.take() {
-                let outcome = s.host.run(call.clone()).await.sanitize();
+                let outcome = s.host.run(call.clone()).await.cap_stored();
                 let resolved = s.host.resolved_call(&call);
                 let wire = if resolved != call {
                     format!(
@@ -466,49 +532,23 @@ fn stream<'a>(
                 };
                 let call = resolved;
                 let turn = s.turn.as_mut().unwrap();
-                turn.last_run = matches!(outcome, ToolOutcome::Completed(_))
-                    .then(|| (normalized(&call.command), call.target));
-                turn.output_chars = turn.output_chars.saturating_add(wire.chars().count());
                 turn.steps += 1;
                 s.steps += 1;
                 append(
                     &mut turn.request,
                     Message::tool_results(vec![raw.result(vec![ToolResultContent::text(wire)])]),
                 );
-                if turn.output_chars >= s.limits.output_chars.min(64_000) {
-                    s.error = Some(AiError::ToolOutputLimit);
-                }
                 if matches!(outcome, ToolOutcome::Disconnected) {
                     s.error = Some(AiError::Disconnected);
                 }
                 s.answer().items.push(outcome.item(&call));
                 return Some((AgentEvent::StepFinished { call, outcome }, s));
             }
-            if s.steps >= s.limits.steps.clamp(1, 15) {
-                let resume = s.turn.take().unwrap();
-                let steps = resume.steps;
-                s.done = true;
-                s.answer().sanitize();
-                return Some((
-                    AgentEvent::StepLimit {
-                        steps,
-                        resume: Box::new(resume),
-                    },
-                    s,
-                ));
+            if s.limits.max_steps.is_some_and(|max| s.steps >= max) {
+                return Some((s.pause(PauseReason::StepLimit), s));
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
                 match pending {
-                    Pending::Call(raw, call)
-                        if s.turn.as_ref().unwrap().last_run
-                            == Some((normalized(&call.command), call.target)) =>
-                    {
-                        s.turn.as_mut().unwrap().pending.push_front(Pending::Invalid(
-                            raw,
-                            "这条命令刚刚已经执行过，结果就在上一条工具结果中，本次未重复执行。请直接根据已有结果回答；确需再次执行时，先说明原因并调整命令。".into(),
-                        ));
-                        continue;
-                    }
                     Pending::Call(raw, call) => {
                         s.turn.as_mut().unwrap().invalid_calls = 0;
                         s.active = Some((*raw, call.clone()));
@@ -523,7 +563,23 @@ fn stream<'a>(
                         s.steps += 1;
                         turn.invalid_calls += 1;
                         if turn.invalid_calls >= 3 {
-                            return Some((s.fail(AiError::InvalidResponse), s));
+                            return Some((s.pause(PauseReason::InvalidCalls), s));
+                        }
+                        continue;
+                    }
+                    Pending::Truncated(output) => {
+                        let turn = s.turn.as_mut().unwrap();
+                        append(
+                            &mut turn.request,
+                            Message::user(format!(
+                                "上一次工具调用因达到单次输出上限（{output}）被截断，未执行。请拆成更小的步骤（例如分多次写入文件）或缩短命令后重试。"
+                            )),
+                        );
+                        turn.steps += 1;
+                        s.steps += 1;
+                        turn.invalid_calls += 1;
+                        if turn.invalid_calls >= 3 {
+                            return Some((s.pause(PauseReason::InvalidCalls), s));
                         }
                         continue;
                     }
@@ -534,50 +590,45 @@ fn stream<'a>(
                 }
             }
             if s.model.is_none() {
+                s.first = true;
+                s.received = false;
+                s.defer_text = false;
                 match s
                     .client
                     .agent_open(s.turn.as_ref().unwrap().request.clone())
                 {
                     Ok(model) => {
                         s.model = Some(model);
-                        s.started = Instant::now();
-                        s.first = true;
-                        s.received = false;
-                        s.defer_text = false;
                     }
                     Err(e) => {
-                        if s.retry(&e) {
+                        if s.retry_option(&e) {
                             continue;
                         }
-                        return Some((s.fail(map_error(*e)), s));
+                        return Some((s.provider_failure(*e), s));
                     }
                 }
             }
             let timeouts = s.client.timeouts();
-            let remaining = timeouts.total.saturating_sub(s.started.elapsed());
-            let wait = remaining.min(if s.first {
+            let wait = if s.first {
                 timeouts.first
             } else {
                 timeouts.idle
-            });
+            };
             let next = tokio::time::timeout(wait, s.model.as_mut().unwrap().next()).await;
             match next {
-                Err(_) => return Some((s.fail(AiError::Timeout), s)),
+                Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
                 Ok(Some(Err(e))) => {
-                    if s.retry(&e) {
+                    if s.retry_option(&e) {
                         continue;
                     }
-                    return Some((s.fail(map_error(e)), s));
+                    return Some((s.provider_failure(e), s));
                 }
                 Ok(Some(Ok(item))) => {
                     s.first = false;
                     match item {
                         Item::Event(StreamEvent::Text { text, .. }) => {
-                            s.received = true;
-                            s.text_bytes += text.len();
-                            if s.text_bytes > 256 * 1024 {
-                                return Some((s.fail(AiError::ContextTooLong), s));
-                            }
+                            s.received |= !text.is_empty();
+                            s.retry_notice = false;
                             if s.defer_text {
                                 continue;
                             }
@@ -590,34 +641,79 @@ fn stream<'a>(
                         }) => {
                             s.received = true;
                             s.defer_text = true;
+                            if std::mem::take(&mut s.retry_notice) {
+                                return Some((AgentEvent::Thinking, s));
+                            }
                         }
                         // Never expose reasoning text. finish() retains native signatures.
-                        Item::Event(StreamEvent::Reasoning { .. }) => {
-                            s.received = true;
-                            if !s.thinking && s.text_bytes == 0 {
+                        Item::Event(
+                            event @ (StreamEvent::Reasoning { .. }
+                            | StreamEvent::Start {
+                                kind: PartKind::Reasoning,
+                                ..
+                            }
+                            | StreamEvent::End {
+                                content: AssistantContent::Reasoning(_),
+                                ..
+                            }),
+                        ) => {
+                            s.received |= !matches!(event, StreamEvent::Start { .. });
+                            if !s.thinking || s.retry_notice {
+                                s.retry_notice = false;
                                 s.thinking = true;
                                 return Some((AgentEvent::Thinking, s));
                             }
                         }
+                        Item::Event(
+                            StreamEvent::Arguments { .. }
+                            | StreamEvent::Start {
+                                kind: PartKind::ToolCall,
+                                ..
+                            },
+                        ) => {
+                            s.received = true;
+                            if std::mem::take(&mut s.retry_notice) {
+                                return Some((AgentEvent::Thinking, s));
+                            }
+                        }
+                        Item::Event(StreamEvent::Start { .. }) => {}
+                        Item::Event(_) => s.received = true,
                         _ => {}
                     }
                 }
                 Ok(None) => {
                     let model = s.model.take().unwrap();
-                    let response = match tokio::time::timeout(remaining, model.finish()).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(e)) => {
-                            if s.retry(&e) {
-                                continue;
+                    let mut response =
+                        match tokio::time::timeout(timeouts.idle, model.finish()).await {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(e)) => {
+                                if s.retry_option(&e) {
+                                    continue;
+                                }
+                                return Some((s.provider_failure(e), s));
                             }
-                            return Some((s.fail(map_error(e)), s));
-                        }
-                        Err(_) => return Some((s.fail(AiError::Timeout), s)),
-                    };
-                    if response.error.is_some()
-                        || response.aborted.is_some()
-                        || response.unfinished_calls().next().is_some()
-                    {
+                            Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
+                        };
+                    if response.error.is_some() || response.aborted.is_some() {
+                        return Some((s.fail(AiError::InvalidResponse), s));
+                    }
+                    s.failures = 0;
+                    let mut unfinished: Vec<_> = response
+                        .unfinished_calls()
+                        .map(|call| call.id.clone())
+                        .collect();
+                    // rig 0.46's Chat decoder explicitly closes cut calls; close_item()
+                    // does not add them to unfinished_calls(), but retains invalid_arguments.
+                    if response.finish_reason() == Some(FinishReason::Length) {
+                        unfinished.extend(
+                            response
+                                .tool_calls()
+                                .filter(|call| call.function.invalid_arguments.is_some())
+                                .map(|call| call.id.clone()),
+                        );
+                    }
+                    let truncated = !unfinished.is_empty();
+                    if truncated && response.finish_reason() != Some(FinishReason::Length) {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
                     let mut pending = VecDeque::new();
@@ -626,6 +722,9 @@ fn stream<'a>(
                         match content {
                             AssistantContent::ToolCall(raw) => {
                                 after_call = true;
+                                if unfinished.contains(&raw.id) {
+                                    continue;
+                                }
                                 let raw = Box::new(raw.clone());
                                 pending.push_back(
                                     match parse_call(&raw, &s.turn.as_ref().unwrap().capabilities) {
@@ -640,13 +739,23 @@ fn stream<'a>(
                             _ => {}
                         }
                     }
-                    let Some(message) = response.message() else {
+                    if truncated {
+                        pending.push_back(Pending::Truncated(s.client.output_tokens()));
+                    }
+                    // message() includes unfinished calls. Remove only those blocks, leaving
+                    // native signed reasoning, text and complete calls byte-for-byte intact.
+                    response.choice.retain(|content| {
+                        !matches!(content,
+                        AssistantContent::ToolCall(call) if unfinished.contains(&call.id))
+                    });
+                    let message = response.message();
+                    if message.is_none() && !truncated {
                         return Some((s.fail(AiError::InvalidResponse), s));
-                    };
+                    }
                     if pending.is_empty() {
                         s.done = true;
                         s.turn = None;
-                        s.answer().sanitize();
+                        s.answer().cap_stored();
                         let u = response.usage;
                         let usage = (u.input_tokens.is_some() || u.output_tokens.is_some())
                             .then_some(Usage {
@@ -656,7 +765,9 @@ fn stream<'a>(
                         return Some((AgentEvent::Done(usage), s));
                     }
                     let turn = s.turn.as_mut().unwrap();
-                    append(&mut turn.request, message);
+                    if let Some(message) = message {
+                        append(&mut turn.request, message);
+                    }
                     turn.pending = pending;
                 }
             }
@@ -666,9 +777,6 @@ fn stream<'a>(
         inner: Box::pin(inner),
         dropped_turns,
     }
-}
-fn normalized(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 /// Append after the current question. `CompletionRequest::message` inserts *before* the
 /// prompt (its last message), which would leave the question after the tool results and make

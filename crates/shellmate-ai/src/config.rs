@@ -110,27 +110,8 @@ impl ReasoningLevel {
             Self::Default
         }
     }
-    pub fn max_tokens(self) -> u64 {
-        match self {
-            Self::Default | Self::Off => 2048,
-            Self::Minimal | Self::Low => 4096,
-            Self::Medium => 8192,
-            Self::High => 16384,
-            Self::XHigh | Self::Max => 32000,
-        }
-    }
     pub fn timeouts(self) -> Timeouts {
-        let first = match self {
-            Self::Default | Self::Off | Self::Minimal | Self::Low => 45,
-            Self::Medium => 90,
-            Self::High => 150,
-            Self::XHigh | Self::Max => 240,
-        };
-        Timeouts {
-            first: Duration::from_secs(first),
-            idle: Duration::from_secs(30),
-            total: Duration::from_secs(180.max(first + 150)),
-        }
+        Timeouts::default()
     }
 }
 #[derive(Clone)]
@@ -155,12 +136,41 @@ impl fmt::Debug for ApiKey {
 pub struct Timeouts {
     pub first: Duration,
     pub idle: Duration,
-    pub total: Duration,
 }
 impl Default for Timeouts {
     fn default() -> Self {
-        ReasoningLevel::Default.timeouts()
+        Self {
+            first: Duration::from_secs(600),
+            idle: Duration::from_secs(300),
+        }
     }
+}
+/// Output allowance, independent of reasoning effort.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputTokens {
+    #[default]
+    Auto,
+    Tokens(u32),
+}
+impl OutputTokens {
+    pub fn resolve(self, provider: &Provider, model: &str) -> u32 {
+        let maximum = catalog_spec(provider, model).and_then(|spec| spec.max_output_tokens);
+        let requested = match self {
+            Self::Auto => 32_000,
+            Self::Tokens(n) => n.clamp(1024, 128_000),
+        };
+        maximum.map_or(requested, |max| requested.min(max))
+    }
+}
+/// Vendor lookup (including dated aliases), then exact cross-vendor ids for proxies.
+pub fn catalog_spec(provider: &Provider, model: &str) -> Option<&'static rig_core::catalog::ModelSpec> {
+    static FACTS: std::sync::OnceLock<rig_core::catalog::ModelFacts> = std::sync::OnceLock::new();
+    let facts = FACTS.get_or_init(Default::default);
+    facts.for_model(provider.id(), model).or_else(|| {
+        matches!(provider, Provider::OpenAiCompatible { .. })
+            .then(|| rig_core::catalog::Catalog::builtin().iter().find(|spec| spec.id == model))
+            .flatten()
+    })
 }
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -168,6 +178,7 @@ pub struct Config {
     pub model: String,
     pub api_key: ApiKey,
     pub reasoning: ReasoningLevel,
+    pub max_output_tokens: OutputTokens,
     pub timeouts: Timeouts,
 }
 impl Config {
@@ -180,7 +191,6 @@ impl Config {
             || self.model.chars().any(char::is_control)
             || self.timeouts.first.is_zero()
             || self.timeouts.idle.is_zero()
-            || self.timeouts.total.is_zero()
         {
             return Err(AiError::InvalidConfig);
         }
@@ -210,23 +220,22 @@ mod tests {
         assert_eq!(Minimal.for_provider(&anthropic), Default);
         assert_eq!(Max.for_provider(&openai), Max);
         assert_eq!(ReasoningLevel::from_id("future-level"), Default);
-        for (level, id, label, first, total) in [
-            (Default, "default", "默认", 45, 195),
-            (Off, "off", "关闭", 45, 195),
-            (Minimal, "minimal", "最低", 45, 195),
-            (Low, "low", "低", 45, 195),
-            (Medium, "medium", "中", 90, 240),
-            (High, "high", "高", 150, 300),
-            (XHigh, "xhigh", "超高", 240, 390),
-            (Max, "max", "最高", 240, 390),
+        for (level, id, label) in [
+            (Default, "default", "默认"),
+            (Off, "off", "关闭"),
+            (Minimal, "minimal", "最低"),
+            (Low, "low", "低"),
+            (Medium, "medium", "中"),
+            (High, "high", "高"),
+            (XHigh, "xhigh", "超高"),
+            (Max, "max", "最高"),
         ] {
             assert_eq!(level.id(), id);
             assert_eq!(ReasoningLevel::from_id(id), level);
             assert_eq!(level.label(), label);
             let timeouts = level.timeouts();
-            assert_eq!(timeouts.first, Duration::from_secs(first));
-            assert_eq!(timeouts.idle, Duration::from_secs(30));
-            assert_eq!(timeouts.total, Duration::from_secs(total));
+            assert_eq!(timeouts.first, Duration::from_secs(600));
+            assert_eq!(timeouts.idle, Duration::from_secs(300));
         }
     }
     #[test]

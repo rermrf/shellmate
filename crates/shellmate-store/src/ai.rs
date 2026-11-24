@@ -1,9 +1,9 @@
-//! Local history; never includes credentials, raw input, or terminal capture before redaction.
+//! Local AI history; content is stored as sent, with bounded tool-output excerpts.
 use crate::{HostStore, Result, StoreError};
 use rusqlite::{OptionalExtension, params};
 use shellmate_ai::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, Conversation, PermissionMode, Provider,
-    ReasoningLevel, Turn, UserTurn, redact::redact,
+    ReasoningLevel, Turn, UserTurn,
 };
 pub const SAVE_CONVERSATIONS: &str = "ai_save_conversations";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub(crate) fn migrate_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         answer
             .items
             .extend(cards.into_iter().map(AnswerItem::Command));
-        answer.sanitize();
+        answer.cap_stored();
         let items = serde_json::to_string(&answer.items)
             .map_err(|_| StoreError::Corrupt("无法编码 AI 回答".into()))?;
         tx.execute(
@@ -163,23 +163,11 @@ impl HostStore {
     pub fn accept_ai_disclosure(&mut self, destination: &str) -> Result<()> {
         self.set_setting(&format!("ai_disclosure:{destination}"), "1")
     }
-    /// The caller invokes this only once the redacted request is dispatched.
+    /// The caller invokes this only once the request is dispatched.
     /// The preference is rechecked at each write, including streamed answers.
     pub fn save_ai_conversation(&mut self, c: &SavedConversation) -> Result<bool> {
         if self.setting(SAVE_CONVERSATIONS)?.as_deref() == Some("0") {
             return Ok(false);
-        }
-        for t in &c.conversation.turns {
-            for text in [
-                &t.user.question,
-                &t.user.context.text,
-                &t.user.context.label,
-                &t.user.context.protocol,
-            ] {
-                if redact(text).text != *text {
-                    return Err(StoreError::Corrupt("拒绝保存未脱敏的 AI 输入".into()));
-                }
-            }
         }
         let tx = self.conn.transaction()?;
         tx.execute("INSERT INTO ai_conversations VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,session_label=excluded.session_label,provider=excluded.provider,model=excluded.model,updated_at=excluded.updated_at",params![c.id,c.host_id,c.label,c.title,c.provider,c.model,c.created_at,c.updated_at])?;
@@ -198,16 +186,16 @@ impl HostStore {
                     context,
                     c.updated_at,
                     (index * 2) as i64,
-                    t.user.redactions as i64
+                    0_i64
                 ],
             )?;
             if let Some(a) = &t.answer {
                 let mut answer = a.clone();
-                answer.sanitize();
+                answer.cap_stored();
                 let items = serde_json::to_string(&answer.items)
                     .map_err(|_| StoreError::Corrupt("无法编码 AI 回答".into()))?;
                 tx.execute(
-                    "INSERT INTO ai_messages VALUES(?1,?2,'assistant','','','[]',?3,?4,0,?5) ON CONFLICT(id) DO UPDATE SET content='',commands_json='[]',items_json=excluded.items_json",
+                    "INSERT INTO ai_messages VALUES(?1,?2,'assistant','','','[]',?3,?4,0,?5) ON CONFLICT(id) DO UPDATE SET content='',commands_json='[]',items_json=excluded.items_json,redactions=0",
                     params![format!("{}:{index}:assistant", c.id), c.id, c.updated_at, (index*2+1) as i64, items],
                 )?;
             } else {
@@ -225,8 +213,8 @@ impl HostStore {
     }
     pub fn ai_conversation(&self, id: &str) -> Result<Option<SavedConversation>> {
         let Some(mut c)=self.conn.query_row("SELECT id,host_id,session_label,title,provider,model,created_at,updated_at FROM ai_conversations WHERE id=?1",[id],|r|Ok(SavedConversation{id:r.get(0)?,host_id:r.get(1)?,label:r.get(2)?,title:r.get(3)?,provider:r.get(4)?,model:r.get(5)?,created_at:r.get(6)?,updated_at:r.get(7)?,conversation:Conversation::default()})).optional()?else{return Ok(None)};
-        let rows=self.conn.prepare("SELECT role,content,context,items_json,redactions FROM ai_messages WHERE conversation_id=?1 ORDER BY position")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?.max(0) as usize)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for (role, content, context, items, count) in rows {
+        let rows=self.conn.prepare("SELECT role,content,context,items_json FROM ai_messages WHERE conversation_id=?1 ORDER BY position")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (role, content, context, items) in rows {
             if role == "user" {
                 let value: serde_json::Value = serde_json::from_str(&context)
                     .map_err(|_| StoreError::Corrupt("AI 上下文损坏".into()))?;
@@ -239,7 +227,6 @@ impl HostStore {
                             protocol: s("protocol"),
                             text: s("text"),
                         },
-                        redactions: count,
                     },
                     answer: None,
                 });
@@ -248,7 +235,7 @@ impl HostStore {
                     .map_err(|_| StoreError::Corrupt("AI 回答损坏".into()))?;
                 if let Some(t) = c.conversation.turns.last_mut() {
                     let mut answer = Answer { items };
-                    answer.sanitize();
+                    answer.cap_stored();
                     t.answer = Some(answer);
                 }
             }
@@ -305,7 +292,7 @@ mod tests {
         assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 9);
     }
     #[test]
-    fn ordered_steps_round_trip_and_only_sanitized_shaped_output_is_stored() {
+    fn ordered_steps_round_trip_preserves_content_and_caps_output() {
         use shellmate_ai::{StepStatus, Target, output::STORED_LIMIT, policy::Class};
         let mut db = HostStore::open_in_memory().unwrap();
         let mut c = saved();
@@ -355,11 +342,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!raw.contains("private-value"));
-        assert!(!raw.contains("denied-secret"));
+        assert!(raw.contains("private-value"));
+        assert!(raw.contains("denied-secret"));
         assert!(!raw.contains("\\u001b"));
         let loaded = db.ai_conversation("c1").unwrap().unwrap();
-        c.conversation.turns[0].answer.as_mut().unwrap().sanitize();
+        c.conversation.turns[0].answer.as_mut().unwrap().cap_stored();
         assert!(loaded.conversation == c.conversation);
         let answer = loaded.conversation.turns[0].answer.as_ref().unwrap();
         assert!(matches!(answer.items[0], AnswerItem::Text(_)));
@@ -367,7 +354,7 @@ mod tests {
         for item in &answer.items {
             if let AnswerItem::Step { output, .. } = item {
                 assert!(output.len() <= STORED_LIMIT);
-                assert_eq!(redact(output).text, *output);
+                assert!(!output.contains('\x1b'));
             }
         }
     }
@@ -493,7 +480,7 @@ mod tests {
             updated_at: 2,
             conversation: Conversation {
                 turns: vec![Turn {
-                    user: UserTurn::redacted(
+                    user: UserTurn::new(
                         "TOKEN=hidden",
                         ContextSnapshot {
                             text: "PASSWORD=hidden".into(),
@@ -506,6 +493,29 @@ mod tests {
                 }],
             },
         }
+    }
+    #[test]
+    fn content_is_stored_verbatim_and_legacy_redaction_count_is_ignored() {
+        const TEXT: &str = "PASSWORD=hunter2 sk-123456789abcdef";
+        let mut db = HostStore::open_in_memory().unwrap();
+        let mut c = saved();
+        c.conversation.turns[0].user = UserTurn::new(TEXT, ContextSnapshot {
+            text: TEXT.into(), label: TEXT.into(), protocol: "SSH".into(),
+        });
+        c.conversation.turns[0].answer = Some(Answer { items: vec![
+            AnswerItem::Text(TEXT.into()),
+            AnswerItem::Command(CommandCard { command: TEXT.into(), explanation: TEXT.into(), risk: shellmate_ai::Risk::Low }),
+        ] });
+        db.save_ai_conversation(&c).unwrap();
+        let count: i64 = db.conn.query_row("SELECT redactions FROM ai_messages WHERE role='user'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        db.conn.execute("UPDATE ai_messages SET redactions=99", []).unwrap();
+        let loaded = db.ai_conversation(&c.id).unwrap().unwrap();
+        assert!(loaded.conversation == c.conversation);
+        db.save_ai_conversation(&loaded).unwrap();
+        let nonzero: i64 = db.conn.query_row("SELECT count(*) FROM ai_messages WHERE redactions<>0", [], |r| r.get(0)).unwrap();
+        assert_eq!(nonzero, 0);
+        assert_eq!(db.schema_version().unwrap(), 9);
     }
     #[test]
     fn crud_cascade_and_save_off() {
@@ -564,13 +574,13 @@ mod tests {
         assert_eq!(s.key_account(), "ai:openai:api_key");
     }
     #[test]
-    fn message_timestamps_survive_followups_and_raw_inputs_are_rejected() {
+    fn message_timestamps_survive_followups_and_raw_inputs_are_preserved() {
         let mut db = HostStore::open_in_memory().unwrap();
         let mut c = saved();
         db.save_ai_conversation(&c).unwrap();
         c.updated_at = 100;
         c.conversation.turns.push(Turn {
-            user: UserTurn::redacted("next", ContextSnapshot::default()),
+            user: UserTurn::new("next", ContextSnapshot::default()),
             answer: None,
         });
         db.save_ai_conversation(&c).unwrap();
@@ -584,7 +594,8 @@ mod tests {
             .unwrap();
         assert_eq!(timestamps, [2, 2, 100]);
         c.conversation.turns.last_mut().unwrap().user.question = "TOKEN=unsafe".into();
-        assert!(db.save_ai_conversation(&c).is_err());
+        assert!(db.save_ai_conversation(&c).unwrap());
+        assert_eq!(db.ai_conversation(&c.id).unwrap().unwrap().conversation.turns.last().unwrap().user.question, "TOKEN=unsafe");
         assert_eq!(db.ai_conversations().unwrap().len(), 1);
     }
 }
