@@ -23,6 +23,8 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) readonly: bool,
     pub(super) continuation: Option<R>,
     pub(super) resume_steps: usize,
+    pub(super) expanded_summaries: HashSet<(usize, usize)>,
+    pub(super) compaction_focus: Option<Option<String>>,
     pub(super) run_config: Option<shellmate_ai::Config>,
 }
 impl<R> Default for ConversationState<R> {
@@ -45,10 +47,17 @@ impl<R> Default for ConversationState<R> {
             continuation: None,
             resume_steps: 0,
             run_config: None,
+            expanded_summaries: HashSet::new(),
+            compaction_focus: None,
         }
     }
 }
 impl<R> ConversationState<R> {
+    pub fn toggle_summary(&mut self, key: (usize, usize)) {
+        if !self.expanded_summaries.remove(&key) {
+            self.expanded_summaries.insert(key);
+        }
+    }
     pub fn reset_conversation(&mut self) {
         *self = Self::default();
     }
@@ -67,7 +76,7 @@ impl<R> ConversationState<R> {
         provider: &str,
         model: &str,
     ) {
-        let Some(first) = self.model.conversation.turns.first() else {
+        let Some(first) = self.model.conversation.turns().first() else {
             return;
         };
         let saved = SavedConversation {
@@ -76,7 +85,7 @@ impl<R> ConversationState<R> {
             label: self
                 .model
                 .conversation
-                .turns
+                .turns()
                 .last()
                 .unwrap()
                 .user
@@ -98,7 +107,7 @@ impl<R> ConversationState<R> {
         }
     }
     pub fn new_conversation_action(&self, history_open: bool) -> NewConversation {
-        let has_content = !self.model.conversation.turns.is_empty()
+        let has_content = !self.model.conversation.turns().is_empty()
             || self.queued.is_some()
             || self.model.error.is_some()
             || self.save_error.is_some();
@@ -289,7 +298,11 @@ mod tests {
         };
         state.model.start("old", ContextSnapshot::default());
         state.model.event(Event::Thinking);
-        state.model.dropped = 3;
+        state.model.meter = Some(crate::ai::model::ContextMeter {
+            used: 37_000,
+            window: 128_000,
+            trigger: 95_000,
+        });
         state.persist(&mut db, None, "openai", "fixture");
         state.save_error = Some("previous error".into());
         state.expanded.insert((0, 0));
@@ -308,9 +321,9 @@ mod tests {
         assert!(state.continuation.is_none());
         assert!(dropped.get());
         assert_eq!(state.resume_steps, 0);
-        assert!(state.model.conversation.turns.is_empty());
+        assert!(state.model.conversation.turns().is_empty());
         assert!(!state.model.busy && !state.model.thinking && !state.pending);
-        assert_eq!(state.model.dropped, 0);
+        assert!(state.model.meter.is_none());
         assert!(state.model.error.is_none() && state.save_error.is_none());
         assert!(
             state.queued.is_none() && state.active_step.is_none() && state.run_config.is_none()
@@ -366,7 +379,11 @@ mod tests {
         assert_eq!(db.ai_conversations().unwrap().len(), 1);
         let saved = db.ai_conversation(&old_id).unwrap().unwrap();
         assert_eq!(
-            saved.conversation.turns[0].answer.as_ref().unwrap().text(),
+            saved.conversation.turns()[0]
+                .answer
+                .as_ref()
+                .unwrap()
+                .text(),
             "partial answer"
         );
         state.id = saved.id;
@@ -380,7 +397,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .conversation
-                .turns
+                .turns()
                 .len(),
             2
         );
@@ -393,7 +410,9 @@ mod tests {
         let moved = temp.path().join("moved.db");
         let mut db = HostStore::open(&path).unwrap();
         let mut state = ConversationState::<()>::default();
-        state.model.start("question", ContextSnapshot::default());
+        state
+            .model
+            .start("TOKEN=fixture-sensitive", ContextSnapshot::default());
         db.set_setting(shellmate_store::ai::SAVE_CONVERSATIONS, "0")
             .unwrap();
         state.persist(&mut db, None, "openai", "fixture");
@@ -401,7 +420,6 @@ mod tests {
         assert!(state.save_error.is_none());
         db.set_setting(shellmate_store::ai::SAVE_CONVERSATIONS, "1")
             .unwrap();
-        state.model.conversation.turns[0].user.question = "TOKEN=fixture-sensitive".into();
         // SQLite refuses writes after its backing file is moved. This exercises
         // a real save failure without relying on the removed redaction policy.
         std::fs::rename(&path, &moved).unwrap();
@@ -418,10 +436,62 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .conversation
-                .turns[0]
+                .turns()[0]
                 .user
                 .question,
             "TOKEN=fixture-sensitive"
         );
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use shellmate_ai::{CompactTrigger, Compaction, ContextSnapshot, Entry, Event, RetainedState};
+    #[test]
+    fn compaction_divider_summary_toggle_roundtrip_and_reset() {
+        let mut state = ConversationState::<()>::default();
+        state.model.start("question", ContextSnapshot::default());
+        state
+            .model
+            .event(Event::TextDelta("original answer".into()));
+        let c = Compaction {
+            summary: Some("handoff summary".into()),
+            retained_user: vec!["question".into()],
+            state: RetainedState::default(),
+            context: ContextSnapshot::default(),
+            before_tokens: 812_000,
+            after_tokens: 41_000,
+            trigger: CompactTrigger::Manual,
+        };
+        assert_eq!(
+            crate::ai::model::compaction_label(&c),
+            "已压缩上下文 · 812K → 41K"
+        );
+        state
+            .model
+            .conversation
+            .append(Entry::Compaction(c.clone()));
+        state.model.event(Event::TextDelta("continued".into()));
+        let items = &state.model.conversation.turns()[0]
+            .answer
+            .as_ref()
+            .unwrap()
+            .items;
+        assert!(
+            matches!(&items[..],[shellmate_ai::AnswerItem::Text(a),shellmate_ai::AnswerItem::Compaction(b),shellmate_ai::AnswerItem::Text(d)] if a=="original answer" && *b==c && d=="continued")
+        );
+        assert!(!state.expanded_summaries.contains(&(0, 1)));
+        state.toggle_summary((0, 1));
+        assert!(state.expanded_summaries.contains(&(0, 1)));
+        state.toggle_summary((0, 1));
+        assert!(!state.expanded_summaries.contains(&(0, 1)));
+        let mut db = HostStore::open_in_memory().unwrap();
+        state.persist(&mut db, None, "openai", "fixture");
+        let loaded = db.ai_conversation(&state.id).unwrap().unwrap();
+        assert!(loaded.conversation == state.model.conversation);
+        state.toggle_summary((0, 1));
+        state.reset_conversation();
+        assert!(state.expanded_summaries.is_empty());
     }
 }

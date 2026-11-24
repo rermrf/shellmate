@@ -31,16 +31,16 @@ fn config(a: bool) -> Config {
         api_key: ApiKey::new("fixture-only"),
         reasoning: ReasoningLevel::Default,
         max_output_tokens: Default::default(),
+        context_window: Default::default(),
+        autocompact_window: Default::default(),
         timeouts: Timeouts::default(),
     }
 }
 fn conversation() -> Conversation {
-    Conversation {
-        turns: vec![Turn {
-            user: UserTurn::new("检查容器", ContextSnapshot::default()),
-            answer: None,
-        }],
-    }
+    Conversation::from_turns(vec![Turn {
+        user: UserTurn::new("检查容器", ContextSnapshot::default()),
+        answer: None,
+    }])
 }
 fn capabilities() -> Capabilities {
     Capabilities {
@@ -236,7 +236,7 @@ async fn both_wires_complete_with_real_tool_results_and_parallel_disabled() {
         } else {
             assert_eq!(bodies[0]["parallel_tool_calls"], false);
         }
-        let answer = c.turns[0].answer.as_ref().unwrap();
+        let answer = c.turns()[0].answer.as_ref().unwrap();
         assert!(matches!(
             &answer.items[..],
             [
@@ -297,7 +297,7 @@ async fn denied_busy_failed_and_disconnected() {
                 assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
             }
             assert!(
-                c.turns[0]
+                c.turns()[0]
                     .answer
                     .as_ref()
                     .unwrap()
@@ -411,8 +411,8 @@ async fn anthropic_signed_thinking_replays_only_in_current_turn() {
     assert!(blocks.iter().any(|v| v["type"] == "thinking"
         && v["thinking"] == "PRIVATE-THINKING"
         && v["signature"] == "signature-fixture"));
-    assert!(!format!("{:?}", c.turns[0].answer).contains("PRIVATE"));
-    c.turns.push(Turn {
+    assert!(!format!("{:?}", c.turns()[0].answer).contains("PRIVATE"));
+    c.push_turn(Turn {
         user: UserTurn::new("继续说明", ContextSnapshot::default()),
         answer: None,
     });
@@ -519,13 +519,13 @@ async fn no_capabilities_keeps_suggestion_tool_and_fenced_fallback() {
     }
 }
 #[tokio::test]
-async fn old_steps_are_plain_text_and_count_toward_history_budget() {
+async fn old_steps_replay_as_tool_pairs_without_dropping_history() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([response(a, &[], "回答", false)]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let host = Host::new([]);
         let mut c = conversation();
-        c.turns[0].answer = Some(Answer {
+        c.push_answer(Answer {
             items: vec![
                 AnswerItem::Step {
                     automatic: false,
@@ -554,22 +554,26 @@ async fn old_steps_are_plain_text_and_count_toward_history_budget() {
                 AnswerItem::Text("分析".into()),
             ],
         });
-        c.turns.push(Turn {
+        c.push_turn(Turn {
             user: UserTurn::new("为什么", ContextSnapshot::default()),
             answer: None,
         });
-        assert_eq!(c.prepare(250).unwrap().dropped_turns, 1);
+        assert!(
+            serde_json::to_string(&c.prepare(&capabilities()).unwrap().chat_history)
+                .unwrap()
+                .contains("docker ps")
+        );
         agent::run(&client, &mut c, capabilities(), &host, Limits::default())
             .unwrap()
             .collect::<Vec<_>>()
             .await;
         let b = bodies(&http);
         let messages = b[0]["messages"].to_string();
-        assert!(messages.contains("已执行（后台）：docker ps → 退出码 0"));
+        assert!(messages.contains("[较早的输出已移出上下文] 命令：docker ps · 退出码 0"));
         assert!(messages.contains("用户拒绝执行：rm x（保留）"));
-        assert!(!messages.contains("tool_result"));
-        assert!(!messages.contains("tool_calls"));
-        assert!(!messages.contains("tool_use"));
+        assert!(messages.contains(if a { "tool_result" } else { "tool_call_id" }));
+        assert!(messages.contains(if a { "tool_use" } else { "tool_calls" }));
+        context_tests::assert_pairs(&b[0], a);
     }
 }
 #[tokio::test]
@@ -718,10 +722,10 @@ async fn anthropic_text_after_a_call_stays_after_its_step() {
         .collect::<Vec<_>>()
         .await;
     assert!(
-        matches!(&events[..], [AgentEvent::StepProposed(_),AgentEvent::StepFinished{..},AgentEvent::TextDelta(t),AgentEvent::TextDelta(_),AgentEvent::Done(_)] if t=="后置文字")
+        matches!(&events[..], [AgentEvent::Context { .. },AgentEvent::StepProposed(_),AgentEvent::StepFinished{..},AgentEvent::TextDelta(t),AgentEvent::TextDelta(_),AgentEvent::Context { .. },AgentEvent::Done(_)] if t=="后置文字")
     );
     assert!(
-        matches!(&c.turns[0].answer.as_ref().unwrap().items[..],[AnswerItem::Step{..},AnswerItem::Text(t)] if t=="后置文字最终回答")
+        matches!(&c.turns()[0].answer.as_ref().unwrap().items[..],[AnswerItem::Step{..},AnswerItem::Text(t)] if t=="后置文字最终回答")
     );
 }
 
@@ -972,8 +976,12 @@ async fn invalid_calls_return_actionable_errors_then_recover_on_both_wires() {
             );
             let b = bodies(&http);
             assert_eq!(b.len(), 3);
-            assert!(tool_result(&b[1], a, "bad").contains(error));
-            if a {
+            if error == "未知工具" {
+                assert!(b[1]["messages"].to_string().contains(error));
+            } else {
+                assert!(tool_result(&b[1], a, "bad").contains(error));
+            }
+            if a && error != "未知工具" {
                 assert!(
                     b[1]["messages"]
                         .as_array()
@@ -986,7 +994,7 @@ async fn invalid_calls_return_actionable_errors_then_recover_on_both_wires() {
                 );
             }
             assert!(matches!(
-                &c.turns[0].answer.as_ref().unwrap().items[..],
+                &c.turns()[0].answer.as_ref().unwrap().items[..],
                 [AnswerItem::Step { .. }, AnswerItem::Text(_)]
             ));
         }
@@ -1054,7 +1062,7 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
             };
             assert_eq!(http.requests().len(), 2);
             assert!(host.calls.lock().unwrap().is_empty());
-            assert!(c.turns[0].answer.as_ref().unwrap().items.is_empty());
+            assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
             let events = agent::resume(&client, &mut c, &host, *resume, Limits::default())
                 .unwrap()
                 .collect::<Vec<_>>()
@@ -1072,7 +1080,7 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
                     })
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
-                assert!(c.turns[0].answer.as_ref().unwrap().items.is_empty());
+                assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
                 assert_eq!(http.requests().len(), 3);
             }
             assert!(tool_result(&bodies(&http)[2], a, "bad-2").contains("缺少 command"));
@@ -1094,7 +1102,7 @@ async fn text_without_tool_calls_finishes_on_both_wires() {
                 .await;
             assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
             assert_eq!(
-                c.turns[0].answer.as_ref().unwrap().items,
+                c.turns()[0].answer.as_ref().unwrap().items,
                 [AnswerItem::Text("无需执行命令。".into())]
             );
             assert!(host.calls.lock().unwrap().is_empty());
@@ -1145,7 +1153,7 @@ async fn queued_invalid_calls_follow_the_same_recovery_and_streak_rules() {
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
                 assert_eq!(http.requests().len(), 1);
-                assert!(c.turns[0].answer.as_ref().unwrap().items.is_empty());
+                assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
             }
         }
     }
@@ -1255,7 +1263,7 @@ async fn approved_edit_and_target_reach_both_wires_events_and_history() {
         assert!(result.contains("用户批准的实际命令：pwd"));
         assert!(result.contains("执行目标：终端"));
         assert!(
-            matches!(&conversation.turns[0].answer.as_ref().unwrap().items[0], AnswerItem::Step {command, target: Target::Terminal, ..} if command == "pwd")
+            matches!(&conversation.turns()[0].answer.as_ref().unwrap().items[0], AnswerItem::Step {command, target: Target::Terminal, ..} if command == "pwd")
         );
     }
 }
@@ -1574,7 +1582,7 @@ async fn transient_after_text_pauses_without_retry_and_preserves_partial_answer(
         else {
             panic!("expected network pause")
         };
-        assert_eq!(c.turns[0].answer.as_ref().unwrap().text(), "partial");
+        assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(), "partial");
         let http = SequencedHttpClient::new([response(a, &[], "recovered", false)]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let events = agent::resume(&client, &mut c, &host, *resume, fast_limits())
@@ -1584,7 +1592,7 @@ async fn transient_after_text_pauses_without_retry_and_preserves_partial_answer(
         assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
         assert!(!bodies(&http)[0]["messages"].to_string().contains("partial"));
         assert_eq!(
-            c.turns[0].answer.as_ref().unwrap().text(),
+            c.turns()[0].answer.as_ref().unwrap().text(),
             "partialrecovered"
         );
     }
@@ -1798,7 +1806,7 @@ async fn three_truncations_pause_and_text_only_length_stops_normally() {
             .collect::<Vec<_>>()
             .await;
         assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
-        assert_eq!(c.turns[0].answer.as_ref().unwrap().text().len(), 300_000);
+        assert_eq!(c.turns()[0].answer.as_ref().unwrap().text().len(), 300_000);
     }
 }
 #[tokio::test]
@@ -1819,14 +1827,14 @@ async fn agent_option_fallbacks_and_credentials_reach_requests_and_answer_verbat
         let http = SequencedHttpClient::new(responses);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let host = Host::new([completed(RAW)]);
-        let mut c = conversation();
-        c.turns[0].user = UserTurn::new(
+        let mut c = Conversation::default();
+        c.push_user(UserTurn::new(
             RAW,
             ContextSnapshot {
                 text: RAW.into(),
                 ..Default::default()
             },
-        );
+        ));
         let events = agent::run(
             &client,
             &mut c,
@@ -1848,7 +1856,7 @@ async fn agent_option_fallbacks_and_credentials_reach_requests_and_answer_verbat
         assert!(bodies[0].to_string().matches(RAW).count() >= 3);
         assert!(tool_result(bodies.last().unwrap(), a, "call").contains(RAW));
         assert!(
-            c.turns[0]
+            c.turns()[0]
                 .answer
                 .as_ref()
                 .unwrap()
@@ -2056,7 +2064,7 @@ async fn anthropic_in_band_provider_errors_pause_after_text_and_retry_before_con
                     matches!(&events[..], [AgentEvent::TextDelta(text), AgentEvent::Paused { reason: PauseReason::Error(error), .. }] if text == "partial" && *error == expected)
                 );
                 assert_eq!(http.requests().len(), 1);
-                assert_eq!(c.turns[0].answer.as_ref().unwrap().text(), "partial");
+                assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(), "partial");
                 let AgentEvent::Paused { resume, .. } = events.into_iter().last().unwrap() else {
                     unreachable!()
                 };
@@ -2066,7 +2074,7 @@ async fn anthropic_in_band_provider_errors_pause_after_text_and_retry_before_con
                     .await;
                 assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
                 assert_eq!(
-                    c.turns[0].answer.as_ref().unwrap().text(),
+                    c.turns()[0].answer.as_ref().unwrap().text(),
                     "partialrecovered"
                 );
             } else {
@@ -2089,7 +2097,7 @@ async fn anthropic_in_band_provider_errors_pause_after_text_and_retry_before_con
                 "failed partial response must not enter request history"
             );
             assert!(
-                !c.turns[0]
+                !c.turns()[0]
                     .answer
                     .as_ref()
                     .unwrap()
@@ -2125,3 +2133,6 @@ async fn anthropic_finished_refusal_stays_invalid_response() {
     ));
     assert_eq!(http.requests().len(), 1);
 }
+
+#[path = "agent/context.rs"]
+mod context_tests;

@@ -47,6 +47,75 @@ docker inspect nginx --format '{{.Name}} {{.Config.Image}} {{json .NetworkSettin
 ![容器服务拓扑](https://example.invalid/never-fetch.png)
 "#;
 
+pub const COMPACTION_SCENES: &[&str] = &[
+    "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
+];
+
+pub const COMPACTION_SUMMARY: &str = "1. 主要请求与意图：定位 502，只读检查。\n2. 关键概念与背景：nginx 转发至 api:8080。\n3. 涉及的文件与内容：待查 app.conf，未修改。\n4. 错误与修复：上游超时；尚未实施修复。\n5. 解决过程：已确认容器运行，待查响应时延。\n6. 用户消息：保留排查记录，不直接改配置。\n7. 待办事项：检查健康端点和超时设置。\n8. 当前工作：已核对容器状态与入口日志。\n9. 下一步：验证 API 健康端点，对照同期日志。";
+
+pub struct CompactionScene {
+    pub model: crate::ai::model::DrawerModel,
+    pub expanded_summary: Option<(usize, usize)>,
+}
+
+/// The same semantic log and model consumed by the live drawer, with inert data only.
+pub fn compaction_scene(scene: &str) -> Option<CompactionScene> {
+    use shellmate_ai::{
+        CompactTrigger, Compaction, ContextSnapshot, Conversation, Entry, Event,
+        LoggedCall, LoggedResult, PermissionMode, RetainedState, Step, StepDisplay,
+        StepStatus, Target, UserTurn, policy::Class,
+    };
+    if !COMPACTION_SCENES.contains(&scene) { return None; }
+    let context = ContextSnapshot {
+        label: "prod-web-01".into(),
+        protocol: "SSH".into(),
+        text: "root@prod-web-01:/srv/app#".into(),
+    };
+    let mut conversation = Conversation::default();
+    conversation.push_user(UserTurn::new("检查 nginx 的 502 报错，先不要修改配置。", context.clone()));
+    for (n, command, purpose, output, cleared) in [
+        (1, "docker ps --format 'table {{.Names}}\t{{.Status}}'", "确认容器运行状态",
+         "标准输出：\nnginx    Up 12 days\napi      Up 3 days\n标准错误：\n", true),
+        (2, "docker logs --tail 3 nginx", "检查入口服务最近的报错",
+         "标准输出：\n10:42:03 upstream timed out: api:8080\n标准错误：\n", false),
+    ] {
+        conversation.append(Entry::Step(Step {
+            message_id: n,
+            call: LoggedCall {
+                id: format!("fixture_context_{n}"),
+                name: "run_command".into(),
+                args_json: serde_json::json!({"command":command,"purpose":purpose,"target":"background"}),
+            },
+            result: LoggedResult { inline: output.into(), output_id: None, cleared, is_error: false },
+            display: Some(StepDisplay {
+                command: command.into(), target: Target::Background, purpose: purpose.into(),
+                class: Class::ReadOnly, status: StepStatus::Completed, exit_code: Some(0),
+                duration_ms: 1200, automatic: true, output: output.into(),
+            }),
+        }));
+    }
+    let mut model = crate::ai::model::DrawerModel { conversation, ..Default::default() };
+    let mut expanded_summary = None;
+    if scene == "ai-compacting" {
+        model.event(Event::Context { used: 93_000, window: 128_000, trigger: 95_000 });
+        model.event(Event::Compacting { tier: 2 });
+    } else {
+        let key = (0, model.conversation.turns()[0].answer.as_ref().unwrap().items.len());
+        model.conversation.append(Entry::Compaction(Compaction {
+            summary: (scene != "ai-compacted-tier1").then(|| COMPACTION_SUMMARY.into()),
+            retained_user: vec!["检查 nginx 的 502 报错，先不要修改配置。".into()],
+            state: RetainedState { permission_mode: PermissionMode::Auto, ..Default::default() },
+            context: context.clone(), before_tokens: 812_000, after_tokens: 41_000,
+            trigger: CompactTrigger::PreRequest,
+        }));
+        if scene == "ai-compacted-open" { expanded_summary = Some(key); }
+        model.conversation.push_user(UserTurn::new("下一步先确认 API 是否能响应。", context));
+        model.conversation.push_text("先检查 API 健康端点与响应耗时，再对照超时日志。当前未修改配置或重启服务。");
+        model.event(Event::Context { used: 41_000, window: 1_000_000, trigger: 967_000 });
+    }
+    Some(CompactionScene { model, expanded_summary })
+}
+
 #[cfg(test)]
 mod tests {
     use markdown::{ParseOptions, mdast::Node};
@@ -110,8 +179,11 @@ mod tests {
     #[test]
     fn ai_fixtures_have_both_themes_and_requested_sizes() {
         assert_eq!(super::super::default_window_size("ai-new-confirm"), (1440, 900));
-        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-new-confirm", "ai-markdown", "ai-markdown-wide"] {
+        for scene in ["ai", "ai-chat", "ai-agent-run", "ai-new-confirm", "ai-markdown", "ai-markdown-wide"]
+            .into_iter().chain(super::COMPACTION_SCENES.iter().copied())
+        {
             assert!(super::super::SCENES.contains(&scene));
+            assert_eq!(super::super::default_window_size(scene), super::super::default_window_size("ai-chat"));
             for dark in [false, true] {
                 assert!(
                     super::super::readings::READINGS
@@ -125,4 +197,48 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn compaction_scenes_cover_real_log_dividers_expansion_and_busy_meter() {
+        use shellmate_ai::{AnswerItem, Entry};
+        let collapsed = super::compaction_scene("ai-compacted").unwrap();
+        let open = super::compaction_scene("ai-compacted-open").unwrap();
+        assert!(collapsed.model.conversation == open.model.conversation);
+        assert!(collapsed.expanded_summary.is_none());
+        assert_eq!(open.expanded_summary, Some((0, 2)));
+        assert!(super::compaction_scene("ai-chat").is_none());
+        for scene in super::COMPACTION_SCENES {
+            let fixture = super::compaction_scene(scene).unwrap();
+            let model = &fixture.model;
+            let entries = model.conversation.entries();
+            assert!(matches!(&entries[..3], [Entry::User { .. }, Entry::Step(first), Entry::Step(second)]
+                if first.result.cleared && !second.result.cleared));
+            let meter = model.meter.unwrap();
+            if *scene == "ai-compacting" {
+                assert!(model.busy && model.compacting && meter.amber());
+                assert_eq!(meter.label(), "已用 93K / 128K");
+                assert_eq!(model.status(false), "正在压缩上下文…");
+                assert!(!entries.iter().any(|e| matches!(e, Entry::Compaction(_))));
+            } else {
+                assert!(!model.busy && !model.compacting && !meter.amber());
+                assert_eq!(meter.label(), "已用 41K / 1M");
+                assert!(matches!(&entries[3..], [Entry::Compaction(_), Entry::User { .. }, Entry::Assistant { .. }]));
+                let answer = model.conversation.turns()[0].answer.as_ref().unwrap();
+                let [AnswerItem::Step { .. }, AnswerItem::Step { .. }, AnswerItem::Compaction(c)] = &answer.items[..] else { panic!("expected steps then divider"); };
+                assert_eq!(crate::ai::model::compaction_label(c), "已压缩上下文 · 812K → 41K");
+                if *scene == "ai-compacted-tier1" {
+                    assert!(c.summary.is_none(), "tier 1 has no summary toggle");
+                    assert!(fixture.expanded_summary.is_none());
+                } else {
+                    let summary = c.summary.as_deref().unwrap();
+                    assert_eq!(summary, super::COMPACTION_SUMMARY);
+                    assert!(summary.lines().count() >= 5);
+                    for section in ["1. 主要请求与意图", "3. 涉及的文件与内容", "4. 错误与修复", "7. 待办事项", "9. 下一步"] {
+                        assert!(summary.contains(section));
+                    }
+                }
+            }
+        }
+    }
+
 }

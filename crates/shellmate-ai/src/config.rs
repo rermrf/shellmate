@@ -167,9 +167,7 @@ pub fn catalog_spec(provider: &Provider, model: &str) -> Option<&'static rig_cor
     static FACTS: std::sync::OnceLock<rig_core::catalog::ModelFacts> = std::sync::OnceLock::new();
     let facts = FACTS.get_or_init(Default::default);
     facts.for_model(provider.id(), model).or_else(|| {
-        matches!(provider, Provider::OpenAiCompatible { .. })
-            .then(|| rig_core::catalog::Catalog::builtin().iter().find(|spec| spec.id == model))
-            .flatten()
+        rig_core::catalog::Catalog::builtin().iter().find(|spec| spec.id == model)
     })
 }
 #[derive(Clone, Debug)]
@@ -179,6 +177,8 @@ pub struct Config {
     pub api_key: ApiKey,
     pub reasoning: ReasoningLevel,
     pub max_output_tokens: OutputTokens,
+    pub context_window: crate::ContextWindow,
+    pub autocompact_window: crate::ContextWindow,
     pub timeouts: Timeouts,
 }
 impl Config {

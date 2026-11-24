@@ -1,21 +1,24 @@
 //! Lazy agent loop. The host alone approves and executes; dropping the stream drops
 //! the in-flight model/host future. A host must cancel its operation on future drop.
 use crate::{
-    AiError, Answer, AnswerItem, CommandCard, Conversation, Event, ProviderClient, RigClient,
-    StepStatus, ToolOutput, Usage, UserTurn,
+    AiError, AnswerItem, CommandCard, CompactTrigger, Compaction, ContextSnapshot, Conversation,
+    Entry, LogUpdate, PermissionMode, RetainedState, RigClient, StepStatus, ToolOutput, Usage,
+    UserTurn,
     client::{map_error, option_refusal},
+    context::{NativeMessages, ThrashGuard, request_tokens},
     policy::{self, Class},
 };
 use futures::{Stream, StreamExt, future::BoxFuture};
 use rig_core::{
     completion::{CompletionRequest, FinishReason},
-    message::{AssistantContent, Message, ToolCall as RigCall, ToolResultContent},
+    message::{AssistantContent, Message, ToolCall as RigCall},
     serde::{Deserialize, Serialize},
     streaming::{CompletionStream, Item, PartKind, StreamEvent},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
@@ -155,7 +158,7 @@ impl ToolOutcome {
             other => other,
         }
     }
-    fn wire_text(&self) -> String {
+    pub(crate) fn wire_text(&self) -> String {
         match self {
             Self::Completed(out) => out.wire_text(),
             Self::Denied { reason } => format!(
@@ -214,6 +217,16 @@ pub trait ToolHost: Send + Sync {
     /// of this future must cancel the operation. The core never spawns host tasks.
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
     /// The approved command may have been edited or retargeted by the user.
+    /// Fresh host snapshot at a compaction boundary. None uses the last sent snapshot.
+    fn context_snapshot(&self) -> BoxFuture<'_, Option<ContextSnapshot>> {
+        Box::pin(async { None })
+    }
+    fn permission_mode(&self) -> PermissionMode {
+        PermissionMode::Ask
+    }
+    fn automatic(&self, _call: &ToolCall) -> bool {
+        false
+    }
     fn resolved_call(&self, call: &ToolCall) -> ToolCall {
         call.clone()
     }
@@ -245,6 +258,19 @@ pub enum PauseReason {
 }
 
 pub enum AgentEvent {
+    Context {
+        used: usize,
+        window: u32,
+        trigger: u32,
+    },
+    Compacting {
+        tier: u8,
+    },
+    Compacted {
+        before: usize,
+        after: usize,
+        summary: Option<String>,
+    },
     Thinking,
     TextDelta(String),
     Command(CommandCard),
@@ -276,7 +302,9 @@ enum Pending {
 /// Opaque, memory-only continuation. Deliberately neither Debug nor serializable:
 /// it owns signed reasoning and real tool messages for this turn only.
 pub struct Resume {
-    request: CompletionRequest,
+    native: NativeMessages,
+    model_steps: usize,
+    guard: ThrashGuard,
     pending: VecDeque<Pending>,
     capabilities: Capabilities,
     steps: usize,
@@ -284,15 +312,25 @@ pub struct Resume {
     turn: UserTurn,
     turns: usize,
     parallel_disabled: bool,
+    message_id: usize,
 }
 pub struct AgentStream<'a> {
     inner: Pin<Box<dyn Stream<Item = AgentEvent> + Send + 'a>>,
-    pub dropped_turns: usize,
+    updates: Arc<Mutex<Vec<LogUpdate>>>,
 }
 impl Stream for AgentStream<'_> {
     type Item = AgentEvent;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.as_mut().poll_next(cx)
+    }
+}
+impl AgentStream<'_> {
+    pub(crate) fn updates_handle(&self) -> Arc<Mutex<Vec<LogUpdate>>> {
+        self.updates.clone()
+    }
+    /// Drain durable mutations after each event; the app applies these before saving.
+    pub fn take_updates(&mut self) -> Vec<LogUpdate> {
+        std::mem::take(&mut *self.updates.lock().unwrap())
     }
 }
 pub fn run<'a>(
@@ -302,62 +340,26 @@ pub fn run<'a>(
     host: &'a dyn ToolHost,
     limits: Limits,
 ) -> Result<AgentStream<'a>, AiError> {
-    if !capabilities.available() {
-        let stream = client.start(conversation)?;
-        let dropped_turns = stream.dropped_turns;
-        let inner = stream.map(move |event| {
-            let answer = conversation
-                .turns
-                .last_mut()
-                .unwrap()
-                .answer
-                .get_or_insert_with(Answer::default);
-            match event {
-                Event::Thinking => AgentEvent::Thinking,
-                Event::TextDelta(text) => {
-                    answer.push_text(&text);
-                    AgentEvent::TextDelta(text)
-                }
-                Event::Command(card) => {
-                    answer.items.push(AnswerItem::Command(card.clone()));
-                    AgentEvent::Command(card)
-                }
-                Event::Done(u) => {
-                    answer.cap_stored();
-                    AgentEvent::Done(u)
-                }
-                Event::Error(e) => {
-                    answer.cap_stored();
-                    AgentEvent::Error(e)
-                }
-            }
-        });
-        return Ok(AgentStream {
-            inner: Box::pin(inner),
-            dropped_turns,
-        });
-    }
-    let capabilities = capabilities.for_question(&conversation.turns.last().unwrap().user.question);
-    let prepared = conversation.prepare_with_capabilities(client.input_budget(), &capabilities)?;
-    conversation.turns.last_mut().unwrap().answer = Some(Answer::default());
+    let user = conversation
+        .latest_user()
+        .ok_or(AiError::InvalidConfig)?
+        .clone();
+    let capabilities = capabilities.for_question(&user.question);
+    conversation.prepare(&capabilities)?;
     let state = Resume {
-        request: prepared.request.parallel_tool_calls(false),
+        native: NativeMessages::new(),
+        model_steps: 0,
+        guard: ThrashGuard::default(),
         pending: VecDeque::new(),
         capabilities,
         steps: 0,
         invalid_calls: 0,
-        turn: conversation.turns.last().unwrap().user.clone(),
-        turns: conversation.turns.len(),
+        turn: user,
+        turns: conversation.turns().len(),
         parallel_disabled: false,
+        message_id: 0,
     };
-    Ok(stream(
-        client,
-        conversation,
-        host,
-        limits,
-        state,
-        prepared.dropped_turns,
-    ))
+    Ok(stream(client, conversation, host, limits, state, None))
 }
 pub fn resume<'a>(
     client: &'a RigClient,
@@ -366,15 +368,54 @@ pub fn resume<'a>(
     continuation: Resume,
     limits: Limits,
 ) -> Result<AgentStream<'a>, AiError> {
-    if conversation.turns.len() != continuation.turns
-        || conversation
-            .turns
-            .last()
-            .is_none_or(|t| t.user != continuation.turn)
+    if conversation.turns().len() != continuation.turns
+        || conversation.latest_user() != Some(&continuation.turn)
     {
         return Err(AiError::InvalidConfig);
     }
-    Ok(stream(client, conversation, host, limits, continuation, 0))
+    Ok(stream(
+        client,
+        conversation,
+        host,
+        limits,
+        continuation,
+        None,
+    ))
+}
+/// Manual compaction also works on an idle/paused log. The caller retains Resume;
+/// resuming rebuilds from the new log view and then processes any pending calls.
+pub fn compact<'a>(
+    client: &'a RigClient,
+    conversation: &'a mut Conversation,
+    capabilities: Capabilities,
+    host: &'a dyn ToolHost,
+    focus: Option<String>,
+) -> Result<AgentStream<'a>, AiError> {
+    let user = conversation
+        .latest_user()
+        .ok_or(AiError::InvalidConfig)?
+        .clone();
+    let state = Resume {
+        native: NativeMessages::new(),
+        model_steps: 0,
+        guard: ThrashGuard::default(),
+        pending: VecDeque::new(),
+        capabilities,
+        steps: 0,
+        invalid_calls: 0,
+        turn: user,
+        turns: conversation.turns().len(),
+        parallel_disabled: false,
+        message_id: 0,
+    };
+    Ok(stream(
+        client,
+        conversation,
+        host,
+        Limits::default(),
+        state,
+        Some(focus),
+    ))
 }
 struct State<'a> {
     client: &'a RigClient,
@@ -394,31 +435,64 @@ struct State<'a> {
     steps: usize,
     done: bool,
     error: Option<AiError>,
+    updates: Arc<Mutex<Vec<LogUpdate>>>,
+    queue: VecDeque<AgentEvent>,
+    message_id: usize,
+    reactive_retry: bool,
+    compacting: Option<CompactWork>,
+    manual: bool,
+    skip_precheck: bool,
 }
 impl State<'_> {
-    fn answer(&mut self) -> &mut Answer {
-        self.conversation
-            .turns
-            .last_mut()
-            .unwrap()
-            .answer
-            .get_or_insert_with(Answer::default)
+    fn record(&mut self, update: LogUpdate) {
+        self.conversation.apply(update.clone());
+        self.updates.lock().unwrap().push(update);
+    }
+    fn entry(&mut self, entry: Entry) {
+        self.record(LogUpdate::Append(Box::new(entry)));
+    }
+    fn text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.entry(Entry::Assistant {
+                text: text.into(),
+                message_id: self.message_id,
+            });
+        }
+    }
+    fn request(&self) -> Result<CompletionRequest, AiError> {
+        let turn = self.turn.as_ref().unwrap();
+        let mut request = self.conversation.request(
+            &turn.capabilities,
+            &turn.native,
+            false,
+            self.conversation.view_start(),
+        )?;
+        if request
+            .chat_history
+            .last()
+            .is_some_and(|m| matches!(&**m, Message::Assistant(_)))
+        {
+            crate::context::add_prompt(&mut request, "请继续。".into());
+        }
+        if turn.capabilities.available() && !turn.parallel_disabled {
+            request = request.parallel_tool_calls(false);
+        }
+        Ok(request)
     }
     fn fail(&mut self, error: AiError) -> AgentEvent {
         self.done = true;
         self.model = None;
         self.turn = None;
-        self.answer().cap_stored();
         AgentEvent::Error(error)
     }
     fn pause(&mut self, reason: PauseReason) -> AgentEvent {
         self.done = true;
         self.model = None;
         let mut resume = self.turn.take().unwrap();
+        resume.message_id = self.message_id;
         if reason == PauseReason::InvalidCalls {
             resume.invalid_calls = 0;
         }
-        self.answer().cap_stored();
         AgentEvent::Paused {
             reason,
             steps: resume.steps,
@@ -431,8 +505,16 @@ impl State<'_> {
             error,
             AiError::RateLimited | AiError::Unavailable | AiError::Network | AiError::Timeout
         );
+        if error == AiError::ContextTooLong && !self.received && !self.reactive_retry {
+            self.reactive_retry = true;
+            match self.begin_compaction(CompactTrigger::Reactive, None) {
+                Ok(()) => return AgentEvent::Compacting { tier: 1 },
+                Err(e) => return self.fail(e),
+            }
+        }
         self.failures += 1;
         if transient
+            && self.turn.as_ref().unwrap().capabilities.available()
             && !self.received
             && (error != AiError::Timeout || self.first)
             && self.failures < MAX_ATTEMPTS
@@ -450,6 +532,13 @@ impl State<'_> {
             };
         }
         if transient {
+            if self.received {
+                self.turn
+                    .as_mut()
+                    .unwrap()
+                    .native
+                    .insert(self.message_id, Default::default());
+            }
             self.pause(PauseReason::Error(error))
         } else {
             self.fail(error)
@@ -466,7 +555,6 @@ impl State<'_> {
         let turn = self.turn.as_mut().unwrap();
         if !turn.parallel_disabled && parallel_refusal(error) {
             turn.parallel_disabled = true;
-            turn.request.options.parallel_tool_calls = None;
         } else if !self.client.option_fallback(error) {
             return false;
         }
@@ -474,6 +562,130 @@ impl State<'_> {
         true
     }
 }
+struct CompactWork {
+    before: usize,
+    trigger: CompactTrigger,
+    focus: Option<String>,
+    tier: u8,
+}
+impl State<'_> {
+    fn begin_compaction(
+        &mut self,
+        trigger: CompactTrigger,
+        focus: Option<String>,
+    ) -> Result<(), AiError> {
+        let request = self.request()?;
+        let turn = self.turn.as_mut().unwrap();
+        turn.guard.record(turn.model_steps, trigger)?;
+        let before = self.conversation.used(&request, &turn.capabilities);
+        self.compacting = Some(CompactWork {
+            before,
+            trigger,
+            focus,
+            tier: 1,
+        });
+        Ok(())
+    }
+    async fn compact_work(&mut self, mut work: CompactWork) -> Result<(), AiError> {
+        if work.tier == 1 {
+            let positions = self.conversation.clear_candidates();
+            let changed = !positions.is_empty();
+            if changed {
+                self.record(LogUpdate::ClearResults(positions));
+            }
+            let after = request_tokens(&self.request()?);
+            if work.trigger != CompactTrigger::Manual
+                && changed
+                && after <= self.client.context_budget().auto as usize / 2
+            {
+                let c = Compaction {
+                    summary: None,
+                    retained_user: vec![],
+                    state: RetainedState::default(),
+                    context: ContextSnapshot::default(),
+                    before_tokens: work.before,
+                    after_tokens: after,
+                    trigger: work.trigger,
+                };
+                self.entry(Entry::Compaction(c));
+                self.queue.push_back(AgentEvent::Compacted {
+                    before: work.before,
+                    after,
+                    summary: None,
+                });
+                let budget = self.client.context_budget();
+                self.queue.push_back(AgentEvent::Context {
+                    used: after,
+                    window: budget.window,
+                    trigger: budget.trigger,
+                });
+                self.skip_precheck = true;
+            } else {
+                work.tier = 2;
+                self.compacting = Some(work);
+                self.queue.push_back(AgentEvent::Compacting { tier: 2 });
+            }
+            return Ok(());
+        }
+        let caps = self.turn.as_ref().unwrap().capabilities.clone();
+        let mut start = self.conversation.view_start();
+        let summary = loop {
+            let mut request =
+                self.conversation
+                    .request(&caps, &NativeMessages::new(), true, start)?;
+            let mut prompt = crate::context::SUMMARY_PROMPT.to_owned();
+            if let Some(focus) = &work.focus {
+                prompt.push_str(&format!("\n额外要求：{focus}"));
+            }
+            crate::context::add_prompt(&mut request, prompt);
+            match self.client.summarize(request).await {
+                Ok(text) => break crate::context::extract_summary(&text),
+                Err(AiError::ContextTooLong)
+                    if self.conversation.entries().len().saturating_sub(start) > 1 =>
+                {
+                    start += 1
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let mut snapshot = self
+            .host
+            .context_snapshot()
+            .await
+            .unwrap_or_else(|| self.conversation.latest_user().unwrap().context.clone());
+        snapshot.text = crate::recent_context(&snapshot.text, 40);
+        let mut c = Compaction {
+            summary: Some(summary.clone()),
+            retained_user: self.conversation.retained_users(),
+            state: self
+                .conversation
+                .retained_state(self.host.permission_mode()),
+            context: snapshot,
+            before_tokens: work.before,
+            after_tokens: 0,
+            trigger: work.trigger,
+        };
+        let mut preview = self.conversation.clone();
+        preview.append(Entry::Compaction(c.clone()));
+        c.after_tokens = request_tokens(&preview.prepare(&caps)?);
+        let after = c.after_tokens;
+        self.entry(Entry::Compaction(c));
+        self.queue.push_back(AgentEvent::Compacted {
+            before: work.before,
+            after,
+            summary: Some(summary),
+        });
+        let budget = self.client.context_budget();
+        self.queue.push_back(AgentEvent::Context {
+            used: after,
+            window: budget.window,
+            trigger: budget.trigger,
+        });
+        self.skip_precheck = true;
+        Ok(())
+    }
+}
+
 fn parallel_refusal(e: &rig_core::ProviderError) -> bool {
     option_refusal(e, &["parallel_tool_calls", "disable_parallel_tool_use"])
 }
@@ -484,9 +696,11 @@ fn stream<'a>(
     host: &'a dyn ToolHost,
     limits: Limits,
     turn: Resume,
-    dropped_turns: usize,
+    manual_focus: Option<Option<String>>,
 ) -> AgentStream<'a> {
-    let state = State {
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let message_id = turn.message_id;
+    let mut state = State {
         client,
         conversation,
         host,
@@ -504,9 +718,26 @@ fn stream<'a>(
         steps: 0,
         done: false,
         error: None,
+        updates: updates.clone(),
+        queue: VecDeque::new(),
+        message_id,
+        reactive_retry: false,
+        compacting: None,
+        manual: manual_focus.is_some(),
+        skip_precheck: false,
     };
+    if let Some(focus) = manual_focus {
+        if let Err(e) = state.begin_compaction(CompactTrigger::Manual, focus) {
+            state.error = Some(e);
+        } else {
+            state.queue.push_back(AgentEvent::Compacting { tier: 1 });
+        }
+    }
     let inner = futures::stream::unfold(state, |mut s| async move {
         loop {
+            if let Some(event) = s.queue.pop_front() {
+                return Some((event, s));
+            }
             if s.done {
                 return None;
             }
@@ -516,6 +747,16 @@ fn stream<'a>(
             }
             if let Some(e) = s.error.take() {
                 return Some((s.fail(e), s));
+            }
+            if let Some(work) = s.compacting.take() {
+                if let Err(e) = s.compact_work(work).await {
+                    return Some((s.fail(e), s));
+                }
+                continue;
+            }
+            if s.manual {
+                s.done = true;
+                return Some((AgentEvent::Done(None), s));
             }
             if let Some((raw, call)) = s.active.take() {
                 let outcome = s.host.run(call.clone()).await.cap_stored();
@@ -534,14 +775,26 @@ fn stream<'a>(
                 let turn = s.turn.as_mut().unwrap();
                 turn.steps += 1;
                 s.steps += 1;
-                append(
-                    &mut turn.request,
-                    Message::tool_results(vec![raw.result(vec![ToolResultContent::text(wire)])]),
-                );
+                let mut display = crate::StepDisplay::from_item(outcome.item(&call)).unwrap();
+                display.automatic = s.host.automatic(&call);
+                s.entry(Entry::Step(crate::Step {
+                    message_id: s.message_id,
+                    call: crate::LoggedCall {
+                        id: raw.id.to_string(),
+                        name: raw.function.name.to_string(),
+                        args_json: serde_json::Value::Object(raw.function.arguments),
+                    },
+                    result: crate::LoggedResult {
+                        inline: wire,
+                        output_id: None,
+                        cleared: false,
+                        is_error: !matches!(outcome, ToolOutcome::Completed(_)),
+                    },
+                    display: Some(display),
+                }));
                 if matches!(outcome, ToolOutcome::Disconnected) {
                     s.error = Some(AiError::Disconnected);
                 }
-                s.answer().items.push(outcome.item(&call));
                 return Some((AgentEvent::StepFinished { call, outcome }, s));
             }
             if s.limits.max_steps.is_some_and(|max| s.steps >= max) {
@@ -555,10 +808,22 @@ fn stream<'a>(
                         return Some((AgentEvent::StepProposed(call), s));
                     }
                     Pending::Invalid(raw, error) => {
+                        s.entry(Entry::Step(crate::Step {
+                            message_id: s.message_id,
+                            call: crate::LoggedCall {
+                                id: raw.id.to_string(),
+                                name: raw.function.name.to_string(),
+                                args_json: serde_json::Value::Object(raw.function.arguments),
+                            },
+                            result: crate::LoggedResult {
+                                inline: error,
+                                output_id: None,
+                                cleared: false,
+                                is_error: true,
+                            },
+                            display: None,
+                        }));
                         let turn = s.turn.as_mut().unwrap();
-                        let mut result = raw.result(vec![ToolResultContent::text(error)]);
-                        result.is_error = true;
-                        append(&mut turn.request, Message::tool_results(vec![result]));
                         turn.steps += 1;
                         s.steps += 1;
                         turn.invalid_calls += 1;
@@ -568,13 +833,8 @@ fn stream<'a>(
                         continue;
                     }
                     Pending::Truncated(output) => {
+                        s.entry(Entry::Notice { kind: "truncated".into(), text: format!("上一次工具调用因达到单次输出上限（{output}）被截断，未执行。请拆成更小的步骤（例如分多次写入文件）或缩短命令后重试。") });
                         let turn = s.turn.as_mut().unwrap();
-                        append(
-                            &mut turn.request,
-                            Message::user(format!(
-                                "上一次工具调用因达到单次输出上限（{output}）被截断，未执行。请拆成更小的步骤（例如分多次写入文件）或缩短命令后重试。"
-                            )),
-                        );
                         turn.steps += 1;
                         s.steps += 1;
                         turn.invalid_calls += 1;
@@ -584,22 +844,33 @@ fn stream<'a>(
                         continue;
                     }
                     Pending::Text(text) => {
-                        s.answer().push_text(&text);
+                        s.text(&text);
                         return Some((AgentEvent::TextDelta(text), s));
                     }
                 }
             }
             if s.model.is_none() {
+                let request = match s.request() {
+                    Ok(r) => r,
+                    Err(e) => return Some((s.fail(e), s)),
+                };
+                let used = s
+                    .conversation
+                    .used(&request, &s.turn.as_ref().unwrap().capabilities);
+                if !std::mem::take(&mut s.skip_precheck)
+                    && used >= s.client.context_budget().trigger as usize
+                {
+                    match s.begin_compaction(CompactTrigger::PreRequest, None) {
+                        Ok(()) => return Some((AgentEvent::Compacting { tier: 1 }, s)),
+                        Err(e) => return Some((s.fail(e), s)),
+                    }
+                }
                 s.first = true;
                 s.received = false;
                 s.defer_text = false;
-                match s
-                    .client
-                    .agent_open(s.turn.as_ref().unwrap().request.clone())
-                {
-                    Ok(model) => {
-                        s.model = Some(model);
-                    }
+                s.message_id = s.conversation.entries().len();
+                match s.client.agent_open(request) {
+                    Ok(model) => s.model = Some(model),
                     Err(e) => {
                         if s.retry_option(&e) {
                             continue;
@@ -632,7 +903,7 @@ fn stream<'a>(
                             if s.defer_text {
                                 continue;
                             }
-                            s.answer().push_text(&text);
+                            s.text(&text);
                             return Some((AgentEvent::TextDelta(text), s));
                         }
                         Item::Event(StreamEvent::End {
@@ -658,7 +929,7 @@ fn stream<'a>(
                             }),
                         ) => {
                             s.received |= !matches!(event, StreamEvent::Start { .. });
-                            if !s.thinking || s.retry_notice {
+                            if (!s.thinking || s.retry_notice) && (s.turn.as_ref().unwrap().capabilities.available() || !s.conversation.entries()[s.message_id..].iter().any(|e| matches!(e, Entry::Assistant { text, .. } if !text.is_empty()))) {
                                 s.retry_notice = false;
                                 s.thinking = true;
                                 return Some((AgentEvent::Thinking, s));
@@ -698,6 +969,8 @@ fn stream<'a>(
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
                     s.failures = 0;
+                    s.reactive_retry = false;
+                    s.turn.as_mut().unwrap().model_steps += 1;
                     let mut unfinished: Vec<_> = response
                         .unfinished_calls()
                         .map(|call| call.id.clone())
@@ -712,7 +985,41 @@ fn stream<'a>(
                                 .map(|call| call.id.clone()),
                         );
                     }
+                    let mut used_ids: HashSet<_> = s
+                        .conversation
+                        .entries()
+                        .iter()
+                        .filter_map(|e| {
+                            if let Entry::Step(step) = e {
+                                Some(step.call.id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for content in &mut response.choice {
+                        if let AssistantContent::ToolCall(call) = content {
+                            let id = crate::context::portable_id(
+                                &call.id.to_string(),
+                                s.message_id,
+                                &mut used_ids,
+                            );
+                            if id != call.id.to_string() {
+                                let old_id = call.id.clone();
+                                call.id = rig_core::message::CallId::from_wire(id);
+                                for id in &mut unfinished {
+                                    if *id == old_id {
+                                        *id = call.id.clone();
+                                    }
+                                }
+                                call.native = None;
+                            }
+                        }
+                    }
                     let truncated = !unfinished.is_empty();
+                    if truncated && !s.turn.as_ref().unwrap().capabilities.available() {
+                        return Some((s.fail(AiError::InvalidResponse), s));
+                    }
                     if truncated && response.finish_reason() != Some(FinishReason::Length) {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
@@ -723,6 +1030,38 @@ fn stream<'a>(
                             AssistantContent::ToolCall(raw) => {
                                 after_call = true;
                                 if unfinished.contains(&raw.id) {
+                                    continue;
+                                }
+                                if !s.turn.as_ref().unwrap().capabilities.available() {
+                                    if raw.function.name.as_str() == "propose_command" {
+                                        let card = serde_json::from_value::<CommandCard>(
+                                            serde_json::Value::Object(
+                                                raw.function.arguments.clone(),
+                                            ),
+                                        )
+                                        .ok()
+                                        .filter(|c| {
+                                            !c.command.trim().is_empty()
+                                                && c.command.len() <= 16384
+                                                && c.explanation.len() <= 8192
+                                        });
+                                        let Some(card) = card else {
+                                            return Some((s.fail(AiError::InvalidResponse), s));
+                                        };
+                                        if s.conversation.entries()[s.message_id..]
+                                            .iter()
+                                            .filter(|e| matches!(e, Entry::CommandCard { .. }))
+                                            .count()
+                                            >= 20
+                                        {
+                                            return Some((s.fail(AiError::InvalidResponse), s));
+                                        }
+                                        s.entry(Entry::CommandCard {
+                                            card: card.clone(),
+                                            message_id: s.message_id,
+                                        });
+                                        s.queue.push_back(AgentEvent::Command(card));
+                                    }
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
@@ -742,6 +1081,16 @@ fn stream<'a>(
                     if truncated {
                         pending.push_back(Pending::Truncated(s.client.output_tokens()));
                     }
+                    // Suggestion responses end after their cards and any following text.
+                    // They never start another model call just to acknowledge a card.
+                    if !s.turn.as_ref().unwrap().capabilities.available() {
+                        while let Some(pending) = pending.pop_front() {
+                            if let Pending::Text(text) = pending {
+                                s.text(&text);
+                                s.queue.push_back(AgentEvent::TextDelta(text));
+                            }
+                        }
+                    }
                     // message() includes unfinished calls. Remove only those blocks, leaving
                     // native signed reasoning, text and complete calls byte-for-byte intact.
                     response.choice.retain(|content| {
@@ -752,39 +1101,80 @@ fn stream<'a>(
                     if message.is_none() && !truncated {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
+                    // Anchor reasoning-only or tool-only batches even before their result.
+                    if !s.conversation.entries()[s.message_id..]
+                        .iter()
+                        .any(|e| e.message_id() == Some(s.message_id))
+                    {
+                        s.entry(Entry::Assistant {
+                            text: String::new(),
+                            message_id: s.message_id,
+                        });
+                    }
+                    if s.turn.as_ref().unwrap().capabilities.available()
+                        && let Some(Message::Assistant(message)) = message
+                    {
+                        s.turn
+                            .as_mut()
+                            .unwrap()
+                            .native
+                            .insert(s.message_id, message);
+                    }
+                    let u = response.usage;
+                    let usage =
+                        (u.input_tokens.is_some() || u.output_tokens.is_some()).then_some(Usage {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                        });
+                    if let Some(u) = usage {
+                        s.record(LogUpdate::Usage(u));
+                    }
+                    let request = s.request().unwrap();
+                    let budget = s.client.context_budget();
+                    s.queue.push_back(AgentEvent::Context {
+                        used: s
+                            .conversation
+                            .used(&request, &s.turn.as_ref().unwrap().capabilities),
+                        window: budget.window,
+                        trigger: budget.trigger,
+                    });
                     if pending.is_empty() {
+                        if !s.turn.as_ref().unwrap().capabilities.available()
+                            && !s.conversation.entries()[s.message_id..]
+                                .iter()
+                                .any(|e| matches!(e, Entry::CommandCard { .. }))
+                        {
+                            let text: String = s.conversation.entries()[s.message_id..]
+                                .iter()
+                                .filter_map(|e| {
+                                    if let Entry::Assistant { text, .. } = e {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            for card in crate::client::fenced_commands(&text) {
+                                s.entry(Entry::CommandCard {
+                                    card: card.clone(),
+                                    message_id: s.message_id,
+                                });
+                                s.queue.push_back(AgentEvent::Command(card));
+                            }
+                        }
                         s.done = true;
-                        s.turn = None;
-                        s.answer().cap_stored();
-                        let u = response.usage;
-                        let usage = (u.input_tokens.is_some() || u.output_tokens.is_some())
-                            .then_some(Usage {
-                                input_tokens: u.input_tokens,
-                                output_tokens: u.output_tokens,
-                            });
-                        return Some((AgentEvent::Done(usage), s));
+                        s.queue.push_back(AgentEvent::Done(usage));
+                    } else {
+                        s.turn.as_mut().unwrap().pending = pending;
                     }
-                    let turn = s.turn.as_mut().unwrap();
-                    if let Some(message) = message {
-                        append(&mut turn.request, message);
-                    }
-                    turn.pending = pending;
                 }
             }
         }
     });
     AgentStream {
         inner: Box::pin(inner),
-        dropped_turns,
+        updates,
     }
-}
-/// Append after the current question. `CompletionRequest::message` inserts *before* the
-/// prompt (its last message), which would leave the question after the tool results and make
-/// the model treat it as a new request and run the same command again.
-fn append(request: &mut CompletionRequest, message: impl Into<Message>) {
-    request
-        .chat_history
-        .push(std::sync::Arc::new(message.into()));
 }
 fn parse_call(raw: &RigCall, capabilities: &Capabilities) -> Result<ToolCall, String> {
     #[derive(Deserialize)]

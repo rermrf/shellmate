@@ -34,16 +34,24 @@ fn config() -> Result<Config, &'static str> {
         api_key: ApiKey::new(key.trim()),
         reasoning,
         max_output_tokens: Default::default(),
+        context_window: Default::default(),
+        autocompact_window: Default::default(),
         timeouts: reasoning.timeouts(),
     })
 }
-async fn answer(client: &dyn ProviderClient, c: &Conversation) -> Result<(Answer, usize), AiError> {
+async fn answer(
+    client: &dyn ProviderClient,
+    c: &mut Conversation,
+) -> Result<(Answer, usize), AiError> {
     let mut stream = client.start(c)?;
     let mut a = Answer::default();
     let mut deltas = 0;
     while let Some(event) = stream.next().await {
         match event {
-            Event::Thinking => {}
+            Event::Thinking
+            | Event::Context { .. }
+            | Event::Compacting { .. }
+            | Event::Compacted { .. } => {}
             Event::TextDelta(text) => {
                 deltas += 1;
                 a.push_text(&text)
@@ -61,7 +69,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     let cfg = config().unwrap_or_else(|e| panic!("configuration: {e}"));
     let client = RigClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}"));
     let mut c = Conversation::default();
-    c.turns.push(Turn {
+    c.push_turn(Turn {
         user: UserTurn::new(
             "给我一个列出进程的命令。先用一句中文解释用途，再通过 propose_command 提出命令，不要执行。",
             ContextSnapshot {
@@ -72,7 +80,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         ),
         answer: None,
     });
-    let (a, n) = answer(&client, &c)
+    let (a, n) = answer(&client, &mut c)
         .await
         .unwrap_or_else(|e| panic!("first turn failed: {e}"));
     assert!(n > 0, "first turn did not stream text");
@@ -80,12 +88,12 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         a.commands().next().is_some(),
         "first turn did not propose a command"
     );
-    c.turns[0].answer = Some(a);
-    c.turns.push(Turn {
+    assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(), a.text());
+    c.push_turn(Turn {
         user: UserTurn::new("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
         answer: None,
     });
-    let (a, _) = answer(&client, &c)
+    let (a, _) = answer(&client, &mut c)
         .await
         .unwrap_or_else(|e| panic!("follow-up failed: {e}"));
     // Models often write `grep '[n]ginx'` so grep does not match itself; ignore bracket expressions.
@@ -100,12 +108,15 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
         "follow-up command did not retain requested filter"
     );
     println!("PASS: two-turn continuity and streamed answer");
-    c.turns.last_mut().unwrap().answer = Some(a);
-    c.turns.push(Turn {
+    assert_eq!(
+        c.turns().last().unwrap().answer.as_ref().unwrap().text(),
+        a.text()
+    );
+    c.push_turn(Turn {
         user: UserTurn::new("找出占用 3000 端口的进程", ContextSnapshot::default()),
         answer: None,
     });
-    let (a, _) = answer(&client, &c)
+    let (a, _) = answer(&client, &mut c)
         .await
         .unwrap_or_else(|e| panic!("port question failed: {e}"));
     assert!(
@@ -116,7 +127,7 @@ async fn real_two_turn_stream_commands_and_invalid_key() {
     let mut invalid = cfg.clone();
     invalid.api_key = ApiKey::new("invalid-shellmate-e2e-key");
     let invalid = RigClient::new(&invalid).unwrap_or_else(|e| panic!("invalid-key client: {e}"));
-    let result = answer(&invalid, &c).await;
+    let result = answer(&invalid, &mut c).await;
     assert!(
         matches!(result, Err(AiError::Authentication)),
         "invalid key did not yield Key 无效或无权限"
@@ -149,19 +160,17 @@ async fn real_agent_uses_canned_docker_output_without_execution() {
     let cfg = config().unwrap_or_else(|e| panic!("configuration: {e}"));
     let client = RigClient::new(&cfg).unwrap_or_else(|e| panic!("client: {e}"));
     let host = FakeHost(Mutex::new(Vec::new()));
-    let mut c = Conversation {
-        turns: vec![Turn {
-            user: UserTurn::new(
-                "这台机器上运行了哪些 docker 容器？",
-                ContextSnapshot {
-                    label: "fake-host-only".into(),
-                    protocol: "SSH".into(),
-                    text: String::new(),
-                },
-            ),
-            answer: None,
-        }],
-    };
+    let mut c = Conversation::from_turns(vec![Turn {
+        user: UserTurn::new(
+            "这台机器上运行了哪些 docker 容器？",
+            ContextSnapshot {
+                label: "fake-host-only".into(),
+                protocol: "SSH".into(),
+                text: String::new(),
+            },
+        ),
+        answer: None,
+    }]);
     let mut stream = agent::run(
         &client,
         &mut c,
@@ -193,7 +202,7 @@ async fn real_agent_uses_canned_docker_output_without_execution() {
             .any(|call| call.command.contains("docker"))
     );
     assert!(
-        c.turns[0]
+        c.turns()[0]
             .answer
             .as_ref()
             .unwrap()
@@ -202,7 +211,7 @@ async fn real_agent_uses_canned_docker_output_without_execution() {
     );
     // This fake host's sole implementation returns the literal above and records calls.
     assert!(
-        c.turns[0]
+        c.turns()[0]
             .answer
             .as_ref()
             .unwrap()

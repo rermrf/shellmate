@@ -59,30 +59,24 @@ impl Drawer {
             AgentEvent::Retrying { attempt, max, delay, error } => {
                 self.state.model.retrying = Some(format!("{error}，{} 秒后重试（第 {attempt}/{max} 次）", delay.as_secs()));
             }
+            AgentEvent::Context { used, window, trigger } => self.state.model.event(Event::Context { used, window, trigger }),
+            AgentEvent::Compacting { tier } => self.state.model.event(Event::Compacting { tier }),
+            AgentEvent::Compacted { before, after, summary } => self.state.model.event(Event::Compacted { before, after, summary }),
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
-            AgentEvent::TextDelta(t) => self.state.model.event(Event::TextDelta(t)),
-            AgentEvent::Command(c) => self.state.model.event(Event::Command(c)),
+            AgentEvent::TextDelta(_) | AgentEvent::Command(_) => self.state.model.thinking = false,
             AgentEvent::Done(u) => {
                 self.state.model.event(Event::Done(u));
-                self.state.run_config = None;
+                self.state.model.manual_compaction = false;
+                if self.state.continuation.is_none() { self.state.run_config = None; }
             }
             AgentEvent::Error(e) => {
                 self.state.model.event(Event::Error(e));
-                self.state.run_config = None;
+                self.state.model.manual_compaction = false;
+                if self.state.continuation.is_none() { self.state.run_config = None; }
             }
             // The bridge owns the pending card; separate channels can deliver this after Approval.
             AgentEvent::StepProposed(_) => self.state.model.thinking = false,
-            AgentEvent::StepFinished { call, outcome } => {
-                if let Some(turn) = self.state.model.conversation.turns.last_mut() {
-                    let answer = turn.answer.get_or_insert_with(Answer::default);
-                    let mut item = outcome.item(&call);
-                    if let AnswerItem::Step { automatic, .. } = &mut item {
-                        *automatic = self.state.active_step.as_ref().is_some_and(|s| s.automatic);
-                    }
-                    answer.items.push(item);
-                }
-                self.state.active_step = None;
-            }
+            AgentEvent::StepFinished { .. } => { self.state.active_step = None; }
             AgentEvent::Paused { reason, steps, resume } => {
                 self.state.model.pause(reason);
                 self.state.continuation = Some(resume);
@@ -113,6 +107,12 @@ impl Drawer {
             while let Ok(event) = messages.recv().await {
                 let finish = matches!(event, Ui::TerminalFinish { .. });
                 match event {
+                    Ui::Context { reply } => {
+                        let snapshot = this.update_in(cx, |s, _, cx| {
+                            s.workspace.update(cx, |w, cx| w.ai_context(s.session, cx)).ok()
+                        }).ok().flatten();
+                        let _ = reply.send(snapshot);
+                    }
                     // Cleanup survives drawer cancellation/destruction and ignores the UI epoch.
                     Ui::TerminalFinish { session, nonce }
                     | Ui::TerminalInterrupt { session, nonce } => {
@@ -977,14 +977,7 @@ impl Drawer {
                 text: String::new(),
             },
         );
-        let answer = self.state
-            .model
-            .conversation
-            .turns
-            .last_mut()
-            .unwrap()
-            .answer
-            .get_or_insert_with(Answer::default);
+        let mut answer = Answer::default();
         if !redline {
             answer.items.push(AnswerItem::Step {automatic:true,command:"docker ps \\\n  --no-trunc \\\n  --filter status=running \\\n  --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'".into(),target:Target::Background,purpose:"检查生产环境所有容器的运行状态并确认镜像版本和对外端口映射".into(),class:Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1300,output:"标准输出：\nNAMES      IMAGE                STATUS       PORTS\nnginx      nginx:1.27-alpine     Up 12 days   0.0.0.0:443->443/tcp\napi        shellmate/api:2.8.1   Up 3 days    8080/tcp\nworker     shellmate/jobs:2.8.1  Up 3 days    —\npostgres   postgres:16-alpine    Up 12 days   5432/tcp\nredis      redis:7-alpine        Up 12 days   6379/tcp\n标准错误：\n".into()});
             answer.push_text("5 个容器均在运行。接下来检查 nginx 最近日志。\n");
@@ -1008,5 +1001,6 @@ impl Drawer {
                 class: classify(command),
             }));
         }
+        for item in answer.items { self.state.model.conversation.push_item(item); }
     }
 }

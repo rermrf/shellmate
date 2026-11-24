@@ -24,6 +24,19 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
 }
 pub enum Event {
+    Context {
+        used: usize,
+        window: u32,
+        trigger: u32,
+    },
+    Compacting {
+        tier: u8,
+    },
+    Compacted {
+        before: usize,
+        after: usize,
+        summary: Option<String>,
+    },
     Thinking,
     TextDelta(String),
     Command(CommandCard),
@@ -31,7 +44,10 @@ pub enum Event {
     Error(AiError),
 }
 pub trait ProviderClient: Send + Sync {
-    fn start(&self, conversation: &Conversation) -> Result<ResponseStream, AiError>;
+    fn start<'a>(
+        &'a self,
+        conversation: &'a mut Conversation,
+    ) -> Result<ResponseStream<'a>, AiError>;
 }
 #[derive(Clone)]
 pub struct RigClient {
@@ -39,6 +55,8 @@ pub struct RigClient {
     timeouts: Timeouts,
     reasoning: Option<Reasoning>,
     options: Arc<ClientOptions>,
+    window: u32,
+    auto_window: crate::ContextWindow,
 }
 struct ClientOptions {
     output_tokens: AtomicU32,
@@ -83,6 +101,8 @@ impl RigClient {
             model: Arc::new(model),
             timeouts: config.timeouts.clone(),
             reasoning,
+            window: crate::resolve_window(&config.provider, &config.model, config.context_window).0,
+            auto_window: config.autocompact_window,
             options: Arc::new(ClientOptions {
                 output_tokens: AtomicU32::new(max_tokens),
                 cache: AtomicBool::new(matches!(config.provider, Provider::Anthropic { .. })),
@@ -107,8 +127,8 @@ impl RigClient {
     pub fn output_tokens(&self) -> u32 {
         self.options.output_tokens.load(Ordering::Relaxed)
     }
-    pub fn input_budget(&self) -> usize {
-        crate::history_budget(self.output_tokens())
+    pub fn context_budget(&self) -> crate::ContextBudget {
+        crate::ContextBudget::new(self.window, self.auto_window, self.output_tokens())
     }
     /// Before content, try specific option fixes before a one-shot cache-free 400 retry.
     pub(crate) fn option_fallback(&self, error: &rig_core::ProviderError) -> bool {
@@ -128,7 +148,9 @@ impl RigClient {
                 return true;
             }
         }
-        error.report().http_status == Some(400) && self.options.cache.swap(false, Ordering::Relaxed)
+        !is_context_error(error)
+            && error.report().http_status == Some(400)
+            && self.options.cache.swap(false, Ordering::Relaxed)
     }
     fn open_with_fallback(&self, request: &CompletionRequest) -> Result<CompletionStream, AiError> {
         loop {
@@ -142,18 +164,93 @@ impl RigClient {
     pub(crate) fn timeouts(&self) -> Timeouts {
         self.timeouts.clone()
     }
-    pub fn test_connection(&self) -> Result<ResponseStream, AiError> {
+    pub fn test_connection(&self) -> Result<ResponseStream<'static>, AiError> {
         let request = CompletionRequest::new("请仅回答：连接成功");
-        self.open(request, 0)
+        self.open(request)
     }
-    fn open(&self, request: CompletionRequest, dropped: usize) -> Result<ResponseStream, AiError> {
+    fn open(&self, request: CompletionRequest) -> Result<ResponseStream<'static>, AiError> {
         let stream = self.open_with_fallback(&request)?;
         Ok(ResponseStream::new(
             stream,
             self.timeouts.clone(),
-            dropped,
             Some((self.clone(), request)),
         ))
+    }
+}
+impl ResponseStream<'_> {
+    pub fn take_updates(&mut self) -> Vec<crate::LogUpdate> {
+        std::mem::take(&mut *self.updates.lock().unwrap())
+    }
+}
+impl RigClient {
+    pub(crate) async fn summarize(&self, request: CompletionRequest) -> Result<String, AiError> {
+        loop {
+            let mut request = request
+                .clone()
+                .max_tokens(u64::from(self.output_tokens().min(16_000)));
+            request.options.reasoning = None;
+            request.options.cache = self
+                .options
+                .cache
+                .load(Ordering::Relaxed)
+                .then_some(CacheRetention::Short);
+            let mut stream = match self.model.stream(request) {
+                Ok(s) => s,
+                Err(e) if self.option_fallback(&e) => continue,
+                Err(e) => return Err(map_error(e)),
+            };
+            let mut first = true;
+            let mut received = false;
+            let mut retry = false;
+            loop {
+                match tokio::time::timeout(
+                    if first {
+                        self.timeouts.first
+                    } else {
+                        self.timeouts.idle
+                    },
+                    stream.next(),
+                )
+                .await
+                {
+                    Err(_) => return Err(AiError::Timeout),
+                    Ok(Some(Err(e))) if !received && self.option_fallback(&e) => {
+                        retry = true;
+                        break;
+                    }
+                    Ok(Some(Err(e))) => return Err(map_error(e)),
+                    Ok(Some(Ok(Item::Event(_)))) => {
+                        first = false;
+                        received = true;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(None) => break,
+                }
+            }
+            if retry {
+                continue;
+            }
+            let response = match tokio::time::timeout(self.timeouts.idle, stream.finish()).await {
+                Err(_) => return Err(AiError::Timeout),
+                Ok(Err(e)) if !received && self.option_fallback(&e) => continue,
+                Ok(Err(e)) => return Err(map_error(e)),
+                Ok(Ok(r)) => r,
+            };
+            if response.error.is_some() || response.aborted.is_some() {
+                return Err(AiError::InvalidResponse);
+            }
+            return Ok(response
+                .choice
+                .iter()
+                .filter_map(|c| {
+                    if let AssistantContent::Text(t) = c {
+                        Some(t.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect());
+        }
     }
 }
 fn reasoning_options(config: &Config) -> Result<(Option<Reasoning>, u32), AiError> {
@@ -228,16 +325,71 @@ impl rig_core::http_client::HttpMiddleware for AuthHeader {
     }
 }
 impl ProviderClient for RigClient {
-    fn start(&self, c: &Conversation) -> Result<ResponseStream, AiError> {
-        let p = c.prepare(self.input_budget())?;
-        self.open(p.request, p.dropped_turns)
+    fn start<'a>(&'a self, c: &'a mut Conversation) -> Result<ResponseStream<'a>, AiError> {
+        // Validate provider encoding synchronously; streams are lazy and no I/O occurs.
+        drop(self.open_with_fallback(&c.prepare(&crate::Capabilities::default())?)?);
+        let mut stream = crate::agent::run(
+            self,
+            c,
+            crate::Capabilities::default(),
+            &SuggestionHost,
+            crate::Limits::default(),
+        )?;
+        let updates = stream.updates_handle();
+        let inner =
+            futures::stream::poll_fn(move |cx| Pin::new(&mut stream).poll_next(cx)).map(|event| {
+                match event {
+                    crate::AgentEvent::Thinking => Event::Thinking,
+                    crate::AgentEvent::TextDelta(t) => Event::TextDelta(t),
+                    crate::AgentEvent::Command(c) => Event::Command(c),
+                    crate::AgentEvent::Done(u) => Event::Done(u),
+                    crate::AgentEvent::Error(e) => Event::Error(e),
+                    crate::AgentEvent::Context {
+                        used,
+                        window,
+                        trigger,
+                    } => Event::Context {
+                        used,
+                        window,
+                        trigger,
+                    },
+                    crate::AgentEvent::Compacting { tier } => Event::Compacting { tier },
+                    crate::AgentEvent::Compacted {
+                        before,
+                        after,
+                        summary,
+                    } => Event::Compacted {
+                        before,
+                        after,
+                        summary,
+                    },
+                    crate::AgentEvent::Paused { reason, .. } => Event::Error(match reason {
+                        crate::PauseReason::Error(e) => e,
+                        _ => AiError::InvalidResponse,
+                    }),
+                    crate::AgentEvent::Retrying { .. } => Event::Thinking,
+                    crate::AgentEvent::StepProposed(_) | crate::AgentEvent::StepFinished { .. } => {
+                        unreachable!("suggestion host has no executable tools")
+                    }
+                }
+            });
+        Ok(ResponseStream {
+            inner: Box::pin(inner),
+            updates,
+        })
     }
 }
-pub struct ResponseStream {
-    inner: Pin<Box<dyn Stream<Item = Event> + Send>>,
-    pub dropped_turns: usize,
+struct SuggestionHost;
+impl crate::ToolHost for SuggestionHost {
+    fn run(&self, _: crate::ToolCall) -> futures::future::BoxFuture<'_, crate::ToolOutcome> {
+        Box::pin(async { crate::ToolOutcome::Failed("此会话不支持执行".into()) })
+    }
 }
-impl Stream for ResponseStream {
+pub struct ResponseStream<'a> {
+    inner: Pin<Box<dyn Stream<Item = Event> + Send + 'a>>,
+    updates: Arc<std::sync::Mutex<Vec<crate::LogUpdate>>>,
+}
+impl Stream for ResponseStream<'_> {
     type Item = Event;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Event>> {
         self.inner.as_mut().poll_next(cx)
@@ -274,11 +426,10 @@ impl Reading {
         true
     }
 }
-impl ResponseStream {
+impl ResponseStream<'static> {
     fn new(
         stream: CompletionStream,
         timeouts: Timeouts,
-        dropped_turns: usize,
         fallback: Option<(RigClient, CompletionRequest)>,
     ) -> Self {
         let state = Reading {
@@ -401,14 +552,14 @@ impl ResponseStream {
         });
         Self {
             inner: Box::pin(stream),
-            dropped_turns,
+            updates: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
     /// Deterministic UI fixtures use the same event boundary as live providers.
     pub fn fixture(events: Vec<Event>) -> Self {
         Self {
             inner: Box::pin(futures::stream::iter(events)),
-            dropped_turns: 0,
+            updates: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -461,6 +612,25 @@ pub(crate) fn option_refusal(error: &rig_core::ProviderError, fields: &[&str]) -
                 .any(|word| fields.contains(&word))
         })
 }
+fn is_context_error(error: &rig_core::ProviderError) -> bool {
+    let report = error.report();
+    let code = report.code.as_deref().unwrap_or("").to_ascii_lowercase();
+    let body = report
+        .provider_response_body()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    code.contains("context_length")
+        || [
+            "context_length_exceeded",
+            "prompt is too long",
+            "maximum context length",
+            "context window",
+            "too many tokens",
+            "input is too long",
+        ]
+        .iter()
+        .any(|s| body.contains(s))
+}
 pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
     // Never format or forward the provider's diagnostic: it may echo the key or prompt.
     if matches!(error, rig_core::ProviderError::UnsupportedOption(_)) {
@@ -472,6 +642,9 @@ pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
         .provider_response_body()
         .unwrap_or("")
         .to_ascii_lowercase();
+    if is_context_error(&error) {
+        return AiError::ContextTooLong;
+    }
     if report.http_status == Some(400)
         && [
             "reasoning_effort",
@@ -539,6 +712,8 @@ mod tests {
             api_key: crate::ApiKey::new("fixture"),
             reasoning: ReasoningLevel::Default,
             max_output_tokens: Default::default(),
+            context_window: Default::default(),
+            autocompact_window: Default::default(),
             timeouts: Timeouts::default(),
         };
         let client =
@@ -577,7 +752,7 @@ mod tests {
         let stream = Model::new(MockScript::new("fixture"), Refused)
             .stream(CompletionRequest::new("test"))
             .unwrap();
-        let mut stream = ResponseStream::new(stream, Timeouts::default(), 0, None);
+        let mut stream = ResponseStream::new(stream, Timeouts::default(), None);
         assert!(matches!(
             stream.next().await,
             Some(Event::Error(AiError::UnsupportedReasoning))
@@ -608,7 +783,7 @@ mod tests {
             events.push(MockStreamEvent::FinalResponse(Default::default()));
             let model = MockCompletionModel::from_stream_turns([events]);
             let stream = model.stream(CompletionRequest::new("test")).unwrap();
-            let events = ResponseStream::new(stream, Timeouts::default(), 0, None)
+            let events = ResponseStream::new(stream, Timeouts::default(), None)
                 .collect::<Vec<_>>()
                 .await;
             assert_eq!(

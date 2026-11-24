@@ -1,7 +1,7 @@
 //! gpui-free policies for the drawer, disclosure, retries and settings.
-use shellmate_ai::{AiError, Answer, AnswerItem, Conversation, Event, PauseReason};
+use shellmate_ai::{AiError, Conversation, Event, PauseReason};
 #[cfg(any(test, debug_assertions))]
-use shellmate_ai::{ContextSnapshot, Turn, UserTurn};
+use shellmate_ai::{ContextSnapshot, UserTurn};
 use shellmate_store::{SecretKey, SecretStore, ai::Settings};
 pub const SUGGESTIONS: [&str; 4] = [
     "解释最近的报错",
@@ -48,6 +48,8 @@ pub fn load_config(
         api_key: shellmate_ai::ApiKey::new(secret.expose()),
         reasoning: settings.reasoning,
         max_output_tokens: Default::default(),
+        context_window: Default::default(),
+        autocompact_window: Default::default(),
         timeouts: settings.reasoning.timeouts(),
     };
     config.validate()?;
@@ -74,9 +76,23 @@ pub struct DrawerModel {
     pub retrying: Option<String>,
     pub pause_reason: Option<PauseReason>,
     pub error: Option<AiError>,
-    pub dropped: usize,
+    pub meter: Option<ContextMeter>,
+    pub compacting: bool,
+    pub manual_compaction: bool,
 }
 impl DrawerModel {
+    pub fn context_hint(&self, session_bound: bool) -> &'static str {
+        if !session_bound { "无会话" }
+        else if self.meter.is_none() { " · 最近 40 行输出" }
+        else { " · 已用 " }
+    }
+    pub fn status(&self, pending: bool) -> &str {
+        if self.compacting { "正在压缩上下文…" }
+        else if pending { "正在准备请求…" }
+        else if let Some(retrying) = &self.retrying { retrying }
+        else if self.thinking { "正在思考…" }
+        else { "正在分析当前会话输出…" }
+    }
     pub fn pause(&mut self, reason: PauseReason) {
         self.busy = false;
         self.thinking = false;
@@ -101,10 +117,7 @@ impl DrawerModel {
         if self.busy || question.trim().is_empty() {
             return false;
         }
-        self.conversation.turns.push(Turn {
-            user: UserTurn::new(question.trim(), context),
-            answer: None,
-        });
+        self.conversation.push_user(UserTurn::new(question.trim(), context));
         self.busy = true;
         self.thinking = false;
         self.error = None;
@@ -113,10 +126,9 @@ impl DrawerModel {
         true
     }
     pub fn retry(&mut self) -> bool {
-        if self.busy || self.conversation.turns.is_empty() {
+        if self.busy || self.conversation.turns().is_empty() {
             return false;
         }
-        self.conversation.turns.last_mut().unwrap().answer = None;
         self.error = None;
         self.retrying = None;
         self.pause_reason = None;
@@ -126,37 +138,16 @@ impl DrawerModel {
     }
     pub fn event(&mut self, event: Event) {
         self.retrying = None;
-        self.pause_reason = None;
-        let Some(turn) = self.conversation.turns.last_mut() else {
-            return;
-        };
+        if !self.manual_compaction { self.pause_reason = None; }
         match event {
-            Event::Thinking => {
-                self.thinking = turn.answer.as_ref().is_none_or(|a| a.text().is_empty());
-            }
-            Event::TextDelta(text) => {
-                if !text.is_empty() {
-                    self.thinking = false;
-                }
-                turn.answer
-                    .get_or_insert_with(Answer::default)
-                    .push_text(&text);
-            }
-            Event::Command(card) => turn
-                .answer
-                .get_or_insert_with(Answer::default)
-                .items
-                .push(AnswerItem::Command(card)),
-            Event::Done(_) => {
-                self.busy = false;
-                self.thinking = false;
-                self.error = None
-            }
-            Event::Error(e) => {
-                self.busy = false;
-                self.thinking = false;
-                self.error = Some(e)
-            }
+            Event::Context { used, window, trigger } => self.meter = Some(ContextMeter { used, window, trigger }),
+            Event::Compacting { .. } => { self.compacting = true; self.busy = true; self.thinking = false; }
+            Event::Compacted { .. } => self.compacting = false,
+            Event::Thinking => self.thinking = self.conversation.turns().last().and_then(|t| t.answer.as_ref()).is_none_or(|a| a.text().is_empty()),
+            Event::TextDelta(text) => { if !text.is_empty() { self.thinking = false; } self.conversation.push_text(&text); }
+            Event::Command(card) => self.conversation.push_item(shellmate_ai::AnswerItem::Command(card)),
+            Event::Done(_) => { self.busy = false; self.thinking = false; self.compacting = false; self.error = None; }
+            Event::Error(e) => { self.busy = false; self.thinking = false; self.compacting = false; self.error = Some(e); }
         }
     }
     #[cfg(any(test, debug_assertions))]
@@ -164,6 +155,19 @@ impl DrawerModel {
         *self = Self::default();
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextMeter { pub used: usize, pub window: u32, pub trigger: u32 }
+impl ContextMeter {
+    pub fn amber(self) -> bool { self.used as u128 * 10 >= u128::from(self.trigger) * 9 }
+    #[cfg(test)]
+    pub fn label(self) -> String { format!("已用 {} / {}", tokens(self.used), tokens(self.window as usize)) }
+}
+pub fn tokens(n: usize) -> String {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) { format!("{}M", n / 1_000_000) }
+    else if n >= 1000 { format!("{}K", n / 1000) } else { n.to_string() }
+}
+pub fn compaction_label(c: &shellmate_ai::Compaction) -> String { format!("已压缩上下文 · {} → {}", tokens(c.before_tokens), tokens(c.after_tokens)) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +235,7 @@ mod tests {
         assert!(!d.start("duplicate", ContextSnapshot::default()));
         d.event(Event::Thinking);
         assert!(d.thinking);
-        assert!(d.conversation.turns[0].answer.is_none());
+        assert!(d.conversation.turns()[0].answer.is_none());
         d.event(Event::TextDelta("answer".into()));
         assert!(!d.thinking);
         d.event(Event::Thinking);
@@ -242,10 +246,10 @@ mod tests {
         d.event(Event::Thinking);
         d.event(Event::Error(AiError::Timeout));
         assert!(!d.thinking && !d.busy);
-        assert!(d.conversation.turns[0].answer.is_none());
-        assert_eq!(d.conversation.turns[0].user.question, "TOKEN=hidden");
+        assert_eq!(d.conversation.turns()[0].answer.as_ref().unwrap().text(), "answer");
+        assert_eq!(d.conversation.turns()[0].user.question, "TOKEN=hidden");
         d.clear();
-        assert!(d.conversation.turns.is_empty());
+        assert!(d.conversation.turns().is_empty());
     }
     #[test]
     fn pause_notices_labels_and_retry_status_preserve_the_answer() {
@@ -263,7 +267,7 @@ mod tests {
             assert!(!model.busy && !model.thinking && model.retrying.is_none());
             assert_eq!(model.error, error);
             assert_eq!(model.continuation_label(50), label);
-            assert_eq!(model.conversation.turns[0].answer.as_ref().unwrap().text(), "partial");
+            assert_eq!(model.conversation.turns()[0].answer.as_ref().unwrap().text(), "partial");
         }
         for event in [Event::Thinking, Event::TextDelta("more".into()), Event::Done(None), Event::Error(AiError::Authentication)] {
             model.retrying = Some("retry status".into());
@@ -384,5 +388,57 @@ mod capability_tests {
             assert_eq!(execution_targets(Some(Protocol::Mosh),connected,ssh),(false,false));
             assert_eq!(execution_targets(Some(Protocol::Serial),connected,ssh),(false,false));
         }}
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    #[test]
+    fn header_keeps_recent_output_until_usage_and_unbound_text_stays_unchanged() {
+        let mut model = DrawerModel::default();
+        assert_eq!(format!("上下文：prod-web-01{}", model.context_hint(true)), "上下文：prod-web-01 · 最近 40 行输出");
+        assert_eq!(format!("上下文：{}", model.context_hint(false)), "上下文：无会话");
+        model.event(Event::Context { used: 37_000, window: 1_000_000, trigger: 967_000 });
+        let meter = model.meter.unwrap();
+        assert_eq!(format!("上下文：prod-web-01{}{} / {}", model.context_hint(true), tokens(meter.used), tokens(meter.window as usize)), "上下文：prod-web-01 · 已用 37K / 1M");
+        assert_eq!(model.context_hint(false), "无会话");
+        assert!(!meter.amber());
+        model.clear();
+        assert_eq!(model.context_hint(true), " · 最近 40 行输出");
+    }
+    #[test]
+    fn meter_is_hidden_until_usage_and_amber_at_ninety_percent_of_trigger() {
+        let mut model=DrawerModel::default();
+        assert!(model.meter.is_none());
+        model.event(Event::Context { used:37_000,window:1_000_000,trigger:967_000 });
+        assert_eq!(model.meter.unwrap().label(),"已用 37K / 1M");
+        assert!(!model.meter.unwrap().amber());
+        model.event(Event::Context {used:85_499,window:128_000,trigger:95_000});
+        assert!(!model.meter.unwrap().amber());
+        model.event(Event::Context {used:85_500,window:128_000,trigger:95_000});
+        assert!(model.meter.unwrap().amber());
+        model.clear();assert!(model.meter.is_none());
+    }
+    #[test]
+    fn idle_and_paused_manual_compaction_share_busy_lock_and_status() {
+        for paused in [false,true] {
+            let mut model=DrawerModel::default();model.start("question",ContextSnapshot::default());
+            model.event(Event::Done(None));
+            if paused {model.pause(PauseReason::Error(AiError::Unavailable));}
+            let old_pause=model.pause_reason;
+            model.manual_compaction=true;
+            model.event(Event::Compacting {tier:1});
+            assert!(model.busy && model.compacting);
+            assert_eq!(model.status(false),"正在压缩上下文…");
+            assert!(!model.start("cannot send",ContextSnapshot::default()));
+            model.event(Event::Compacting {tier:2});
+            model.event(Event::Compacted {before:812_000,after:41_000,summary:Some("summary".into())});
+            assert!(model.busy,"lock survives until Done");
+            model.event(Event::Done(None));
+            assert!(!model.busy && !model.compacting);
+            assert_eq!(model.pause_reason,old_pause);
+            if paused { assert_eq!(model.continuation_label(2),"重试"); }
+        }
     }
 }

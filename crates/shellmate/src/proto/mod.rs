@@ -64,6 +64,7 @@ pub const SCENES: &[&str] = &[
     "mon-ov-scrolled", "mon-dk-scrolled", "mon-svc-scrolled", "fwd-scrolled",
     "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
     "ai-agent", "ai-agent-run", "ai-new-confirm", "ai-agent-redline", "ai-agent-full",
+    "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
     "main", "prompt-plain", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
     "files",
@@ -296,7 +297,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 100 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 104 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

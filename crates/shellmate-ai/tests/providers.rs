@@ -28,23 +28,23 @@ fn config(anthropic: bool) -> Config {
         api_key: ApiKey::new("fixture-api-key"),
         reasoning: ReasoningLevel::Default,
         max_output_tokens: Default::default(),
+        context_window: Default::default(),
+        autocompact_window: Default::default(),
         timeouts: Timeouts::default(),
     }
 }
 fn conversation() -> Conversation {
-    Conversation {
-        turns: vec![Turn {
-            user: UserTurn::new(
-                "找出占用 3000 端口的进程",
-                ContextSnapshot {
-                    label: "prod-web-01".into(),
-                    protocol: "SSH".into(),
-                    text: "TOKEN=secret-context".into(),
-                },
-            ),
-            answer: None,
-        }],
-    }
+    Conversation::from_turns(vec![Turn {
+        user: UserTurn::new(
+            "找出占用 3000 端口的进程",
+            ContextSnapshot {
+                label: "prod-web-01".into(),
+                protocol: "SSH".into(),
+                text: "TOKEN=secret-context".into(),
+            },
+        ),
+        answer: None,
+    }])
 }
 fn openai(text: &str, tool: bool) -> String {
     let mut events = vec![
@@ -117,13 +117,15 @@ async fn both_wires_stream_tools_and_use_exact_request_shape() {
             "text/event-stream",
         )]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
-        let mut stream = client.start(&conversation()).unwrap();
+        let mut log = conversation();
+        let mut stream = client.start(&mut log).unwrap();
         assert!(http.requests().is_empty(), "lazy until polled");
         let mut text = String::new();
         let mut cards = vec![];
         let mut done = false;
         while let Some(e) = stream.next().await {
             match e {
+                Event::Context { .. } | Event::Compacting { .. } | Event::Compacted { .. } => {}
                 Event::Thinking => panic!("unexpected reasoning"),
                 Event::TextDelta(d) => text.push_str(&d),
                 Event::Command(c) => cards.push(c),
@@ -189,7 +191,7 @@ async fn fallback_code_blocks_and_multiturn_roles() {
         )]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let mut c = conversation();
-        c.turns[0].answer = Some(Answer {
+        c.push_answer(Answer {
             items: vec![
                 AnswerItem::Text("先查看服务".into()),
                 AnswerItem::Command(CommandCard {
@@ -199,11 +201,11 @@ async fn fallback_code_blocks_and_multiturn_roles() {
                 }),
             ],
         });
-        c.turns.push(Turn {
+        c.push_turn(Turn {
             user: UserTurn::new("把刚才的命令改成只看 nginx", ContextSnapshot::default()),
             answer: None,
         });
-        let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
+        let events = client.start(&mut c).unwrap().collect::<Vec<_>>().await;
         assert!(
             events
                 .iter()
@@ -240,10 +242,15 @@ async fn errors_are_chinese_and_never_echo_payloads() {
             (500, "server_error", AiError::Unavailable),
         ] {
             let rejected = MockHttpResponse::error(StatusCode::from_u16(status).unwrap(), json!({"error":{"code":code,"type":code,"message":"fixture-api-key SECRET REQUEST AND ANSWER"}}).to_string());
-            let http =
-                SequencedHttpClient::new(vec![rejected; if a && status == 400 { 2 } else { 1 }]);
+            let http = SequencedHttpClient::new(vec![rejected; if status == 400 { 2 } else { 1 }]);
             let client = RigClient::with_http(&config(a), http).unwrap();
-            let e = client.start(&conversation()).unwrap().next().await.unwrap();
+            let e = client
+                .start(&mut conversation())
+                .unwrap()
+                .filter(|e| futures::future::ready(!matches!(e, Event::Compacting { .. })))
+                .next()
+                .await
+                .unwrap();
             assert!(
                 matches!(e,Event::Error(found)if found==expected),
                 "{a} {status}"
@@ -259,12 +266,12 @@ async fn timeout_and_cancellation_without_sockets() {
         cfg.timeouts.first = Duration::from_millis(5);
         let client = RigClient::with_http(&cfg, SilentStreamingClient).unwrap();
         assert!(matches!(
-            client.start(&conversation()).unwrap().next().await,
+            client.start(&mut conversation()).unwrap().next().await,
             Some(Event::Error(AiError::Timeout))
         ));
         let http = SequencedHttpClient::new([]);
         let client = RigClient::with_http(&cfg, http.clone()).unwrap();
-        drop(client.start(&conversation()).unwrap());
+        drop(client.start(&mut conversation()).unwrap());
         assert!(http.requests().is_empty());
         let client = RigClient::with_http(
             &cfg,
@@ -274,7 +281,8 @@ async fn timeout_and_cancellation_without_sockets() {
             },
         )
         .unwrap();
-        let mut stream = client.start(&conversation()).unwrap();
+        let mut log = conversation();
+        let mut stream = client.start(&mut log).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(1), stream.next())
                 .await
@@ -316,7 +324,8 @@ async fn stream_idle_timeout_and_network_failure_are_safe() {
             },
         )
         .unwrap();
-        let mut stream = client.start(&conversation()).unwrap();
+        let mut log = conversation();
+        let mut stream = client.start(&mut log).unwrap();
         assert!(matches!(stream.next().await, Some(Event::TextDelta(_))));
         assert!(matches!(
             stream.next().await,
@@ -330,7 +339,7 @@ async fn stream_idle_timeout_and_network_failure_are_safe() {
             )))]),
         )
         .unwrap();
-        let event = client.start(&conversation()).unwrap().next().await;
+        let event = client.start(&mut conversation()).unwrap().next().await;
         assert!(matches!(event, Some(Event::Error(AiError::Network))));
     }
 }
@@ -407,7 +416,8 @@ async fn dropping_started_stream_releases_transport_body() {
             },
         )
         .unwrap();
-        let mut stream = client.start(&conversation()).unwrap();
+        let mut log = conversation();
+        let mut stream = client.start(&mut log).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(5), stream.next())
                 .await
@@ -426,10 +436,11 @@ async fn request_body(cfg: &Config, connection_test: bool) -> Value {
         "text/event-stream",
     )]);
     let client = RigClient::with_http(cfg, http.clone()).unwrap();
+    let mut log = conversation();
     let mut stream = if connection_test {
         client.test_connection().unwrap()
     } else {
-        client.start(&conversation()).unwrap()
+        client.start(&mut log).unwrap()
     };
     let mut done = false;
     while let Some(event) = stream.next().await {
@@ -565,7 +576,8 @@ async fn unsupported_reasoning_is_safe_for_encoding_and_http_errors() {
     cfg.reasoning = ReasoningLevel::Max; // Catalog lists low / medium / high only.
     let http = SequencedHttpClient::new([]);
     let client = RigClient::with_http(&cfg, http.clone()).unwrap();
-    for result in [client.start(&conversation()), client.test_connection()] {
+    let mut log = conversation();
+    for result in [client.start(&mut log), client.test_connection()] {
         assert!(matches!(result, Err(AiError::UnsupportedReasoning)));
     }
     assert!(http.requests().is_empty());
@@ -632,7 +644,7 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
         ]);
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let mut c = conversation();
-        let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
+        let events = client.start(&mut c).unwrap().collect::<Vec<_>>().await;
         assert!(matches!(events.first(), Some(Event::Thinking)));
         assert_eq!(
             events
@@ -653,12 +665,12 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
         }
         assert_eq!(answer.text(), "公开回答");
         assert!(answer.commands().next().is_none());
-        c.turns[0].answer = Some(answer);
-        c.turns.push(Turn {
+        assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(), answer.text());
+        c.push_turn(Turn {
             user: UserTurn::new("继续", ContextSnapshot::default()),
             answer: None,
         });
-        let events = client.start(&c).unwrap().collect::<Vec<_>>().await;
+        let events = client.start(&mut c).unwrap().collect::<Vec<_>>().await;
         assert!(matches!(events.last(), Some(Event::Done(_))));
         let body = String::from_utf8(http.requests()[1].body.to_vec()).unwrap();
         assert!(!body.contains("PRIVATE_"));
@@ -682,7 +694,8 @@ async fn reasoning_activity_resets_idle_timeout() {
     chunks.push(ANSWER);
     assert!(gap * (chunks.len() as u32 - 1) > cfg.timeouts.idle);
     let client = RigClient::with_http(&cfg, PacedStreamingClient { chunks, gap }).unwrap();
-    let mut stream = client.start(&conversation()).unwrap();
+    let mut log = conversation();
+    let mut stream = client.start(&mut log).unwrap();
     assert!(matches!(stream.next().await, Some(Event::Thinking)));
     assert!(matches!(stream.next().await, Some(Event::TextDelta(text)) if text == "answer"));
     assert!(matches!(
@@ -815,7 +828,7 @@ async fn cache_is_anthropic_only_and_rejection_disables_it_for_this_client() {
     for _ in 0..2 {
         assert!(matches!(
             client
-                .start(&conversation())
+                .start(&mut conversation())
                 .unwrap()
                 .collect::<Vec<_>>()
                 .await
@@ -851,7 +864,7 @@ async fn active_stream_has_no_total_cap_and_first_and_idle_deadlines_still_apply
         .unwrap();
         let started = tokio::time::Instant::now();
         let events = client
-            .start(&conversation())
+            .start(&mut conversation())
             .unwrap()
             .collect::<Vec<_>>()
             .await;
@@ -860,7 +873,7 @@ async fn active_stream_has_no_total_cap_and_first_and_idle_deadlines_still_apply
         let client = RigClient::with_http(&cfg, SilentStreamingClient).unwrap();
         let started = tokio::time::Instant::now();
         assert!(matches!(
-            client.start(&conversation()).unwrap().next().await,
+            client.start(&mut conversation()).unwrap().next().await,
             Some(Event::Error(AiError::Timeout))
         ));
         assert_eq!(started.elapsed(), Duration::from_secs(600));
@@ -882,7 +895,8 @@ async fn active_stream_has_no_total_cap_and_first_and_idle_deadlines_still_apply
             },
         )
         .unwrap();
-        let mut stream = client.start(&conversation()).unwrap();
+        let mut log = conversation();
+        let mut stream = client.start(&mut log).unwrap();
         assert!(matches!(stream.next().await, Some(Event::TextDelta(_))));
         let started = tokio::time::Instant::now();
         assert!(matches!(
@@ -913,7 +927,7 @@ async fn generic_400_disables_anthropic_cache_once_but_never_retries_openai() {
             ]);
             let client = RigClient::with_http(&config(a), http.clone()).unwrap();
             let events = client
-                .start(&conversation())
+                .start(&mut conversation())
                 .unwrap()
                 .collect::<Vec<_>>()
                 .await;
@@ -982,7 +996,7 @@ async fn token_fallback_precedes_generic_cache_fallback() {
         let http = SequencedHttpClient::new(responses);
         let client = RigClient::with_http(&config(true), http.clone()).unwrap();
         let events = client
-            .start(&conversation())
+            .start(&mut conversation())
             .unwrap()
             .collect::<Vec<_>>()
             .await;

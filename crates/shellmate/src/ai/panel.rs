@@ -234,8 +234,7 @@ impl Drawer {
                                 s.state
                                     .model
                                     .conversation
-                                    .turns
-                                    .push(Turn { user, answer: None });
+                                    .push_user(user);
                                 s.state.model.busy = true;
                             } else if !s.state.model.retry() {
                                 return;
@@ -254,6 +253,38 @@ impl Drawer {
                 .ok();
             },
         );
+    }
+    /// M4's /compact entry point; shares authorization and the busy lock with send.
+    #[allow(dead_code)]
+    pub(crate) fn compact_context(&mut self, focus: Option<String>, w: &mut Window, cx: &mut Context<Self>) {
+        if self.state.model.busy || self.state.pending || self.state.model.conversation.entries().is_empty() { return; }
+        if let Some(config) = self.state.run_config.clone() {
+            self.state.compaction_focus = Some(focus);
+            self.state.model.manual_compaction = true;
+            self.state.model.busy = true;
+            self.start(config, w, cx);
+            return;
+        }
+        self.state.pending = true;
+        let epoch = self.epoch;
+        let this = cx.entity().downgrade();
+        super::authorize(self.db.clone(), self.credentials.clone(), w, cx, move |result, w, cx| {
+            this.update(cx, |s, cx| {
+                if s.epoch != epoch { return; }
+                s.state.pending = false;
+                match result {
+                    Ok(config) => {
+                        s.state.compaction_focus = Some(focus);
+                        s.state.model.manual_compaction = true;
+                        s.state.model.busy = true;
+                        s.start(config, w, cx);
+                    }
+                    Err(e) => s.state.model.error = Some(e),
+                }
+                cx.notify();
+            }).ok();
+        });
+        cx.notify();
     }
     fn start(&mut self, config: shellmate_ai::Config, w: &mut Window, cx: &mut Context<Self>) {
         self.epoch += 1;
@@ -306,7 +337,8 @@ impl Drawer {
             resolved: Mutex::new(None),
         };
         self.bridge(messages, epoch, w, cx);
-        let continuation = self.state.continuation.take();
+        let compact_focus = self.state.compaction_focus.take();
+        let continuation = if compact_focus.is_none() { self.state.continuation.take() } else { None };
         self.state.run_config = Some(config.clone());
         let join = runtime.spawn(async move {
             let client = match RigClient::new(&config) {
@@ -316,7 +348,9 @@ impl Drawer {
                     return;
                 }
             };
-            let result = match continuation {
+            let result = if let Some(focus) = compact_focus {
+                agent::compact(&client, &mut conversation, capabilities, &host, focus)
+            } else { match continuation {
                 Some(resume) => agent::resume(
                     &client,
                     &mut conversation,
@@ -331,12 +365,12 @@ impl Drawer {
                     &host,
                     agent::Limits::default(),
                 ),
-            };
+            }};
             match result {
                 Ok(mut stream) => {
-                    let _ = tx.send(Worker::Started(stream.dropped_turns)).await;
+                    let _ = tx.send(Worker::Started).await;
                     while let Some(event) = stream.next().await {
-                        if worker_event(&tx, event).await.is_err() {
+                        if worker_update(&tx, event, stream.take_updates()).await.is_err() {
                             break;
                         }
                     }
@@ -355,12 +389,14 @@ impl Drawer {
                             return;
                         }
                         match event {
-                            Worker::Started(n) => {
-                                s.state.model.dropped = n;
+                            Worker::Started => {
                                 s.persist();
                             }
-                            Worker::Event(event, ready) => {
+                            Worker::Event(event, updates, ready) => {
+                                let durable = matches!(&event, AgentEvent::Context { .. }) || updates.iter().any(|u| !matches!(u, shellmate_ai::LogUpdate::Append(e) if matches!(&**e, shellmate_ai::Entry::Assistant { .. })));
+                                for update in updates { s.state.model.conversation.apply(update); }
                                 s.agent_event(event);
+                                if durable { s.persist(); }
                                 let _ = ready.send(());
                                 if !s.state.model.busy {
                                     s.abort = None;
@@ -401,13 +437,8 @@ impl Drawer {
         self.epoch += 1;
         self.state.continuation = None;
         self.state.run_config = None;
-        if let Some(step) = self.state.active_step.take()
-            && let Some(turn) = self.state.model.conversation.turns.last_mut()
-        {
-            turn.answer
-                .get_or_insert_with(Default::default)
-                .items
-                .push(shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call));
+        if let Some(step) = self.state.active_step.take() {
+            self.state.model.conversation.push_item(shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call));
         }
         self.state.pending = false;
         self.binding = None;
@@ -517,14 +548,14 @@ impl Drawer {
             self.state
                 .model
                 .conversation
-                .turns
-                .push(Turn { user, answer: None });
+                .push_user(user);
         } else {
             self.state.model.retry();
         }
         self.state.model.busy = true;
+        let mut fixture_log = self.state.model.conversation.clone();
         let mut stream = FixtureProvider
-            .start(&self.state.model.conversation)
+            .start(&mut fixture_log)
             .expect("fixture provider");
         // The fixture stream is immediately ready; no timer, runtime or HTTP client.
         while let Some(event) = futures::executor::block_on(stream.next()) {
@@ -561,7 +592,21 @@ impl Drawer {
         self.state.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
-        if scene == "ai-new-confirm" {
+        if let Some(fixture) = crate::proto::ai::compaction_scene(scene) {
+            self.state.model = fixture.model;
+            self.label = "prod-web-01".into();
+            self.protocol = "SSH".into();
+            self.history = false;
+            self.state.readonly = false;
+            self.state.pending = false;
+            self.state.active_step = None;
+            self.state.continuation = None;
+            self.state.run_config = None;
+            self.state.expanded_summaries.clear();
+            self.state.expanded_summaries.extend(fixture.expanded_summary);
+            self.capabilities = Capabilities { terminal: true, background: true, ..Default::default() };
+            *self.mode.lock().unwrap() = PermissionMode::Auto;
+        } else if scene == "ai-new-confirm" {
             self.agent_scene("ai-agent-run");
             // Completed steps plus an answer still streaming; exercise the real button path.
             self.state.model.busy = true;
@@ -629,8 +674,7 @@ impl Drawer {
                     model: "fixture".into(),
                     created_at: row.updated_at,
                     updated_at: row.updated_at,
-                    conversation: shellmate_ai::Conversation {
-                        turns: vec![Turn {
+                    conversation: shellmate_ai::Conversation::from_turns(vec![Turn {
                             user: UserTurn::new(
                                 &row.title,
                                 ContextSnapshot {
@@ -644,8 +688,7 @@ impl Drawer {
                                     "已为你整理建议，请先预览后执行。".into(),
                                 )],
                             }),
-                        }],
-                    },
+                        }]),
                 };
                 self.db
                     .borrow_mut()
@@ -665,8 +708,8 @@ fn saving_enabled(db: &SharedStore) -> bool {
         != Some("0")
 }
 enum Worker {
-    Started(usize),
-    Event(AgentEvent, tokio::sync::oneshot::Sender<()>),
+    Started,
+    Event(AgentEvent, Vec<shellmate_ai::LogUpdate>, tokio::sync::oneshot::Sender<()>),
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
@@ -677,10 +720,10 @@ impl Drop for Drawer {
 }
 struct FixtureProvider;
 impl ProviderClient for FixtureProvider {
-    fn start(
-        &self,
-        _: &shellmate_ai::Conversation,
-    ) -> Result<shellmate_ai::ResponseStream, AiError> {
+    fn start<'a>(
+        &'a self,
+        _: &'a mut shellmate_ai::Conversation,
+    ) -> Result<shellmate_ai::ResponseStream<'a>, AiError> {
         Ok(shellmate_ai::ResponseStream::fixture(fixture_events()))
     }
 }
@@ -729,9 +772,16 @@ impl Render for Drawer {
                         .text_ellipsis()
                         .child(self.label.clone()),
                 )
-                .child(div().flex_none().child(" · 最近 40 行输出"))
+                .when(self.state.model.meter.is_none(), |d| {
+                    d.child(div().flex_none().child(self.state.model.context_hint(true)))
+                })
+                .when_some(self.state.model.meter, |d, meter| {
+                    d.child(div().id("ai-context-meter").flex_none().flex().items_center().child(self.state.model.context_hint(true))
+                        .child(div().text_color(if meter.amber() { p.warn } else { p.tx2 }).child(super::model::tokens(meter.used)))
+                        .child(format!(" / {}", super::model::tokens(meter.window as usize))))
+                })
             })
-            .when(self.session.is_none(), |d| d.child("无会话"));
+            .when(self.session.is_none(), |d| d.child(self.state.model.context_hint(false)));
         let header = div()
             .flex_none()
             .flex()
@@ -881,7 +931,7 @@ impl Render for Drawer {
                         .label("去设置")
                         .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
                 );
-        } else if self.state.model.conversation.turns.is_empty() {
+        } else if self.state.model.conversation.turns().is_empty() {
             body = body.child(
                 div()
                     .flex_none()
@@ -913,7 +963,7 @@ impl Render for Drawer {
             );
         }
         if !self.history {
-            for (index, turn) in self.state.model.conversation.turns.iter().enumerate() {
+            for (index, turn) in self.state.model.conversation.turns().iter().enumerate() {
                 body = body.child(
                     div()
                         .flex_none()
@@ -955,6 +1005,25 @@ impl Render for Drawer {
                         .gap(px(8.));
                     for (n, item) in answer.items.iter().enumerate() {
                         let card = match item {
+                            shellmate_ai::AnswerItem::Compaction(c) => {
+                                let key = (index, n);
+                                let expanded = self.state.expanded_summaries.contains(&key);
+                                let mut divider = div().flex_none().flex().flex_col().gap(px(8.))
+                                    .py(px(8.)).border_t_1().border_color(p.line).text_size(px(11.)).text_color(p.tx3)
+                                    .child(div().flex().flex_wrap().items_center().gap(px(6.)).child(super::model::compaction_label(c))
+                                        .when(c.summary.is_some(), |d| d.child("·").child(Button::new(("ai-summary", index * 1000 + n))
+                                            .label(if expanded { "收起摘要" } else { "查看摘要" }).h(px(24.)).text_size(px(11.5))
+                                            .on_click(cx.listener(move |s, _, _, cx| { s.state.toggle_summary(key); cx.notify(); })) )));
+                                if expanded && let Some(summary) = &c.summary {
+                                    divider = divider.child(div().p(px(10.)).rounded(px(12.)).bg(p.card2).text_size(px(12.)).text_color(p.tx2).whitespace_normal().child(summary.clone()));
+                                }
+                                reply = reply.child(divider);
+                                continue;
+                            }
+                            shellmate_ai::AnswerItem::Notice(text) => {
+                                reply = reply.child(div().text_size(px(11.)).text_color(p.tx3).child(text.clone()));
+                                continue;
+                            }
                             item @ shellmate_ai::AnswerItem::Step { .. } => {
                                 reply = reply.child(self.step_card(item, (index, n), cx));
                                 continue;
@@ -1070,36 +1139,22 @@ impl Render for Drawer {
                     .on_click(cx.listener(|s, _, w, cx| s.resume(w, cx))),
                 );
             }
-            if self.state.pending
+            if self.state.model.compacting || self.state.pending
                 || (self.state.model.busy
                     && self.state.active_step.is_none()
                     && self
                         .state
                         .model
                         .conversation
-                        .turns
+                        .turns()
                         .last()
                         .and_then(|t| t.answer.as_ref())
                         .is_none_or(|a| a.text().is_empty())
                         || self.state.model.busy && self.state.model.retrying.is_some())
             {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(
-                    (if self.state.pending {
-                        "正在准备请求…"
-                    } else if let Some(retrying) = &self.state.model.retrying {
-                        retrying.as_str()
-                    } else if self.state.model.thinking {
-                        "正在思考…"
-                    } else {
-                        "正在分析当前会话输出…"
-                    }).to_owned(),
+                    self.state.model.status(self.state.pending).to_owned(),
                 ));
-            }
-            if self.state.model.dropped > 0 {
-                body = body.child(div().text_size(px(11.)).text_color(p.tx3).child(format!(
-                    "本次请求已省略最早 {} 轮对话",
-                    self.state.model.dropped
-                )));
             }
             if let Some(error) = self.state.model.error {
                 body = body.child(
@@ -1218,7 +1273,10 @@ impl Render for Drawer {
 }
 
 async fn worker_event(tx: &async_channel::Sender<Worker>, event: AgentEvent) -> Result<(), ()> {
+    worker_update(tx, event, vec![]).await
+}
+async fn worker_update(tx: &async_channel::Sender<Worker>, event: AgentEvent, updates: Vec<shellmate_ai::LogUpdate>) -> Result<(), ()> {
     let (ready, receive) = tokio::sync::oneshot::channel();
-    tx.send(Worker::Event(event, ready)).await.map_err(|_| ())?;
+    tx.send(Worker::Event(event, updates, ready)).await.map_err(|_| ())?;
     receive.await.map_err(|_| ())
 }

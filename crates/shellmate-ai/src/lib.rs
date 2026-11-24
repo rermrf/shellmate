@@ -3,12 +3,16 @@ pub mod agent;
 mod client;
 mod config;
 mod conversation;
+mod log;
+pub mod context;
+pub use log::{Conversation, Entry, LoggedCall, LoggedResult, Step, StepDisplay, Compaction, CompactTrigger, RetainedState, DeniedCommand, LogUpdate};
+pub use context::{ContextWindow, WindowSource, resolve_window, ContextBudget, ContextBreakdown};
 pub mod output;
 pub mod policy;
 pub use client::{Event, ProviderClient, ResponseStream, RigClient, Usage};
 pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts, OutputTokens, catalog_spec};
 pub use conversation::{
-    Answer, AnswerItem, ContextSnapshot, Conversation, estimate_tokens, history_budget, recent_context, Prepared, StepStatus, Turn,
+    Answer, AnswerItem, ContextSnapshot, estimate_tokens, recent_context, StepStatus, Turn,
     UserTurn,
 };
 use rig_core::serde::{Deserialize, Serialize};
@@ -53,6 +57,8 @@ pub enum AiError {
     Quota,
     #[error("上下文过长，请开始新对话或缩短问题")]
     ContextTooLong,
+    #[error("上下文刚压缩就又满了（可能是单条输出过大）。可以用 /clear 开始新对话，或调大上下文窗口")]
+    CompactionThrash,
     #[error("请求超时，请稍后重试")]
     Timeout,
     #[error("网络或 DNS 连接失败，请检查网络与 Base URL")]

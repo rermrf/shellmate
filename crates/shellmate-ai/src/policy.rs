@@ -8,7 +8,8 @@ pub enum Class {
     Other,
     RedLine,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde")]
 pub enum PermissionMode {
     #[default]
     Ask,

@@ -12,6 +12,9 @@ pub enum Approval {
     Deny { reason: Option<String> },
 }
 pub enum Ui {
+    Context {
+        reply: oneshot::Sender<Option<shellmate_ai::ContextSnapshot>>,
+    },
     Approval {
         call: ToolCall,
         redline: bool,
@@ -51,7 +54,7 @@ pub struct Host {
     pub ui: async_channel::Sender<Ui>,
     pub executor: Box<dyn Executor>,
     pub alive: Arc<AtomicBool>,
-    pub resolved: Mutex<Option<ToolCall>>,
+    pub resolved: Mutex<Option<(ToolCall, bool)>>,
 }
 struct PendingGuard {
     ui: async_channel::Sender<Ui>,
@@ -66,6 +69,23 @@ impl Drop for PendingGuard {
     }
 }
 impl ToolHost for Host {
+    fn permission_mode(&self) -> PermissionMode {
+        *self.mode.lock().unwrap()
+    }
+    fn automatic(&self, call: &ToolCall) -> bool {
+        self.resolved
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(c, automatic)| c.id == call.id && *automatic)
+    }
+    fn context_snapshot(&self) -> BoxFuture<'_, Option<shellmate_ai::ContextSnapshot>> {
+        Box::pin(async move {
+            let (reply, receive) = oneshot::channel();
+            self.ui.send(Ui::Context { reply }).await.ok()?;
+            receive.await.ok().flatten()
+        })
+    }
     fn run(&self, mut call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
             tokio::select! {
@@ -92,7 +112,7 @@ impl ToolHost for Host {
                             Err(_) => return ToolOutcome::Denied { reason: Some("审批已取消".into()) },
                         }
                     }
-                    *self.resolved.lock().unwrap() = Some(call.clone());
+                    *self.resolved.lock().unwrap() = Some((call.clone(), decision == Decision::Run));
                     let (ready, receive) = oneshot::channel();
                     if self.ui.send(Ui::Running { call: call.clone(), automatic: decision == Decision::Run, ready }).await.is_err() || receive.await.is_err() { return ToolOutcome::Disconnected; }
                     self.executor.execute(call).await
@@ -105,8 +125,8 @@ impl ToolHost for Host {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|c| c.id == call.id)
-            .cloned()
+            .filter(|(c, _)| c.id == call.id)
+            .map(|(c, _)| c.clone())
             .unwrap_or_else(|| call.clone())
     }
 }

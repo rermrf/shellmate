@@ -3,7 +3,7 @@ use crate::{HostStore, Result, StoreError};
 use rusqlite::{OptionalExtension, params};
 use shellmate_ai::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, Conversation, PermissionMode, Provider,
-    ReasoningLevel, Turn, UserTurn,
+    ReasoningLevel, UserTurn,
 };
 pub const SAVE_CONVERSATIONS: &str = "ai_save_conversations";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +76,39 @@ pub(crate) fn migrate_v9(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             "UPDATE ai_messages SET items_json=?1,content='',commands_json='[]' WHERE id=?2",
             params![items, id],
         )?;
+    }
+    Ok(())
+}
+pub(crate) fn migrate_v10(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let rows = tx.prepare("SELECT conversation_id,position,role,content,context,items_json,created_at FROM ai_messages ORDER BY conversation_id,position")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut logs = std::collections::HashMap::<String, Conversation>::new();
+    for (id, old_position, role, content, context, items, timestamp) in rows {
+        let log = logs.entry(id.clone()).or_default();
+        let start = log.entries().len();
+        if role == "user" {
+            let value: serde_json::Value = serde_json::from_str(&context).map_err(|_| StoreError::Corrupt("AI 上下文损坏".into()))?;
+            let field = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+            log.push_user(UserTurn::new(&content, ContextSnapshot { label: field("label"), protocol: field("protocol"), text: field("text") }));
+        } else {
+            let items: Vec<AnswerItem> = serde_json::from_str(&items).map_err(|_| StoreError::Corrupt("AI 回答损坏".into()))?;
+            for (n, item) in items.into_iter().enumerate() {
+                let mut part = Conversation::default();
+                part.push_item(item);
+                let mut entry = part.entries()[0].clone();
+                match &mut entry {
+                    shellmate_ai::Entry::Step(s) => { s.call.id = format!("legacy_{old_position}_{n}"); s.message_id = log.entries().len(); }
+                    shellmate_ai::Entry::Assistant { message_id, .. } | shellmate_ai::Entry::CommandCard { message_id, .. } => *message_id = log.entries().len(),
+                    _ => {}
+                }
+                log.append(entry);
+            }
+        }
+        for (position, entry) in log.entries().iter().enumerate().skip(start) {
+            let json = serde_json::to_string(entry).map_err(|_| StoreError::Corrupt("无法编码 AI 日志".into()))?;
+            tx.execute("INSERT INTO ai_log VALUES(?1,?2,?3,?4,?5)", params![id, position as i64, entry.kind(), json, timestamp])?;
+        }
     }
     Ok(())
 }
@@ -171,39 +204,9 @@ impl HostStore {
         }
         let tx = self.conn.transaction()?;
         tx.execute("INSERT INTO ai_conversations VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,session_label=excluded.session_label,provider=excluded.provider,model=excluded.model,updated_at=excluded.updated_at",params![c.id,c.host_id,c.label,c.title,c.provider,c.model,c.created_at,c.updated_at])?;
-        tx.execute(
-            "DELETE FROM ai_messages WHERE conversation_id=?1 AND position>=?2",
-            params![c.id, (c.conversation.turns.len() * 2) as i64],
-        )?;
-        for (index, t) in c.conversation.turns.iter().enumerate() {
-            let context=serde_json::json!({"label":t.user.context.label,"protocol":t.user.context.protocol,"text":t.user.context.text}).to_string();
-            tx.execute(
-                "INSERT INTO ai_messages VALUES(?1,?2,'user',?3,?4,'[]',?5,?6,?7,'[]') ON CONFLICT(id) DO UPDATE SET content=excluded.content,context=excluded.context,redactions=excluded.redactions",
-                params![
-                    format!("{}:{index}:user", c.id),
-                    c.id,
-                    t.user.question,
-                    context,
-                    c.updated_at,
-                    (index * 2) as i64,
-                    0_i64
-                ],
-            )?;
-            if let Some(a) = &t.answer {
-                let mut answer = a.clone();
-                answer.cap_stored();
-                let items = serde_json::to_string(&answer.items)
-                    .map_err(|_| StoreError::Corrupt("无法编码 AI 回答".into()))?;
-                tx.execute(
-                    "INSERT INTO ai_messages VALUES(?1,?2,'assistant','','','[]',?3,?4,0,?5) ON CONFLICT(id) DO UPDATE SET content='',commands_json='[]',items_json=excluded.items_json,redactions=0",
-                    params![format!("{}:{index}:assistant", c.id), c.id, c.updated_at, (index*2+1) as i64, items],
-                )?;
-            } else {
-                tx.execute(
-                    "DELETE FROM ai_messages WHERE id=?1",
-                    [format!("{}:{index}:assistant", c.id)],
-                )?;
-            }
+        for (position, entry) in c.conversation.entries().iter().enumerate() {
+            let json = serde_json::to_string(entry).map_err(|_| StoreError::Corrupt("无法编码 AI 日志".into()))?;
+            tx.execute("INSERT INTO ai_log(conversation_id,position,kind,json,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(conversation_id,position) DO UPDATE SET kind=excluded.kind,json=excluded.json WHERE ai_log.kind<>excluded.kind OR ai_log.json<>excluded.json", params![c.id, position as i64, entry.kind(), json, c.updated_at])?;
         }
         tx.commit()?;
         Ok(true)
@@ -213,33 +216,9 @@ impl HostStore {
     }
     pub fn ai_conversation(&self, id: &str) -> Result<Option<SavedConversation>> {
         let Some(mut c)=self.conn.query_row("SELECT id,host_id,session_label,title,provider,model,created_at,updated_at FROM ai_conversations WHERE id=?1",[id],|r|Ok(SavedConversation{id:r.get(0)?,host_id:r.get(1)?,label:r.get(2)?,title:r.get(3)?,provider:r.get(4)?,model:r.get(5)?,created_at:r.get(6)?,updated_at:r.get(7)?,conversation:Conversation::default()})).optional()?else{return Ok(None)};
-        let rows=self.conn.prepare("SELECT role,content,context,items_json FROM ai_messages WHERE conversation_id=?1 ORDER BY position")?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for (role, content, context, items) in rows {
-            if role == "user" {
-                let value: serde_json::Value = serde_json::from_str(&context)
-                    .map_err(|_| StoreError::Corrupt("AI 上下文损坏".into()))?;
-                let s = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
-                c.conversation.turns.push(Turn {
-                    user: UserTurn {
-                        question: content,
-                        context: ContextSnapshot {
-                            label: s("label"),
-                            protocol: s("protocol"),
-                            text: s("text"),
-                        },
-                    },
-                    answer: None,
-                });
-            } else {
-                let items: Vec<AnswerItem> = serde_json::from_str(&items)
-                    .map_err(|_| StoreError::Corrupt("AI 回答损坏".into()))?;
-                if let Some(t) = c.conversation.turns.last_mut() {
-                    let mut answer = Answer { items };
-                    answer.cap_stored();
-                    t.answer = Some(answer);
-                }
-            }
-        }
+        let jsons = self.conn.prepare("SELECT json FROM ai_log WHERE conversation_id=?1 ORDER BY position")?.query_map([id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let entries = jsons.iter().map(|s| serde_json::from_str::<shellmate_ai::Entry>(s).map_err(|_| StoreError::Corrupt("AI 日志损坏".into()))).collect::<Result<Vec<_>>>()?;
+        c.conversation = Conversation::from_entries(entries);
         Ok(Some(c))
     }
     pub fn delete_ai_conversation(&mut self, id: &str) -> Result<()> {
@@ -255,6 +234,7 @@ impl HostStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shellmate_ai::Turn;
     #[test]
     fn migration_v8_to_v9_preserves_order_and_clears_legacy_columns() {
         let dir = tempfile::tempdir().unwrap();
@@ -274,10 +254,10 @@ mod tests {
         conn.execute("INSERT INTO ai_messages VALUES('a','c1','assistant','回答','','[{\"command\":\"ls\",\"explanation\":\"列表\",\"risk\":\"low\"}]',2,1,0)", []).unwrap();
         drop(conn);
         let db = HostStore::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         let c = db.ai_conversation("c1").unwrap().unwrap();
         assert!(
-            matches!(&c.conversation.turns[0].answer.as_ref().unwrap().items[..], [AnswerItem::Text(text),AnswerItem::Command(card)] if text=="回答" && card.command=="ls")
+            matches!(&c.conversation.turns()[0].answer.as_ref().unwrap().items[..], [AnswerItem::Text(text),AnswerItem::Command(card)] if text=="回答" && card.command=="ls")
         );
         let legacy: (String, String, i64) = db
             .conn
@@ -289,7 +269,7 @@ mod tests {
             .unwrap();
         assert_eq!(legacy, (String::new(), "[]".into(), 2));
         drop(db);
-        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 9);
+        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 10);
     }
     #[test]
     fn ordered_steps_round_trip_preserves_content_and_caps_output() {
@@ -332,12 +312,12 @@ mod tests {
                 output: String::new(),
             },
         ];
-        c.conversation.turns[0].answer = Some(Answer { items });
+        c.conversation = Conversation::from_turns(vec![Turn { user: c.conversation.turns()[0].user.clone(), answer: Some(Answer { items }) }]);
         db.save_ai_conversation(&c).unwrap();
         let raw: String = db
             .conn
             .query_row(
-                "SELECT items_json FROM ai_messages WHERE role='assistant'",
+                "SELECT group_concat(json) FROM ai_log WHERE kind<>'user'",
                 [],
                 |r| r.get(0),
             )
@@ -346,9 +326,8 @@ mod tests {
         assert!(raw.contains("denied-secret"));
         assert!(!raw.contains("\\u001b"));
         let loaded = db.ai_conversation("c1").unwrap().unwrap();
-        c.conversation.turns[0].answer.as_mut().unwrap().cap_stored();
         assert!(loaded.conversation == c.conversation);
-        let answer = loaded.conversation.turns[0].answer.as_ref().unwrap();
+        let answer = loaded.conversation.turns()[0].answer.as_ref().unwrap();
         assert!(matches!(answer.items[0], AnswerItem::Text(_)));
         assert!(matches!(answer.items[1], AnswerItem::Command(_)));
         for item in &answer.items {
@@ -478,8 +457,7 @@ mod tests {
             model: "test-model".into(),
             created_at: 1,
             updated_at: 2,
-            conversation: Conversation {
-                turns: vec![Turn {
+            conversation: Conversation::from_turns(vec![Turn {
                     user: UserTurn::new(
                         "TOKEN=hidden",
                         ContextSnapshot {
@@ -490,8 +468,7 @@ mod tests {
                     answer: Some(Answer {
                         items: vec![AnswerItem::Text("回答".into())],
                     }),
-                }],
-            },
+                }]),
         }
     }
     #[test]
@@ -499,23 +476,24 @@ mod tests {
         const TEXT: &str = "PASSWORD=hunter2 sk-123456789abcdef";
         let mut db = HostStore::open_in_memory().unwrap();
         let mut c = saved();
-        c.conversation.turns[0].user = UserTurn::new(TEXT, ContextSnapshot {
+        c.conversation = Conversation::default();
+        c.conversation.push_user(UserTurn::new(TEXT, ContextSnapshot {
             text: TEXT.into(), label: TEXT.into(), protocol: "SSH".into(),
-        });
-        c.conversation.turns[0].answer = Some(Answer { items: vec![
+        }));
+        c.conversation.push_answer(Answer { items: vec![
             AnswerItem::Text(TEXT.into()),
             AnswerItem::Command(CommandCard { command: TEXT.into(), explanation: TEXT.into(), risk: shellmate_ai::Risk::Low }),
         ] });
         db.save_ai_conversation(&c).unwrap();
-        let count: i64 = db.conn.query_row("SELECT redactions FROM ai_messages WHERE role='user'", [], |r| r.get(0)).unwrap();
+        let count: i64 = db.conn.query_row("SELECT count(*) FROM ai_messages", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0);
-        db.conn.execute("UPDATE ai_messages SET redactions=99", []).unwrap();
+        db.conn.execute("INSERT INTO ai_messages VALUES('legacy','c1','user','old','{}','[]',1,0,99,'[]')", []).unwrap();
         let loaded = db.ai_conversation(&c.id).unwrap().unwrap();
         assert!(loaded.conversation == c.conversation);
         db.save_ai_conversation(&loaded).unwrap();
         let nonzero: i64 = db.conn.query_row("SELECT count(*) FROM ai_messages WHERE redactions<>0", [], |r| r.get(0)).unwrap();
-        assert_eq!(nonzero, 0);
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(nonzero, 1, "v10 saves leave v9 rows untouched");
+        assert_eq!(db.schema_version().unwrap(), 10);
     }
     #[test]
     fn crud_cascade_and_save_off() {
@@ -533,7 +511,7 @@ mod tests {
         db.delete_ai_conversation(&c.id).unwrap();
         assert_eq!(
             db.conn
-                .query_row::<i64, _, _>("SELECT count(*) FROM ai_messages", [], |r| r.get(0))
+                .query_row::<i64, _, _>("SELECT count(*) FROM ai_log", [], |r| r.get(0))
                 .unwrap(),
             0
         );
@@ -554,7 +532,7 @@ mod tests {
             .unwrap();
         drop(conn);
         let db = HostStore::open(path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         assert_eq!(db.setting("fixture").unwrap().as_deref(), Some("kept"));
         assert!(db.ai_conversations().unwrap().is_empty());
     }
@@ -579,23 +557,27 @@ mod tests {
         let mut c = saved();
         db.save_ai_conversation(&c).unwrap();
         c.updated_at = 100;
-        c.conversation.turns.push(Turn {
+        c.conversation.push_turn(Turn {
             user: UserTurn::new("next", ContextSnapshot::default()),
             answer: None,
         });
         db.save_ai_conversation(&c).unwrap();
         let timestamps = db
             .conn
-            .prepare("SELECT created_at FROM ai_messages ORDER BY position")
+            .prepare("SELECT created_at FROM ai_log ORDER BY position")
             .unwrap()
             .query_map([], |r| r.get::<_, i64>(0))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(timestamps, [2, 2, 100]);
-        c.conversation.turns.last_mut().unwrap().user.question = "TOKEN=unsafe".into();
+        c.conversation.push_user(UserTurn::new("TOKEN=unsafe", ContextSnapshot::default()));
         assert!(db.save_ai_conversation(&c).unwrap());
-        assert_eq!(db.ai_conversation(&c.id).unwrap().unwrap().conversation.turns.last().unwrap().user.question, "TOKEN=unsafe");
+        assert_eq!(db.ai_conversation(&c.id).unwrap().unwrap().conversation.turns().last().unwrap().user.question, "TOKEN=unsafe");
         assert_eq!(db.ai_conversations().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "ai_log_tests.rs"]
+mod log_tests;

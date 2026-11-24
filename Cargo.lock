@@ -7729,8 +7729,10 @@ dependencies = [
 name = "shellmate-store"
 version = "0.3.0"
 dependencies = [
+ "futures",
  "keyring",
  "keyring-core",
+ "rig-core",
  "rusqlite",
  "serde_json",
  "shellmate-ai",
@@ -7739,6 +7741,7 @@ dependencies = [
  "shellmate-vault",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "uuid",
  "zeroize",
 ]
