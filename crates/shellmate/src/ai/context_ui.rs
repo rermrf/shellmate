@@ -22,8 +22,12 @@ impl Drawer {
             );
             return;
         }
-        self.state.context_popover.show();
-        self.popup.escape();
+        crate::ai::mode_popover::show(
+            crate::ai::mode_popover::Kind::Context,
+            &mut self.permission_menu,
+            &mut self.state.context_popover,
+            &mut self.popup,
+        );
         w.focus(&self.context_focus, cx);
         cx.notify();
     }
@@ -127,7 +131,12 @@ impl Drawer {
                     .on_click(cx.listener(|s, _, w, cx| {
                         s.state.context_popover.toggle();
                         if s.state.context_popover.open {
-                            s.popup.escape();
+                            crate::ai::mode_popover::show(
+                                crate::ai::mode_popover::Kind::Context,
+                                &mut s.permission_menu,
+                                &mut s.state.context_popover,
+                                &mut s.popup,
+                            );
                             w.focus(&s.context_focus, cx);
                         } else {
                             s.input.focus_handle(cx).focus(w, cx);

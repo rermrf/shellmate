@@ -97,6 +97,16 @@ impl Drawer {
             cx.propagate();
             return;
         }
+        if self.permission_menu && (action as &dyn Action).as_any().is::<input::Escape>() {
+            let composing = self.input_composing(w, cx);
+            if crate::ai::mode_popover::escape(&mut self.permission_menu, composing) {
+                self.input.focus_handle(cx).focus(w, cx);
+                cx.stop_propagation();
+                w.prevent_default();
+                cx.notify();
+                return;
+            }
+        }
         match route_action(
             action,
             composer_focused,

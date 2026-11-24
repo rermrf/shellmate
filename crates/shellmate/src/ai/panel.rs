@@ -1,3 +1,5 @@
+#[path = "mode_ui.rs"]
+mod mode_ui;
 #[path = "remote_ui.rs"]
 mod remote_ui;
 #[path = "agent_ui.rs"]
@@ -214,6 +216,7 @@ impl Drawer {
         }
         if self.session != context.session {
             self.state.context_popover.close();
+            super::mode_popover::close(&mut self.permission_menu);
             self.retire_tasks();
         }
         self.session = context.session;
@@ -246,6 +249,7 @@ impl Drawer {
     }
     fn input_changed(&mut self, cx: &mut Context<Self>) {
         self.popup.changed(&self.input.read(cx).value());
+        if self.popup.open { super::mode_popover::show(super::mode_popover::Kind::Slash,&mut self.permission_menu,&mut self.state.context_popover,&mut self.popup); }
         cx.notify();
     }
     fn set_composer_text(&mut self, text: impl Into<SharedString>, w: &mut Window, cx: &mut Context<Self>) {
@@ -815,6 +819,14 @@ impl Drawer {
         self.configured = scene != "ai-unconfigured";
         self.fixture_tasks.clear();
         self.fixture_copy = Default::default();
+        if scene==crate::proto::mode::SCENE {
+            self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
+            self.state.model.clear();self.state.model.conversation=crate::proto::mode::conversation();
+            self.capabilities=Capabilities {terminal:true,background:true,..Default::default()};
+            *self.mode.lock().unwrap()=PermissionMode::Full;
+            super::mode_popover::show(super::mode_popover::Kind::Mode,&mut self.permission_menu,&mut self.state.context_popover,&mut self.popup);
+            crate::proto::focus_after_layout(self.context_focus.clone(),w);
+        }
         if scene=="ai-memory-chip" {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
             self.state.model.clear();self.state.model.conversation=crate::proto::memory::conversation();

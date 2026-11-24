@@ -47,6 +47,8 @@ Reading {scene:"host-editor-ai-note",dark:true,reconnect:2,cpu:19.,memory_gib:9.
 Reading {scene:"host-editor-ai-note",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-memory-chip",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-memory-chip",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-mode-popover",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-mode-popover",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"prompt-plain",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},

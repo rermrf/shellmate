@@ -150,3 +150,5 @@ pub fn now() -> i64 {
 mod remote;
 pub(crate) mod memory_model;
 pub(crate) mod memory_manager;
+
+pub(crate) mod mode_popover;
