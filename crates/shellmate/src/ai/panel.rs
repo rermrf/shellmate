@@ -405,6 +405,11 @@ impl Drawer {
         });
         cx.notify();
     }
+    pub(super) fn memory_files(&self) -> shellmate_core::memory::Memory {
+        let saved = self.host.as_deref().filter(|id| self.db.borrow().host(&shellmate_core::HostId::from_raw(*id)).ok().flatten().is_some());
+        let key = if self.binding.as_ref().is_some_and(|b| b.local) { Some(self.permission_key()) } else { saved };
+        shellmate_core::memory::Memory::new(self.data_root.clone(), key)
+    }
     fn start(&mut self, config: shellmate_ai::Config, w: &mut Window, cx: &mut Context<Self>) {
         self.epoch += 1;
         if self.state.continuation.is_none() && !self.fixture {
@@ -451,6 +456,7 @@ impl Drawer {
             .map(|b| b.alive.clone())
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let executor = super::exec::AppExecutor {
+            memory: Some((self.memory_files(), self.label.clone())),
             tasks: self.tasks.as_ref().unwrap().clone(),
             binding: binding.unwrap_or(super::exec::Binding {
                 session: usize::MAX,
@@ -1554,7 +1560,7 @@ fn drawer_stream<'a>(
     compact_focus: Option<Option<String>>,
 ) -> Result<agent::AgentStream<'a>, AiError> {
     if let Some(focus) = compact_focus {
-        agent::compact(client, conversation, capabilities, host, focus)
+        agent::compact_with_limits(client, conversation, capabilities, host, focus, limits)
     } else if let Some(resume) = continuation {
         agent::resume(client, conversation, host, *resume, limits)
     } else {

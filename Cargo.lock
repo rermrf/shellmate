@@ -7625,6 +7625,8 @@ dependencies = [
  "futures",
  "rig-core",
  "serde_json",
+ "shellmate-core",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "zeroize",
@@ -7634,6 +7636,8 @@ dependencies = [
 name = "shellmate-core"
 version = "0.3.0"
 dependencies = [
+ "libc",
+ "tempfile",
  "uuid",
  "zeroize",
 ]

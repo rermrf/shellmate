@@ -279,6 +279,14 @@ impl HostStore {
         self.save_hosts(&plan.hosts)
     }
 
+    /// Delete the record first, then its local memory. A cleanup warning must not prevent
+    /// the caller from deleting credentials and refreshing its host list.
+    pub fn delete_host_with_memory(&mut self, id: &HostId, data_root: &Path) -> Result<Option<String>> {
+        self.delete_host(id)?;
+        Ok(shellmate_core::memory::Memory::new(data_root, Some(id.as_str())).delete_host()
+            .err().map(|error| format!("主机已删除，但主机记忆未能清除：{error}")))
+    }
+
     /// Deletes a host. Refused while other hosts use it as a jump host.
     /// (Its keychain password is not touched: delete the `SecretKey::HostPassword` too.)
     pub fn delete_host(&mut self, id: &HostId) -> Result<()> {

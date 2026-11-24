@@ -338,6 +338,7 @@ impl PtyHarness {
         });
         Self {
             executor: AppExecutor {
+                memory: None,
                 tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),
                 binding: Binding {
                     session: 1,
@@ -612,6 +613,7 @@ async fn terminal_cancel_before_start_reply_cleans_up_registration() {
     let (ui, rx) = async_channel::unbounded();
     let temp = Temp::new();
     let executor = AppExecutor {
+        memory: None,
         tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),
         binding: Binding {
             session: 17,

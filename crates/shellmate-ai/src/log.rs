@@ -222,6 +222,7 @@ impl Entry {
 }
 #[derive(Clone, Debug)]
 pub enum LogUpdate {
+    Memory(crate::memory::Snapshot),
     Append(Box<Entry>),
     ClearResults(Vec<usize>),
     Usage(Usage),
@@ -232,6 +233,7 @@ pub(crate) struct Accounting {
 }
 #[derive(Clone, Default)]
 pub struct Conversation {
+    pub(crate) memory: Option<crate::memory::Snapshot>,
     entries: Vec<Entry>,
     turns: Vec<Turn>,
     pub(crate) accounting: Accounting,
@@ -333,6 +335,7 @@ impl Conversation {
     }
     pub fn apply(&mut self, update: LogUpdate) {
         match update {
+            LogUpdate::Memory(snapshot) => self.memory = Some(snapshot),
             LogUpdate::Append(e) => self.append(*e),
             LogUpdate::ClearResults(positions) => {
                 for pos in positions {
@@ -387,6 +390,11 @@ impl Conversation {
                         Entry::Step(s) => {
                             if let Some(display) = &s.display {
                                 answer.items.push(display.item());
+                            } else if s.call.name == "memory" {
+                                answer.items.push(AnswerItem::Notice(crate::memory::notice(
+                                    &s.call.args_json,
+                                    s.result.is_error,
+                                )));
                             } else if matches!(s.call.name.as_str(), "read_output" | "stop_task") {
                                 let label = if s.call.name == "read_output" {
                                     "读取输出"

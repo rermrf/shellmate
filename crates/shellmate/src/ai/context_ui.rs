@@ -65,7 +65,7 @@ impl Drawer {
             .exec;
         let log = &self.state.model.conversation;
         if log.entries().is_empty() {
-            Some(ContextBreakdown::for_session(
+            Some(ContextBreakdown::for_session_with_memory(
                 budget,
                 &self.capabilities,
                 &ContextSnapshot {
@@ -74,6 +74,11 @@ impl Drawer {
                     text: String::new(),
                 },
                 limits,
+                &shellmate_ai::memory::Snapshot::load(
+                    &self.memory_files(),
+                    &self.label,
+                    settings.auto_memory,
+                ),
             ))
         } else {
             log.breakdown_with_limits(budget, &self.capabilities, limits)
@@ -183,6 +188,7 @@ impl Drawer {
                 p.ok,
                 p.warn,
                 p.err,
+                shellmate_term::colors::to_hsla(terminal.ansi[4]),
             ];
             let categories = b.categories();
             let denominator = (b.budget.window as usize).max(b.total).max(1) as f32;
@@ -221,6 +227,7 @@ impl Drawer {
                     ContextCategory::Messages => ("对话消息", None),
                     ContextCategory::Results => ("工具结果", None),
                     ContextCategory::Summary => ("压缩摘要", None),
+                    ContextCategory::Memory => ("说明与记忆", None),
                 };
                 popover = popover.child(usage_row(label, sub, n, b.budget.window, colors[i]));
             }

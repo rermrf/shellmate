@@ -57,7 +57,7 @@ fn system_and_tool_schemas_are_separate_even_before_first_message() {
             crate::conversation::system_prompt(&context)
         };
         assert_eq!(b.system_prompt, estimate_tokens(&prompt) + 8);
-        assert_eq!(b.tool_count, if caps.available() { 3 } else { 1 });
+        assert_eq!(b.tool_count, if caps.available() { 4 } else { 1 });
         assert!(b.tool_definitions > 0);
         assert_eq!(b.total, b.system_prompt + b.tool_definitions);
         assert_eq!(

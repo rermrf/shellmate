@@ -59,6 +59,7 @@ impl Settings {
     pub fn limits(&self) -> shellmate_ai::agent::Limits {
         let s = self.normalized();
         shellmate_ai::agent::Limits {
+            auto_memory: s.auto_memory,
             max_steps: s.max_steps,
             exec: s.exec,
             ..Default::default()
@@ -76,6 +77,7 @@ impl HostStore {
         Ok(s.normalized())
     }
     pub(super) fn read_ai_limits(&self, s: &mut Settings) -> Result<()> {
+        s.auto_memory = self.setting("ai_auto_memory")?.as_deref() != Some("false");
         s.max_steps = number(self.setting("ai_max_steps")?, 1, 10_000).map(|n| n as usize);
         s.exec.tool_output_chars =
             number(self.setting("ai_tool_output_chars")?, 1000, 150_000).unwrap_or(30_000) as usize;
@@ -90,6 +92,7 @@ impl HostStore {
 pub(super) fn save_limits(tx: &Transaction<'_>, s: &Settings) -> Result<()> {
     let s = s.normalized();
     for (key, value) in [
+        ("ai_auto_memory".into(), s.auto_memory.to_string()),
         (key("ai_context_window", &s), window_text(s.context_window)),
         (
             key("ai_autocompact_window", &s),
@@ -222,5 +225,29 @@ mod tests {
         let s = db.ai_settings().unwrap();
         assert_eq!(s.exec.default_timeout_secs, 30);
         assert_eq!(s.exec.max_timeout_secs, 30);
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn auto_memory_defaults_invalid_values_and_global_roundtrip() {
+        let mut store = HostStore::open_in_memory().unwrap();
+        assert!(store.ai_settings().unwrap().auto_memory);
+        for value in ["garbage", "0", "", "TRUE", "true"] {
+            store.set_setting("ai_auto_memory", value).unwrap();
+            assert!(store.ai_settings().unwrap().auto_memory);
+        }
+        let settings = Settings {
+            auto_memory: false,
+            ..Default::default()
+        };
+        store.save_ai_settings(&settings).unwrap();
+        assert!(!store.ai_settings().unwrap().auto_memory);
+        assert!(!store.ai_settings().unwrap().limits().auto_memory);
+        assert!(!store.ai_settings_for_provider(true).unwrap().auto_memory);
+        store.save_ai_settings(&Settings::default()).unwrap();
+        assert!(store.ai_settings().unwrap().auto_memory);
     }
 }

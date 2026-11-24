@@ -223,6 +223,7 @@ pub struct ReadOutput {
 }
 #[derive(Clone, Debug)]
 pub enum LocalTool {
+    Memory(crate::memory::Command),
     ReadOutput(ReadOutput),
     StopTask { id: String },
 }
@@ -279,6 +280,12 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    fn memory_snapshot(&self, auto_memory: bool) -> crate::memory::Snapshot {
+        crate::memory::Snapshot {
+            auto_memory,
+            ..Default::default()
+        }
+    }
     /// Consume a manual request only at a boundary with no tool/model future in flight.
     fn take_compaction(&self) -> Option<Option<String>> {
         None
@@ -324,6 +331,7 @@ pub trait ToolHost: Send + Sync {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    pub auto_memory: bool,
     /// Tool steps per run/resume; None means unlimited.
     pub max_steps: Option<usize>,
     pub exec: ExecLimits,
@@ -333,6 +341,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            auto_memory: true,
             max_steps: None,
             exec: ExecLimits::default(),
             backoff: retry_backoff,
@@ -485,6 +494,21 @@ pub fn compact<'a>(
     host: &'a dyn ToolHost,
     focus: Option<String>,
 ) -> Result<AgentStream<'a>, AiError> {
+    let limits = Limits {
+        auto_memory: conversation.memory.as_ref().is_none_or(|m| m.auto_memory),
+        ..Default::default()
+    };
+    compact_with_limits(client, conversation, capabilities, host, focus, limits)
+}
+/// Manual compaction of a restored conversation uses the drawer's current settings too.
+pub fn compact_with_limits<'a>(
+    client: &'a RigClient,
+    conversation: &'a mut Conversation,
+    capabilities: Capabilities,
+    host: &'a dyn ToolHost,
+    focus: Option<String>,
+    limits: Limits,
+) -> Result<AgentStream<'a>, AiError> {
     let user = conversation
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
@@ -506,7 +530,7 @@ pub fn compact<'a>(
         client,
         conversation,
         host,
-        Limits::default(),
+        limits,
         state,
         Some(focus),
     ))
@@ -702,6 +726,10 @@ impl State<'_> {
                 && changed
                 && after <= self.client.context_budget().auto as usize / 2
             {
+                self.record(LogUpdate::Memory(
+                    self.host.memory_snapshot(self.limits.auto_memory),
+                ));
+                let after = request_tokens(&self.request()?);
                 let c = Compaction {
                     summary: None,
                     retained_user: vec![],
@@ -752,6 +780,9 @@ impl State<'_> {
                 Err(e) => return Err(e),
             }
         };
+        self.record(LogUpdate::Memory(
+            self.host.memory_snapshot(self.limits.auto_memory),
+        ));
         let mut snapshot = self
             .host
             .context_snapshot()
@@ -803,7 +834,17 @@ fn stream<'a>(
     turn: Resume,
     manual_focus: Option<Option<String>>,
 ) -> AgentStream<'a> {
-    let updates = Arc::new(Mutex::new(Vec::new()));
+    let mut initial_updates = Vec::new();
+    if conversation
+        .memory
+        .as_ref()
+        .is_none_or(|m| m.auto_memory != limits.auto_memory)
+    {
+        let snapshot = host.memory_snapshot(limits.auto_memory);
+        conversation.memory = Some(snapshot.clone());
+        initial_updates.push(LogUpdate::Memory(snapshot));
+    }
+    let updates = Arc::new(Mutex::new(initial_updates));
     let message_id = turn.message_id;
     let mut state = State {
         client,
@@ -1231,7 +1272,7 @@ fn stream<'a>(
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
-                                pending.push_back(match parse_local(&raw) {
+                                pending.push_back(match parse_local(&raw, s.limits.auto_memory) {
                                     Ok(Some(tool)) => Pending::Local(raw, tool),
                                     Err(error) => Pending::Invalid(raw, error),
                                     Ok(None) => match parse_call(
@@ -1426,15 +1467,23 @@ fn parse_call(
     })
 }
 
-fn parse_local(raw: &RigCall) -> Result<Option<LocalTool>, String> {
+fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
-    if !matches!(name, "read_output" | "stop_task") {
+    if !matches!(name, "read_output" | "stop_task" | "memory") {
         return Ok(None);
     }
     if raw.function.invalid_arguments.is_some() {
         return Err("工具参数无效：需要 JSON 对象".into());
     }
     let args = serde_json::Value::Object(raw.function.arguments.clone());
+    if name == "memory" {
+        if !auto_memory {
+            return Err("自动记忆已关闭，memory 工具不可用".into());
+        }
+        return serde_json::from_value(args)
+            .map(|command| Some(LocalTool::Memory(command)))
+            .map_err(|e| format!("memory 参数无效：{e}"));
+    }
     if name == "read_output" {
         let a: ReadOutput = serde_json::from_value(args).map_err(|_| "read_output 参数无效")?;
         if a.id.is_empty()

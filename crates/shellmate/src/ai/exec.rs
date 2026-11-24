@@ -202,11 +202,21 @@ pub async fn disconnected(alive: &AtomicBool) {
 }
 #[derive(Clone)]
 pub struct AppExecutor {
+    pub memory: Option<(shellmate_core::memory::Memory, String)>,
     pub binding: Binding,
     pub tasks: super::tasks::Tasks,
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
+        self.memory.as_ref().map_or_else(
+            || shellmate_ai::memory::Snapshot {
+                auto_memory,
+                ..Default::default()
+            },
+            |(memory, label)| shellmate_ai::memory::Snapshot::load(memory, label, auto_memory),
+        )
+    }
     fn output_id(&self, call: &ToolCall) -> Option<String> {
         self.tasks.output_id_for(&call.id)
     }
@@ -215,6 +225,18 @@ impl Executor for AppExecutor {
         tool: shellmate_ai::agent::LocalTool,
         limits: shellmate_ai::agent::ExecLimits,
     ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        if let shellmate_ai::agent::LocalTool::Memory(command) = tool {
+            return Box::pin(async move {
+                self.memory.as_ref().map_or_else(
+                    || shellmate_ai::agent::LocalResult {
+                        inline: "记忆存储不可用".into(),
+                        output_id: None,
+                        is_error: true,
+                    },
+                    |(memory, _)| command.execute(memory),
+                )
+            });
+        }
         Box::pin(self.tasks.local_tool(tool, limits))
     }
     fn take_notices(&self) -> Vec<String> {

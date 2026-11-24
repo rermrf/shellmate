@@ -2139,3 +2139,6 @@ mod context_tests;
 
 #[path = "agent/execution.rs"]
 mod execution_tests;
+
+#[path = "agent/memory.rs"]
+mod memory_tests;

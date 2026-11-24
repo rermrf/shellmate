@@ -11,3 +11,7 @@ test-support = []
 [dependencies]
 uuid = { workspace = true }
 zeroize.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -47,10 +47,13 @@ impl Workspace {
 
     fn delete_host_now(&mut self, id: &HostId, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
         let name = self.hub.book.borrow().host(id).map(|h| h.name.clone()).unwrap_or_default();
-        self.hub.store.borrow_mut().delete_host(id).map_err(|e|e.to_string())?;
+        let memory_warning = self.hub.store.borrow_mut().delete_host_with_memory(id, &self.hub.data_root.borrow()).map_err(|e|e.to_string())?;
         let warning = shellmate_store::SecretStore::delete(self.hub.secrets.as_ref(), &shellmate_store::SecretKey::HostPassword(id.clone())).err().map(|e|e.to_string());
         self.reload_book(window, cx);
         window.push_notification(Notification::success(format!("已删除 {name}")), cx);
+        if let Some(warning) = memory_warning {
+            window.push_notification(Notification::warning(warning), cx);
+        }
         if let Some(warning) = warning {
             window.push_notification(
                 Notification::warning(format!("主机已删除，但凭据存储中的密码没有清除：{warning}")),

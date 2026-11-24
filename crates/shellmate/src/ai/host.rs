@@ -44,6 +44,12 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
+        shellmate_ai::memory::Snapshot {
+            auto_memory,
+            ..Default::default()
+        }
+    }
     fn output_id(&self, _call: &ToolCall) -> Option<String> {
         None
     }
@@ -84,6 +90,9 @@ impl Drop for PendingGuard {
     }
 }
 impl ToolHost for Host {
+    fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
+        self.executor.memory_snapshot(auto_memory)
+    }
     fn take_compaction(&self) -> Option<Option<String>> {
         self.compaction.lock().unwrap().take()
     }

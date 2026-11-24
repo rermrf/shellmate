@@ -220,6 +220,11 @@ impl Tasks {
     }
     pub async fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> LocalResult {
         match tool {
+            LocalTool::Memory(_) => LocalResult {
+                inline: "记忆工具必须由会话主机处理".into(),
+                output_id: None,
+                is_error: true,
+            },
             LocalTool::StopTask { id } => {
                 let task = {
                     let state = self.0.state.lock().unwrap();

@@ -70,6 +70,7 @@ impl ContextBudget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextBreakdown {
     pub system_prompt: usize,
+    pub instructions_memory: usize,
     pub tool_definitions: usize,
     pub tool_count: usize,
     pub terminal_context: usize,
@@ -91,9 +92,10 @@ pub enum ContextCategory {
     Messages,
     Results,
     Summary,
+    Memory,
 }
 impl ContextBreakdown {
-    pub fn categories(&self) -> [(ContextCategory, usize); 6] {
+    pub fn categories(&self) -> [(ContextCategory, usize); 7] {
         [
             (ContextCategory::System, self.system_prompt),
             (ContextCategory::Tools, self.tool_definitions),
@@ -101,6 +103,7 @@ impl ContextBreakdown {
             (ContextCategory::Messages, self.messages),
             (ContextCategory::Results, self.tool_results),
             (ContextCategory::Summary, self.summary),
+            (ContextCategory::Memory, self.instructions_memory),
         ]
     }
     /// Integer cumulative apportionment preserves zero categories and makes the
@@ -124,6 +127,7 @@ impl ContextBreakdown {
             self.messages,
             self.tool_results,
             self.summary,
+            self.instructions_memory,
         ] = scaled;
         self.total = total;
     }
@@ -137,6 +141,21 @@ impl ContextBreakdown {
         context: &crate::ContextSnapshot,
         limits: crate::agent::ExecLimits,
     ) -> Self {
+        Self::for_session_with_memory(
+            budget,
+            caps,
+            context,
+            limits,
+            &crate::memory::Snapshot::default(),
+        )
+    }
+    pub fn for_session_with_memory(
+        budget: ContextBudget,
+        caps: &Capabilities,
+        context: &crate::ContextSnapshot,
+        limits: crate::agent::ExecLimits,
+        memory: &crate::memory::Snapshot,
+    ) -> Self {
         let system = if caps.available() {
             crate::conversation::execution_prompt(context, caps)
         } else {
@@ -147,17 +166,22 @@ impl ContextBreakdown {
         } else {
             Vec::new()
         };
+        if caps.available() && memory.auto_memory {
+            tools.push(crate::memory::tool());
+        }
         tools.push(if caps.available() {
             crate::conversation::run_command_tool_with_limits(caps, limits)
         } else {
             crate::conversation::command_tool()
         });
-        let system_prompt = estimate_tokens(&system) + 8;
+        let instructions_memory = estimate_tokens(&memory.text());
+        let system_prompt = estimate_tokens(&(system + &memory.text())) + 8 - instructions_memory;
         let tool_definitions = tools
             .iter()
             .map(|t| estimate_tokens(&serde_json::to_string(t).unwrap()))
             .sum::<usize>();
         Self {
+            instructions_memory,
             system_prompt,
             tool_definitions,
             tool_count: tools.len(),
@@ -165,7 +189,7 @@ impl ContextBreakdown {
             summary: 0,
             messages: 0,
             tool_results: 0,
-            total: system_prompt + tool_definitions,
+            total: system_prompt + tool_definitions + instructions_memory,
             provider_usage: false,
             budget,
         }
@@ -263,6 +287,8 @@ impl Conversation {
         } else {
             crate::conversation::system_prompt(&newest.context)
         };
+        let memory = self.memory.clone().unwrap_or_default();
+        let system = system + &memory.text();
         let tool = if caps.available() {
             crate::conversation::run_command_tool(caps)
         } else {
@@ -270,6 +296,8 @@ impl Conversation {
         };
         let offered = if summarizing {
             &[][..]
+        } else if caps.available() && memory.auto_memory {
+            &["run_command", "read_output", "stop_task", "memory"][..]
         } else if caps.available() {
             &["run_command", "read_output", "stop_task"][..]
         } else {
@@ -409,6 +437,9 @@ impl Conversation {
         if !summarizing {
             request = request.tool(tool);
             if caps.available() {
+                if memory.auto_memory {
+                    request = request.tool(crate::memory::tool());
+                }
                 for tool in crate::conversation::output_tools() {
                     request = request.tool(tool);
                 }
@@ -462,7 +493,11 @@ impl Conversation {
             .iter()
             .map(|t| estimate_tokens(&serde_json::to_string(t).unwrap()))
             .sum::<usize>();
-        let system_prompt = system_tokens(&request) - tool_definitions;
+        let instructions_memory = self
+            .memory
+            .as_ref()
+            .map_or(0, |m| estimate_tokens(&m.text()));
+        let system_prompt = system_tokens(&request) - tool_definitions - instructions_memory;
         let mut summary = 0;
         let mut terminal_context = 0;
         let mut tool_results = 0;
@@ -512,6 +547,7 @@ impl Conversation {
             .usage
             .is_some_and(|(_, pos)| pos >= self.view_start());
         let mut breakdown = ContextBreakdown {
+            instructions_memory,
             system_prompt,
             tool_definitions,
             tool_count: request.tools.len(),
@@ -519,7 +555,12 @@ impl Conversation {
             summary,
             tool_results,
             messages: estimated.saturating_sub(
-                system_prompt + tool_definitions + terminal_context + summary + tool_results,
+                system_prompt
+                    + instructions_memory
+                    + tool_definitions
+                    + terminal_context
+                    + summary
+                    + tool_results,
             ),
             total: estimated,
             provider_usage,

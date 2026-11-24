@@ -268,3 +268,63 @@ async fn local_output_tools_bypass_all_approval_modes_and_background_command_doe
     let event = tokio::select! { event=f.ui.recv()=>event.unwrap(), _=&mut run=>panic!("approval skipped") };
     assert!(matches!(event, Ui::Approval { .. }));
 }
+
+#[tokio::test]
+async fn memory_uses_local_executor_without_approval_or_task_registration() {
+    use shellmate_ai::agent::{LocalTool, ToolHost};
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Auto,
+        PermissionMode::Full,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let files = shellmate_core::memory::Memory::new(root.path(), Some("local"));
+        files
+            .create("/memories/global/AGENTS.md", "instructions")
+            .unwrap();
+        let tasks = crate::ai::tasks::Tasks::new(root.path().to_path_buf(), "memory-test".into());
+        let (ui, rx) = async_channel::unbounded();
+        let alive = Arc::new(AtomicBool::new(true));
+        let host = Host {
+            compaction: Default::default(),
+            mode: Arc::new(Mutex::new(mode)),
+            executor: Box::new(crate::ai::exec::AppExecutor {
+                memory: Some((files.clone(), "local".into())),
+                tasks: tasks.clone(),
+                binding: crate::ai::exec::Binding {
+                    session: 1,
+                    capabilities: shellmate_ai::Capabilities {
+                        background: true,
+                        ..Default::default()
+                    },
+                    connection: None,
+                    local: true,
+                    alive: alive.clone(),
+                },
+                ui: ui.clone(),
+            }),
+            ui,
+            alive,
+            resolved: Mutex::new(None),
+        };
+        let out = host
+            .local_tool(
+                LocalTool::Memory(shellmate_ai::memory::Command::Create {
+                    path: "/memories/host/note.md".into(),
+                    file_text: "remember".into(),
+                }),
+                Default::default(),
+            )
+            .await;
+        assert!(!out.is_error);
+        assert_eq!(out.inline, "已保存记忆 · host/note.md");
+        assert!(rx.is_empty());
+        assert!(tasks.list().is_empty());
+        assert_eq!(files.read("/memories/host/note.md").unwrap(), "remember");
+        assert!(
+            host.memory_snapshot(false)
+                .instructions
+                .contains("instructions")
+        );
+    }
+}
