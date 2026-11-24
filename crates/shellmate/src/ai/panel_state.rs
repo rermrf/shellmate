@@ -8,6 +8,9 @@ use std::collections::HashSet;
 // Resume is opaque. Keeping its ownership generic lets tests use a drop-tracked marker.
 pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) model: DrawerModel,
+    pub(super) local_cards: Vec<super::slash_ui::LocalCard>,
+    pub(super) run_limits: Option<agent::Limits>,
+    pub(super) run_budget: Option<(shellmate_ai::ContextBudget, shellmate_ai::WindowSource)>,
     pub(super) id: String,
     pub(super) created: i64,
     pub(super) save_error: Option<String>,
@@ -31,6 +34,9 @@ impl<R> Default for ConversationState<R> {
     fn default() -> Self {
         Self {
             model: Default::default(),
+            local_cards: Vec::new(),
+            run_limits: None,
+            run_budget: None,
             id: shellmate_core::HostId::generate().to_string(),
             created: crate::ai::now(),
             save_error: None,

@@ -39,6 +39,7 @@ fn fixture(mode: PermissionMode, wait: bool) -> Fixture {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let running = Arc::new(AtomicUsize::new(0));
     let host = Host {
+        compaction: Default::default(),
         mode: Arc::new(Mutex::new(mode)),
         ui: tx,
         executor: Box::new(Fake {

@@ -1,3 +1,5 @@
+#[path = "settings_limits.rs"]
+mod limits;
 use crate::{security::password::PasswordInput, theme::ActivePalette};
 use crate::ui::{Surface, field_input};
 use futures::StreamExt;
@@ -14,6 +16,8 @@ use shellmate_ai::{Event, Provider, ReasoningLevel, RigClient};
 use shellmate_store::{CredentialStore, SecretKey, SecretStore, SharedStore, ai::Settings};
 use std::sync::Arc;
 pub struct AiSettings {
+    limits: limits::Fields,
+    _subscriptions: Vec<Subscription>,
     workspace: WeakEntity<crate::workspace::Workspace>,
     db: SharedStore,
     credentials: Arc<CredentialStore>,
@@ -40,7 +44,17 @@ impl AiSettings {
     ) -> Self {
         let s = db.borrow().ai_settings().unwrap_or_default();
         let anthropic = matches!(s.provider, Provider::Anthropic { .. });
+        let model = cx.new(|cx| InputState::new(w, cx).default_value(s.model.clone()).placeholder("gpt-4o-mini / deepseek-chat / qwen…"));
+        let limits = limits::Fields::new(&s, w, cx);
+        let mut subscriptions = vec![cx.subscribe_in(&model, w, |s: &mut Self, _, event: &gpui::component::input::InputEvent, w, cx| {
+            if matches!(event, gpui::component::input::InputEvent::Change) {
+                s.reload_model_limits(w, cx);
+            }
+        })];
+        for input in &limits.inputs { subscriptions.push(cx.subscribe(input, |_: &mut Self, _, _: &gpui::component::input::InputEvent, cx| cx.notify())); }
         Self {
+            limits,
+            _subscriptions: subscriptions,
             workspace,
             db,
             credentials,
@@ -50,11 +64,7 @@ impl AiSettings {
                     .default_value(s.provider.base_url())
                     .placeholder(base_placeholder(anthropic))
             }),
-            model: cx.new(|cx| {
-                InputState::new(w, cx)
-                    .default_value(s.model)
-                    .placeholder("gpt-4o-mini / deepseek-chat / qwen…")
-            }),
+            model,
             reasoning: s.reasoning,
             key: cx.new(|cx| PasswordInput::new("输入 API Key", Surface::Card, w, cx)),
             key_saved: false,
@@ -66,8 +76,20 @@ impl AiSettings {
             fixture: crate::prototype_fixture(),
         }
     }
+    #[cfg(debug_assertions)]
+    pub(crate) fn fixture_advanced(&mut self, cx: &mut Context<Self>) {
+        self.limits.advanced = true;
+        self.limits.choices[0] = limits::Choice::Custom;
+        cx.notify();
+    }
     pub(crate) fn replace_key(&mut self, cx: &mut Context<Self>) {
         self.replace = true;
+        cx.notify();
+    }
+    fn reload_model_limits(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let values = self.values(cx);
+        let saved = self.db.borrow().ai_model_settings(&values).unwrap_or(values);
+        self.limits.load_model(&saved, w, cx);
         cx.notify();
     }
     fn values(&self, cx: &App) -> Settings {
@@ -78,7 +100,7 @@ impl AiSettings {
             .trim()
             .trim_end_matches('/')
             .to_owned();
-        Settings {
+        self.limits.apply(Settings {
             provider: if self.provider {
                 Provider::Anthropic { base_url }
             } else {
@@ -87,7 +109,8 @@ impl AiSettings {
             model: self.model.read(cx).value().trim().into(),
             reasoning: self.reasoning,
             save_conversations: self.save,
-        }
+            ..Default::default()
+        }, cx)
     }
     pub fn refresh_key(&mut self, cx: &mut Context<Self>) {
         if self.fixture {
@@ -129,6 +152,7 @@ impl AiSettings {
             return;
         }
         let settings = self.values(cx);
+        self.limits.normalize_inputs(&settings, w, cx);
         if settings.provider.destination().is_err() {
             self.result = Some("Base URL 无效，请使用完整的 http(s) 地址".into());
             cx.notify();
@@ -392,6 +416,7 @@ impl Render for AiSettings {
                                 });
                                 s.replace = false;
                                 s.model.update(cx, |i, cx| i.set_value("", w, cx));
+                                s.reload_model_limits(w, cx);
                                 s.refresh_key(cx);
                             }))
                     }),
@@ -427,6 +452,7 @@ impl Render for AiSettings {
             .child(div().text_size(px(12.)).text_color(p.tx2).child(
                 "等级越高，回答越慢、越耗 token",
             ));
+        form = form.child(self.limit_fields(cx));
         if self.key_saved && !self.replace {
             form = form.child(
                 div()

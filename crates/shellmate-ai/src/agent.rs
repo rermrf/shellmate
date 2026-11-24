@@ -279,6 +279,11 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    /// Consume a manual request only at a boundary with no tool/model future in flight.
+    fn take_compaction(&self) -> Option<Option<String>> {
+        None
+    }
+
     fn local_tool(&self, _tool: LocalTool, _limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async {
             LocalResult {
@@ -556,6 +561,16 @@ impl State<'_> {
             false,
             self.conversation.view_start(),
         )?;
+        if let Some(tool) = request
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name.as_str() == "run_command")
+        {
+            *tool = Arc::new(crate::conversation::run_command_tool_with_limits(
+                &turn.capabilities,
+                self.limits.exec,
+            ));
+        }
         if request
             .chat_history
             .last()
@@ -826,6 +841,16 @@ fn stream<'a>(
     let inner = futures::stream::unfold(state, |mut s| async move {
         loop {
             if let Some(event) = s.queue.pop_front() {
+                if matches!(event, AgentEvent::Done(_))
+                    && let Some(focus) = s.host.take_compaction()
+                {
+                    s.done = false;
+                    s.manual = true;
+                    match s.begin_compaction(CompactTrigger::Manual, focus) {
+                        Ok(()) => return Some((AgentEvent::Compacting { tier: 1 }, s)),
+                        Err(e) => return Some((s.fail(e), s)),
+                    }
+                }
                 return Some((event, s));
             }
             if s.done {
@@ -901,6 +926,14 @@ fn stream<'a>(
                     s.error = Some(AiError::Disconnected);
                 }
                 return Some((AgentEvent::StepFinished { call, outcome }, s));
+            }
+            if s.model.is_none()
+                && let Some(focus) = s.host.take_compaction()
+            {
+                match s.begin_compaction(CompactTrigger::Manual, focus) {
+                    Ok(()) => return Some((AgentEvent::Compacting { tier: 1 }, s)),
+                    Err(e) => return Some((s.fail(e), s)),
+                }
             }
             if s.limits.max_steps.is_some_and(|max| s.steps >= max) {
                 return Some((s.pause(PauseReason::StepLimit), s));

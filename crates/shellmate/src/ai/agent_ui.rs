@@ -130,7 +130,14 @@ impl Drawer {
             AgentEvent::Retrying { attempt, max, delay, error } => {
                 self.state.model.retrying = Some(format!("{error}，{} 秒后重试（第 {attempt}/{max} 次）", delay.as_secs()));
             }
-            AgentEvent::Context { used, window, trigger } => self.state.model.event(Event::Context { used, window, trigger }),
+            AgentEvent::Context { used, window, trigger } => {
+                if let Some((budget, _)) = &mut self.state.run_budget {
+                    budget.window = window;
+                    budget.trigger = trigger;
+                    budget.reserve = budget.auto.saturating_sub(trigger);
+                }
+                self.state.model.event(Event::Context { used, window, trigger });
+            }
             AgentEvent::Compacting { tier } => self.state.model.event(Event::Compacting { tier }),
             AgentEvent::Compacted { before, after, summary } => self.state.model.event(Event::Compacted { before, after, summary }),
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
@@ -295,18 +302,13 @@ impl Drawer {
         })
         .detach();
     }
-    fn set_permission(&mut self, mode: PermissionMode, cx: &mut Context<Self>) -> bool {
-        if self
-            .db
-            .borrow_mut()
-            .set_ai_permission(self.permission_key(), mode)
-            .is_err()
+    pub(super) fn set_permission(&mut self, mode: PermissionMode, cx: &mut Context<Self>) -> bool {
+        if super::super::model::save_permission(&mut self.db.borrow_mut(), self.permission_key(), &self.mode, mode).is_err()
         {
             self.state.save_error = Some("无法保存审批设置，请重试".into());
             cx.notify();
             return false;
         }
-        *self.mode.lock().unwrap() = mode;
         self.permission_menu = false;
         cx.notify();
         true

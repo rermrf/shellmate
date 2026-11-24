@@ -300,7 +300,7 @@ impl Workspace {
                 use drawer_motion::Drawer;
                 self.open_ai(window, cx);
                 if let Some(drawer) = &self.ai_drawer {
-                    drawer.update(cx, |drawer, cx| drawer.scene("ai", cx));
+                    drawer.update(cx, |drawer, cx| drawer.scene("ai", window, cx));
                 }
                 if scene == "drawer-swap-mid" {
                     self.toggle_commands(window, cx);
@@ -367,11 +367,11 @@ impl Workspace {
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
             | "ai-tasks" | "ai-output-large" | "ai-compacted" | "ai-compacted-open"
             | "ai-compacting" | "ai-compacted-tier1" | "ai-history" | "ai-error"
-            | "ai-unconfigured" => {
+            | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
                 self.open_ai(window, cx);
                 if let Some(drawer) = &self.ai_drawer {
                     drawer.update(cx, |d, cx| {
-                        d.scene(if scene == "ai-markdown-wide" { "ai-markdown" } else { scene }, cx);
+                        d.scene(if scene == "ai-markdown-wide" { "ai-markdown" } else { scene }, window, cx);
                         if scene == "ai-agent-full" {
                             d.confirm_full(window, cx);
                         } else if scene == "ai-new-confirm" {
@@ -386,10 +386,13 @@ impl Workspace {
                 if s == "settings-update" { self.open_settings(6, window, cx); }
                 if s.starts_with("update-") { crate::updater::open(window, cx); }
             }
-            "set-ai" | "set-ai-replace" => {
-                self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{model:"gpt-5".into(),reasoning:shellmate_ai::ReasoningLevel::Medium,..Default::default()}).unwrap();
+            "set-ai" | "set-ai-replace" | "set-ai-advanced" => {
+                let fixture = crate::proto::slash::settings_scene(scene).unwrap();
+                self.hub.store.borrow_mut().save_ai_settings(&fixture.settings).unwrap();
                 let view = settings(5, window, cx);
                 if scene == "set-ai-replace" { view.update(cx, |settings, cx| settings.fixture_replace_key(cx)); }
+                if fixture.advanced { view.update(cx, |settings, cx| settings.fixture_ai_advanced(cx)); }
+                if fixture.scroll_to_bottom { view.update(cx, |settings, _| settings.fixture_scroll_bottom(window)); }
             }
             "set-ai-anthropic"=>{self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-cred" => self.open_settings(0, window, cx),

@@ -4,6 +4,8 @@ use super::markdown::{self, MarkdownCache};
 use super::model::SUGGESTIONS;
 #[path = "panel_state.rs"]
 mod state;
+#[path = "slash_ui.rs"]
+mod slash_ui;
 use crate::{
     theme::{ActivePalette, MONO_FONT},
     workspace::Workspace,
@@ -40,6 +42,8 @@ pub struct SessionContext {
 }
 pub struct Drawer {
     state: state::ConversationState,
+    popup: super::commands::Popup,
+    compact_queue: Arc<Mutex<Option<Option<String>>>>,
     data_root: std::path::PathBuf,
     tasks: Option<super::tasks::Tasks>,
     fixture_tasks: Vec<super::tasks::TaskInfo>,
@@ -84,8 +88,10 @@ impl Drawer {
             &input,
             window,
             |s: &mut Self, _, event: &InputEvent, w, cx| {
-                if let InputEvent::PressEnter { .. } = event {
-                    s.send_input(w, cx)
+                match event {
+                    InputEvent::PressEnter { .. } => s.send_input(w, cx),
+                    InputEvent::Change => { s.popup.changed(&s.input.read(cx).value()); cx.notify(); }
+                    _ => {}
                 }
             },
         );
@@ -129,6 +135,8 @@ impl Drawer {
         })
         .detach();
         Self {
+            popup: Default::default(),
+            compact_queue: Default::default(),
             data_root,
             tasks: None,
             fixture_tasks: Vec::new(),
@@ -194,17 +202,17 @@ impl Drawer {
         cx.notify();
     }
     fn send_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let question = self.input.read(cx).value().to_string();
-        if !question.trim().is_empty() {
-            self.ask(question, w, cx);
-        }
+        let text = self.input.read(cx).value().to_string();
+        self.dispatch_input(&text, w, cx);
     }
+
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
         if self.state.pending || self.state.model.busy || question.trim().is_empty() {
             return;
         }
         self.state.continuation = None;
         self.state.run_config = None;
+        self.state.run_budget = None;
         self.release_context(cx);
         let context = self
             .workspace
@@ -289,6 +297,7 @@ impl Drawer {
                             s.start(config, w, cx);
                         }
                         Err(e) => {
+                            s.compact_queue.lock().unwrap().take();
                             s.state.model.error = Some(e);
                             if e == AiError::NotConfigured {
                                 s.configured = false;
@@ -302,9 +311,13 @@ impl Drawer {
         );
     }
     /// M4's /compact entry point; shares authorization and the busy lock with send.
-    #[allow(dead_code)]
     pub(crate) fn compact_context(&mut self, focus: Option<String>, w: &mut Window, cx: &mut Context<Self>) {
-        if self.state.model.busy || self.state.pending || self.state.model.conversation.entries().is_empty() { return; }
+        if self.state.model.busy || self.state.pending {
+            *self.compact_queue.lock().unwrap() = Some(focus);
+            self.local(slash_ui::LocalBody::Hint(super::commands::QUEUED.into()), cx);
+            return;
+        }
+        if self.state.model.conversation.entries().is_empty() { return; }
         if let Some(config) = self.state.run_config.clone() {
             self.state.compaction_focus = Some(focus);
             self.state.model.manual_compaction = true;
@@ -390,6 +403,7 @@ impl Drawer {
             ui: ui.clone(),
         };
         let host = super::host::Host {
+            compaction: self.compact_queue.clone(),
             mode: self.mode.clone(),
             ui,
             executor: Box::new(executor),
@@ -397,8 +411,16 @@ impl Drawer {
             resolved: Mutex::new(None),
         };
         self.bridge(messages, epoch, w, cx);
+        let keep_limits = self.state.continuation.is_some() || self.state.compaction_focus.is_some();
         let compact_focus = self.state.compaction_focus.take();
         let continuation = if compact_focus.is_none() { self.state.continuation.take() } else { None };
+        let limits = if keep_limits {
+            self.state.run_limits.unwrap_or_else(|| self.db.borrow().ai_settings().unwrap_or_default().limits())
+        } else {
+            self.db.borrow().ai_settings().unwrap_or_default().limits()
+        };
+        self.state.run_limits = Some(limits);
+        self.state.run_budget = None;
         self.state.run_config = Some(config.clone());
         let join = runtime.spawn(async move {
             let client = match RigClient::new(&config) {
@@ -408,27 +430,10 @@ impl Drawer {
                     return;
                 }
             };
-            let result = if let Some(focus) = compact_focus {
-                agent::compact(&client, &mut conversation, capabilities, &host, focus)
-            } else { match continuation {
-                Some(resume) => agent::resume(
-                    &client,
-                    &mut conversation,
-                    &host,
-                    *resume,
-                    agent::Limits::default(),
-                ),
-                None => agent::run(
-                    &client,
-                    &mut conversation,
-                    capabilities,
-                    &host,
-                    agent::Limits::default(),
-                ),
-            }};
+            let result = drawer_stream(&client, &mut conversation, capabilities, &host, limits, continuation, compact_focus);
             match result {
                 Ok(mut stream) => {
-                    let _ = tx.send(Worker::Started).await;
+                    let _ = tx.send(Worker::Started(client.context_budget())).await;
                     while let Some(event) = stream.next().await {
                         if worker_update(&tx, event, stream.take_updates()).await.is_err() {
                             break;
@@ -449,7 +454,11 @@ impl Drawer {
                             return;
                         }
                         match event {
-                            Worker::Started => {
+                            Worker::Started(budget) => {
+                                if let Some(config) = &s.state.run_config {
+                                    let source = shellmate_ai::resolve_window(&config.provider, &config.model, config.context_window).1;
+                                    s.state.run_budget = Some((budget, source));
+                                }
                                 s.persist();
                             }
                             Worker::Event(event, updates, ready) => {
@@ -460,6 +469,7 @@ impl Drawer {
                                 if durable { s.persist(); }
                                 let _ = ready.send(());
                                 if !s.state.model.busy {
+                                    s.compact_queue.lock().unwrap().take();
                                     s.abort = None;
                                     s.persist();
                                     if s.state.continuation.is_none() {
@@ -536,6 +546,7 @@ impl Drawer {
             abort.abort();
         }
         self.epoch += 1;
+        self.compact_queue.lock().unwrap().take();
         self.state.continuation = None;
         self.state.run_config = None;
         if let Some(step) = self.state.active_step.take() {
@@ -571,6 +582,7 @@ impl Drawer {
         self.stop(cx);
         self.close_outputs();
         self.state.reset_conversation();
+        self.popup.escape();
         self.permission_menu = false;
         self.history_rows.clear();
         self.history = false;
@@ -714,13 +726,24 @@ impl Drawer {
     }
 
     #[cfg(debug_assertions)]
-    pub fn scene(&mut self, scene: &str, cx: &mut Context<Self>) {
+    pub fn scene(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
         self.state.id = format!("fixture-{scene}");
         self.state.markdown = MarkdownCache::default();
         self.state.follow_bottom = true;
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
         self.fixture_tasks.clear();
+        if let Some(fixture) = crate::proto::slash::scene(scene) {
+            self.state.model = fixture.model;
+            self.fixture_tasks = fixture.tasks;
+            self.label = "prod-web-01".into();
+            self.protocol = "SSH".into();
+            self.capabilities = Capabilities { terminal:true,background:true,..Default::default() };
+            self.input.update(cx, |i,cx|i.set_value(fixture.input,w,cx));
+            self.popup.changed(fixture.input);
+            if let Some(context)=fixture.context { self.local(slash_ui::LocalBody::Context(context,shellmate_ai::WindowSource::Catalog),cx); }
+            if scene=="ai-slash-tasks" { self.local(slash_ui::LocalBody::Tasks,cx); }
+        }
         if let Some(fixture) = crate::proto::ai::execution_scene(scene) {
             self.state.model = fixture.model;
             self.fixture_tasks = fixture.tasks;
@@ -850,7 +873,7 @@ fn saving_enabled(db: &SharedStore) -> bool {
         != Some("0")
 }
 enum Worker {
-    Started,
+    Started(shellmate_ai::ContextBudget),
     Event(
         Box<AgentEvent>,
         Vec<shellmate_ai::LogUpdate>,
@@ -1111,6 +1134,7 @@ impl Render for Drawer {
         }
         if !self.history {
             for (index, turn) in self.state.model.conversation.turns().iter().enumerate() {
+                body = body.children(self.local_cards_at(index, cx));
                 body = body.child(
                     div()
                         .flex_none()
@@ -1275,6 +1299,7 @@ impl Render for Drawer {
                     body = body.child(reply);
                 }
             }
+            body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
             if self.state.continuation.is_some() {
                 body = body.child(
                     crate::dialogs::button(
@@ -1343,6 +1368,7 @@ impl Render for Drawer {
             body = body.child(self.active_card(cx));
         }
         let footer = div()
+            .relative()
             .flex_none()
             .pt(px(10.))
             .px(px(12.))
@@ -1354,6 +1380,7 @@ impl Render for Drawer {
             .gap(px(6.))
             .children(self.task_strip(cx))
             .child(self.permission_chip(cx))
+            .children(self.slash_popup(cx))
             .child(
                 div()
                     .flex()
@@ -1395,6 +1422,7 @@ impl Render for Drawer {
                     ),
             );
         div()
+            .capture_key_down(cx.listener(Self::slash_key))
             .w_full()
             .flex_none()
             .h_full()
@@ -1430,3 +1458,25 @@ async fn worker_update(tx: &async_channel::Sender<Worker>, event: AgentEvent, up
         .map_err(|_| ())?;
     receive.await.map_err(|_| ())
 }
+
+/// The run/resume factory shared by the drawer worker and its offline integration tests.
+fn drawer_stream<'a>(
+    client: &'a RigClient,
+    conversation: &'a mut shellmate_ai::Conversation,
+    capabilities: Capabilities,
+    host: &'a dyn agent::ToolHost,
+    limits: agent::Limits,
+    continuation: Option<Box<agent::Resume>>,
+    compact_focus: Option<Option<String>>,
+) -> Result<agent::AgentStream<'a>, AiError> {
+    if let Some(focus) = compact_focus {
+        agent::compact(client, conversation, capabilities, host, focus)
+    } else if let Some(resume) = continuation {
+        agent::resume(client, conversation, host, *resume, limits)
+    } else {
+        agent::run(client, conversation, capabilities, host, limits)
+    }
+}
+#[cfg(test)]
+#[path = "slash_tests.rs"]
+mod slash_tests;

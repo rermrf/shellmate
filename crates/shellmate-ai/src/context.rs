@@ -75,6 +75,7 @@ pub struct ContextBreakdown {
     pub tool_results: usize,
     /// Provider usage + appended estimates when available; components are estimates.
     pub total: usize,
+    pub provider_usage: bool,
     pub budget: ContextBudget,
 }
 pub const SUMMARY_PREFIX: &str = "本会话延续自之前的对话，此前的上下文已压缩。以下是之前对话的摘要。你仍可看到工具的当前状态；请在已完成的工作基础上继续，避免重复。";
@@ -327,6 +328,13 @@ impl Conversation {
         client: &crate::RigClient,
         caps: &Capabilities,
     ) -> Result<ContextBreakdown, AiError> {
+        self.breakdown_for_budget(client.context_budget(), caps)
+    }
+    pub fn breakdown_for_budget(
+        &self,
+        budget: ContextBudget,
+        caps: &Capabilities,
+    ) -> Result<ContextBreakdown, AiError> {
         let request = self.prepare(caps)?;
         let system_prompt = system_tokens(&request);
         let mut summary = 0;
@@ -349,7 +357,11 @@ impl Conversation {
             tool_results,
             messages: estimated.saturating_sub(system_prompt + summary + tool_results),
             total: self.used(&request, caps),
-            budget: client.context_budget(),
+            provider_usage: self
+                .accounting
+                .usage
+                .is_some_and(|(_, pos)| pos >= self.view_start()),
+            budget,
         })
     }
     pub(crate) fn used(&self, request: &CompletionRequest, caps: &Capabilities) -> usize {

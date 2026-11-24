@@ -47,9 +47,9 @@ pub fn load_config(
         model: settings.model.clone(),
         api_key: shellmate_ai::ApiKey::new(secret.expose()),
         reasoning: settings.reasoning,
-        max_output_tokens: Default::default(),
-        context_window: Default::default(),
-        autocompact_window: Default::default(),
+        max_output_tokens: settings.normalized().max_output_tokens,
+        context_window: settings.normalized().context_window,
+        autocompact_window: settings.normalized().autocompact_window,
         timeouts: settings.reasoning.timeouts(),
     };
     config.validate()?;
@@ -441,4 +441,11 @@ mod context_tests {
             if paused { assert_eq!(model.continuation_label(2),"重试"); }
         }
     }
+}
+
+/// Both the permission chip and /mode commit before publishing the new mode.
+pub(super) fn save_permission(db: &mut shellmate_store::HostStore, key: &str, current: &std::sync::Mutex<shellmate_ai::PermissionMode>, mode: shellmate_ai::PermissionMode) -> shellmate_store::Result<()> {
+    db.set_ai_permission(key, mode)?;
+    *current.lock().unwrap() = mode;
+    Ok(())
 }

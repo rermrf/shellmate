@@ -1,3 +1,4 @@
+pub(crate) mod commands;
 pub mod exec;
 pub mod host;
 pub(crate) mod markdown;

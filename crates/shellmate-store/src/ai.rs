@@ -5,6 +5,8 @@ use shellmate_ai::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, Conversation, PermissionMode, Provider,
     ReasoningLevel, UserTurn,
 };
+#[path = "ai_settings.rs"]
+mod settings;
 pub const SAVE_CONVERSATIONS: &str = "ai_save_conversations";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -12,6 +14,11 @@ pub struct Settings {
     pub model: String,
     pub reasoning: ReasoningLevel,
     pub save_conversations: bool,
+    pub context_window: shellmate_ai::ContextWindow,
+    pub autocompact_window: shellmate_ai::ContextWindow,
+    pub max_output_tokens: shellmate_ai::OutputTokens,
+    pub max_steps: Option<usize>,
+    pub exec: shellmate_ai::agent::ExecLimits,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -20,6 +27,11 @@ impl Default for Settings {
             model: String::new(),
             reasoning: ReasoningLevel::Default,
             save_conversations: true,
+            context_window: Default::default(),
+            autocompact_window: Default::default(),
+            max_output_tokens: Default::default(),
+            max_steps: None,
+            exec: Default::default(),
         }
     }
 }
@@ -152,12 +164,15 @@ impl HostStore {
                 .unwrap_or_default(),
         )
         .for_provider(&provider);
-        Ok(Settings {
+        let mut settings = Settings {
             provider,
             reasoning,
             model: self.setting("ai_model")?.unwrap_or_default(),
             save_conversations: self.setting(SAVE_CONVERSATIONS)?.as_deref() != Some("0"),
-        })
+            ..Settings::default()
+        };
+        self.read_ai_limits(&mut settings)?;
+        Ok(settings)
     }
     pub fn save_ai_settings(&mut self, s: &Settings) -> Result<()> {
         s.provider
@@ -184,6 +199,7 @@ impl HostStore {
         ] {
             tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         }
+        settings::save_limits(&tx, s)?;
         tx.commit()?;
         Ok(())
     }

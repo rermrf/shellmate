@@ -64,6 +64,7 @@ pub trait Executor: Send + Sync {
     fn execute(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
 }
 pub struct Host {
+    pub compaction: Arc<Mutex<Option<Option<String>>>>,
     pub mode: Arc<Mutex<PermissionMode>>,
     pub ui: async_channel::Sender<Ui>,
     pub executor: Box<dyn Executor>,
@@ -83,6 +84,9 @@ impl Drop for PendingGuard {
     }
 }
 impl ToolHost for Host {
+    fn take_compaction(&self) -> Option<Option<String>> {
+        self.compaction.lock().unwrap().take()
+    }
     fn output_id(&self, call: &ToolCall) -> Option<String> {
         self.executor.output_id(call)
     }
