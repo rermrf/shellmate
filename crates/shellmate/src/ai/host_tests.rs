@@ -329,3 +329,86 @@ async fn memory_uses_local_executor_without_approval_or_task_registration() {
         );
     }
 }
+
+#[tokio::test]
+async fn child_and_main_have_identical_approval_decisions_in_all_modes() {
+    use shellmate_ai::{SubagentKind, SubagentRef};
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Auto,
+        PermissionMode::Full,
+    ] {
+        for command in [
+            "pwd",
+            "/bin/pwd",
+            "/usr/bin/pwd",
+            "/bin/ls -la",
+            "bash -lc 'pwd; ls -la'",
+            "uname -s",
+            "touch /tmp/fixture",
+            "reboot",
+        ] {
+            for kind in [
+                None,
+                Some(SubagentKind::General),
+                Some(SubagentKind::Explore),
+            ] {
+                let f = fixture(mode, false);
+                let mut c = call(Class::ReadOnly);
+                c.command = command.into();
+                let source = kind.map(|kind| SubagentRef {
+                    id: "agent-1".into(),
+                    description: "inspect".into(),
+                    kind,
+                });
+                let expected_source = source.clone();
+                let class = classify(command);
+                let decision = decide(mode, class);
+                let ui = async {
+                    if decision != Decision::Run {
+                        let Ui::Approval {
+                            reply,
+                            source,
+                            redline,
+                            ..
+                        } = f.ui.recv().await.unwrap()
+                        else {
+                            panic!("approval")
+                        };
+                        assert_eq!(source, expected_source);
+                        assert_eq!(redline, class == Class::RedLine);
+                        reply
+                            .send(Approval::Deny {
+                                reason: Some("fixture denial".into()),
+                            })
+                            .ok()
+                            .unwrap();
+                    } else {
+                        let Ui::Running {
+                            ready,
+                            source,
+                            automatic,
+                            ..
+                        } = f.ui.recv().await.unwrap()
+                        else {
+                            panic!("running")
+                        };
+                        assert_eq!(source, expected_source);
+                        assert!(automatic);
+                        ready.send(()).unwrap();
+                    }
+                };
+                let (out, ()) = tokio::join!(f.host.run_from(c, source), ui);
+                if decision == Decision::Run {
+                    assert!(matches!(out, ToolOutcome::Completed(_)));
+                    assert_eq!(f.calls.lock().unwrap().len(), 1);
+                } else {
+                    assert!(
+                        matches!(out,ToolOutcome::Denied{reason:Some(r)} if r=="fixture denial")
+                    );
+                    assert!(f.calls.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+}

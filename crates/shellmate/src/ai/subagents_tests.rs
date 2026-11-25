@@ -380,7 +380,7 @@ fn call() -> ToolCall {
     }
 }
 #[tokio::test]
-async fn approval_edits_restrict_explore_and_force_general_to_background() {
+async fn approval_edits_follow_the_parent_policy_for_current_and_legacy_children() {
     use shellmate_ai::ToolHost;
     for kind in [SubagentKind::Explore, SubagentKind::General] {
         let (ui, rx) = async_channel::unbounded();
@@ -417,21 +417,16 @@ async fn approval_edits_restrict_explore_and_force_general_to_background() {
             })
             .ok()
             .unwrap();
-        if kind == SubagentKind::Explore {
-            assert!(
-                matches!(run.await,ToolOutcome::Failed(text) if text.contains("只读子任务不能执行此命令"))
-            );
-            assert!(calls.lock().unwrap().is_empty());
-        } else {
-            let Ui::Running { ready, call, .. } = (tokio::select! {_=&mut run=>panic!("must wait for ready"),e=rx.recv()=>e.unwrap()})
-            else {
-                panic!("running")
-            };
-            assert_eq!(call.target, Target::Background);
-            ready.send(()).unwrap();
-            assert!(matches!(run.await, ToolOutcome::Completed(_)));
-            assert_eq!(calls.lock().unwrap()[0].target, Target::Background);
-        }
+        let Ui::Running { ready, call, .. } =
+            (tokio::select! {_=&mut run=>panic!("must wait for ready"),e=rx.recv()=>e.unwrap()})
+        else {
+            panic!("running")
+        };
+        assert_eq!(call.target, Target::Background);
+        assert_eq!(call.class, Class::Other);
+        ready.send(()).unwrap();
+        assert!(matches!(run.await, ToolOutcome::Completed(_)));
+        assert_eq!(calls.lock().unwrap()[0].target, Target::Background);
     }
 }
 #[tokio::test]
@@ -807,4 +802,163 @@ async fn completion_after_retiring_saved_conversation_persists_and_cannot_be_rep
     c.apply(shellmate_ai::LogUpdate::ClearResults(vec![1]));
     assert!(!service.tasks.sync_agents(&mut c));
     assert!(matches!(&c.entries()[1],Entry::Step(s) if s.result.cleared));
+}
+
+fn tool_response(name: &str, args: Value) -> MockHttpResponse {
+    let chunks = [
+        json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call1","type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":null}]}),
+        json!({"id":"x","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ];
+    MockHttpResponse::success_typed(
+        chunks
+            .into_iter()
+            .map(|c| format!("data: {c}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n",
+        "text/event-stream",
+    )
+}
+
+#[tokio::test]
+async fn project_investigation_executes_real_local_commands_with_inherited_full_access() {
+    let commands = [
+        "pwd",
+        "/bin/pwd",
+        "/usr/bin/pwd",
+        "/bin/ls -la",
+        "bash -lc 'set -o pipefail\nroot=\"$PWD\"\nprintf \"CURRENT_PATH\\n%s\\n\" \"$root\"\n/bin/ls -la \"$root\"\nfor name in README.md Cargo.toml; do if [ -f \"$name\" ]; then cat \"$name\"; fi; done'",
+    ];
+    let mut responses = commands
+        .iter()
+        .map(|command| {
+            tool_response(
+                "run_command",
+                json!({"command":command,"target":"background"}),
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(response(
+        false,
+        "Rust project identified from README and Cargo.toml",
+    ));
+    let (root, service, ui, _) = fixture(responses);
+    std::fs::write(root.path().join("README.md"), "# Fixture Rust project\n").unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\n",
+    )
+    .unwrap();
+    *service.mode.lock().unwrap() = shellmate_ai::PermissionMode::Full;
+    let mut request = request(false);
+    request.kind = SubagentKind::Explore; // old callers inherit too
+    let mut run = service.start(request, "project-investigation");
+    let result=tokio::time::timeout(Duration::from_secs(15),async{
+        loop {tokio::select!{
+            result=&mut run=>break result,
+            event=ui.recv()=>match event.unwrap(){
+                Ui::Running{ready,source,..}=>{assert!(source.is_some());ready.send(()).unwrap();}
+                Ui::LocalCwd{reply,..}=>{reply.send(Some(root.path().to_string_lossy().into())).unwrap();}
+                Ui::Approval{..}=>panic!("Full mode must match the main agent for ordinary commands"),
+                _=>{}
+            }
+        }}
+    }).await.unwrap();
+    assert!(!result.is_error);
+    let view = service.tasks.agent_views().pop().unwrap();
+    assert_eq!(view.step_list.len(), commands.len());
+    for step in &view.step_list {
+        // macOS provides /bin/pwd, not /usr/bin/pwd. Missing executables must
+        // reach the shell and return its real exit code, not a policy rejection.
+        let expected =
+            if step.command == "/usr/bin/pwd" && !std::path::Path::new("/usr/bin/pwd").exists() {
+                127
+            } else {
+                0
+            };
+        assert_eq!(
+            step.exit_code,
+            Some(expected),
+            "{}: {}",
+            step.command,
+            step.output
+        );
+        assert_eq!(step.status, shellmate_ai::StepStatus::Completed);
+    }
+    assert!(
+        view.step_list
+            .last()
+            .unwrap()
+            .output
+            .contains("Fixture Rust project")
+    );
+}
+
+#[tokio::test]
+async fn subagent_memory_supports_the_same_mutations_and_reports_write_conflicts() {
+    let path = "/memories/global/project.md";
+    let operations = [
+        json!({"command":"create","path":path,"file_text":"project: old\n"}),
+        json!({"command":"str_replace","path":path,"old_str":"old","new_str":"new"}),
+        json!({"command":"insert","path":path,"insert_line":1,"insert_text":"checked\n"}),
+        json!({"command":"rename","old_path":path,"new_path":"/memories/global/renamed.md"}),
+        json!({"command":"view","path":"/memories/global/renamed.md"}),
+        json!({"command":"delete","path":"/memories/global/renamed.md"}),
+    ];
+    let mut responses = operations
+        .into_iter()
+        .map(|args| tool_response("memory", args))
+        .collect::<Vec<_>>();
+    responses.push(response(false, "memory updated"));
+    let (root, service, _, http) = fixture(responses);
+    let result = service.start(request(false), "memory").await;
+    assert!(!result.is_error);
+    let view = service.tasks.agent_views().pop().unwrap();
+    let entries = view.transcript.unwrap();
+    let steps = entries
+        .iter()
+        .filter_map(|e| {
+            if let Entry::Step(s) = e {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(steps.len(), 6);
+    assert!(steps.iter().all(|s| !s.result.is_error));
+    assert!(steps[4].result.inline.contains("project: new"));
+    assert!(steps[4].result.inline.contains("checked"));
+    assert!(!root.path().join("memory/global/renamed.md").exists());
+    let body: Value = serde_json::from_slice(&http.requests()[0].body).unwrap();
+    let memory = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "memory")
+        .unwrap();
+    assert_eq!(
+        memory["function"]["parameters"]["properties"]["command"]["enum"],
+        json!([
+            "view",
+            "create",
+            "str_replace",
+            "insert",
+            "delete",
+            "rename"
+        ])
+    );
+
+    // Two child contexts share the main store's write lock and optimistic replacement behavior.
+    service.memory.create(path, "before").unwrap();
+    let first = service.memory.clone();
+    let second = service.memory.clone();
+    let a = tokio::task::spawn_blocking(move || first.str_replace(path, "before", "first"));
+    let b = tokio::task::spawn_blocking(move || second.str_replace(path, "before", "second"));
+    let (a, b) = tokio::join!(a, b);
+    let results = [a.unwrap(), b.unwrap()];
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(matches!(
+        service.memory.read(path).unwrap().as_str(),
+        "first" | "second"
+    ));
 }

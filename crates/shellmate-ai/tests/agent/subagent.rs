@@ -16,7 +16,7 @@ fn request(kind: SubagentKind) -> SubagentRequest {
     }
 }
 fn delegation() -> Value {
-    json!({"description":"检查入口服务","prompt":"检查 nginx 状态","type":"explore","run_in_background":false})
+    json!({"description":"检查入口服务","prompt":"检查 nginx 状态","run_in_background":false})
 }
 fn context() -> SubagentContext {
     SubagentContext {
@@ -216,6 +216,26 @@ fn schema_and_validation_cover_provider_options_and_chinese_errors() {
         let cfg = config(a);
         let definition = subagent::agent_tool(&cfg);
         assert!(definition.description.contains(&cfg.model));
+        assert!(definition.parameters["properties"].get("type").is_none());
+        assert_eq!(
+            definition.parameters["required"],
+            json!(["description", "prompt"])
+        );
+        assert_eq!(
+            SubagentRequest::parse(delegation(), &cfg.provider)
+                .unwrap()
+                .kind,
+            SubagentKind::General
+        );
+        for legacy in ["explore", "general"] {
+            let mut args = delegation();
+            args["type"] = json!(legacy);
+            assert_eq!(
+                SubagentRequest::parse(args, &cfg.provider).unwrap().kind,
+                SubagentKind::General
+            );
+        }
+
         let ids = ReasoningLevel::options(&cfg.provider)
             .iter()
             .map(|r| json!(r.id()))
@@ -370,7 +390,7 @@ async fn isolation_tools_snapshot_and_auto_memory_on_both_wires() {
                 "prod-web-01",
                 "SSH",
                 "/srv/app",
-                "不能向用户提问",
+                "交回主代理协调",
                 "结论 / 关键证据 / 执行过的变更 / 未完成或风险",
                 "GLOBAL-INSTRUCTIONS",
                 "HOST-INSTRUCTIONS",
@@ -401,7 +421,14 @@ async fn isolation_tools_snapshot_and_auto_memory_on_both_wires() {
             if enabled {
                 assert_eq!(
                     schema(tool(body, a, "memory").unwrap(), a)["properties"]["command"]["enum"],
-                    json!(["view"])
+                    json!([
+                        "view",
+                        "create",
+                        "str_replace",
+                        "insert",
+                        "delete",
+                        "rename"
+                    ])
                 );
             } else {
                 assert!(tool(body, a, "memory").is_none());
@@ -413,72 +440,73 @@ async fn isolation_tools_snapshot_and_auto_memory_on_both_wires() {
     }
 }
 #[tokio::test]
-async fn explore_readonly_runs_but_writes_and_redline_never_reach_approval_host() {
+async fn all_child_commands_reach_the_common_host_policy_in_every_mode() {
     for a in [false, true] {
         for mode in [
             PermissionMode::Ask,
             PermissionMode::Auto,
             PermissionMode::Full,
         ] {
-            let http = SequencedHttpClient::new([
-                response(
-                    a,
-                    &[
-                        ("read", "run_command", json!({"command":"uname -s"})),
-                        ("write", "run_command", json!({"command":"touch /tmp/a"})),
-                        ("red", "run_command", json!({"command":"reboot"})),
-                    ],
-                    "",
-                    false,
-                ),
-                response(a, &[], "report", false),
-            ]);
-            let client = RigClient::with_http(&config(a), http.clone()).unwrap();
-            let mut inner = Inner::new([]);
-            inner.mode = mode;
-            let out = subagent::run(
-                &client,
-                request(SubagentKind::Explore),
-                context(),
-                snapshot(),
-                &inner,
-                fast_limits(),
-                |_| {},
-            )
-            .await;
-            assert_eq!(out.status, SubagentStatus::Completed);
-            assert_eq!(out.steps, 3);
-            let calls = inner.seen.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0.command, "uname -s");
-            assert_eq!(calls[0].0.target, Target::Background);
-            assert_eq!(calls[0].1.as_ref().unwrap().kind, SubagentKind::Explore);
-            assert_eq!(calls[0].1.as_ref().unwrap().id, "agent-test");
-            let second = &bodies(&http)[1];
-            for id in ["write", "red"] {
-                let text = tool_result(second, a, id);
-                assert!(
-                    text.contains("只读子任务不能执行此命令")
-                        && text.contains("如需变更请写进报告")
-                );
+            for kind in [SubagentKind::Explore, SubagentKind::General] {
+                let commands = [
+                    "pwd",
+                    "/bin/pwd",
+                    "/usr/bin/pwd",
+                    "/bin/ls -la",
+                    "bash -lc 'pwd; ls -la'",
+                    "touch /tmp/fixture",
+                    "reboot",
+                ];
+                let calls: Vec<_> = commands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, command)| (format!("call-{i}"), json!({"command":command})))
+                    .collect();
+                let wire_calls: Vec<_> = calls
+                    .iter()
+                    .map(|(id, args)| (id.as_str(), "run_command", args.clone()))
+                    .collect();
+                let http = SequencedHttpClient::new([
+                    response(a, &wire_calls, "", false),
+                    response(a, &[], "report", false),
+                ]);
+                let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+                let mut inner = Inner::new([]);
+                inner.mode = mode;
+                let out = subagent::run(
+                    &client,
+                    request(kind),
+                    context(),
+                    snapshot(),
+                    &inner,
+                    fast_limits(),
+                    |_| {},
+                )
+                .await;
+                assert_eq!(out.status, SubagentStatus::Completed);
+                let seen = inner.seen.lock().unwrap();
+                assert_eq!(seen.len(), commands.len());
+                for ((call, source), command) in seen.iter().zip(commands) {
+                    assert_eq!(call.command, command);
+                    assert_eq!(call.class, shellmate_ai::policy::classify(command));
+                    assert_eq!(call.target, Target::Background);
+                    assert_eq!(source.as_ref().unwrap().kind, SubagentKind::General);
+                }
+                assert!(!bodies(&http)[1].to_string().contains("只读子任务不能执行"));
             }
-            let rejected = out
-                .transcript
-                .entries()
-                .iter()
-                .filter(|e| matches!(e,Entry::Step(s) if s.result.is_error))
-                .count();
-            assert_eq!(rejected, 2);
         }
     }
-    // Test the wrapper directly too: no proposed call is allowed to sneak in via target/class.
+    // A caller cannot mislabel a command as ReadOnly to bypass the common approval policy.
     let inner = Inner::new([]);
-    let source = SubagentRef {
-        id: "test".into(),
-        description: "explore".into(),
-        kind: SubagentKind::Explore,
-    };
-    let child = ChildHost::new(&inner, source, snapshot());
+    let child = ChildHost::new(
+        &inner,
+        SubagentRef {
+            id: "test".into(),
+            description: "legacy".into(),
+            kind: SubagentKind::Explore,
+        },
+        snapshot(),
+    );
     let call = ToolCall {
         id: "fake".into(),
         command: "rm -rf /".into(),
@@ -489,8 +517,8 @@ async fn explore_readonly_runs_but_writes_and_redline_never_reach_approval_host(
         exec_limits: ExecLimits::default(),
         class: Class::ReadOnly,
     };
-    assert!(matches!(child.run(call).await, ToolOutcome::Failed(_)));
-    assert!(inner.seen.lock().unwrap().is_empty());
+    child.run(call).await;
+    assert_eq!(inner.seen.lock().unwrap()[0].0.class, Class::RedLine);
 }
 #[tokio::test]
 async fn general_passes_source_denial_and_background_only() {
@@ -527,7 +555,7 @@ async fn general_passes_source_denial_and_background_only() {
     }
 }
 #[tokio::test]
-async fn no_nested_agents_terminal_or_memory_writes_and_scoped_output_reads() {
+async fn memory_writes_are_inherited_while_outputs_and_execution_targets_remain_scoped() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([
             response(
@@ -582,8 +610,8 @@ async fn no_nested_agents_terminal_or_memory_writes_and_scoped_output_reads() {
         .await;
         assert_eq!(out.status, SubagentStatus::Completed);
         assert!(inner.seen.lock().unwrap().is_empty());
-        assert_eq!(inner.locals.lock().unwrap().len(), 1);
-        assert!(tool_result(&bodies(&http)[1], a, "write").contains("只允许 view"));
+        assert_eq!(inner.locals.lock().unwrap().len(), 2);
+        assert!(tool_result(&bodies(&http)[1], a, "write").contains("local result"));
         assert!(
             bodies(&http)[1]["messages"]
                 .to_string()

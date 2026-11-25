@@ -308,7 +308,7 @@ pub trait ToolHost: Send + Sync {
     ) -> BoxFuture<'_, LocalResult> {
         Box::pin(async { LocalResult::error("当前会话不支持子任务") })
     }
-    /// Source labels approvals. M2 must preserve background/explore restrictions on edits.
+    /// Source labels approvals; child commands follow the same permission policy.
     fn run_from(
         &self,
         call: ToolCall,
@@ -1417,24 +1417,18 @@ fn stream<'a>(
                                     });
                                     continue;
                                 }
-                                pending.push_back(
-                                    match parse_local(
+                                pending.push_back(match parse_local(&raw, s.limits.auto_memory) {
+                                    Ok(Some(tool)) => Pending::Local(raw, tool),
+                                    Err(error) => Pending::Invalid(raw, error),
+                                    Ok(None) => match parse_call(
                                         &raw,
-                                        s.limits.auto_memory,
-                                        s.conversation.child.is_some(),
+                                        &s.turn.as_ref().unwrap().capabilities,
+                                        s.limits.exec,
                                     ) {
-                                        Ok(Some(tool)) => Pending::Local(raw, tool),
+                                        Ok(call) => Pending::Call(raw, call),
                                         Err(error) => Pending::Invalid(raw, error),
-                                        Ok(None) => match parse_call(
-                                            &raw,
-                                            &s.turn.as_ref().unwrap().capabilities,
-                                            s.limits.exec,
-                                        ) {
-                                            Ok(call) => Pending::Call(raw, call),
-                                            Err(error) => Pending::Invalid(raw, error),
-                                        },
                                     },
-                                );
+                                });
                             }
                             AssistantContent::Text(text) if after_call => {
                                 pending.push_back(Pending::Text(text.text.clone()))
@@ -1618,7 +1612,7 @@ fn parse_call(
     })
 }
 
-fn parse_local(raw: &RigCall, auto_memory: bool, child: bool) -> Result<Option<LocalTool>, String> {
+fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
     if !matches!(name, "read_output" | "stop_task" | "memory") {
         return Ok(None);
@@ -1633,9 +1627,6 @@ fn parse_local(raw: &RigCall, auto_memory: bool, child: bool) -> Result<Option<L
         }
         let command: crate::memory::Command =
             serde_json::from_value(args).map_err(|e| format!("memory 参数无效：{e}"))?;
-        if child && !matches!(command, crate::memory::Command::View { .. }) {
-            return Err("子任务记忆只允许 view，不能写入".into());
-        }
         return Ok(Some(LocalTool::Memory(command)));
     }
     if name == "read_output" {

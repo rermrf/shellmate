@@ -7,7 +7,7 @@ use gpui::{
     prelude::*,
     *,
 };
-use shellmate_ai::{SubagentKind, SubagentStatus};
+use shellmate_ai::SubagentStatus;
 use std::collections::BTreeMap;
 
 impl Drawer {
@@ -75,13 +75,6 @@ impl Drawer {
             .items_center()
             .gap(px(5.))
             .child(agent_ui::target_chip("子任务", color))
-            .child(agent_ui::neutral_chip(
-                match view.kind {
-                    SubagentKind::Explore => "只读",
-                    SubagentKind::General => "通用",
-                },
-                &p,
-            ))
             .when(view.background, |d| {
                 d.child(agent_ui::neutral_chip("后台", &p))
             });

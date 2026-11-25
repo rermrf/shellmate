@@ -217,11 +217,8 @@ impl ToolHost for Host {
                                 call.target = target;
                                 call.timeout = call.exec_limits.timeout(Some(call.timeout.as_secs()));
                                 call.class = classify(&call.command);
-                                if let Some(source)=&source {
+                                if source.is_some() {
                                     call.target=Target::Background;
-                                    if source.kind==shellmate_ai::SubagentKind::Explore && call.class!=shellmate_ai::policy::Class::ReadOnly {
-                                        return ToolOutcome::Failed(format!("只读子任务不能执行此命令：{}；如需变更请写进报告",call.command));
-                                    }
                                 }
                             }
                             Ok(Approval::Deny { reason }) => return ToolOutcome::Denied { reason },

@@ -454,11 +454,7 @@ impl Conversation {
             request = request.tool(tool);
             if caps.available() {
                 if memory.auto_memory {
-                    request = request.tool(if self.child.is_some() {
-                        crate::memory::view_tool()
-                    } else {
-                        crate::memory::tool()
-                    });
+                    request = request.tool(crate::memory::tool());
                 }
                 if self.child.is_none()
                     && caps.background

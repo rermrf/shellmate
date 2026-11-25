@@ -37,7 +37,7 @@ pub fn duration(seconds: u64) -> String {
 pub fn status(status: &SubagentStatus, steps: usize, seconds: u64) -> (String, Color) {
     let (label, color, time) = match status {
         SubagentStatus::Running => ("运行中", Color::Accent, true),
-        SubagentStatus::Completed => ("完成", Color::Ok, true),
+        SubagentStatus::Completed => ("已结束", Color::Ok, true),
         SubagentStatus::StepLimit => ("达到步数上限", Color::Warning, false),
         SubagentStatus::Failed(_) => ("失败", Color::Error, false),
         SubagentStatus::Stopped => ("已停止", Color::Quiet, false),

@@ -82,14 +82,6 @@ pub fn tool() -> ToolDefinition {
     )
 }
 
-pub(crate) fn view_tool() -> ToolDefinition {
-    ToolDefinition::new(
-        ToolName::new("memory").unwrap(),
-        "查看本机说明与记忆，只读；子任务不能创建、修改、删除或重命名文件。",
-        serde_json::json!({"type":"object","properties":{"command":{"type":"string","enum":["view"]},"path":{"type":"string"},"view_range":{"type":"array","items":{"type":"integer","minimum":1},"minItems":2,"maxItems":2}},"required":["command","path"],"additionalProperties":false}),
-    )
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub auto_memory: bool,

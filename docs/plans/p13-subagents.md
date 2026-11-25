@@ -1,4 +1,4 @@
-# P13 AI subagents (Claude Code style)
+# P13 AI subagents (inherited capabilities)
 
 ## Goal
 Today one drawer runs one agent with one context. A long investigation, such as 「为什么 502」 across nginx, application and system logs, fills the main context with output that is only needed to reach a conclusion. Independent checks also run strictly one after another.
@@ -7,7 +7,7 @@ P13 lets the main agent delegate a self-contained task to a **subagent**:
 - The subagent has its own context window, runs its own tool loop on the **same host** in the background, and hands back **only a final report**.
 - Several subagents can run at once in the background.
 
-The design follows Claude Code (CC); Codex is a second reference.
+The current design uses default capability and permission inheritance, following Codex. Claude Code is a reference for context isolation, approvals and transcripts. The 2026-11-25 inheritance revision below supersedes the original Explore/General split.
 
 P13 builds on:
 - **P11** (`docs/plans/p11-agent-long-tasks.md`): the conversation log, compaction, background tasks, output spooling, `read_output` / `stop_task` and `/tasks`;
@@ -20,7 +20,7 @@ P13 builds on:
 | Approvals in 每步审批 | A general subagent's approval cards **pop up as usual**, labelled with the subagent that asks. |
 | Concurrency | Default **3** running subagents. A setting changes it. |
 | Model | **Same as the main conversation by default.** The main agent may pass a **model and reasoning level** when the user asks for them in the prompt. |
-| Custom subagent types | **Later, together with skills.** P13 ships two built-in types. |
+| Custom subagent types | **Later, together with skills.** New delegations are general-purpose; roles are task instructions. |
 
 ## References (verified 2026-11-25)
 **CC** ([sub-agents docs](https://code.claude.com/docs/en/sub-agents)):
@@ -59,7 +59,6 @@ P13 builds on:
 {
   "description": "一句话标题，显示在卡片上（≤ 30 字）",
   "prompt": "完整、自包含的任务说明（子任务看不到对话历史）",
-  "type": "explore | general",
   "run_in_background": false,
   "model": "可选：同一服务商下的模型 ID，仅在用户要求时填写",
   "reasoning": "可选：default | off | minimal | low | medium | high | xhigh | max（按服务商可用项）"
@@ -74,7 +73,7 @@ P13 builds on:
 - Use it for noisy, self-contained investigations, or for several independent checks in parallel (background).
 - Don't use it for a single quick command.
 - Write a self-contained prompt.
-- Prefer `explore` for read-only diagnosis.
+- Pass the user’s task, authorization and constraints explicitly. Read-only/no-edit requests remain instructions to follow; they do not select an additional command whitelist.
 - Fill `model` / `reasoning` only when the user asked for them.
 - The description names the current model and the reasoning ids valid for this provider.
 
@@ -86,9 +85,9 @@ P13 builds on:
 
 ## 2. Subagent runtime (`shellmate-ai`, new `subagent.rs`)
 **Context.** A fresh child `Conversation`. Its system prompt is:
-- the execution prompt adapted for a subagent: same host and cwd; background target only; no user interaction; it can't ask questions;
+- the main execution prompt plus delegation guidance: same host and cwd, using its independent background channel; requests requiring interactive input, clarification or further delegation are handed back to the parent;
 - the safety rules, unchanged;
-- instructions plus the memory index (P12 snapshot), **read-only**;
+- the same instructions and memory rules as the main agent;
 - the required report shape: 「结论 / 关键证据 / 执行过的变更 / 未完成或风险」.
 
 It does not see the main conversation.
@@ -97,14 +96,14 @@ It does not see the main conversation.
 - **`run_command`:** the target is fixed to **background**; the terminal is never offered.
 - **`read_output`:** its own outputs only.
 - **`stop_task`:** its own tasks only.
-- **`memory`:** `view` only.
-- **Not available:** `agent`, `propose_command` and memory writes.
+- **`memory`:** the same view/create/replace/insert/delete/rename tool as the parent, when auto memory is enabled. The same local/global and host scope, file rules, write lock and conflict checks apply.
+- **Scheduling boundary:** this implementation provides independent background execution. Shared interactive-terminal access, nested scheduling and follow-up/resume are not implemented in this revision; the parent coordinates those requests.
 
-**Types:**
-- **`explore` (只读排查):** only commands classified `ReadOnly` run.
-  - Anything else, red-line included, is **refused without asking**, returned as a tool error: 「只读子任务不能执行此命令：…；如需变更请写进报告」.
-  - In 自动审批 or 完全访问 it therefore never interrupts the user. In 每步审批 its read-only commands still ask, per the user's mode.
-- **`general` (通用):** the same `decide(mode, class)` as the main agent, under the host's current permission mode. Approvals go to the drawer labelled with the subagent (§4). Red-line commands always ask.
+**Permission inheritance:**
+- Every new delegation is general-purpose and uses the main agent's `decide(mode, class)` policy. A command that is not recognized as read-only may require approval in 自动审批, and runs normally in 完全访问, exactly as it does for the parent.
+- Source-labelled approval cards, denials and red-line confirmation use the same host path; approval edits do not enter a second child-only classifier.
+- The tool schema no longer advertises or requires `type`. Legacy `type: explore | general` calls remain accepted when continuing old conversations and normalize to general-purpose. Stored kinds remain readable as historical metadata.
+- The command classifier is used for approval decisions only, not as a child capability gate.
 
 **Model:** `model` / `reasoning` override the main `Config` for this run only.
 - They use the same provider, base URL and API key.
@@ -166,13 +165,13 @@ The drawer changes from one `active_step` to an **ordered list of pending approv
 The subagent card is a step card in the main conversation, in the same surface family as the approval card (card2 surface, same radius and padding).
 
 **Header:**
-- the 「子任务」 chip and a type chip (只读 / 通用);
+- the 「子任务」 chip; no separate 只读 / 通用 permission badge;
 - 「后台」 when the subagent runs in the background;
 - the description.
 
 **Status, on the right:**
 - 运行中 · 3 步 · 12s
-- 完成 · 8 步 · 1m02s
+- 已结束 · 8 步 · 1m02s (the agent finished its turn; the report states what was actually accomplished)
 - 失败
 - 已停止
 - 达到步数上限
@@ -205,22 +204,22 @@ Pending subagent approvals render inside the card, using the normal approval car
 **Compaction of the main log:** a subagent step is a tool result like any other, so tier 1 can clear it, keeping the head and tail lines and its output id.
 
 ## 7. Memory and safety
-- Subagents read instructions and the memory index, and may `view` memory files. **Only the main agent writes memory**; it can save conclusions from a report.
+- Subagents inherit memory settings and read/write tools. User instructions still control what may be changed; AGENTS.md edits require the same explicit request as in the parent. Concurrent mutations use the existing shared write mutex and replacement preconditions.
 - Reports are untrusted tool output, the same rule as command output. The main prompt says so.
 - Command output inside a subagent is untrusted for the subagent too, and the same red-line rules apply.
 
 ## Milestones
 | # | Scope | Main files |
 |---|---|---|
-| **M1** | **Core.** The `agent` tool schema and validation; the subagent runner; the restricted tool host; the explore/general policies; model/reasoning override; limits; compaction; partial reports; report spooling; usage. Tests run against a fake model and fake host. | `shellmate-ai` (`subagent.rs`, `agent.rs`, `conversation.rs`, `policy.rs`) |
+| **M1** | **Core.** The `agent` tool schema and validation; the subagent runner; the source-labelled tool host; inherited permission policies; model/reasoning override; limits; compaction; partial reports; report spooling; usage. Tests run against a fake model and fake host. | `shellmate-ai` (`subagent.rs`, `agent.rs`, `conversation.rs`, `policy.rs`) |
 | **M2** | **App integration.** Foreground and background execution; the agent task kind in the registry (notices, `read_output`, `stop_task`, `/tasks`); the concurrency setting; approvals with `source` and a pending list; stop and lifetime rules; persistence of child transcripts. | `shellmate/src/ai/{host,exec,tasks,panel,panel_state,agent_ui}.rs`, `shellmate-store` |
 | **M3** | **UI.** The subagent card (live, collapsed and expanded, report, stop); stacked approvals; the settings row. Proto scenes in both themes: `ai-subagent-running`, `ai-subagent-done`, `ai-subagent-approval` (two pending: main + subagent), `ai-subagent-background` (two running in the background), `ai-tasks-subagents`, `set-ai-advanced` (with the new row). | `shellmate/src/ai/*`, `proto/*` |
 
 ## Test outline
 - **Tool availability:** only in the main agent; hidden without a background target; hidden inside subagents.
 - **Validation:** model / reasoning per provider; concurrency limit error.
-- **explore:** read-only runs; write and red-line are refused without asking, in every mode.
-- **general:** follows `decide(mode, class)`; approvals carry `source`; a denial returns to the subagent.
+- **Permission parity:** normal and legacy child requests follow `decide(mode, class)` exactly as the parent; approvals carry `source`, and a denial returns to the child. Cover `pwd`, absolute paths, compound scripts, writes and red-line operations without executing unsafe test commands.
+- **Memory parity:** enabled children receive the same memory schema and operations; disabled memory stays unavailable. Verify mutations in a temporary scope and conflicting concurrent updates.
 - **Report:** the final message is returned and spooled; partial on the step limit, failure or stop; the usage footer.
 - **Override:** the request uses the override model and reasoning; the window comes from that model's settings.
 - **Background:** returns immediately; completion notice; `read_output` while running and after; `stop_task`; `/tasks`; `/clear` stops it.
@@ -262,3 +261,28 @@ Validation:
   report in both themes. Clipboard contents were restored after the checks.
 - GUI fixtures use temporary data/log/cache directories and an in-memory database.
   No live provider or SSH session was used; those paths are covered by mock tests.
+
+
+## Capability inheritance revision (2026-11-25)
+
+The project-inspection task revealed that the former Explore gate rejected `pwd`
+and `/bin/ls` as `Other` before the parent's Full-access policy could run them.
+Explore also used a reduced memory tool even though general command execution
+already shared the parent's executor. The user approved default general-purpose
+children and removal of these child-only capability restrictions.
+
+Implemented: optional legacy-type parsing, a role-free tool schema, the same
+command/approval path for all children, the complete parent memory tool, shared
+execution instructions, preserved task/output ownership, removal of the role
+badge, and an “已结束” card status that does not claim the investigation succeeded.
+
+This revision does not add a terminal scheduler, recursive delegation, messaging
+or resume; those requests are explicitly handed back to the main agent. Existing
+same-host, concurrency, context and cancellation behavior is preserved.
+
+References: [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents),
+[Claude Code available tools](https://code.claude.com/docs/en/sub-agents#available-tools).
+
+Inheritance validation: **1073 tests passed** (app 766, AI 122, core 82, store 103); five pre-existing external-integration tests remain ignored. Workspace/all-target Clippy and the application build pass offline with zero warnings. New tests cover the full parent/child approval matrix, real local project inspection using temporary files, all memory mutations, and conflicting concurrent replacements. No live provider or SSH host was contacted.
+
+Visual validation: running, ended, expanded and multi-approval subagent scenes were inspected in light and dark themes. The settings scene is pixel-identical in both themes. The mode-popover drawer is unchanged; the full-window diff is confined to a sidebar row under the mouse pointer.

@@ -41,7 +41,7 @@ fn status_colors_and_duration_boundaries() {
             "运行中 · 3 步 · 18s",
             Color::Accent,
         ),
-        (SubagentStatus::Completed, "完成 · 3 步 · 18s", Color::Ok),
+        (SubagentStatus::Completed, "已结束 · 3 步 · 18s", Color::Ok),
         (
             SubagentStatus::StepLimit,
             "达到步数上限 · 3 步",
