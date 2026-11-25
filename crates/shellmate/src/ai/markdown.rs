@@ -235,7 +235,7 @@ fn literal(text: &str) -> String {
     escaped
 }
 
-fn preprocess(source: &str, commands: &[String]) -> String {
+pub(super) fn preprocess(source: &str, commands: &[String]) -> String {
     if !source.contains("![") && !source.contains('<') && commands.is_empty() {
         return source.to_owned();
     }

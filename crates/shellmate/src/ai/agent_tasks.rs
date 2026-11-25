@@ -170,6 +170,7 @@ impl Tasks {
         let id = state.next_agent;
         state.next_agent += 1;
         let mut view = View::new(format!("agent-{id}"), request, config);
+        view.call_id = call_id.into();
         view.output_id = Some(view.id.clone());
         let cancel = Cancellation::default();
         let (sender, result) = watch::channel(None);

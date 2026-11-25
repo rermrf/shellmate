@@ -576,26 +576,11 @@ impl Drawer {
             let overflowing = self.state.overflowing_output.contains(&key);
             let drawer = cx.entity().downgrade();
             let epoch = self.epoch;
-            let content = div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap(px(8.))
-                .when(!stdout.is_empty(), |d| {
-                    d.child(div().child(crate::ai::markdown::plain(("step-stdout",key.0*1000+key.1),stdout.to_owned())))
-                })
-                .when(!stderr.is_empty(), |d| {
-                    d.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .child(div().text_color(p.err).child("标准错误"))
-                            .child(div().child(crate::ai::markdown::plain(("step-stderr",key.0*1000+key.1),stderr.to_owned()))),
-                    )
-                })
-                .when(!has_output, |d| d.child("（无输出）"));
+            let content = output_content(
+                stdout, stderr,
+                ("step-stdout",key.0*1000+key.1).into(),
+                ("step-stderr",key.0*1000+key.1).into(), &p,
+            );
             if output_view.prose {
                 card = card.child(div().w_full().min_w_0().text_size(px(12.)).line_height(px(18.))
                     .text_color(p.tx2).whitespace_normal().child(output_view.preview.to_owned()));
@@ -630,25 +615,12 @@ impl Drawer {
                         }
                     });
             card = card.child(
-                ScrollArea::new(
+                output_scroll(
                     SharedString::from(format!(
                         "{}:ai-step-output-{}-{}-{expanded}",
                         self.state.id, key.0, key.1
-                    )),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .text_size(px(12.5))
-                        .line_height(px(18.))
-                        .font_family(MONO_FONT)
-                        .whitespace_nowrap()
-                        .text_color(p.tx2)
-                        .child(measured),
-                    p.card2,
+                    )), measured, expanded, self.selection_scroll.clone(), &p,
                 )
-                .selection(self.selection_scroll.clone())
-                .height_limit(if expanded { 320. } else { 8. * 18. }, expanded),
             );
             }
             if let Some(saved) = output_view.saved {
@@ -787,7 +759,7 @@ pub(super) fn step_surface(p: &crate::theme::Palette) -> Div {
     div().p(px(10.)).rounded(px(12.)).bg(p.card2)
 }
 
-fn step_actions() -> Div {
+pub(super) fn step_actions() -> Div {
     div()
         .flex_none()
         .w_full()
@@ -818,11 +790,17 @@ pub(super) fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &Ap
 }
 
 // Keep the persisted v9 output representation compatible; labels are presentation only.
-fn output_sections(output: &str) -> (&str, &str) {
+pub(super) fn output_sections(output: &str) -> (&str, &str) {
     match output.strip_prefix("标准输出：\n") {
         Some(output) => output.split_once("\n标准错误：\n").unwrap_or((output, "")),
         None => (output, ""),
     }
+}
+pub(super) fn target_chip(label: &str, color: Hsla) -> Div {
+    div().flex_none().font_weight(FontWeight::MEDIUM).px(px(5.)).py(px(2.)).rounded(px(5.)).bg(color.opacity(0.1)).child(label.to_owned())
+}
+pub(super) fn neutral_chip(label: &str, p: &crate::theme::Palette) -> Div {
+    div().flex_none().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_size(px(10.5)).text_color(p.tx2).child(label.to_owned())
 }
 fn step_header(
     purpose: &str,
@@ -834,60 +812,32 @@ fn step_header(
     cx: &App,
 ) -> Div {
     let p = cx.palette();
-    div()
-        .flex()
-        .flex_col()
-        .min_w_0()
-        .gap(px(6.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(5.))
-                .text_size(px(11.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.))
-                        .when(source.is_some(),|d|d.min_w_0().flex_1())
-                        .children(source.map(|source|div().min_w_0().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_color(p.tx2).font_weight(FontWeight::MEDIUM).overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("子任务 · {}",source.description))))
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_weight(FontWeight::MEDIUM)
-                                .px(px(5.))
-                                .py(px(2.))
-                                .rounded(px(5.))
-                                .bg(color.opacity(0.1))
-                                .child(target.label()),
-                        )
-                        .when(automatic, |d| {
-                            d.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(5.))
-                                    .py(px(2.))
-                                    .rounded(px(5.))
-                                    .bg(p.card3)
-                                    .text_size(px(10.5))
-                                    .text_color(p.tx2)
-                                    .child("自动执行"),
-                            )
-                        }),
-                )
-                .child(div().flex_none().text_color(color).child(state.to_owned())),
-        )
-        .child(
-            div()
-                .w_full()
-                .text_color(p.tx)
-                .text_size(px(13.))
-                .line_height(px(20.8))
-                .whitespace_normal()
-                .child(purpose.to_owned()),
-        )
+    let chips = div().flex().items_center().gap(px(5.))
+        .when(source.is_some(),|d|d.min_w_0().flex_1())
+        .children(source.map(|source|div().min_w_0().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_color(p.tx2).font_weight(FontWeight::MEDIUM).overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("子任务 · {}",source.description))))
+        .child(target_chip(target.label(),color))
+        .when(automatic, |d|d.child(neutral_chip("自动执行",p)));
+    step_heading(purpose.to_owned(), chips, state, color, cx)
+}
+pub(super) fn step_heading(purpose: impl IntoElement, chips: Div, state: &str, color: Hsla, cx: &App) -> Div {
+    let p = cx.palette();
+    div().flex().flex_col().min_w_0().gap(px(6.))
+        .child(div().flex().items_center().justify_between().gap(px(5.)).text_size(px(11.))
+            .child(chips).child(div().flex_none().text_color(color).child(state.to_owned())))
+        .child(div().w_full().text_color(p.tx).text_size(px(13.)).line_height(px(20.8)).whitespace_normal().child(purpose))
+}
+/// Shared literal stdout/stderr and viewport used by command and child-step output.
+pub(super) fn output_content(stdout: &str, stderr: &str, stdout_id: ElementId, stderr_id: ElementId, p: &crate::theme::Palette) -> Div {
+    div().flex_none().flex().flex_col().items_start().gap(px(8.))
+        .when(!stdout.is_empty(), |d|d.child(div().child(crate::ai::markdown::plain(stdout_id,stdout.to_owned()))))
+        .when(!stderr.is_empty(), |d|d.child(div().flex().flex_col().gap(px(8.))
+            .child(div().text_color(p.err).child("标准错误"))
+            .child(div().child(crate::ai::markdown::plain(stderr_id,stderr.to_owned())))))
+        .when(stdout.is_empty() && stderr.is_empty(), |d|d.child("（无输出）"))
+}
+pub(super) fn output_scroll(id: SharedString, content: Div, expanded: bool, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, p: &crate::theme::Palette) -> ScrollArea {
+    ScrollArea::new(id, div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content), p.card2)
+        .selection(selection).height_limit(if expanded {320.} else {8.*18.},expanded)
 }
 fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, cx: &App) -> Div {
     let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);

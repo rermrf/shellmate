@@ -1,4 +1,4 @@
-//! M3 data API: no subagent card rendering. Live events and reopened transcript rows share this model.
+//! Live and reopened subagent cards share this model; history files load only on demand.
 use shellmate_ai::{
     AgentEvent, Entry, SubagentDisplay, SubagentRequest, SubagentStatus, Usage,
     subagent::SubagentEvent,
@@ -12,10 +12,13 @@ pub struct StepView {
     pub duration_ms: u64,
     pub output_id: Option<String>,
     pub status: shellmate_ai::StepStatus,
+    pub running: bool,
+    pub output: String,
 }
 #[derive(Clone, Debug)]
 pub struct View {
     pub id: String,
+    pub call_id: String,
     pub description: String,
     pub kind: shellmate_ai::SubagentKind,
     pub background: bool,
@@ -34,11 +37,15 @@ pub struct View {
     pub output_id: Option<String>,
     pub transcript_id: Option<String>,
     pub transcript: Option<Vec<Entry>>,
+    pub history: bool,
+    transcript_loaded: bool,
+    report_loaded: bool,
 }
 impl View {
     pub fn new(id: String, request: &SubagentRequest, config: &shellmate_ai::Config) -> Self {
         Self {
             id,
+            call_id: String::new(),
             description: request.description.clone(),
             kind: request.kind,
             background: request.background,
@@ -57,6 +64,9 @@ impl View {
             output_id: None,
             transcript_id: None,
             transcript: None,
+            history: false,
+            transcript_loaded: false,
+            report_loaded: false,
         }
     }
     pub fn event(&mut self, event: SubagentEvent<'_>) {
@@ -76,6 +86,8 @@ impl View {
                     duration_ms: 0,
                     output_id: None,
                     status: shellmate_ai::StepStatus::Background,
+                    running: true,
+                    output: String::new(),
                 });
             }
             SubagentEvent::Agent(AgentEvent::StepFinished { call, outcome }) => {
@@ -92,6 +104,8 @@ impl View {
                     duration_ms: display.duration_ms,
                     output_id,
                     status: display.status,
+                    running: false,
+                    output: display.output,
                 };
                 if let Some(old) = self.step_list.iter_mut().find(|s| s.id == call.id) {
                     *old = step;
@@ -122,6 +136,8 @@ impl View {
                 self.report = out.report.clone();
                 self.latest_activity = status_label(&self.status).into();
                 self.read_steps(out.transcript.entries());
+                self.transcript = Some(out.transcript.entries().to_vec());
+                self.transcript_loaded = true;
             }
             _ => {}
         }
@@ -138,6 +154,8 @@ impl View {
                         duration_ms: d.duration_ms,
                         output_id: s.result.output_id.clone(),
                         status: d.status.clone(),
+                        running: false,
+                        output: d.output.clone(),
                     })
                 } else {
                     None
@@ -169,6 +187,7 @@ impl View {
     ) -> Self {
         Self {
             id,
+            call_id: String::new(),
             description: display.description.clone(),
             kind: display.kind,
             background,
@@ -189,12 +208,30 @@ impl View {
             output_id: display.output_id.clone(),
             transcript_id: display.transcript_id.clone(),
             transcript: None,
+            history: true,
+            transcript_loaded: false,
+            report_loaded: false,
+        }
+    }
+    /// Load a historical full report once, keeping the inline fallback if its spool expired.
+    pub fn load_report(&mut self, root: &std::path::Path, conversation: &str) {
+        if !self.history || self.report_loaded {
+            return;
+        }
+        self.report_loaded = true;
+        if let Some(text) = self
+            .output_id
+            .as_deref()
+            .and_then(|id| saved_output(root, conversation, id))
+        {
+            self.report = text;
         }
     }
     pub fn load_transcript(&mut self, root: &std::path::Path, conversation: &str) {
-        if self.transcript.is_some() {
+        if self.transcript_loaded || self.transcript.is_some() {
             return;
         }
+        self.transcript_loaded = true;
         if let Some(entries) = self
             .transcript_id
             .as_deref()
@@ -203,6 +240,22 @@ impl View {
             self.read_steps(&entries);
             self.transcript = Some(entries);
         }
+    }
+    /// Continuing a reopened conversation registers historical tasks too. Their
+    /// one-second snapshots must not discard drawer-owned lazy reads (including misses).
+    pub fn refresh(&mut self, mut next: Self) {
+        if self.history && next.history {
+            if self.report_loaded {
+                next.report = std::mem::take(&mut self.report);
+                next.report_loaded = true;
+            }
+            if self.transcript_loaded {
+                next.transcript = self.transcript.take();
+                next.step_list = std::mem::take(&mut self.step_list);
+                next.transcript_loaded = true;
+            }
+        }
+        *self = next;
     }
     pub fn progress(&self) -> String {
         let detail = self
@@ -237,4 +290,17 @@ pub fn status_label(status: &SubagentStatus) -> &'static str {
         SubagentStatus::Stopped => "已停止",
         SubagentStatus::StepLimit => "达到步数上限",
     }
+}
+
+/// Output ids are validated by the shared spool API; never interpret arbitrary paths.
+pub fn saved_output(root: &std::path::Path, conversation: &str, id: &str) -> Option<String> {
+    use std::io::Read;
+    let path = shellmate_core::ai_output::path(root, conversation, id).ok()?;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(shellmate_core::ai_output::KEEP_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= shellmate_core::ai_output::KEEP_BYTES).then_some(text)
 }

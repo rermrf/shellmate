@@ -1,3 +1,5 @@
+#[path = "subagent_ui.rs"]
+mod subagent_ui;
 #[path = "mode_ui.rs"]
 mod mode_ui;
 #[path = "agent_ui.rs"]
@@ -137,7 +139,9 @@ impl Drawer {
                 if this
                     .update_in(cx, |s, _, cx| {
                         if let Some(tasks)=&s.tasks {
-                            for view in tasks.agent_views(){s.state.subagents.insert(view.id.clone(),view);}
+                            for view in tasks.agent_views(){
+                                if let Some(old)=s.state.subagents.get_mut(&view.id){old.refresh(view);}else{s.state.subagents.insert(view.id.clone(),view);}
+                            }
                         }
                         if !s.state.model.busy
                             && let Some(tasks) = &s.tasks
@@ -745,12 +749,6 @@ impl Drawer {
                 self.provider = c.provider;
                 self.model_id = c.model;
                 self.state.model.conversation = c.conversation;
-                for entry in self.state.model.conversation.entries() {
-                    if let shellmate_ai::Entry::Step(step)=entry && let Some(display)=&step.result.subagent {
-                        let id=display.transcript_id.clone().or_else(||display.output_id.clone()).unwrap_or_else(||step.call.id.clone());
-                        self.state.subagents.insert(id.clone(),super::subagent_view::View::reopened(id,display,step.call.args_json["run_in_background"].as_bool().unwrap_or(false),step.result.inline.clone()));
-                    }
-                }
                 self.history = false;
                 self.state.readonly = true;
                 cx.notify();
@@ -856,12 +854,20 @@ impl Drawer {
             self.state.model.clear();self.capabilities=Capabilities {terminal:true,background:true,..Default::default()};
             self.state.model.conversation.push_user(UserTurn::new("并行检查服务和日志",ContextSnapshot::default()));
             self.state.model.conversation.push_text("子任务正在后台处理。 ");
+            if let Some(fixture) = crate::proto::subagents::cards(scene) {
+                self.state.model.conversation = fixture.conversation;
+                self.state.subagents = fixture.views.into_iter().map(|v|(v.id.clone(),v)).collect();
+                self.fixture_tasks = fixture.tasks;
+                if let Some((id,step)) = fixture.expanded {
+                    let card = self.state.agent_cards.entry(id).or_default();card.open=true;card.step=Some(step);
+                }
+            }
             if scene=="ai-subagent-approval" {
                 for (source,call) in crate::proto::subagents::approvals() {
                     let key=super::host::approval_key(Some(&source),&call.id);let mut step=agent_ui::ActiveStep::new(call);step.source=Some(source.clone());
                     self.state.active_steps.insert(key,Some(source.id),step);
                 }
-            } else {self.fixture_tasks=crate::proto::subagents::tasks();}
+            } else if scene=="ai-tasks-subagents" {self.fixture_tasks=crate::proto::subagents::tasks();}
         }
         if scene==crate::proto::mode::SCENE {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
@@ -1075,6 +1081,7 @@ fn ago(time: i64) -> String {
 }
 impl Render for Drawer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let agent_items = self.prepare_subagent_cards();
         let p = cx.palette().clone();
         // Only the session label may shrink; the context prefix and line count
         // keep their intrinsic widths below the title/actions row.
@@ -1322,7 +1329,12 @@ impl Render for Drawer {
                         .gap(px(8.));
                     for (n, item) in answer.items.iter().enumerate() {
                         let card = match item {
-                            shellmate_ai::AnswerItem::Subagent { .. } => continue, // M2/M3 opt-in; no live tool or UI yet.
+                            shellmate_ai::AnswerItem::Subagent { .. } => {
+                                if let Some(view) = agent_items.get(&(index,n)).and_then(|id|self.state.subagents.get(id)) {
+                                    reply = reply.child(self.subagent_card(view, window, cx));
+                                }
+                                continue;
+                            }
                             shellmate_ai::AnswerItem::Compaction(c) => {
                                 let key = (index, n);
                                 let expanded = self.state.expanded_summaries.contains(&key);
@@ -1451,6 +1463,11 @@ impl Render for Drawer {
                     }
                     body = body.child(reply);
                 }
+            }
+            // The awaited foreground call has not produced its Step yet. Keep its
+            // live card at that position, before pending approvals, without a duplicate.
+            for view in self.state.subagents.values().filter(|v| !v.history && !agent_items.values().any(|id|id==&v.id)) {
+                body = body.child(self.subagent_card(view,window,cx));
             }
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
             if self.state.continuation.is_some() {
