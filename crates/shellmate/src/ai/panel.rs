@@ -58,6 +58,8 @@ pub struct Drawer {
     compact_queue: Arc<Mutex<Option<Option<String>>>>,
     data_root: std::path::PathBuf,
     tasks: Option<super::tasks::Tasks>,
+    task_ui: Option<async_channel::Sender<super::host::Ui>>,
+    main_cancel: shellmate_ai::subagent::Cancellation,
     fixture_tasks: Vec<super::tasks::TaskInfo>,
     fixture_context: Option<shellmate_ai::ContextBreakdown>,
     save_conversations: bool,
@@ -134,11 +136,14 @@ impl Drawer {
                     .await;
                 if this
                     .update_in(cx, |s, _, cx| {
+                        if let Some(tasks)=&s.tasks {
+                            for view in tasks.agent_views(){s.state.subagents.insert(view.id.clone(),view);}
+                        }
                         if !s.state.model.busy
                             && let Some(tasks) = &s.tasks
                         {
                             let notices = tasks.take_notices();
-                            let changed = !notices.is_empty();
+                            let changed = tasks.sync_agents(&mut s.state.model.conversation) || !notices.is_empty();
                             for text in notices {
                                 s.state
                                     .model
@@ -170,6 +175,8 @@ impl Drawer {
             compact_queue: Default::default(),
             data_root,
             tasks: None,
+            task_ui: None,
+            main_cancel: Default::default(),
             fixture_tasks: Vec::new(),
             fixture_context: None,
             state: state::ConversationState::default(),
@@ -312,7 +319,7 @@ impl Drawer {
         }
         self.state.readonly = false;
         self.state.continuation = None;
-        self.state.active_step = None;
+        self.state.active_steps.clear_main();
         self.state.pending = true;
         self.history = false;
         self.state.model.error = None;
@@ -446,6 +453,7 @@ impl Drawer {
         };
         self.ensure_tasks();
         if let Some(tasks) = &self.tasks {
+            tasks.sync_agents(&mut self.state.model.conversation);
             for text in tasks.take_notices() {
                 self.state
                     .model
@@ -459,7 +467,9 @@ impl Drawer {
         let mut conversation = self.state.model.conversation.clone();
         let (tx, rx) = async_channel::bounded(64);
         let epoch = self.epoch;
-        let (ui, messages) = async_channel::unbounded();
+        let ui=if let Some(ui)=&self.task_ui {ui.clone()} else {
+            let (ui,messages)=async_channel::unbounded();self.bridge(messages,self.state.id.clone(),w,cx);self.task_ui=Some(ui.clone());ui
+        };
         let binding = self.binding.clone();
         let capabilities = binding
             .as_ref()
@@ -470,7 +480,25 @@ impl Drawer {
             .as_ref()
             .map(|b| b.alive.clone())
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let keep_limits = self.state.continuation.is_some() || self.state.compaction_focus.is_some();
+        let compact_focus = self.state.compaction_focus.take();
+        let continuation = if compact_focus.is_none() { self.state.continuation.take() } else { None };
+        let limits = if keep_limits {
+            self.state.run_limits.unwrap_or_else(|| self.db.borrow().ai_settings().unwrap_or_default().limits())
+        } else {
+            self.db.borrow().ai_settings().unwrap_or_default().limits()
+        };
+        let settings=if keep_limits {self.state.run_subagent_settings.clone().unwrap_or_else(||self.db.borrow().ai_settings().unwrap_or_default())}else{self.db.borrow().ai_settings().unwrap_or_default()};
+        self.state.run_subagent_settings=Some(settings.clone());
+        let memory_snapshot=conversation.memory_snapshot().cloned().unwrap_or_else(||shellmate_ai::memory::Snapshot::load(&self.memory_files(),&self.label,limits.auto_memory));
+        self.main_cancel=Default::default();
+        let subagents=binding.as_ref().filter(|b|b.capabilities.background).map(|binding|Arc::new(super::subagents::Service {
+            tasks:self.tasks.as_ref().unwrap().clone(),config:config.clone(),settings,limits,db:self.db.clone(),snapshot:Arc::new(Mutex::new(memory_snapshot)),
+            context:conversation.latest_user().map(|u|u.context.clone()).unwrap_or_default(),binding:binding.clone(),memory:self.memory_files(),
+            ui:ui.clone(),mode:self.mode.clone(),cancel:self.main_cancel.clone(),factory:Arc::new(RigClient::new),
+        }));
         let executor = super::exec::AppExecutor {
+            subagents,
             memory: Some((self.memory_files(), self.label.clone())),
             tasks: self.tasks.as_ref().unwrap().clone(),
             binding: binding.unwrap_or(super::exec::Binding {
@@ -489,15 +517,6 @@ impl Drawer {
             executor: Box::new(executor),
             alive,
             resolved: Mutex::new(None),
-        };
-        self.bridge(messages, epoch, w, cx);
-        let keep_limits = self.state.continuation.is_some() || self.state.compaction_focus.is_some();
-        let compact_focus = self.state.compaction_focus.take();
-        let continuation = if compact_focus.is_none() { self.state.continuation.take() } else { None };
-        let limits = if keep_limits {
-            self.state.run_limits.unwrap_or_else(|| self.db.borrow().ai_settings().unwrap_or_default().limits())
-        } else {
-            self.db.borrow().ai_settings().unwrap_or_default().limits()
         };
         self.state.run_limits = Some(limits);
         self.state.run_budget = None;
@@ -586,11 +605,11 @@ impl Drawer {
             .remember_outputs(&self.state.model.conversation);
     }
     fn retire_tasks(&mut self) {
-        if let Some(tasks) = self.tasks.take() {
-            tasks.stop_all();
-        }
+        self.task_ui=None;
+        if let Some(tasks) = self.tasks.take() { tasks.retire(); }
     }
     fn close_outputs(&mut self) {
+        if !saving_enabled(&self.db) && let Some(tasks)=&self.tasks {tasks.discard();}
         self.retire_tasks();
         if !self.fixture
             && let Err(e) = shellmate_core::ai_output::close_conversation(
@@ -619,8 +638,9 @@ impl Drawer {
         );
     }
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(tasks) = &self.tasks {
-            tasks.stop_all();
+        self.main_cancel.cancel();
+        if self.tasks.as_ref().is_some_and(|tasks|tasks.stop_foreground()) {
+            self.state.active_steps.clear_main();cx.notify();return;
         }
         if let Some(abort) = self.abort.take() {
             abort.abort();
@@ -629,7 +649,7 @@ impl Drawer {
         self.compact_queue.lock().unwrap().take();
         self.state.continuation = None;
         self.state.run_config = None;
-        if let Some(step) = self.state.active_step.take() {
+        if let Some(step) = self.state.active_steps.take_main() {
             let display = shellmate_ai::StepDisplay::from_item(
                 shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call),
             );
@@ -658,9 +678,14 @@ impl Drawer {
         self.release_context(cx);
         cx.notify();
     }
+    pub(crate) fn discard_and_clear(&mut self, cx: &mut Context<Self>) {
+        if let Some(tasks)=&self.tasks {tasks.discard();}
+        self.clear(cx);
+    }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.selection_scroll.update(cx, |s, _| s.stop());
         self.stop(cx);
+        if let Some(abort)=self.abort.take(){abort.abort();}self.epoch+=1;
         self.close_outputs();
         self.state.reset_conversation();
         self.popup.escape();
@@ -720,6 +745,12 @@ impl Drawer {
                 self.provider = c.provider;
                 self.model_id = c.model;
                 self.state.model.conversation = c.conversation;
+                for entry in self.state.model.conversation.entries() {
+                    if let shellmate_ai::Entry::Step(step)=entry && let Some(display)=&step.result.subagent {
+                        let id=display.transcript_id.clone().or_else(||display.output_id.clone()).unwrap_or_else(||step.call.id.clone());
+                        self.state.subagents.insert(id.clone(),super::subagent_view::View::reopened(id,display,step.call.args_json["run_in_background"].as_bool().unwrap_or(false),step.result.inline.clone()));
+                    }
+                }
                 self.history = false;
                 self.state.readonly = true;
                 cx.notify();
@@ -739,6 +770,7 @@ impl Drawer {
         match deleted {
             Ok(current) => {
                 if current {
+                    if let Some(tasks)=&self.tasks {tasks.discard();}
                     self.retire_tasks();
                 }
                 if let Err(e) = shellmate_core::ai_output::delete_conversation(&self.data_root, id)
@@ -819,6 +851,18 @@ impl Drawer {
         self.fixture_tasks.clear();
         self.fixture_context = None;
         self.fixture_copy = Default::default();
+        if crate::proto::subagents::SCENES.contains(&scene) {
+            self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
+            self.state.model.clear();self.capabilities=Capabilities {terminal:true,background:true,..Default::default()};
+            self.state.model.conversation.push_user(UserTurn::new("并行检查服务和日志",ContextSnapshot::default()));
+            self.state.model.conversation.push_text("子任务正在后台处理。 ");
+            if scene=="ai-subagent-approval" {
+                for (source,call) in crate::proto::subagents::approvals() {
+                    let key=super::host::approval_key(Some(&source),&call.id);let mut step=agent_ui::ActiveStep::new(call);step.source=Some(source.clone());
+                    self.state.active_steps.insert(key,Some(source.id),step);
+                }
+            } else {self.fixture_tasks=crate::proto::subagents::tasks();}
+        }
         if scene==crate::proto::mode::SCENE {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
             self.state.model.clear();self.state.model.conversation=crate::proto::mode::conversation();
@@ -860,7 +904,7 @@ impl Drawer {
             self.protocol = "SSH".into();
             self.history = false;
             self.state.readonly = false;
-            self.state.active_step = None;
+            self.state.active_steps.clear_main();
             self.capabilities = Capabilities {
                 terminal: true,
                 background: true,
@@ -873,7 +917,7 @@ impl Drawer {
             self.history = false;
             self.state.readonly = false;
             self.state.pending = false;
-            self.state.active_step = None;
+            self.state.active_steps.clear_main();
             self.state.continuation = None;
             self.state.run_config = None;
             self.state.expanded_summaries.clear();
@@ -1422,7 +1466,7 @@ impl Render for Drawer {
             }
             if self.state.model.compacting || self.state.pending
                 || (self.state.model.busy
-                    && self.state.active_step.is_none()
+                    && self.state.active_steps.is_empty()
                     && self
                         .state
                         .model
@@ -1473,8 +1517,8 @@ impl Render for Drawer {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e.clone()));
         }
         // Keep the blocking card last so following the bottom reveals all its actions.
-        if !self.history && self.state.active_step.is_some() {
-            body = body.child(self.active_card(cx));
+        if !self.history {
+            for (key,_) in self.state.active_steps.iter() { body=body.child(self.active_card(key,cx)); }
         }
         // M1's single-line Input ignores h(32); the 30px action determines the row.
         // Clip the expanded inner editor at the field edge, before the button gap.

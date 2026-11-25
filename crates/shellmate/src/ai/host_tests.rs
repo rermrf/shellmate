@@ -289,6 +289,7 @@ async fn memory_uses_local_executor_without_approval_or_task_registration() {
             compaction: Default::default(),
             mode: Arc::new(Mutex::new(mode)),
             executor: Box::new(crate::ai::exec::AppExecutor {
+                subagents: None,
                 memory: Some((files.clone(), "local".into())),
                 tasks: tasks.clone(),
                 binding: crate::ai::exec::Binding {

@@ -202,20 +202,52 @@ pub async fn disconnected(alive: &AtomicBool) {
 }
 #[derive(Clone)]
 pub struct AppExecutor {
+    pub subagents: Option<Arc<super::subagents::Service>>,
     pub memory: Option<(shellmate_core::memory::Memory, String)>,
     pub binding: Binding,
     pub tasks: super::tasks::Tasks,
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn subagents(&self) -> bool {
+        self.subagents.as_ref().is_some_and(|s| s.supported())
+    }
+    fn subagent(
+        &self,
+        request: shellmate_ai::SubagentRequest,
+        call_id: &str,
+    ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        match &self.subagents {
+            Some(service) => service.start(request, call_id),
+            None => Box::pin(async {
+                shellmate_ai::agent::LocalResult::error("当前会话不支持子任务")
+            }),
+        }
+    }
+    fn cancelled(&self) -> bool {
+        self.subagents
+            .as_ref()
+            .is_some_and(|s| s.cancel.is_cancelled())
+    }
+    fn subagent_results(&self) -> Vec<(String, shellmate_ai::LoggedResult)> {
+        self.tasks.agent_updates()
+    }
+    fn finish_subagent(&self) {
+        self.tasks.stop_all();
+    }
+
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
-        self.memory.as_ref().map_or_else(
+        let snapshot = self.memory.as_ref().map_or_else(
             || shellmate_ai::memory::Snapshot {
                 auto_memory,
                 ..Default::default()
             },
             |(memory, label)| shellmate_ai::memory::Snapshot::load(memory, label, auto_memory),
-        )
+        );
+        if let Some(service) = &self.subagents {
+            *service.snapshot.lock().unwrap() = snapshot.clone();
+        }
+        snapshot
     }
     fn output_id(&self, call: &ToolCall) -> Option<String> {
         self.tasks.output_id_for(&call.id)

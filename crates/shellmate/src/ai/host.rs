@@ -16,16 +16,20 @@ pub enum Ui {
         reply: oneshot::Sender<Option<shellmate_ai::ContextSnapshot>>,
     },
     Approval {
+        source: Option<shellmate_ai::SubagentRef>,
         call: ToolCall,
         redline: bool,
         reply: oneshot::Sender<Approval>,
     },
     Running {
+        source: Option<shellmate_ai::SubagentRef>,
         call: ToolCall,
         automatic: bool,
         ready: oneshot::Sender<()>,
     },
     CancelApproval(String),
+    CancelSource(String),
+    Finished(String),
     LocalCwd {
         session: usize,
         reply: oneshot::Sender<Option<String>>,
@@ -44,6 +48,26 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn subagents(&self) -> bool {
+        false
+    }
+    fn subagent(
+        &self,
+        _request: shellmate_ai::SubagentRequest,
+        _call_id: &str,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        Box::pin(async {
+            shellmate_ai::agent::LocalResult::error("当前会话不支持子任务")
+        })
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+    fn subagent_results(&self) -> Vec<(String, shellmate_ai::LoggedResult)> {
+        vec![]
+    }
+    fn finish_subagent(&self) {}
+
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
         shellmate_ai::memory::Snapshot {
             auto_memory,
@@ -89,7 +113,40 @@ impl Drop for PendingGuard {
         }
     }
 }
+pub fn approval_key(source: Option<&shellmate_ai::SubagentRef>, id: &str) -> String {
+    source.map_or_else(|| id.into(), |s| format!("{}:{id}", s.id))
+}
+struct RunningGuard {
+    ui: async_channel::Sender<Ui>,
+    key: String,
+}
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let _ = self.ui.try_send(Ui::Finished(self.key.clone()));
+    }
+}
 impl ToolHost for Host {
+    fn subagents(&self) -> bool {
+        self.executor.subagents()
+    }
+    fn subagent(
+        &self,
+        request: shellmate_ai::SubagentRequest,
+        call_id: &str,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        self.executor.subagent(request, call_id)
+    }
+    fn cancelled(&self) -> bool {
+        self.executor.cancelled()
+    }
+    fn subagent_results(&self) -> Vec<(String, shellmate_ai::LoggedResult)> {
+        self.executor.subagent_results()
+    }
+    fn finish_subagent(&self, source: &shellmate_ai::SubagentRef) {
+        self.executor.finish_subagent();
+        let _ = self.ui.try_send(Ui::CancelSource(source.id.clone()));
+    }
+
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
         self.executor.memory_snapshot(auto_memory)
     }
@@ -130,18 +187,27 @@ impl ToolHost for Host {
             receive.await.ok().flatten()
         })
     }
-    fn run(&self, mut call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        self.run_from(call, None)
+    }
+    fn run_from(
+        &self,
+        mut call: ToolCall,
+        source: Option<shellmate_ai::SubagentRef>,
+    ) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
             tokio::select! {
                 biased;
                 () = super::exec::disconnected(&self.alive) => ToolOutcome::Disconnected,
                 out = async {
+                    if source.is_some(){call.target=Target::Background;}
                     call.class = classify(&call.command);
+                    let key=approval_key(source.as_ref(),&call.id);
                     let decision = decide(*self.mode.lock().unwrap(), call.class);
                     if decision != Decision::Run {
-                        let mut guard = PendingGuard { ui: self.ui.clone(), id: call.id.clone(), armed: true };
+                        let mut guard = PendingGuard { ui: self.ui.clone(), id: key.clone(), armed: true };
                         let (reply, receive) = oneshot::channel();
-                        if self.ui.send(Ui::Approval { call: call.clone(), redline: decision == Decision::AskRedLine, reply }).await.is_err() { return ToolOutcome::Disconnected; }
+                        if self.ui.send(Ui::Approval { source: source.clone(), call: call.clone(), redline: decision == Decision::AskRedLine, reply }).await.is_err() { return ToolOutcome::Disconnected; }
                         let approval = receive.await;
                         guard.armed = false;
                         match approval {
@@ -151,6 +217,12 @@ impl ToolHost for Host {
                                 call.target = target;
                                 call.timeout = call.exec_limits.timeout(Some(call.timeout.as_secs()));
                                 call.class = classify(&call.command);
+                                if let Some(source)=&source {
+                                    call.target=Target::Background;
+                                    if source.kind==shellmate_ai::SubagentKind::Explore && call.class!=shellmate_ai::policy::Class::ReadOnly {
+                                        return ToolOutcome::Failed(format!("只读子任务不能执行此命令：{}；如需变更请写进报告",call.command));
+                                    }
+                                }
                             }
                             Ok(Approval::Deny { reason }) => return ToolOutcome::Denied { reason },
                             Err(_) => return ToolOutcome::Denied { reason: Some("审批已取消".into()) },
@@ -158,7 +230,8 @@ impl ToolHost for Host {
                     }
                     *self.resolved.lock().unwrap() = Some((call.clone(), decision == Decision::Run));
                     let (ready, receive) = oneshot::channel();
-                    if self.ui.send(Ui::Running { call: call.clone(), automatic: decision == Decision::Run, ready }).await.is_err() || receive.await.is_err() { return ToolOutcome::Disconnected; }
+                    if self.ui.send(Ui::Running { source: source.clone(), call: call.clone(), automatic: decision == Decision::Run, ready }).await.is_err() || receive.await.is_err() { return ToolOutcome::Disconnected; }
+                    let _guard=source.as_ref().map(|_|RunningGuard {ui:self.ui.clone(),key});
                     self.executor.execute(call).await
                 } => out,
             }

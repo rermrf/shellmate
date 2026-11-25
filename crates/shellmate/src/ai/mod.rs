@@ -152,3 +152,7 @@ pub(crate) mod memory_manager;
 
 pub(crate) mod mode_popover;
 pub(crate) mod memory_edit;
+pub(crate) mod subagent_view;
+mod subagent_files;
+pub(crate) mod subagents;
+pub(crate) mod approvals;

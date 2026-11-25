@@ -11,6 +11,7 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) context_popover: crate::ai::context_view::Popover,
     pub(super) local_cards: Vec<super::slash_ui::LocalCard>,
     pub(super) run_limits: Option<agent::Limits>,
+    pub(super) run_subagent_settings: Option<shellmate_store::ai::Settings>,
     pub(super) run_budget: Option<(shellmate_ai::ContextBudget, shellmate_ai::WindowSource)>,
     pub(super) id: String,
     pub(super) created: i64,
@@ -18,7 +19,8 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) pending: bool,
     pub(super) queued: Option<UserTurn>,
     pub(super) follow_bottom: bool,
-    pub(super) active_step: Option<ActiveStep>,
+    pub(super) active_steps: crate::ai::approvals::Queue<ActiveStep>,
+    pub(super) subagents: std::collections::BTreeMap<String, crate::ai::subagent_view::View>,
     pub(super) expanded: HashSet<(usize, usize)>,
     pub(super) overflowing_output: HashSet<(usize, usize)>,
     pub(super) expanded_commands: HashSet<(usize, usize)>,
@@ -39,6 +41,7 @@ impl<R> Default for ConversationState<R> {
             context_popover: Default::default(),
             local_cards: Vec::new(),
             run_limits: None,
+            run_subagent_settings: None,
             run_budget: None,
             id: shellmate_core::HostId::generate().to_string(),
             created: crate::ai::now(),
@@ -46,7 +49,8 @@ impl<R> Default for ConversationState<R> {
             pending: false,
             queued: None,
             follow_bottom: true,
-            active_step: None,
+            active_steps: Default::default(),
+            subagents: Default::default(),
             expanded: HashSet::new(),
             overflowing_output: HashSet::new(),
             expanded_commands: HashSet::new(),
@@ -123,7 +127,7 @@ impl<R> ConversationState<R> {
             || self.save_error.is_some();
         let running = self.model.busy
             || self.pending
-            || self.active_step.is_some()
+            || !self.active_steps.is_empty()
             || self.continuation.is_some();
         new_conversation_action(has_content, running, history_open)
     }
@@ -167,6 +171,16 @@ pub(super) fn new_conversation_confirmation(save_conversations: bool) -> &'stati
 
 #[cfg(test)]
 mod tests {
+    fn approval_fixture(
+        step: Option<super::ActiveStep>,
+    ) -> crate::ai::approvals::Queue<super::ActiveStep> {
+        let mut queue = crate::ai::approvals::Queue::default();
+        if let Some(step) = step {
+            queue.insert(step.call.id.clone(), None, step);
+        }
+        queue
+    }
+
     use super::*;
     use shellmate_ai::{
         AiError, ContextSnapshot, Event,
@@ -214,7 +228,7 @@ mod tests {
                     ..Default::default()
                 },
                 pending: flags & 2 != 0,
-                active_step: (flags & 4 != 0).then(step),
+                active_steps: approval_fixture((flags & 4 != 0).then(step)),
                 continuation: (flags & 8 != 0).then_some(()),
                 ..Default::default()
             };
@@ -303,7 +317,7 @@ mod tests {
             continuation: Some(ResumeMarker(dropped.clone())),
             resume_steps: 20,
             queued: Some(UserTurn::new("queued", ContextSnapshot::default())),
-            active_step: Some(step()),
+            active_steps: approval_fixture(Some(step())),
             pending: true,
             follow_bottom: false,
             ..Default::default()
@@ -338,7 +352,7 @@ mod tests {
         assert!(state.model.meter.is_none());
         assert!(state.model.error.is_none() && state.save_error.is_none());
         assert!(
-            state.queued.is_none() && state.active_step.is_none() && state.run_config.is_none()
+            state.queued.is_none() && state.active_steps.is_empty() && state.run_config.is_none()
         );
         assert!(state.expanded.is_empty() && state.expanded_commands.is_empty());
         assert!(state.overflowing_output.is_empty() && state.overflowing_commands.is_empty());

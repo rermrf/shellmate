@@ -15,6 +15,7 @@ pub struct Settings {
     pub reasoning: ReasoningLevel,
     pub save_conversations: bool,
     pub auto_memory: bool,
+    pub subagent_limit: usize,
     pub context_window: shellmate_ai::ContextWindow,
     pub autocompact_window: shellmate_ai::ContextWindow,
     pub max_output_tokens: shellmate_ai::OutputTokens,
@@ -29,6 +30,7 @@ impl Default for Settings {
             reasoning: ReasoningLevel::Default,
             save_conversations: true,
             auto_memory: true,
+            subagent_limit: 3,
             context_window: Default::default(),
             autocompact_window: Default::default(),
             max_output_tokens: Default::default(),
@@ -223,11 +225,33 @@ impl HostStore {
         let tx = self.conn.transaction()?;
         tx.execute("INSERT INTO ai_conversations VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,session_label=excluded.session_label,provider=excluded.provider,model=excluded.model,updated_at=excluded.updated_at",params![c.id,c.host_id,c.label,c.title,c.provider,c.model,c.created_at,c.updated_at])?;
         for (position, entry) in c.conversation.entries().iter().enumerate() {
+            // A worker can finish between the drawer's clone and this save. Never replace
+            // its terminal result with an older Running result from that clone.
+            if matches!(entry,shellmate_ai::Entry::Step(step) if step.result.subagent.as_ref().is_some_and(|d|d.status==shellmate_ai::SubagentStatus::Running)) {
+                let old:Option<String>=tx.query_row("SELECT json FROM ai_log WHERE conversation_id=?1 AND position=?2",params![c.id,position as i64],|r|r.get(0)).optional()?;
+                if old.and_then(|json|serde_json::from_str::<shellmate_ai::Entry>(&json).ok()).is_some_and(|old|matches!(old,shellmate_ai::Entry::Step(step) if step.result.subagent.as_ref().is_some_and(|d|d.status!=shellmate_ai::SubagentStatus::Running))) {continue;}
+            }
             let json = serde_json::to_string(entry).map_err(|_| StoreError::Corrupt("无法编码 AI 日志".into()))?;
             tx.execute("INSERT INTO ai_log(conversation_id,position,kind,json,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(conversation_id,position) DO UPDATE SET kind=excluded.kind,json=excluded.json WHERE ai_log.kind<>excluded.kind OR ai_log.json<>excluded.json", params![c.id, position as i64, entry.kind(), json, c.updated_at])?;
         }
         tx.commit()?;
         Ok(true)
+    }
+    /// Background child completion may arrive after its drawer has switched conversations.
+    /// Update only the original agent Step; never recreate a deleted conversation.
+    pub fn finish_ai_subagent(&mut self, conversation: &str, call_id: &str, result: &shellmate_ai::LoggedResult) -> Result<()> {
+        let rows = self.conn.prepare("SELECT position,json FROM ai_log WHERE conversation_id=?1 AND kind='step'")?
+            .query_map([conversation], |row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (position,json) in rows {
+            let mut entry: shellmate_ai::Entry=serde_json::from_str(&json).map_err(|_|StoreError::Corrupt("AI 日志损坏".into()))?;
+            if let shellmate_ai::Entry::Step(step)=&mut entry && step.call.name=="agent" && step.call.id==call_id {
+                step.result=result.clone();
+                let json=serde_json::to_string(&entry).map_err(|_|StoreError::Corrupt("无法编码 AI 日志".into()))?;
+                self.conn.execute("UPDATE ai_log SET json=?3 WHERE conversation_id=?1 AND position=?2",params![conversation,position,json])?;
+                break;
+            }
+        }
+        Ok(())
     }
     pub fn ai_conversations(&self) -> Result<Vec<ConversationSummary>> {
         Ok(self.conn.prepare("SELECT id,session_label,title,updated_at FROM ai_conversations ORDER BY updated_at DESC,id")?.query_map([],|r|Ok(ConversationSummary{id:r.get(0)?,label:r.get(1)?,title:r.get(2)?,updated_at:r.get(3)?}))?.collect::<rusqlite::Result<_>>()?)

@@ -281,17 +281,7 @@ impl Drawer {
                         }
                         for (n, task) in tasks.into_iter().enumerate() {
                             let running = task.status == Status::Running;
-                            let status = match task.status {
-                                Status::Running => {
-                                    format!("运行中 · {}s", task.started.elapsed().as_secs())
-                                }
-                                Status::Exited(code) => format!(
-                                    "已完成 · 退出码 {}",
-                                    code.map_or_else(|| "未知".into(), |n| n.to_string())
-                                ),
-                                Status::Stopped => "已停止".into(),
-                                Status::Disconnected => "连接已断开".into(),
-                            };
+                            let status = task.status_text();
                             let id = task.id.clone();
                             card = card.child(
                                 div()
@@ -307,7 +297,7 @@ impl Drawer {
                                             .child(div().flex_1().child(format!(
                                                 "任务 #{} · {}",
                                                 task.id,
-                                                task.target.label()
+                                                task.target_label()
                                             )))
                                             .when(running, |d| {
                                                 d.child(

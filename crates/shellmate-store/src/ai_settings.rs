@@ -27,6 +27,7 @@ fn key(prefix: &str, s: &Settings) -> String {
 impl Settings {
     pub fn normalized(&self) -> Self {
         let mut s = self.clone();
+        s.subagent_limit = s.subagent_limit.clamp(1, 8);
         s.context_window = window(Some(window_text(s.context_window)));
         let w = resolve_window(&s.provider, &s.model, s.context_window).0;
         s.autocompact_window = match auto_window(Some(window_text(s.autocompact_window))) {
@@ -67,6 +68,24 @@ impl Settings {
     }
 }
 impl HostStore {
+    /// Snapshot effective per-model budgets without changing provider, URL, key or global limits.
+    pub fn subagent_config(
+        &self,
+        main: &shellmate_ai::Config,
+        request: &shellmate_ai::SubagentRequest,
+    ) -> Result<shellmate_ai::Config> {
+        let mut config = main.with_override(request.model.as_deref(), request.reasoning);
+        let s = self.ai_model_settings(&Settings {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            ..Settings::default()
+        })?;
+        config.context_window = s.context_window;
+        config.autocompact_window = s.autocompact_window;
+        config.max_output_tokens = s.max_output_tokens;
+        Ok(config)
+    }
+
     pub fn set_auto_memory(&mut self, enabled: bool) -> Result<()> {
         self.set_setting("ai_auto_memory", if enabled { "true" } else { "false" })
     }
@@ -82,6 +101,11 @@ impl HostStore {
     }
     pub(super) fn read_ai_limits(&self, s: &mut Settings) -> Result<()> {
         s.auto_memory = self.setting("ai_auto_memory")?.as_deref() != Some("false");
+        s.subagent_limit = self
+            .setting("ai_subagent_limit")?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(3)
+            .clamp(1, 8) as usize;
         s.max_steps = number(self.setting("ai_max_steps")?, 1, 10_000).map(|n| n as usize);
         s.exec.tool_output_chars =
             number(self.setting("ai_tool_output_chars")?, 1000, 150_000).unwrap_or(30_000) as usize;
@@ -97,6 +121,7 @@ pub(super) fn save_limits(tx: &Transaction<'_>, s: &Settings) -> Result<()> {
     let s = s.normalized();
     for (key, value) in [
         ("ai_auto_memory".into(), s.auto_memory.to_string()),
+        ("ai_subagent_limit".into(), s.subagent_limit.to_string()),
         (key("ai_context_window", &s), window_text(s.context_window)),
         (
             key("ai_autocompact_window", &s),
@@ -253,5 +278,54 @@ mod memory_tests {
         assert!(!store.ai_settings_for_provider(true).unwrap().auto_memory);
         store.save_ai_settings(&Settings::default()).unwrap();
         assert!(store.ai_settings().unwrap().auto_memory);
+    }
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::*;
+    #[test]
+    fn global_limit_clamps_and_model_override_uses_its_stored_budgets() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        assert_eq!(db.ai_settings().unwrap().subagent_limit, 3);
+        for (value, expected) in [("bad", 3), ("0", 1), ("-7", 1), ("99", 8), ("5", 5)] {
+            db.set_setting("ai_subagent_limit", value).unwrap();
+            assert_eq!(db.ai_settings().unwrap().subagent_limit, expected);
+        }
+        let settings = Settings {
+            model: "child".into(),
+            context_window: ContextWindow::Tokens(400000),
+            autocompact_window: ContextWindow::Tokens(200000),
+            max_output_tokens: OutputTokens::Tokens(8192),
+            subagent_limit: 6,
+            ..Default::default()
+        };
+        db.save_ai_settings(&settings).unwrap();
+        assert_eq!(db.ai_settings().unwrap().subagent_limit, 6);
+        let main = shellmate_ai::Config {
+            provider: settings.provider.clone(),
+            model: "parent".into(),
+            api_key: shellmate_ai::ApiKey::new("fixture"),
+            reasoning: Default::default(),
+            max_output_tokens: Default::default(),
+            context_window: ContextWindow::Tokens(128000),
+            autocompact_window: Default::default(),
+            timeouts: Default::default(),
+        };
+        let request = shellmate_ai::SubagentRequest {
+            description: "test".into(),
+            prompt: "test".into(),
+            kind: shellmate_ai::SubagentKind::Explore,
+            background: false,
+            model: Some("child".into()),
+            reasoning: Some(shellmate_ai::ReasoningLevel::High),
+        };
+        let effective = db.subagent_config(&main, &request).unwrap();
+        assert_eq!(effective.model, "child");
+        assert_eq!(effective.context_window, settings.context_window);
+        assert_eq!(effective.autocompact_window, settings.autocompact_window);
+        assert_eq!(effective.max_output_tokens, settings.max_output_tokens);
+        assert_eq!(effective.api_key.expose(), "fixture");
+        assert_eq!(effective.provider, main.provider);
     }
 }

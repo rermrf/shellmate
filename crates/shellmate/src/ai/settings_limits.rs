@@ -17,6 +17,7 @@ pub(super) struct Fields {
     pub choices: [Choice; 4],
     pub inputs: [Entity<InputState>; 7],
     pub advanced: bool,
+    pub subagent_limit: usize,
 }
 fn choices(s: &Settings) -> [Choice; 4] {
     [
@@ -72,6 +73,7 @@ impl Fields {
                 })
             }),
             advanced: false,
+            subagent_limit: s.subagent_limit,
         }
     }
     pub fn load_model(&mut self, s: &Settings, w: &mut Window, cx: &mut Context<AiSettings>) {
@@ -83,6 +85,7 @@ impl Fields {
         }
     }
     pub fn normalize_inputs(&mut self, s: &Settings, w: &mut Window, cx: &mut Context<AiSettings>) {
+        self.subagent_limit = s.subagent_limit;
         let choices = choices(s);
         for (i, choice) in choices.into_iter().enumerate() {
             if self.choices[i] != Choice::Custom || choice == Choice::Auto {
@@ -100,6 +103,7 @@ impl Fields {
             Choice::Fixed(n) => ContextWindow::Tokens(n),
             Choice::Custom => ContextWindow::Tokens(n(i).saturating_mul(1000)),
         };
+        s.subagent_limit = self.subagent_limit;
         s.context_window = window(0);
         s.autocompact_window = window(1);
         s.max_steps = match self.choices[2] {
@@ -351,7 +355,35 @@ impl AiSettings {
                     format!("1–{} 秒，不超过最长超时", s.exec.max_timeout_secs),
                     cx,
                 ))
-                .child(self.numeric_row(6, "命令最长超时", "1–600 秒".into(), cx));
+                .child(self.numeric_row(6, "命令最长超时", "1–600 秒".into(), cx))
+                .child(settings_row(
+                    "子任务并发上限",
+                    "同时运行的子任务数量上限",
+                    {
+                        let this = cx.weak_entity();
+                        let limit = self.limits.subagent_limit;
+                        crate::ui::stepper(
+                            "ai-subagent-limit",
+                            limit.to_string(),
+                            limit > 1 && !self.busy,
+                            limit < 8 && !self.busy,
+                            move |direction, _, cx| {
+                                this.update(cx, |s, cx| {
+                                    if !s.busy {
+                                        s.limits.subagent_limit = (s.limits.subagent_limit as i64
+                                            + i64::from(direction))
+                                        .clamp(1, 8)
+                                            as usize;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            },
+                            cx,
+                        )
+                    },
+                    cx,
+                ));
         }
         div()
             .flex()

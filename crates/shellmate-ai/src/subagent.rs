@@ -175,6 +175,10 @@ pub enum SubagentEvent<'a> {
         reasoning: ReasoningLevel,
     },
     Agent(&'a AgentEvent),
+    Progress {
+        steps: usize,
+        usage: Usage,
+    },
     Finished(&'a SubagentOutcome),
 }
 /// Cloneable, race-free cancellation. Dropping run stops its in-flight future; drive
@@ -187,6 +191,9 @@ impl Default for Cancellation {
     }
 }
 impl Cancellation {
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
     pub fn cancel(&self) {
         self.0.send_replace(true);
     }
@@ -377,6 +384,8 @@ pub async fn run_with_cancel(
         match result {
             Err(error) => SubagentStatus::Failed(error),
             Ok(mut stream) => {
+                let mut steps = 0;
+                let mut usage = Usage::default();
                 let status = loop {
                     let event = tokio::select! {biased; ()=cancel.cancelled()=>break SubagentStatus::Stopped, event=stream.next()=>event};
                     let Some(event) = event else {
@@ -400,7 +409,16 @@ pub async fn run_with_cancel(
                         _ => None,
                     };
                     on_event(SubagentEvent::Agent(&event));
-                    stream.take_updates(); // transcript owns the semantic log, no separate UI mirror here
+                    for update in stream.take_updates() {
+                        match update {
+                            LogUpdate::RequestUsage(u) => usage.add(u),
+                            LogUpdate::Append(entry) if matches!(*entry, Entry::Step(_)) => {
+                                steps += 1
+                            }
+                            _ => {}
+                        }
+                    }
+                    on_event(SubagentEvent::Progress { steps, usage });
                     if let Some(status) = status {
                         break status;
                     }

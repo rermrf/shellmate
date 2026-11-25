@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 pub(super) struct ActiveStep {
+    pub source: Option<shellmate_ai::SubagentRef>,
     pub call: ToolCall,
     pub reply: Option<oneshot::Sender<Approval>>,
     pub redline: bool,
@@ -26,6 +27,7 @@ impl ActiveStep {
     pub fn new(call: ToolCall) -> Self {
         let redline = call.class == Class::RedLine;
         Self {
+            source: None,
             call,
             reply: None,
             redline,
@@ -77,7 +79,7 @@ impl Drawer {
                             .py(px(2.))
                             .rounded(px(5.))
                             .bg(p.card3)
-                            .child(format!("#{} {}", id, task.target.label())),
+                            .child(format!("#{} {}", task.bar_id(), task.target_label())),
                     )
                     .child(
                         div()
@@ -154,7 +156,7 @@ impl Drawer {
             }
             // The bridge owns the pending card; separate channels can deliver this after Approval.
             AgentEvent::StepProposed(_) => self.state.model.thinking = false,
-            AgentEvent::StepFinished { .. } => { self.state.active_step = None; }
+            AgentEvent::StepFinished { .. } => { self.state.active_steps.clear_main(); }
             AgentEvent::Paused { reason, steps, resume } => {
                 self.state.model.pause(reason);
                 self.state.continuation = Some(resume);
@@ -176,11 +178,12 @@ impl Drawer {
     pub(super) fn bridge(
         &self,
         messages: async_channel::Receiver<Ui>,
-        epoch: u64,
+        conversation: String,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let workspace = self.workspace.clone();
+        let timer_conversation=conversation.clone();
         cx.spawn_in(w, async move |this, cx| {
             while let Ok(event) = messages.recv().await {
                 let finish = matches!(event, Ui::TerminalFinish { .. });
@@ -220,7 +223,7 @@ impl Drawer {
                         reply,
                     } => {
                         let valid = this
-                            .update_in(cx, |s, _, _| s.epoch == epoch)
+                            .update_in(cx, |s, _, _| s.state.id == conversation)
                             .unwrap_or(false);
                         if reply.is_closed() || !valid {
                             continue;
@@ -240,7 +243,7 @@ impl Drawer {
                     }
                     event => {
                         this.update_in(cx, |s, _, cx| {
-                            if s.epoch != epoch {
+                            if s.state.id != conversation {
                                 return;
                             }
                             match event {
@@ -248,31 +251,34 @@ impl Drawer {
                                     call,
                                     redline,
                                     reply,
+                                    source,
                                 } => {
+                                    if reply.is_closed(){return;}
+                                    let key=crate::ai::host::approval_key(source.as_ref(),&call.id);
                                     let mut step = ActiveStep::new(call);
+                                    step.source=source.clone();
                                     step.reply = Some(reply);
                                     step.redline = redline;
-                                    s.state.active_step = Some(step);
+                                    s.state.active_steps.insert(key,source.map(|s|s.id),step);
                                     s.state.follow_bottom = true;
                                 }
                                 Ui::Running {
                                     call,
                                     automatic,
                                     ready,
+                                    source,
                                 } => {
+                                    if ready.is_closed(){return;}
+                                    let key=crate::ai::host::approval_key(source.as_ref(),&call.id);
+                                    if source.is_some(){s.state.active_steps.remove(&key);let _=ready.send(());cx.notify();return;}
                                     let mut step = ActiveStep::new(call);
                                     step.started = Some(Instant::now());
                                     step.automatic = automatic;
-                                    s.state.active_step = Some(step);
+                                    s.state.active_steps.insert(key,None,step);
                                     let _ = ready.send(());
                                 }
-                                Ui::CancelApproval(id)
-                                    if s.state.active_step.as_ref().is_some_and(|step| {
-                                        step.call.id == id && step.started.is_none()
-                                    }) =>
-                                {
-                                    s.state.active_step = None;
-                                }
+                                Ui::CancelApproval(id) | Ui::Finished(id) => {s.state.active_steps.remove(&id);}
+                                Ui::CancelSource(id) => {s.state.active_steps.remove_source(&id);}
                                 _ => {}
                             }
                             cx.notify();
@@ -288,7 +294,7 @@ impl Drawer {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 if !this
                     .update_in(cx, |s, window, cx| {
-                        if s.epoch != epoch || !s.state.model.busy {
+                        if s.state.id != timer_conversation || (!s.state.model.busy && !s.has_running_tasks()) {
                             return false;
                         }
                         if window.is_visible() { cx.notify(); }
@@ -321,8 +327,8 @@ impl Drawer {
         let body = cx.new(|_| FullAccess { drawer, label, key });
         dialogs::open(w, cx, "开启完全访问", 500., body);
     }
-    fn approve(&mut self, deny: bool, cx: &mut Context<Self>) {
-        let Some(step) = &mut self.state.active_step else {
+    fn approve(&mut self, key: &str, deny: bool, cx: &mut Context<Self>) {
+        let Some(step) = self.state.active_steps.get_mut(key) else {
             return;
         };
         let command = step
@@ -349,18 +355,21 @@ impl Drawer {
         };
         if let Some(reply) = step.reply.take() {
             let _ = reply.send(approval);
+            self.state.active_steps.remove(key);
         }
         cx.notify();
     }
-    pub(super) fn active_card(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn active_card(&self, key: &str, cx: &mut Context<Self>) -> AnyElement {
         let p = cx.palette().clone();
-        let step = self.state.active_step.as_ref().unwrap();
+        let step = self.state.active_steps.get(key).unwrap();
+        let key = key.to_owned();
         let red = step
             .edit
             .as_ref()
             .map(|i| classify(&i.read(cx).value()) == Class::RedLine)
             .unwrap_or(step.redline);
         let mut card = step_surface(&p)
+            .id(SharedString::from(key.clone()))
             .flex_none()
             .bg(if red { p.errs } else { p.card2 })
             .flex()
@@ -385,6 +394,7 @@ impl Drawer {
             step.automatic,
             &state,
             p.tx2,
+            step.source.as_ref(),
             cx,
         ));
         card = if let Some(edit) = &step.edit {
@@ -396,7 +406,7 @@ impl Drawer {
         } else {
             card.child(command_block(
                 &step.call.command,
-                SharedString::from(format!("{}:active-command", self.state.id)),
+                SharedString::from(if step.source.is_some(){format!("{}:{key}:active-command",self.state.id)}else{format!("{}:active-command", self.state.id)}),
                 self.selection_scroll.clone(),
                 cx,
             ))
@@ -407,7 +417,7 @@ impl Drawer {
                     .on_click(cx.listener(|s, _, _, cx| s.stop(cx))),
             );
         } else {
-            if self.capabilities.terminal && self.capabilities.background {
+            if step.source.is_none() && self.capabilities.terminal && self.capabilities.background {
                 let mut row = div().flex().gap(px(4.));
                 for target in [Target::Terminal, Target::Background] {
                     row = row.child(
@@ -427,12 +437,12 @@ impl Drawer {
                         )
                         .h(px(25.))
                         .text_size(px(11.))
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            if let Some(step) = &mut s.state.active_step {
+                        .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| {
+                            if let Some(step) = s.state.active_steps.get_mut(&key) {
                                 step.call.target = target;
                             }
                             cx.notify();
-                        })),
+                        } })),
                     );
                 }
                 card = card.child(row);
@@ -440,7 +450,7 @@ impl Drawer {
             if let Some(reason) = &step.reason {
                 card = card.child(crate::ui::field_input(reason, crate::ui::Surface::Card2, false)).child(
                     dialogs::button("ai-step-deny-confirm", "确认拒绝", Tone::Plain, true)
-                        .on_click(cx.listener(|s, _, _, cx| s.approve(true, cx))),
+                        .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, true, cx) })),
                 );
             } else {
                 card = card.child(
@@ -455,12 +465,12 @@ impl Drawer {
                                 if red { Tone::Danger } else { Tone::Primary },
                                 true,
                             )
-                            .on_click(cx.listener(|s, _, _, cx| s.approve(false, cx))),
+                            .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, false, cx) })),
                         )
                         .child(
                             dialogs::button("ai-step-edit", "编辑", Tone::Plain, true).on_click(
-                                cx.listener(|s, _, w, cx| {
-                                    if let Some(step) = &mut s.state.active_step {
+                                cx.listener({ let key=key.clone(); move |s, _, w, cx| {
+                                    if let Some(step) = s.state.active_steps.get_mut(&key) {
                                         let command = step.call.command.clone();
                                         let edit = cx.new(|cx| {
                                             // Approval must expose the entire edited command too.
@@ -474,19 +484,19 @@ impl Drawer {
                                         step.edit = Some(edit);
                                     }
                                     cx.notify();
-                                }),
+                                } }),
                             ),
                         )
                         .child(
                             dialogs::button("ai-step-deny", "拒绝", Tone::Plain, true).on_click(
-                                cx.listener(|s, _, w, cx| {
-                                    if let Some(step) = &mut s.state.active_step {
+                                cx.listener({ let key=key.clone(); move |s, _, w, cx| {
+                                    if let Some(step) = s.state.active_steps.get_mut(&key) {
                                         step.reason = Some(cx.new(|cx| {
                                             InputState::new(w, cx).placeholder("拒绝原因（可选）")
                                         }));
                                     }
                                     cx.notify();
-                                }),
+                                } }),
                             ),
                         ),
                 );
@@ -542,7 +552,7 @@ impl Drawer {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(step_header(purpose, *target, *automatic, &state, color, cx))
+            .child(step_header(purpose, *target, *automatic, &state, color, None, cx))
             .child(self.ended_command(command, key, cx));
         match status {
             StepStatus::Denied {
@@ -820,6 +830,7 @@ fn step_header(
     automatic: bool,
     state: &str,
     color: Hsla,
+    source: Option<&shellmate_ai::SubagentRef>,
     cx: &App,
 ) -> Div {
     let p = cx.palette();
@@ -840,6 +851,8 @@ fn step_header(
                         .flex()
                         .items_center()
                         .gap(px(5.))
+                        .when(source.is_some(),|d|d.min_w_0().flex_1())
+                        .children(source.map(|source|div().min_w_0().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_color(p.tx2).font_weight(FontWeight::MEDIUM).overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("子任务 · {}",source.description))))
                         .child(
                             div()
                                 .flex_none()
@@ -954,7 +967,7 @@ impl Drawer {
         self.protocol = "SSH".into();
         self.state.readonly = false;
         self.state.model.clear();
-        self.state.active_step = None;
+        self.state.active_steps.clear_main();
         self.state.expanded.clear();
         self.state.overflowing_output.clear();
         self.state.expanded_commands.clear();
@@ -992,7 +1005,7 @@ impl Drawer {
             answer.push_text(crate::proto::ai::AGENT_ANALYSIS);
             self.state.model.busy = false;
         } else {
-            self.state.active_step = Some(ActiveStep::new(ToolCall {
+            let step = ActiveStep::new(ToolCall {
                 id: "fixture-step-2".into(),
                 command: command.into(),
                 purpose: if redline {
@@ -1006,7 +1019,8 @@ impl Drawer {
                 run_in_background: false,
                 exec_limits: shellmate_ai::agent::ExecLimits::default(),
                 class: classify(command),
-            }));
+            });
+            self.state.active_steps.insert(step.call.id.clone(),None,step);
         }
         for item in answer.items { self.state.model.conversation.push_item(item); }
     }

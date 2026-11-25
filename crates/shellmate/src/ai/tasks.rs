@@ -1,5 +1,7 @@
 //! Per-drawer, per-session task ownership. Workers hold only Weak registry refs;
 //! dropping the registry cancels every worker and its process/channel/PTY guard.
+#[path = "agent_tasks.rs"]
+mod agents;
 use futures::future::BoxFuture;
 use shellmate_ai::{
     agent::{ExecLimits, LocalResult, LocalTool, Target, ToolCall, ToolOutcome},
@@ -20,9 +22,17 @@ pub enum Status {
     Exited(Option<i32>),
     Stopped,
     Disconnected,
+    Failed,
+    StepLimit,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Command,
+    Agent,
 }
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
+    pub kind: Kind,
     pub call_id: String,
     pub id: String,
     pub command: String,
@@ -31,6 +41,39 @@ pub struct TaskInfo {
     pub status: Status,
     pub output_id: String,
     pub background: bool,
+}
+impl TaskInfo {
+    pub fn target_label(&self) -> &'static str {
+        if self.kind == Kind::Agent {
+            "子任务"
+        } else {
+            self.target.label()
+        }
+    }
+    pub fn bar_id(&self) -> &str {
+        self.id.strip_prefix("agent-").unwrap_or(&self.id)
+    }
+    pub fn status_text(&self) -> String {
+        let text = match self.status {
+            Status::Running => "运行中".into(),
+            Status::Exited(code) if self.kind == Kind::Command => {
+                return format!(
+                    "已完成 · 退出码 {}",
+                    code.map_or_else(|| "未知".into(), |n| n.to_string())
+                );
+            }
+            Status::Exited(_) => "已完成".into(),
+            Status::Stopped => "已停止".into(),
+            Status::Disconnected => "连接已断开".into(),
+            Status::Failed => "失败".into(),
+            Status::StepLimit => "达到步数上限".into(),
+        };
+        if self.status == Status::Running || self.kind == Kind::Agent {
+            format!("{text} · {}s", self.started.elapsed().as_secs())
+        } else {
+            text
+        }
+    }
 }
 struct Task {
     info: TaskInfo,
@@ -44,18 +87,25 @@ enum Stop {
     Timeout,
 }
 struct State {
+    next_agent: u64,
+    agents: BTreeMap<u64, agents::AgentTask>,
+    retired: bool,
     next: u64,
     tasks: BTreeMap<u64, Task>,
     notices: Vec<String>,
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    discarded: Arc<Mutex<bool>>,
     root: PathBuf,
     conversation: String,
     state: Mutex<State>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        for task in self.state.get_mut().unwrap().agents.values() {
+            task.cancel.cancel();
+        }
         for task in self.state.get_mut().unwrap().tasks.values() {
             let _ = task.cancel.send(Some(Stop::User));
         }
@@ -66,46 +116,43 @@ pub struct Tasks(Arc<Inner>);
 impl Tasks {
     pub fn new(root: PathBuf, conversation: String) -> Self {
         Self(Arc::new(Inner {
+            discarded: Arc::new(Mutex::new(false)),
             root,
             conversation,
             state: Mutex::new(State {
                 next: 1,
+                next_agent: 1,
+                agents: BTreeMap::new(),
+                retired: false,
                 tasks: BTreeMap::new(),
                 notices: Vec::new(),
                 remembered: Vec::new(),
             }),
         }))
     }
-    /// Stable API for M4 /tasks: includes completed tasks, ordered by task number.
-    #[allow(dead_code)]
     pub fn list(&self) -> Vec<TaskInfo> {
-        self.0
-            .state
-            .lock()
-            .unwrap()
+        let state = self.0.state.lock().unwrap();
+        let mut list: Vec<_> = state
             .tasks
             .values()
             .map(|t| t.info.clone())
-            .collect()
+            .chain(
+                state
+                    .agents
+                    .values()
+                    .map(|t| agents::info(&t.view, &t.call_id)),
+            )
+            .collect();
+        list.sort_by_key(|t| t.started);
+        list
     }
     pub fn has_running(&self) -> bool {
-        self.0
-            .state
-            .lock()
-            .unwrap()
-            .tasks
-            .values()
-            .any(|t| t.info.status == Status::Running)
+        self.list().iter().any(|t| t.status == Status::Running)
     }
     pub fn running(&self) -> Vec<TaskInfo> {
-        self.0
-            .state
-            .lock()
-            .unwrap()
-            .tasks
-            .values()
-            .filter(|t| t.info.status == Status::Running && t.info.background)
-            .map(|t| t.info.clone())
+        self.list()
+            .into_iter()
+            .filter(|t| t.status == Status::Running && t.background)
             .collect()
     }
     pub fn take_notices(&self) -> Vec<String> {
@@ -113,7 +160,7 @@ impl Tasks {
     }
     pub fn state(&self) -> (Vec<String>, Vec<String>) {
         let state = self.0.state.lock().unwrap();
-        let running = state
+        let mut running: Vec<String> = state
             .tasks
             .values()
             .filter(|t| t.info.status == Status::Running)
@@ -124,6 +171,13 @@ impl Tasks {
                 )
             })
             .collect();
+        running.extend(
+            state
+                .agents
+                .values()
+                .filter(|a| a.view.status == shellmate_ai::SubagentStatus::Running)
+                .map(|a| format!("{} · 子任务 · {}", a.view.id, a.view.description)),
+        );
         let mut outputs: Vec<_> = state
             .tasks
             .values()
@@ -132,6 +186,14 @@ impl Tasks {
             .take(20)
             .map(|t| (t.info.output_id.clone(), t.info.command.clone()))
             .collect();
+        for agent in state.agents.values().rev() {
+            if outputs.len() >= 20 {
+                break;
+            }
+            if let Some(id) = &agent.view.output_id {
+                outputs.push((id.clone(), agent.view.description.clone()));
+            }
+        }
         for pair in &state.remembered {
             if outputs.len() == 20 {
                 break;
@@ -150,6 +212,7 @@ impl Tasks {
         (running, readable)
     }
     pub fn remember_outputs(&self, conversation: &shellmate_ai::Conversation) {
+        self.remember_agents(conversation);
         let mut state = self.0.state.lock().unwrap();
         state.remembered.clear();
         for e in conversation.entries().iter().rev() {
@@ -205,6 +268,9 @@ impl Tasks {
             .map(|t| t.info.output_id.clone())
     }
     pub fn stop_all(&self) {
+        for task in self.0.state.lock().unwrap().agents.values() {
+            task.cancel.cancel();
+        }
         for task in self.0.state.lock().unwrap().tasks.values() {
             if task.info.status == Status::Running {
                 let _ = task.cancel.send(Some(Stop::User));
@@ -213,12 +279,28 @@ impl Tasks {
     }
     pub fn stop(&self, id: &str) -> bool {
         let state = self.0.state.lock().unwrap();
+        if let Some(number) = id
+            .strip_prefix("agent-")
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            return state.agents.get(&number).is_some_and(|t| {
+                if t.view.status == shellmate_ai::SubagentStatus::Running {
+                    t.cancel.cancel();
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         let Some(task) = id.parse::<u64>().ok().and_then(|n| state.tasks.get(&n)) else {
             return false;
         };
         task.info.status == Status::Running && task.cancel.send(Some(Stop::User)).is_ok()
     }
     pub async fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> LocalResult {
+        if let Some(result) = self.agent_tool(&tool).await {
+            return result;
+        }
         match tool {
             LocalTool::Memory(_) => LocalResult {
                 subagent: None,
@@ -354,6 +436,7 @@ impl Tasks {
                 number,
                 Task {
                     info: TaskInfo {
+                        kind: Kind::Command,
                         call_id: call.id.clone(),
                         id: number.to_string(),
                         command: call.command.clone(),

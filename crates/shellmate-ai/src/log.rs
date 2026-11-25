@@ -26,6 +26,15 @@ pub struct LoggedResult {
     pub cleared: bool,
     pub is_error: bool,
 }
+impl LoggedResult {
+    /// Registry completions must not undo tier-1 output clearing on later request boundaries.
+    pub fn same_content(&self, other: &Self) -> bool {
+        self.inline == other.inline
+            && self.output_id == other.output_id
+            && self.is_error == other.is_error
+            && self.subagent == other.subagent
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct StepDisplay {
@@ -225,6 +234,10 @@ impl Entry {
 }
 #[derive(Clone, Debug)]
 pub enum LogUpdate {
+    SubagentResult {
+        call_id: String,
+        result: LoggedResult,
+    },
     AgentTool(Option<rig_core::completion::ToolDefinition>),
     RequestUsage(Usage),
     Memory(crate::memory::Snapshot),
@@ -254,6 +267,9 @@ impl PartialEq for Conversation {
 }
 impl Eq for Conversation {}
 impl Conversation {
+    pub fn memory_snapshot(&self) -> Option<&crate::memory::Snapshot> {
+        self.memory.as_ref()
+    }
     pub fn memory_action(&self, turn: usize, item: usize) -> Option<&crate::memory::Action> {
         self.memory_actions.get(&(turn, item))
     }
@@ -367,6 +383,25 @@ impl Conversation {
     }
     pub fn apply(&mut self, update: LogUpdate) {
         match update {
+            LogUpdate::SubagentResult { call_id, result } => {
+                if let Some(Entry::Step(step)) = self.entries.iter_mut().find(
+                    |e| matches!(e,Entry::Step(s) if s.call.id==call_id && s.call.name=="agent"),
+                ) {
+                    if step.result.same_content(&result) {
+                        return;
+                    }
+                    let cleared = step.result.cleared;
+                    step.result = result;
+                    step.result.cleared = cleared;
+                    let entries = std::mem::take(&mut self.entries);
+                    self.turns.clear();
+                    self.memory_actions.clear();
+                    self.accounting.usage = None;
+                    for entry in entries {
+                        self.append(entry);
+                    }
+                }
+            }
             LogUpdate::AgentTool(tool) => self.agent_tool = tool,
             LogUpdate::RequestUsage(usage) => self.request_usage.add(usage),
             LogUpdate::Memory(snapshot) => self.memory = Some(snapshot),

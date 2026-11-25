@@ -170,7 +170,7 @@ impl Workspace {
     }
     pub(crate) fn clear_ai_memory(&mut self, cx: &mut Context<Self>) {
         if let Some(drawer) = &self.ai_drawer {
-            drawer.update(cx, |d, cx| d.clear(cx));
+            drawer.update(cx, |d, cx| d.discard_and_clear(cx));
         }
         // The existing clear-all action deletes the entire conversation library.
         let outputs = self.hub.data_root.borrow().join("ai-outputs");

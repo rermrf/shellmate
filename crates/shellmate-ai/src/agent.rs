@@ -289,6 +289,14 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    /// Registry updates applied before the next request; never adds child usage to this context.
+    fn subagent_results(&self) -> Vec<(String, crate::LoggedResult)> {
+        Vec::new()
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+
     /// M1 is opt-in; the live app stays false until M2 provides a scoped registry.
     fn subagents(&self) -> bool {
         false
@@ -946,6 +954,9 @@ fn stream<'a>(
             if s.done {
                 return None;
             }
+            if s.host.cancelled() {
+                return Some((s.fail(AiError::Cancelled), s));
+            }
             if let Some(delay) = s.retry_wait.take() {
                 // Owned by this stream: dropping it cancels the backoff future.
                 tokio::time::sleep(delay).await;
@@ -1152,7 +1163,15 @@ fn stream<'a>(
                 }
             }
             if s.model.is_none() {
-                for text in s.host.take_notices() {
+                // Drain notices first: every completion notice observed here must have its
+                // final report applied before the next request is assembled.
+                let notices = s.host.take_notices();
+                for (call_id, result) in s.host.subagent_results() {
+                    if s.conversation.entries().iter().any(|e| matches!(e, Entry::Step(step) if step.call.id==call_id && !step.result.same_content(&result))) {
+                        s.record(LogUpdate::SubagentResult {call_id,result});
+                    }
+                }
+                for text in notices {
                     s.entry(Entry::Notice {
                         kind: "task".into(),
                         text,
