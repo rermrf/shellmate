@@ -49,8 +49,8 @@ fn scopes_include_global_local_current_and_existing_memory_only() {
     assert!(model.files.is_empty());
 }
 #[test]
-fn manager_create_save_delete_stamp_limits_and_trust_actions() {
-    let (root, mut db, current, _, _) = setup();
+fn manager_create_save_delete_stamp_limits() {
+    let (root, db, current, _, _) = setup();
     let mut model = Model::new(
         root.path().into(),
         &db,
@@ -90,23 +90,11 @@ fn manager_create_save_delete_stamp_limits_and_trust_actions() {
     model.delete(&path).unwrap();
     model.create("replacement.md", "x").unwrap();
     assert!(model.delete(&path).is_err());
-    db.save_remote_doc_trust(current.id.as_str(), &[("/srv/AGENTS.md".into(), true)])
-        .unwrap();
-    model.reload(&db).unwrap();
-    assert_eq!(model.remote, [("/srv/AGENTS.md".into(), true)]);
-    model.trust(&mut db, "/srv/AGENTS.md", Some(false)).unwrap();
-    assert_eq!(
-        db.remote_doc_trust(current.id.as_str(), "/srv/AGENTS.md")
-            .unwrap(),
-        Some(false)
-    );
-    model.trust(&mut db, "/srv/AGENTS.md", Some(true)).unwrap();
-    assert!(model.remote[0].1);
-    model.trust(&mut db, "/srv/AGENTS.md", None).unwrap();
-    assert!(model.remote.is_empty());
+    model.reload().unwrap();
+    assert_eq!(model.files.len(), 200);
 }
 #[test]
-fn clear_all_removes_only_memory_and_remote_trust() {
+fn clear_all_removes_only_memory_and_leaves_conversations() {
     let (root, mut db, current, _, _) = setup();
     Memory::new(root.path(), Some("local"))
         .save("/memories/host/AGENTS.md", "local")
@@ -115,12 +103,7 @@ fn clear_all_removes_only_memory_and_remote_trust() {
         .save("/memories/global/AGENTS.md", "global")
         .unwrap();
     db.set_auto_memory(false).unwrap();
-    db.set_setting("ai_remote_doc_trust_extra", "keep").unwrap();
     db.set_setting("other", "keep").unwrap();
-    db.save_remote_doc_trust(current.id.as_str(), &[("/srv/AGENTS.md".into(), true)])
-        .unwrap();
-    db.save_remote_doc_trust("local", &[("/tmp/CLAUDE.md".into(), false)])
-        .unwrap();
     let mut conversation = Conversation::default();
     conversation.push_user(UserTurn::new("preserve", ContextSnapshot::default()));
     db.save_ai_conversation(&shellmate_store::ai::SavedConversation {
@@ -137,17 +120,11 @@ fn clear_all_removes_only_memory_and_remote_trust() {
     .unwrap();
     std::fs::create_dir(root.path().join("ai-outputs")).unwrap();
     std::fs::write(root.path().join("ai-outputs/keep"), "keep").unwrap();
-    clear_all(root.path(), &mut db).unwrap();
+    clear_all(root.path()).unwrap();
     assert!(!root.path().join("memory").exists());
     assert!(root.path().join("ai-outputs/keep").exists());
-    assert!(db.remote_docs(current.id.as_str()).unwrap().is_empty());
-    assert!(db.remote_docs("local").unwrap().is_empty());
     assert!(!db.ai_settings().unwrap().auto_memory);
     assert_eq!(db.setting("other").unwrap().as_deref(), Some("keep"));
-    assert_eq!(
-        db.setting("ai_remote_doc_trust_extra").unwrap().as_deref(),
-        Some("keep")
-    );
     assert!(db.ai_conversation("test-memory-clear").unwrap().is_some());
     assert_eq!(db.hosts().unwrap().len(), 3);
 }

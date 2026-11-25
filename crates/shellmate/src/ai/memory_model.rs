@@ -60,7 +60,6 @@ pub struct Model {
     pub scopes: Vec<Scope>,
     pub selected: usize,
     pub files: Vec<FileInfo>,
-    pub remote: Vec<(String, bool)>,
 }
 impl Model {
     pub fn new(
@@ -99,9 +98,8 @@ impl Model {
             scopes,
             selected,
             files: Vec::new(),
-            remote: Vec::new(),
         };
-        model.reload(db)?;
+        model.reload()?;
         Ok(model)
     }
     pub fn memory(&self) -> Memory {
@@ -114,15 +112,11 @@ impl Model {
             "/memories/global"
         }
     }
-    pub fn reload(&mut self, db: &HostStore) -> Result<(), String> {
+    pub fn reload(&mut self) -> Result<(), String> {
         self.files = self
             .memory()
             .files(self.scopes[self.selected].key.is_some())
             .map_err(|e| e.to_string())?;
-        self.remote = match &self.scopes[self.selected].key {
-            Some(key) => db.remote_docs(key).map_err(|e| e.to_string())?,
-            None => Vec::new(),
-        };
         Ok(())
     }
     pub fn read(&self, path: &str) -> Result<String, String> {
@@ -158,30 +152,13 @@ impl Model {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    pub fn trust(
-        &mut self,
-        db: &mut HostStore,
-        path: &str,
-        decision: Option<bool>,
-    ) -> Result<(), String> {
-        let key = self.scopes[self.selected]
-            .key
-            .as_deref()
-            .ok_or("全局没有远端信任记录")?;
-        match decision {
-            Some(value) => db.save_remote_doc_trust(key, &[(path.into(), value)]),
-            None => db.remove_remote_doc_trust(key, path),
-        }
-        .map_err(|e| e.to_string())?;
-        self.reload(db)
-    }
 }
+
 pub const TEMPLATE: &str = "---\nname: 新记忆\ndescription: 一句话说明\ntype: project\n---\n\n";
-pub fn clear_all(root: &Path, db: &mut HostStore) -> Result<(), String> {
+pub fn clear_all(root: &Path) -> Result<(), String> {
     Memory::new(root, None)
         .clear_all()
-        .map_err(|e| e.to_string())?;
-    db.clear_remote_doc_trust().map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
 }
 pub fn save_host_note(root: &Path, db: &HostStore, id: &HostId, text: &str) -> Result<(), String> {
     if db.host(id).map_err(|e| e.to_string())?.is_none() {

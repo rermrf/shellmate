@@ -12,12 +12,6 @@ pub enum Approval {
     Deny { reason: Option<String> },
 }
 pub enum Ui {
-    RemoteTrust {
-        id: String,
-        discovery: shellmate_core::remote_instructions::Discovery,
-        reply: oneshot::Sender<shellmate_core::remote_instructions::Discovery>,
-    },
-    CancelRemoteTrust(String),
     Context {
         reply: oneshot::Sender<Option<shellmate_ai::ContextSnapshot>>,
     },
@@ -50,13 +44,6 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
-    fn discover_instructions(
-        &self,
-        _cwd: Option<String>,
-        _refresh: bool,
-    ) -> BoxFuture<'_, Option<shellmate_core::remote_instructions::Discovery>> {
-        Box::pin(async { None })
-    }
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
         shellmate_ai::memory::Snapshot {
             auto_memory,
@@ -102,47 +89,7 @@ impl Drop for PendingGuard {
         }
     }
 }
-struct RemoteGuard {
-    ui: async_channel::Sender<Ui>,
-    id: String,
-}
-impl Drop for RemoteGuard {
-    fn drop(&mut self) {
-        let _ = self.ui.try_send(Ui::CancelRemoteTrust(self.id.clone()));
-    }
-}
 impl ToolHost for Host {
-    fn remote_instructions(
-        &self,
-        cwd: Option<String>,
-        refresh: bool,
-    ) -> BoxFuture<'_, Option<shellmate_core::remote_instructions::Discovery>> {
-        Box::pin(async move {
-            let discovery = self.executor.discover_instructions(cwd, refresh).await?;
-            if discovery.files.is_empty() {
-                return Some(discovery);
-            }
-            let id = shellmate_core::remote_instructions::nonce();
-            let _guard = RemoteGuard {
-                ui: self.ui.clone(),
-                id: id.clone(),
-            };
-            let (reply, receive) = oneshot::channel();
-            self.ui
-                .send(Ui::RemoteTrust {
-                    id,
-                    discovery,
-                    reply,
-                })
-                .await
-                .ok()?;
-            tokio::select! {
-                biased;
-                () = super::exec::disconnected(&self.alive) => None,
-                result = receive => result.ok(),
-            }
-        })
-    }
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
         self.executor.memory_snapshot(auto_memory)
     }

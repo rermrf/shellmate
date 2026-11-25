@@ -363,7 +363,7 @@ impl Workspace {
             }
             "memory-manager" | "host-editor-ai-note" => {
                 let host=self.hub.book.borrow().hosts.iter().find(|h|h.id.as_str()=="h1").unwrap().clone();
-                crate::proto::memory::seed(&self.memory_root(),&mut self.hub.store.borrow_mut(),host.id.as_str());
+                crate::proto::memory::seed(&self.memory_root(),host.id.as_str());
                 if scene=="memory-manager" {
                     self.open_memory_manager(Some(crate::ai::memory_model::Focus {host:Some(host.id.to_string()),path:Some("/memories/host/deploy.md".into())}),window,cx).unwrap();
                 } else {crate::dialogs::host_editor::HostEditor::open(cx.weak_entity(),crate::dialogs::host_editor::EditorMode::Edit(host),&self.hub.book.borrow(),&self.memory_root(),window,cx);}
@@ -374,9 +374,9 @@ impl Workspace {
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
             | "ai-tasks" | "ai-output-large" | "ai-input-multiline" | "ai-code-copy" | "ai-code-copied" | "ai-code-select" | "ai-context-popover" | "ai-context-amber" | "ai-compacted" | "ai-compacted-open"
             | "ai-compacting" | "ai-compacted-tier1" | "ai-history" | "ai-error"
-            | "ai-remote-trust" | "ai-remote-loaded" | "ai-memory-chip" | "ai-mode-popover"
+            | "ai-memory-chip" | "ai-mode-popover"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
-                if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),&mut self.hub.store.borrow_mut(),"h1");}
+                if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),"h1");}
                 self.open_ai(window, cx);
                 if let Some(drawer) = &self.ai_drawer {
                     drawer.update(cx, |d, cx| {

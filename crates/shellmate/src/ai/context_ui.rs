@@ -32,6 +32,11 @@ impl Drawer {
         cx.notify();
     }
     fn context_details(&self) -> Option<ContextBreakdown> {
+        if self.fixture
+            && let Some(context) = &self.fixture_context
+        {
+            return Some(context.clone());
+        }
         if !context_view::visible(self.session.is_some(), self.configured) {
             return None;
         }

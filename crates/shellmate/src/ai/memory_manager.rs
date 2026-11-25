@@ -112,7 +112,7 @@ impl MemoryManager {
         self.path = None;
         self.creating = false;
         self.saved = None;
-        self.error = self.model.reload(&self.db.borrow()).err();
+        self.error = self.model.reload().err();
         cx.notify();
     }
     fn save(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -136,7 +136,7 @@ impl MemoryManager {
                 if let Some(path) = self.path.clone() {
                     self.select_file(path, w, cx);
                 }
-                self.error = self.model.reload(&self.db.borrow()).err();
+                self.error = self.model.reload().err();
                 self.saved = Some(message);
             }
             Err(e) => self.error = Some(e),
@@ -169,7 +169,7 @@ impl MemoryManager {
                     s.model.delete(&path)?;
                     s.path = None;
                     s.saved = None;
-                    s.model.reload(&s.db.borrow())?;
+                    s.model.reload()?;
                     cx.notify();
                     Ok(())
                 })
@@ -178,13 +178,6 @@ impl MemoryManager {
             w,
             cx,
         );
-    }
-    fn set_trust(&mut self, path: &str, choice: Option<bool>, cx: &mut Context<Self>) {
-        self.error = self
-            .model
-            .trust(&mut self.db.borrow_mut(), path, choice)
-            .err();
-        cx.notify();
     }
     fn file_row(
         &self,
@@ -388,82 +381,6 @@ impl Render for MemoryManager {
             ));
         }
         files = files.child(memories);
-        if self.model.scopes[self.model.selected].key.is_some() {
-            files = files.child(div().mt(px(8.)).child(section("远端说明", &p)));
-            let mut remote = grouped_card(&p);
-            if self.model.remote.is_empty() {
-                remote = remote.child(
-                    div()
-                        .flex_none()
-                        .min_h(px(56.))
-                        .py(px(12.))
-                        .flex()
-                        .items_center()
-                        .text_size(px(12.))
-                        .line_height(px(18.))
-                        .text_color(p.tx3)
-                        .child("暂无远端说明信任记录"),
-                );
-            }
-            for (index, (path, trust)) in self.model.remote.iter().enumerate() {
-                let toggle = path.clone();
-                let remove = path.clone();
-                let next = !*trust;
-                remote = remote.child(
-                    div()
-                        .flex_none()
-                        .min_w_0()
-                        .min_h(px(56.))
-                        .py(px(12.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(
-                                    ui::ellipsis(("memory-remote-path", index), path.clone())
-                                        .min_w_0()
-                                        .text_size(px(13.5))
-                                        .line_height(px(16.))
-                                        .font_weight(FontWeight::SEMIBOLD),
-                                )
-                                .child(neutral_chip(if *trust { "已信任" } else { "已忽略" }, &p)),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    Button::new(("memory-trust-toggle", index))
-                                        .label(if *trust {
-                                            "改为忽略"
-                                        } else {
-                                            "改为信任"
-                                        })
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            s.set_trust(&toggle, Some(next), cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new(("memory-trust-remove", index))
-                                        .label("移除")
-                                        .text_color(p.err)
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            s.set_trust(&remove, None, cx)
-                                        })),
-                                ),
-                        ),
-                );
-            }
-            files = files.child(remote);
-        }
         let mut right = div()
             .flex_1()
             .min_w_0()

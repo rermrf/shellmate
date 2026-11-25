@@ -99,19 +99,22 @@ pub fn scene(scene: &str) -> Option<Fixture> {
                 input_tokens: Some(used - 1000),
                 output_tokens: Some(1000),
             }));
-        context = Some(
-            model
-                .conversation
-                .breakdown_for_budget(
-                    ContextBudget::new(200000, ContextWindow::Auto, 32000),
-                    &shellmate_ai::agent::Capabilities {
-                        terminal: true,
-                        background: true,
-                        ..Default::default()
-                    },
-                )
-                .unwrap(),
-        );
+        // Pin the pre-removal demo's accounting so prompt-rule edits do not shift its pixels.
+        let mut breakdown = ContextBreakdown {
+            system_prompt: 704,
+            instructions_memory: 0,
+            tool_definitions: 861,
+            tool_count: 4,
+            terminal_context: 597,
+            summary: 0,
+            messages: 130,
+            tool_results: 212,
+            total: 2504,
+            provider_usage: true,
+            budget: ContextBudget::new(200000, ContextWindow::Auto, 32000),
+        };
+        breakdown.scale_to(used as usize);
+        context = Some(breakdown);
     }
     if scene == "ai-slash-tasks" {
         tasks = super::ai::execution_scene("ai-tasks").unwrap().tasks;
@@ -195,6 +198,16 @@ mod tests {
         let b = f.context.unwrap();
         assert!(!f.model.conversation.entries().is_empty());
         assert_eq!(b.total, 73600);
+        assert_eq!(
+            (
+                b.system_prompt,
+                b.tool_definitions,
+                b.terminal_context,
+                b.messages,
+                b.tool_results
+            ),
+            (20692, 25308, 17547, 3821, 6232)
+        );
         assert!(f.context_open);
         assert!(b.terminal_context > 0 && b.tool_results > 0 && b.tool_definitions > 0);
         assert!(b.provider_usage);

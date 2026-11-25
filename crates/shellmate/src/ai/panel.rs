@@ -1,7 +1,5 @@
 #[path = "mode_ui.rs"]
 mod mode_ui;
-#[path = "remote_ui.rs"]
-mod remote_ui;
 #[path = "agent_ui.rs"]
 pub(super) mod agent_ui;
 use super::markdown::{self, MarkdownCache};
@@ -61,6 +59,7 @@ pub struct Drawer {
     data_root: std::path::PathBuf,
     tasks: Option<super::tasks::Tasks>,
     fixture_tasks: Vec<super::tasks::TaskInfo>,
+    fixture_context: Option<shellmate_ai::ContextBreakdown>,
     save_conversations: bool,
     workspace: WeakEntity<Workspace>,
     db: SharedStore,
@@ -172,6 +171,7 @@ impl Drawer {
             data_root,
             tasks: None,
             fixture_tasks: Vec::new(),
+            fixture_context: None,
             state: state::ConversationState::default(),
             save_conversations,
             workspace,
@@ -629,7 +629,6 @@ impl Drawer {
         self.compact_queue.lock().unwrap().take();
         self.state.continuation = None;
         self.state.run_config = None;
-        self.state.remote_trust = None;
         if let Some(step) = self.state.active_step.take() {
             let display = shellmate_ai::StepDisplay::from_item(
                 shellmate_ai::agent::ToolOutcome::Failed("已停止".into()).item(&step.call),
@@ -818,6 +817,7 @@ impl Drawer {
         self.fixture = true;
         self.configured = scene != "ai-unconfigured";
         self.fixture_tasks.clear();
+        self.fixture_context = None;
         self.fixture_copy = Default::default();
         if scene==crate::proto::mode::SCENE {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
@@ -830,22 +830,6 @@ impl Drawer {
         if scene=="ai-memory-chip" {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
             self.state.model.clear();self.state.model.conversation=crate::proto::memory::conversation();
-        }
-        if crate::proto::remote::SCENES.contains(&scene) {
-            self.label = "prod-web-01".into();
-            self.protocol = "SSH".into();
-            self.history = false;
-            self.state.model.clear();
-            self.state.model.conversation.push_user(UserTurn::new("检查这个项目的部署约定", ContextSnapshot::default()));
-            if scene == "ai-remote-trust" {
-                let mut batch = crate::ai::remote::TrustBatch::new(crate::proto::remote::discovery(), |_| None);
-                batch.choices = vec![Some(true), Some(false)];
-                self.state.remote_trust = Some(remote_ui::PendingTrust { id: "fixture".into(), batch, expanded: [0].into(), key: "fixture".into(), persist: false, reply: None });
-                self.state.model.busy = true;
-            } else {
-                self.state.model.conversation.append(shellmate_ai::Entry::Notice { kind: shellmate_core::remote_instructions::CONTEXT_KIND.into(), text: crate::proto::remote::discovery().files[0].wrapped() });
-                self.state.model.conversation.push_text("已加载该项目的说明。接下来先检查服务健康状态。 ");
-            }
         }
         if crate::proto::ai::COPY_SCENES.contains(&scene) {
             self.fixture_copy = match scene { "ai-code-copied" => markdown::CopyFixture::Copied, "ai-code-copy" => markdown::CopyFixture::Hovered, _ => markdown::CopyFixture::None };
@@ -861,6 +845,7 @@ impl Drawer {
             self.capabilities = Capabilities { terminal:true,background:true,..Default::default() };
             self.set_composer_text(fixture.input,w,cx);
             if self.popup.open { crate::proto::focus_after_layout(self.input.focus_handle(cx),w); }
+            self.fixture_context = fixture.context.clone();
             if let Some(context)=fixture.context {
                 self.state.run_budget = Some((context.budget,shellmate_ai::WindowSource::Catalog));
                 self.state.model.meter = Some(super::model::ContextMeter { used:context.total,window:context.budget.window,trigger:context.budget.trigger });
@@ -1437,7 +1422,6 @@ impl Render for Drawer {
             if self.state.model.compacting || self.state.pending
                 || (self.state.model.busy
                     && self.state.active_step.is_none()
-                    && self.state.remote_trust.is_none()
                     && self
                         .state
                         .model
@@ -1490,9 +1474,6 @@ impl Render for Drawer {
         // Keep the blocking card last so following the bottom reveals all its actions.
         if !self.history && self.state.active_step.is_some() {
             body = body.child(self.active_card(cx));
-        }
-        if !self.history && self.state.remote_trust.is_some() {
-            body = body.child(self.remote_trust_card(cx));
         }
         // M1's single-line Input ignores h(32); the 30px action determines the row.
         // Clip the expanded inner editor at the field edge, before the button gap.

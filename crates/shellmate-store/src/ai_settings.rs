@@ -67,6 +67,10 @@ impl Settings {
     }
 }
 impl HostStore {
+    pub fn set_auto_memory(&mut self, enabled: bool) -> Result<()> {
+        self.set_setting("ai_auto_memory", if enabled { "true" } else { "false" })
+    }
+
     /// Reload model-specific values after editing the model/provider; globals stay in the form.
     pub fn ai_model_settings(&self, settings: &Settings) -> Result<Settings> {
         let mut s = settings.clone();

@@ -2142,6 +2142,3 @@ mod execution_tests;
 
 #[path = "agent/memory.rs"]
 mod memory_tests;
-
-#[path = "agent/remote.rs"]
-mod remote_tests;

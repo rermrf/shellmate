@@ -147,7 +147,6 @@ pub fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
-mod remote;
 pub(crate) mod memory_model;
 pub(crate) mod memory_manager;
 

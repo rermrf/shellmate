@@ -41,7 +41,7 @@ impl AiSettings {
             ))
             .child(settings_row(
                 "记忆管理",
-                "查看和编辑 AI 说明、主题笔记与远端信任",
+                "查看和编辑 AI 说明与主题笔记",
                 Button::new("ai-memory-manage")
                     .label("打开")
                     .on_click(cx.listener(|s, _, w, cx| s.open_memory(None, w, cx))),
@@ -116,17 +116,16 @@ impl AiSettings {
         let Ok(root) = self.workspace.update(cx, |w, _| w.memory_root()) else {
             return;
         };
-        let db = self.db.clone();
         let this = cx.weak_entity();
         crate::dialogs::confirm::ConfirmDialog::open(
             "清除所有记忆？",
-            "将删除所有全局、主机说明和记忆，并清除远端说明的信任选择。对话记录会保留。此操作无法撤销。",
+            "将删除所有全局、主机说明和记忆。对话记录会保留。此操作无法撤销。",
             "清除所有记忆",
             true,
             move |_, cx| {
-                crate::ai::memory_model::clear_all(&root, &mut db.borrow_mut())?;
+                crate::ai::memory_model::clear_all(&root)?;
                 this.update(cx, |s, cx| {
-                    s.result = Some("所有记忆及远端信任选择已清除".into());
+                    s.result = Some("所有记忆已清除".into());
                     cx.notify();
                 })
                 .ok();
