@@ -11,7 +11,7 @@ use crate::{
 use gpui::{
     component::{
         Sizable, Size,
-        button::{Button, ButtonVariants},
+        button::Button,
         input::{InputEvent, InputState, Textarea, TextareaState},
     },
     prelude::*,
@@ -96,7 +96,7 @@ impl MemoryManager {
             let close = modal_body.clone();
             let height = px(dialogs::shell_height(
                 f32::from(w.viewport_size().height),
-                840.,
+                640.,
                 30.,
             ));
             dialog
@@ -410,24 +410,37 @@ impl MemoryManager {
         let creating = detail.path.is_none();
         let mut body = div().flex_1().min_h_0().flex().flex_col().gap(px(10.));
         if let Content::Topic(topic) = &detail.draft.content {
-            if creating {
-                body = body.child(form_field(
-                    "文件名",
-                    ui::field_input(&self.filename, ui::Surface::Window, true),
-                    p,
-                ));
-            }
-            body = body
-                .child(form_field(
-                    "名称",
-                    ui::field_input(&self.name, ui::Surface::Window, false),
-                    p,
-                ))
-                .child(form_field(
-                    "描述",
-                    ui::field_input(&self.description, ui::Surface::Window, false),
-                    p,
-                ));
+            let name = form_field(
+                "名称",
+                ui::field_input(&self.name, ui::Surface::Window, false),
+                p,
+            );
+            // Creating: 文件名 | 名称 share one row, like the host editor's 名称 | 分组.
+            body = if creating {
+                body.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap(px(12.))
+                        .child(
+                            form_field(
+                                "文件名",
+                                ui::field_input(&self.filename, ui::Surface::Window, true),
+                                p,
+                            )
+                            .flex_1()
+                            .min_w_0(),
+                        )
+                        .child(name.flex_1().min_w_0()),
+                )
+            } else {
+                body.child(name)
+            };
+            body = body.child(form_field(
+                "描述",
+                ui::field_input(&self.description, ui::Surface::Window, false),
+                p,
+            ));
             let this = cx.weak_entity();
             let picker = ui::segmented(
                 "memory-type",
@@ -497,30 +510,49 @@ impl MemoryManager {
                 ),
             ),
         );
-        let back = Button::new("memory-back")
-            .ghost()
-            .label(format!("‹ {}", detail.section()))
-            .h(px(28.))
+        // Sub-page header: ‹ back chevron beside the title, like a settings sub-page.
+        let back = div()
+            .id("memory-back")
+            .flex_none()
+            .size(px(30.))
+            .rounded(px(10.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|d| d.bg(p.card))
+            .child(
+                crate::icons::group_chevron(false)
+                    .rotate(gpui::radians(std::f32::consts::PI))
+                    .text_color(p.tx2),
+            )
             .on_click(cx.listener(|s, _, w, cx| s.navigate(Navigation::Back, w, cx)));
         let heading = div()
             .flex_none()
             .flex()
-            .flex_col()
-            .gap(px(6.))
-            .child(div().flex().items_start().child(back))
+            .items_center()
+            .gap(px(8.))
+            .ml(px(-6.))
+            .child(back)
             .child(
                 div()
-                    .text_size(px(18.))
-                    .line_height(px(24.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .whitespace_normal()
-                    .child(detail.title().to_owned()),
-            )
-            .child(
-                ui::ellipsis("memory-detail-path", self.page.subtitle(&self.model))
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .text_color(p.tx3),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        ui::ellipsis("memory-detail-title", detail.title().to_owned())
+                            .text_size(px(16.))
+                            .line_height(px(22.))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        ui::ellipsis("memory-detail-path", self.page.subtitle(&self.model))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(p.tx3),
+                    ),
             );
         let footer = div()
             .h(px(75.))

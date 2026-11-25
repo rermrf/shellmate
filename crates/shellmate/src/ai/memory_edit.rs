@@ -198,13 +198,6 @@ impl Detail {
     pub fn dirty(&self) -> bool {
         self.draft != self.original
     }
-    pub fn section(&self) -> &'static str {
-        if matches!(self.draft.content, Content::Instructions(_)) {
-            "说明"
-        } else {
-            "记忆"
-        }
-    }
     pub fn title(&self) -> &str {
         if self.path.is_none() {
             return "新建记忆";
