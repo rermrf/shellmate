@@ -56,6 +56,7 @@ async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknow
                 reasoning: None,
             },
             SubagentContext {
+                origin: None,
                 id: "agent-test".into(),
                 snapshot: Default::default(),
                 cwd: None,
@@ -230,6 +231,70 @@ async fn releasing_a_wait_has_a_distinct_reason_from_natural_completion() {
     ));
     assert!(c.auto_continue());
     assert_eq!(http.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn non_command_tools_emit_started_then_result_without_changing_provider_pairs() {
+    struct Local {
+        executed: AtomicUsize,
+    }
+    impl ToolHost for Local {
+        fn run(&self, _: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+            Box::pin(async { panic!("no command") })
+        }
+        fn local_tool(
+            &self,
+            _: agent::LocalTool,
+            _: agent::ExecLimits,
+        ) -> BoxFuture<'_, agent::LocalResult> {
+            Box::pin(async move {
+                self.executed.fetch_add(1, Ordering::SeqCst);
+                agent::LocalResult::text("result body")
+            })
+        }
+    }
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[("read", "read_output", json!({"id":"output-1"}))],
+                "before",
+                false,
+            ),
+            response(a, &[], "after", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Local {
+            executed: AtomicUsize::new(0),
+        };
+        let mut log = conversation();
+        log.push_user_from(
+            UserTurn::new("extra", Default::default()),
+            Some(MessageOrigin::User),
+        );
+        let mut stream =
+            agent::run(&client, &mut log, capabilities(), &host, fast_limits()).unwrap();
+        let mut calls = vec![];
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::ToolStarted(call) => {
+                    assert_eq!(host.executed.load(Ordering::SeqCst), 0);
+                    calls.push(call.id);
+                }
+                AgentEvent::ToolFinished(id) => {
+                    assert_eq!(calls, [id]);
+                    assert_eq!(host.executed.load(Ordering::SeqCst), 1);
+                    assert!(stream.take_updates().iter().any(|u|matches!(u,LogUpdate::Append(e) if matches!(&**e,Entry::Step(s) if s.result.inline=="result body"))));
+                }
+                _ => {}
+            }
+        }
+        drop(stream);
+        assert_eq!(calls, ["read"]);
+        let body = bodies(&http);
+        context_tests::assert_pairs(&body[1], a);
+        assert!(!body[0].to_string().contains("\"origin\""));
+    }
 }
 
 #[tokio::test]

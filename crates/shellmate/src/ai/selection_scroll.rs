@@ -49,6 +49,11 @@ fn usable(bounds: Bounds<Pixels>) -> bool {
 }
 
 impl SelectionScroll {
+    pub fn set_conversation(&mut self, scroll: ScrollHandle) {
+        self.stop();
+        self.conversation = scroll;
+        self.viewports.clear();
+    }
     pub fn new(conversation: ScrollHandle) -> Self {
         Self {
             conversation,

@@ -4,6 +4,36 @@ impl Drawer {
     pub(in crate::ai::panel) fn prepare_output_views(&mut self, cx: &mut Context<Self>) {
         let mut sources = Vec::new();
         let mut initially_open = BTreeSet::new();
+        let mut generic = Vec::new();
+        for e in self.state.model.conversation.entries() {
+            if let shellmate_ai::Entry::Step(step) = e
+                && step.display.is_none()
+                && step.result.subagent.is_none()
+            {
+                generic.push(("main".to_owned(), step));
+            }
+        }
+        for view in self.state.subagents.values() {
+            if let Some(entries) = &view.transcript {
+                for e in entries {
+                    if let shellmate_ai::Entry::Step(step) = e {
+                        generic.push((format!("child:{}", view.id), step));
+                    }
+                }
+            }
+        }
+        for (scope, step) in generic {
+            let key = super::super::tool_ui::key(&scope, &step.call.id);
+            if self.state.tool_expanded.contains(&key) || step.result.is_error {
+                initially_open.insert(key.clone());
+            }
+            sources.push(source(
+                key,
+                step.result.output_id.clone(),
+                &step.result.inline,
+                false,
+            ));
+        }
         for (turn, t) in self.state.model.conversation.turns().iter().enumerate() {
             if let Some(answer) = &t.answer {
                 for (item, entry) in answer.items.iter().enumerate() {
@@ -43,26 +73,6 @@ impl Drawer {
                         task.status == crate::ai::tasks::Status::Running,
                     ));
                 }
-            }
-        }
-        for view in self.state.subagents.values() {
-            for step in &view.step_list {
-                let key = child_key(&view.id, &step.id);
-                if self
-                    .state
-                    .agent_cards
-                    .get(&view.id)
-                    .and_then(|c| c.step.as_deref())
-                    == Some(step.id.as_str())
-                {
-                    initially_open.insert(key.clone());
-                }
-                sources.push(source(
-                    key,
-                    step.output_id.clone(),
-                    &step.output,
-                    step.running,
-                ));
             }
         }
         for source in sources {

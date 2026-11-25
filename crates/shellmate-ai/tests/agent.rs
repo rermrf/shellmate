@@ -995,7 +995,11 @@ async fn invalid_calls_return_actionable_errors_then_recover_on_both_wires() {
             }
             assert!(matches!(
                 &c.turns()[0].answer.as_ref().unwrap().items[..],
-                [AnswerItem::Step { .. }, AnswerItem::Text(_)]
+                [
+                    AnswerItem::Notice(_),
+                    AnswerItem::Step { .. },
+                    AnswerItem::Text(_)
+                ]
             ));
         }
     }
@@ -1062,7 +1066,16 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
             };
             assert_eq!(http.requests().len(), 2);
             assert!(host.calls.lock().unwrap().is_empty());
-            assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
+            assert_eq!(c.turns()[0].answer.as_ref().unwrap().items.len(), 2);
+            assert!(
+                c.turns()[0]
+                    .answer
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .all(|i| matches!(i, AnswerItem::Notice(_)))
+            );
             let events = agent::resume(&client, &mut c, &host, *resume, Limits::default())
                 .unwrap()
                 .collect::<Vec<_>>()
@@ -1080,7 +1093,16 @@ async fn invalid_streak_counts_steps_survives_resume_and_resets_on_valid_call() 
                     })
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
-                assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
+                assert_eq!(c.turns()[0].answer.as_ref().unwrap().items.len(), 3);
+                assert!(
+                    c.turns()[0]
+                        .answer
+                        .as_ref()
+                        .unwrap()
+                        .items
+                        .iter()
+                        .all(|i| matches!(i, AnswerItem::Notice(_)))
+                );
                 assert_eq!(http.requests().len(), 3);
             }
             assert!(tool_result(&bodies(&http)[2], a, "bad-2").contains("缺少 command"));
@@ -1153,7 +1175,19 @@ async fn queued_invalid_calls_follow_the_same_recovery_and_streak_rules() {
                 ));
                 assert!(host.calls.lock().unwrap().is_empty());
                 assert_eq!(http.requests().len(), 1);
-                assert!(c.turns()[0].answer.as_ref().unwrap().items.is_empty());
+                assert_eq!(
+                    c.turns()[0].answer.as_ref().unwrap().items.len(),
+                    invalid_count
+                );
+                assert!(
+                    c.turns()[0]
+                        .answer
+                        .as_ref()
+                        .unwrap()
+                        .items
+                        .iter()
+                        .all(|i| matches!(i, AnswerItem::Notice(_)))
+                );
             }
         }
     }

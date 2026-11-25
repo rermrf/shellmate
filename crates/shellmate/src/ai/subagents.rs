@@ -43,6 +43,24 @@ impl Service {
         resume: bool,
         call_id: &str,
     ) -> BoxFuture<'_, LocalResult> {
+        self.message_from(
+            id,
+            text,
+            immediate,
+            resume,
+            call_id,
+            shellmate_ai::MessageOrigin::Parent,
+        )
+    }
+    pub fn message_from(
+        &self,
+        id: &str,
+        text: &str,
+        immediate: bool,
+        resume: bool,
+        call_id: &str,
+        origin: shellmate_ai::MessageOrigin,
+    ) -> BoxFuture<'_, LocalResult> {
         let id = id.to_owned();
         let text = text.to_owned();
         let call_id = call_id.to_owned();
@@ -59,14 +77,20 @@ impl Service {
                 };
                 let control = children.control();
                 let accepted = self.tasks.while_retained(|| {
-                    control.enqueue_with(call_id.clone(), text, self.context.clone(), |input| {
-                        super::subagent_files::append_input(
-                            &self.tasks.root(),
-                            self.tasks.conversation_id(),
-                            &view.id,
-                            input,
-                        )
-                    })
+                    control.enqueue_from(
+                        call_id.clone(),
+                        text,
+                        self.context.clone(),
+                        Some(origin),
+                        |input| {
+                            super::subagent_files::append_input(
+                                &self.tasks.root(),
+                                self.tasks.conversation_id(),
+                                &view.id,
+                                input,
+                            )
+                        },
+                    )
                 });
                 match accepted {
                     Some(Ok(true)) => {}
@@ -128,30 +152,23 @@ impl Service {
             else {
                 return LocalResult::error("执行记录已清理，无法继续原上下文");
             };
+            let mut transcript = shellmate_ai::Conversation::from_entries(transcript);
+            for input in pending {
+                transcript.push_user_from(
+                    shellmate_ai::UserTurn::new(&input.text, input.context),
+                    input.origin,
+                );
+            }
             let mut request = record.request;
-            request.prompt = if pending.is_empty() {
-                text
-            } else {
-                format!(
-                    "上次尚未处理的消息：\n{}\n\n本次追加：{text}",
-                    pending
-                        .iter()
-                        .map(|i| i.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            };
+            request.prompt = text;
             request.background = true;
             request.model = Some(record.model);
             request.reasoning = Some(record.reasoning);
             self.start_history(
                 request,
                 &call_id,
-                Some((
-                    shellmate_ai::Conversation::from_entries(transcript),
-                    record.context,
-                    stable,
-                )),
+                Some((transcript, record.context, stable)),
+                origin,
             )
             .await
         })
@@ -164,7 +181,12 @@ impl Service {
         )
     }
     pub fn start(&self, request: SubagentRequest, call_id: &str) -> BoxFuture<'_, LocalResult> {
-        self.start_history(request, call_id, None)
+        self.start_history(
+            request,
+            call_id,
+            None,
+            shellmate_ai::MessageOrigin::Delegation,
+        )
     }
     fn start_history(
         &self,
@@ -175,6 +197,7 @@ impl Service {
             subagent::SubagentContext,
             String,
         )>,
+        origin: shellmate_ai::MessageOrigin,
     ) -> BoxFuture<'_, LocalResult> {
         let call_id = call_id.to_owned();
         Box::pin(async move {
@@ -230,6 +253,7 @@ impl Service {
             };
             let snapshot = self.memory_snapshot();
             let context = SubagentContext {
+                origin: Some(origin),
                 id: source.id.clone(),
                 snapshot: restored
                     .as_ref()
@@ -259,10 +283,12 @@ impl Service {
             }
             let transcript = history.map(|(history, _, _)| history).unwrap_or_default();
             let mut checkpoint_log = transcript.clone();
-            checkpoint_log.push_user(shellmate_ai::UserTurn::new(
+            subagent::prepare_history(
+                &mut checkpoint_log,
                 &request.prompt,
                 context.snapshot.clone(),
-            ));
+                context.origin,
+            );
             let saved = self.tasks.while_retained(|| {
                 super::subagent_files::checkpoint(
                     &self.tasks.root(),
@@ -285,6 +311,7 @@ impl Service {
             let token = ticket.cancel.clone();
             let immediate = ticket.start_result();
             let weak = ticket.view_handle();
+            weak.configure(&checkpoint_log, &binding.capabilities.cwd);
             let ui = self.ui.clone();
             let source_id = source.id.clone();
             let alive = binding.alive.clone();
@@ -427,6 +454,9 @@ fn load_record(root: &std::path::Path, conversation: &str, id: &str) -> Option<A
 }
 pub fn saved_family(root: &std::path::Path, conversation: &str, id: &str) -> Option<String> {
     load_record(root, conversation, id).map(|r| r.stable_id)
+}
+pub fn saved_cwd(root: &std::path::Path, conversation: &str, id: &str) -> Option<String> {
+    load_record(root, conversation, id).and_then(|r| r.context.cwd)
 }
 
 #[cfg(test)]

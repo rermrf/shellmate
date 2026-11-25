@@ -17,6 +17,11 @@ pub struct StepView {
 }
 #[derive(Clone, Debug)]
 pub struct View {
+    pub pending_inputs: Vec<shellmate_ai::interaction::Input>,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub active_tools: Vec<shellmate_ai::LoggedCall>,
+    pub revision: u64,
     pub id: String,
     pub call_id: String,
     pub description: String,
@@ -45,6 +50,11 @@ pub struct View {
 impl View {
     pub fn new(id: String, request: &SubagentRequest, config: &shellmate_ai::Config) -> Self {
         Self {
+            pending_inputs: vec![],
+            prompt: request.prompt.clone(),
+            cwd: None,
+            active_tools: vec![],
+            revision: 0,
             id,
             call_id: String::new(),
             description: request.description.clone(),
@@ -72,7 +82,44 @@ impl View {
         }
     }
     pub fn event(&mut self, event: SubagentEvent<'_>) {
+        self.revision = self.revision.wrapping_add(1);
         match event {
+            SubagentEvent::Snapshot(entries) => {
+                self.transcript = Some(entries.to_vec());
+                self.transcript_loaded = true;
+                self.read_steps(entries);
+            }
+            SubagentEvent::Updates(updates) => {
+                let entries = self.transcript.get_or_insert_with(Vec::new);
+                for update in updates {
+                    match update {
+                        shellmate_ai::LogUpdate::Append(e) => {
+                            if let Entry::Step(step) = &**e {
+                                self.active_tools.retain(|c| c.id != step.call.id);
+                            }
+                            entries.push(*e.clone());
+                        }
+                        shellmate_ai::LogUpdate::ClearResults(indices) => {
+                            for index in indices {
+                                if let Some(Entry::Step(step)) = entries.get_mut(*index) {
+                                    step.result.cleared = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            SubagentEvent::Agent(AgentEvent::ToolStarted(call)) => {
+                self.latest_activity = call.name.clone();
+                self.active_tools.push(call.clone());
+            }
+            SubagentEvent::Agent(AgentEvent::ToolFinished(id)) => {
+                self.active_tools.retain(|c| c.id != *id);
+            }
+            SubagentEvent::Agent(AgentEvent::InputsAccepted(_)) => {
+                self.active_tools.clear();
+            }
             SubagentEvent::Started {
                 model, reasoning, ..
             } => {
@@ -80,6 +127,7 @@ impl View {
                 self.reasoning = reasoning;
             }
             SubagentEvent::Agent(AgentEvent::StepProposed(call)) => {
+                self.active_tools.push(shellmate_ai::LoggedCall{id:call.id.clone(),name:"run_command".into(),args_json:serde_json::json!({"command":call.command,"purpose":call.purpose,"target":call.target.id(),"cwd":self.cwd})});
                 self.latest_activity = call.command.clone();
                 self.step_list.push(StepView {
                     id: call.id.clone(),
@@ -93,6 +141,7 @@ impl View {
                 });
             }
             SubagentEvent::Agent(AgentEvent::StepFinished { call, outcome }) => {
+                self.active_tools.retain(|c| c.id != call.id);
                 let display = shellmate_ai::StepDisplay::from_item(outcome.item(call)).unwrap();
                 let output_id = if let shellmate_ai::ToolOutcome::Completed(out) = outcome {
                     out.output_id.clone()
@@ -140,6 +189,7 @@ impl View {
                 self.usage = usage;
             }
             SubagentEvent::Finished(out) => {
+                self.active_tools.clear();
                 self.saving = false;
                 self.duration_ms = out.duration.as_millis().min(u64::MAX as u128) as u64;
                 self.status = out.status.clone();
@@ -205,6 +255,11 @@ impl View {
             display.status.clone()
         };
         Self {
+            pending_inputs: vec![],
+            prompt: String::new(),
+            cwd: None,
+            active_tools: vec![],
+            revision: 0,
             id,
             call_id: String::new(),
             description: display.description.clone(),
@@ -252,12 +307,32 @@ impl View {
             return;
         }
         self.transcript_loaded = true;
+        self.cwd = super::subagents::saved_cwd(root, conversation, &self.id);
+        self.pending_inputs = super::subagent_files::read_checkpoint(root, conversation, &self.id)
+            .map(|c| c.inbox.inputs.into_iter().filter(|i| !i.claimed).collect())
+            .unwrap_or_default();
         if let Some(entries) = self
             .transcript_id
             .as_deref()
             .and_then(|id| super::subagent_files::read(root, conversation, id))
+            .or_else(|| {
+                super::subagent_files::read_checkpoint(root, conversation, &self.id)
+                    .map(|c| c.entries)
+            })
         {
             self.read_steps(&entries);
+            if self.prompt.is_empty() {
+                self.prompt = entries
+                    .iter()
+                    .find_map(|e| {
+                        if let Entry::User { text, .. } = e {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+            }
             self.transcript = Some(entries);
         }
     }
@@ -265,11 +340,18 @@ impl View {
     /// one-second snapshots must not discard drawer-owned lazy reads (including misses).
     pub fn refresh(&mut self, mut next: Self) {
         if self.history && next.history {
+            if next.cwd.is_none() {
+                next.cwd = self.cwd.clone();
+            }
+            if next.prompt.is_empty() {
+                next.prompt = self.prompt.clone();
+            }
             if self.report_loaded {
                 next.report = std::mem::take(&mut self.report);
                 next.report_loaded = true;
             }
             if self.transcript_loaded {
+                next.pending_inputs = self.pending_inputs.clone();
                 next.transcript = self.transcript.take();
                 next.step_list = std::mem::take(&mut self.step_list);
                 next.transcript_loaded = true;

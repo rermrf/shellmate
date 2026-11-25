@@ -120,6 +120,7 @@ impl Drawer {
     }
     pub(super) fn release_context(&mut self, cx: &mut Context<Self>) {
         if !self.state.model.busy
+            && self.state.child_page.selected.is_none()
             && !self.state.pending
             && !self.state.timing.live()
             && self.state.continuation.is_none()
@@ -133,12 +134,15 @@ impl Drawer {
     }
 
     pub(super) fn agent_event(&mut self, event: AgentEvent) {
+        self.state.active_tools.retain(|call|!self.state.model.conversation.entries().iter().any(|e|matches!(e,shellmate_ai::Entry::Step(step) if step.call.id==call.id)));
         self.timing_event(&event);
         if !matches!(event, AgentEvent::Retrying { .. }) {
             self.state.model.retrying = None;
         }
         match event {
-            AgentEvent::InputsAccepted(ids)=>self.state.accepted_inputs.extend(ids),
+            AgentEvent::ToolStarted(call)=>self.state.active_tools.push(call),
+            AgentEvent::ToolFinished(id)=>self.state.active_tools.retain(|c|c.id!=id),
+            AgentEvent::InputsAccepted(ids)=>{self.state.active_tools.clear();self.state.accepted_inputs.extend(ids);},
             AgentEvent::CompletionsAccepted(ids)=>self.state.accepted_events.extend(ids),
             AgentEvent::Retrying { attempt, max, delay, error } => {
                 self.state.model.retrying = Some(format!("{error}，{} 秒后重试（第 {attempt}/{max} 次）", delay.as_secs()));
@@ -156,15 +160,18 @@ impl Drawer {
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
             AgentEvent::TextDelta(_) | AgentEvent::Command(_) => self.state.model.thinking = false,
             AgentEvent::Done(u) => {
+                self.state.active_tools.clear();
                 self.state.model.event(Event::Done(u));
                 self.state.model.manual_compaction = false;
                 // Retain the run configuration for queued input and background-result delivery.
             }
             AgentEvent::Released(_) => {
+                self.state.active_tools.clear();
                 self.state.model.event(Event::Done(None));
                 self.state.model.manual_compaction = false;
             }
             AgentEvent::Error(e) => {
+                self.state.active_tools.clear();
                 self.state.control.hold();self.state.control.release_claims();
                 self.state.model.event(Event::Error(e));
                 self.state.model.manual_compaction = false;
@@ -174,6 +181,7 @@ impl Drawer {
             AgentEvent::StepProposed(_) => self.state.model.thinking = false,
             AgentEvent::StepFinished { .. } => { self.state.active_steps.clear_main(); }
             AgentEvent::Paused { reason, steps, resume } => {
+                self.state.active_tools.clear();
                 self.state.control.hold();
                 self.state.model.pause(reason);
                 self.state.continuation = Some(resume);
@@ -266,7 +274,7 @@ impl Drawer {
                                     step.reply = Some(reply);
                                     step.redline = redline;
                                     s.state.active_steps.insert(key,source.map(|s|s.id),step);
-                                    s.state.follow_bottom = true;
+                                    if s.state.child_page.selected.is_none(){s.state.follow_bottom = true;}
                                 }
                                 Ui::Running {
                                     call,

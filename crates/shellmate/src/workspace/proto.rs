@@ -383,6 +383,7 @@ impl Workspace {
             | "ai-output-short" | "ai-output-expanded" | "ai-output-history" | "ai-output-missing" | "ai-output-retained" | "ai-output-running" | "ai-output-giant"
             | "ai-live-queue" | "ai-live-waiting" | "ai-live-approval" | "ai-live-restored" | "ai-live-target" | "ai-live-btw"
             | "ai-timing-running" | "ai-timing-waiting" | "ai-timing-done" | "ai-timing-paused" | "ai-timing-interrupted"
+            | "ai-child-thread" | "ai-child-running" | "ai-child-approval" | "ai-child-restored" | "ai-child-long-prompt"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
                 if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),"h1");}
                 self.open_ai(window, cx);

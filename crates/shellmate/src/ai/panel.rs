@@ -8,6 +8,10 @@ mod timing;
 mod timing_ui;
 #[path = "subagent_ui.rs"]
 mod subagent_ui;
+#[path = "thread_ui.rs"]
+mod thread_ui;
+#[path = "tool_ui.rs"]
+mod tool_ui;
 #[path = "output_ui.rs"]
 mod output_ui;
 #[path = "mode_ui.rs"]
@@ -57,6 +61,7 @@ pub fn init(cx: &mut App) {
     output_ui::init(cx);
     // The popover owns focus outside the textarea's Input key context.
     cx.bind_keys([KeyBinding::new("escape", input::Escape, Some(CONTEXT_POPOVER_KEYS))]);
+    cx.bind_keys([KeyBinding::new("escape",input::Escape,Some("AiChildThread")),KeyBinding::new("cmd-enter",interaction_ui::SendNow,Some("AiChildThread"))]);
 }
 pub struct SessionContext {
     pub session: Option<usize>,
@@ -235,7 +240,7 @@ impl Drawer {
         if self.fixture {
             return;
         }
-        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks() || self.state.timing.live()
+        if self.state.child_page.selected.is_some() || self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks() || self.state.timing.live()
             || !self.state.control.snapshot().inputs.is_empty() || self.state.control.pending_completions() {
             self.next_context = Some(context);
             return;
@@ -275,6 +280,7 @@ impl Drawer {
         self.selection_scroll.read(cx).debug_viewport_at(position,cx)
     }
     fn input_changed(&mut self, cx: &mut Context<Self>) {
+        if self.state.child_page.selected.is_some(){self.popup.escape();cx.notify();return;}
         self.popup.changed(&self.input.read(cx).value());
         if self.popup.open { super::mode_popover::show(super::mode_popover::Kind::Slash,&mut self.permission_menu,&mut self.state.context_popover,&mut self.popup); }
         cx.notify();
@@ -295,11 +301,13 @@ impl Drawer {
     }
     fn send_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
+        if let Some(id)=self.state.child_page.selected.clone(){self.state.message_target=Some(id);self.send_to_child(text,false,w,cx);return;}
         if self.state.message_target.is_some(){self.send_to_child(text,false,w,cx);return;}
         self.dispatch_input(&text, w, cx);
     }
 
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
+        if self.state.child_page.selected.is_some(){self.back_to_main(w,cx);}
         if question.trim().is_empty(){return;}
         if self.state.pending || self.state.model.busy {
             self.queue_message(question,w,cx);return;
@@ -790,7 +798,7 @@ impl Drawer {
                     if let Ok(records)=serde_json::from_value::<Vec<timing::Record>>(runtime["timing"].clone()) { self.state.timing.restore(records); }
                     if let Ok(mut queue)=serde_json::from_value::<shellmate_ai::interaction::Snapshot>(runtime["queue"].clone()) {
                         if self.state.model.conversation.turns().is_empty() && let Some(text)=runtime["preparing"]["text"].as_str() {
-                            queue.inputs.push_front(shellmate_ai::interaction::Input{id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
+                            queue.inputs.push_front(shellmate_ai::interaction::Input{origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
                         }
                         self.state.control.restore(queue);
                     }
@@ -925,7 +933,7 @@ impl Drawer {
                 self.state.subagents = fixture.views.into_iter().map(|v|(v.id.clone(),v)).collect();
                 self.fixture_tasks = fixture.tasks;
                 if let Some((id,step)) = fixture.expanded {
-                    let card = self.state.agent_cards.entry(id).or_default();card.open=true;card.step=Some(step);
+                    self.state.tool_expanded.insert(tool_ui::key(&format!("child:{id}"),&step));self.open_child(&id,w,cx);
                 }
             }
             if scene=="ai-subagent-approval" {
@@ -1150,6 +1158,7 @@ impl Render for Drawer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_items = self.prepare_subagent_cards();
         self.prepare_output_views(cx);
+        if self.state.child_page.selected.is_some(){return self.render_child(window,cx);}
         let p = cx.palette().clone();
         // Only the session label may shrink; the context prefix and line count
         // keep their intrinsic widths below the title/actions row.
@@ -1423,6 +1432,7 @@ impl Render for Drawer {
                                 continue;
                             }
                             shellmate_ai::AnswerItem::Notice(text) => {
+                                if let Some(step)=self.state.model.conversation.displayed_step(index,n){reply=reply.child(self.tool_card("main",&step.call,Some(&step.result),step.display.as_ref(),window,cx));continue;}
                                 let action = self.state.model.conversation.memory_action(index,n).cloned();
                                 let label = output_ui::notice_label(text, self.state.model.conversation.displayed_step(index,n));
                                 let line = div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(label);
@@ -1545,6 +1555,7 @@ impl Render for Drawer {
             for view in self.state.subagents.values().filter(|v| !v.history && !agent_items.values().any(|id|id==&v.id)) {
                 body = body.child(self.subagent_card(view,window,cx));
             }
+            for call in &self.state.active_tools{body=body.child(self.tool_card("main",call,None,None,window,cx));}
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
             if self.state.continuation.is_some() {
                 body = body.child(
@@ -1705,7 +1716,7 @@ impl Render for Drawer {
                     .child(body)
                     .child(crate::ui::scroll::scroll_fades(self.scroll.clone(), p.card)),
             )
-            .child(footer)
+            .child(footer).into_any_element()
     }
 }
 

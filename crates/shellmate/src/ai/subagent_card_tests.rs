@@ -96,20 +96,6 @@ fn preview_strips_markers_and_clamps_nonempty_lines() {
     );
 }
 #[test]
-fn expansion_is_per_id_and_only_one_step_is_open() {
-    let mut cards: BTreeMap<String, Expansion> = BTreeMap::new();
-    let a = cards.entry("agent-1".into()).or_default();
-    assert!(!a.open);
-    a.open = true;
-    a.toggle_step("one");
-    a.toggle_step("two");
-    assert_eq!(a.step.as_deref(), Some("two"));
-    a.toggle_step("two");
-    assert_eq!(a.step, None);
-    assert!(!cards.entry("agent-2".into()).or_default().open);
-    assert!(cards["agent-1"].open);
-}
-#[test]
 fn missing_and_corrupt_transcripts_are_loaded_once_and_report_is_retained() {
     let root = tempfile::tempdir().unwrap();
     let mut v = view();

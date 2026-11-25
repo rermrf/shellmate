@@ -1088,6 +1088,7 @@ async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint(
         .inbox
         .inputs
         .push_back(shellmate_ai::interaction::Input {
+            origin: None,
             id: "pending".into(),
             text: "RECOVERED-PENDING".into(),
             context: Default::default(),
@@ -1232,4 +1233,89 @@ async fn initial_checkpoint_failure_does_not_start_a_model_request() {
         SubagentStatus::Failed(shellmate_ai::AiError::Persistence)
     );
     assert!(http.requests().is_empty());
+}
+
+#[tokio::test]
+async fn live_child_transcript_preserves_delegation_and_message_sources_before_and_after_reload() {
+    use shellmate_ai::MessageOrigin;
+    let (root, service, ui, _) = fixture(vec![
+        response(true, "checking live"),
+        response(false, "finished"),
+    ]);
+    service.start(request(true), "initial").await;
+    let (_, reply) = approval(&ui).await;
+    let running = service.tasks.agent_views().remove(0);
+    assert!(
+        matches!(&running.transcript.as_ref().unwrap()[0],Entry::User{text,origin:Some(MessageOrigin::Delegation),..} if text=="inspect")
+    );
+    assert!(
+        running
+            .transcript
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e,Entry::Assistant{text,..} if text.contains("checking live")))
+    );
+    assert_eq!(running.active_tools.len(), 1);
+    service
+        .message("agent-1", "parent followup", false, false, "parent-message")
+        .await;
+    service
+        .message_from(
+            "agent-1",
+            "user followup",
+            false,
+            false,
+            "user-message",
+            MessageOrigin::User,
+        )
+        .await;
+    reply.send(Approval::Deny { reason: None }).ok().unwrap();
+    settled(&service.tasks).await;
+    let completed = service.tasks.agent_views().remove(0);
+    assert!(completed.active_tools.is_empty());
+    let entries = completed.transcript.as_ref().unwrap();
+    assert!(entries.iter().any(|e|matches!(e,Entry::User{text,origin:Some(MessageOrigin::Parent),..} if text=="parent followup")));
+    assert!(entries.iter().any(|e|matches!(e,Entry::User{text,origin:Some(MessageOrigin::User),..} if text=="user followup")));
+    let mut restored = subagent_view::View::reopened(
+        completed.id.clone(),
+        &completed.display(),
+        true,
+        completed.report.clone(),
+    );
+    restored.load_transcript(root.path(), "conversation");
+    assert_eq!(restored.transcript, completed.transcript);
+    assert_eq!(restored.cwd, service.binding.capabilities.cwd);
+}
+
+#[tokio::test]
+async fn stopped_child_keeps_undelivered_user_messages_visible_after_reopening() {
+    use shellmate_ai::MessageOrigin;
+    let (root, service, ui, _) = fixture(vec![response(true, "waiting")]);
+    service.start(request(true), "initial").await;
+    let (_, reply) = approval(&ui).await;
+    service
+        .message_from(
+            "agent-1",
+            "keep my queued request",
+            false,
+            false,
+            "user-message",
+            MessageOrigin::User,
+        )
+        .await;
+    service.tasks.stop("agent-1");
+    settled(&service.tasks).await;
+    drop(reply);
+    let stopped = service.tasks.agent_views().remove(0);
+    assert_eq!(stopped.pending_inputs.len(), 1);
+    assert_eq!(stopped.pending_inputs[0].origin, Some(MessageOrigin::User));
+    let mut restored = subagent_view::View::reopened(
+        stopped.id.clone(),
+        &stopped.display(),
+        true,
+        stopped.report.clone(),
+    );
+    restored.load_transcript(root.path(), "conversation");
+    assert_eq!(restored.pending_inputs, stopped.pending_inputs);
 }

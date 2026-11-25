@@ -175,6 +175,8 @@ pub struct SubagentOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct SubagentContext {
+    #[serde(default)]
+    pub origin: Option<crate::MessageOrigin>,
     pub id: String,
     pub snapshot: ContextSnapshot,
     pub cwd: Option<String>,
@@ -182,6 +184,7 @@ pub struct SubagentContext {
 /// Borrowed events avoid handing ownership of an interactive Resume to a child UI.
 /// Agent forwards all existing events (text, proposals/results, compaction, retries, pauses).
 pub enum SubagentEvent<'a> {
+    Snapshot(&'a [Entry]),
     Updates(&'a [LogUpdate]),
     /// The owner saves the current transcript and inbox before the runner can
     /// acknowledge inputs or execute another step. Retries do not replay Updates.
@@ -417,7 +420,12 @@ pub async fn run_from_history(
     }
     transcript.child = Some(source.clone());
     transcript.memory = Some(snapshot);
-    transcript.push_user(UserTurn::new(&request.prompt, context.snapshot));
+    prepare_history(
+        &mut transcript,
+        &request.prompt,
+        context.snapshot,
+        context.origin,
+    );
     let initial_entries = transcript.entries().len();
     let caps = Capabilities {
         background: true,
@@ -429,6 +437,7 @@ pub async fn run_from_history(
         model: &client.config.model,
         reasoning: client.config.reasoning,
     });
+    on_event(SubagentEvent::Snapshot(transcript.entries()));
     let status = loop {
         let used = transcript
             .entries()
@@ -567,6 +576,20 @@ pub async fn run_from_history(
     };
     on_event(SubagentEvent::Finished(&outcome));
     outcome
+}
+pub fn prepare_history(
+    log: &mut Conversation,
+    prompt: &str,
+    context: ContextSnapshot,
+    origin: Option<crate::MessageOrigin>,
+) {
+    if !log.entries().is_empty() {
+        log.append(Entry::Notice {
+            kind: "resume".into(),
+            text: "继续执行".into(),
+        });
+    }
+    log.push_user_from(UserTurn::new(prompt, context), origin);
 }
 fn partial_report(log: &Conversation) -> String {
     if let Some(group) = log.entries().iter().rev().find_map(|e| {

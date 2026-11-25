@@ -419,6 +419,8 @@ pub enum PauseReason {
 }
 
 pub enum AgentEvent {
+    ToolStarted(crate::LoggedCall),
+    ToolFinished(String),
     InputsAccepted(Vec<String>),
     CompletionsAccepted(Vec<String>),
     Context {
@@ -462,6 +464,7 @@ pub enum ReleaseReason {
     Detached,
     Stopped,
 }
+#[derive(Clone)]
 enum Pending {
     AgentMessage(Box<RigCall>, String, String, bool, bool),
     Subagent(Box<RigCall>, crate::SubagentRequest),
@@ -613,6 +616,7 @@ pub fn compact_with_limits<'a>(
     ))
 }
 struct State<'a> {
+    started_tool: Option<String>,
     client: &'a RigClient,
     conversation: &'a mut Conversation,
     host: &'a dyn ToolHost,
@@ -941,6 +945,7 @@ fn stream<'a>(
     let updates = Arc::new(Mutex::new(initial_updates));
     let message_id = turn.message_id;
     let mut state = State {
+        started_tool: None,
         client,
         conversation,
         host,
@@ -1090,8 +1095,23 @@ fn stream<'a>(
                 return Some((s.pause(PauseReason::StepLimit), s));
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
+                if let Pending::Local(raw, _) | Pending::AgentMessage(raw, ..) = &pending {
+                    let id = raw.id.to_string();
+                    if s.started_tool.as_deref() != Some(&id) {
+                        let call = crate::LoggedCall {
+                            id: id.clone(),
+                            name: raw.function.name.to_string(),
+                            args_json: serde_json::Value::Object(raw.function.arguments.clone()),
+                        };
+                        s.started_tool = Some(id);
+                        s.turn.as_mut().unwrap().pending.push_front(pending);
+                        return Some((AgentEvent::ToolStarted(call), s));
+                    }
+                    s.started_tool = None;
+                }
                 match pending {
                     Pending::AgentMessage(raw, id, text, immediate, resume) => {
+                        let tool_id = raw.id.to_string();
                         let result = s
                             .host
                             .send_agent_message(&id, &text, immediate, resume, &raw.id.to_string())
@@ -1114,7 +1134,7 @@ fn stream<'a>(
                         }));
                         s.steps += 1;
                         s.turn.as_mut().unwrap().steps += 1;
-                        continue;
+                        return Some((AgentEvent::ToolFinished(tool_id), s));
                     }
                     Pending::Subagent(raw, request) => {
                         s.phase(crate::interaction::Phase::Executing);
@@ -1167,6 +1187,7 @@ fn stream<'a>(
                         continue;
                     }
                     Pending::Local(raw, tool) => {
+                        let tool_id = raw.id.to_string();
                         let result = s.host.local_tool(tool, s.limits.exec).await;
                         s.entry(Entry::Step(crate::Step {
                             message_id: s.message_id,
@@ -1187,7 +1208,7 @@ fn stream<'a>(
                         s.steps += 1;
                         s.turn.as_mut().unwrap().steps += 1;
                         s.turn.as_mut().unwrap().invalid_calls = 0;
-                        continue;
+                        return Some((AgentEvent::ToolFinished(tool_id), s));
                     }
                     Pending::Call(raw, call) => {
                         s.turn.as_mut().unwrap().invalid_calls = 0;

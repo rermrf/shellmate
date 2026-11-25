@@ -6,7 +6,7 @@ mod config;
 mod conversation;
 mod log;
 pub mod context;
-pub use log::{Conversation, Entry, LoggedCall, LoggedResult, Step, StepDisplay, Compaction, CompactTrigger, RetainedState, DeniedCommand, LogUpdate};
+pub use log::{MessageOrigin, Conversation, Entry, LoggedCall, LoggedResult, Step, StepDisplay, Compaction, CompactTrigger, RetainedState, DeniedCommand, LogUpdate};
 pub use context::{ContextWindow, WindowSource, resolve_window, ContextBudget, ContextBreakdown};
 pub mod output;
 pub mod policy;

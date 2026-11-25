@@ -382,6 +382,9 @@ impl ProviderClient for RigClient {
         let inner =
             futures::stream::poll_fn(move |cx| Pin::new(&mut stream).poll_next(cx)).map(|event| {
                 match event {
+                    crate::AgentEvent::ToolStarted(_) | crate::AgentEvent::ToolFinished(_) => {
+                        Event::TextDelta(String::new())
+                    }
                     crate::AgentEvent::InputsAccepted(_)
                     | crate::AgentEvent::CompletionsAccepted(_) => Event::TextDelta(String::new()),
                     crate::AgentEvent::Thinking => Event::Thinking,

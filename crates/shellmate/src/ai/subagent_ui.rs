@@ -1,5 +1,5 @@
-//! Subagent cards reuse command-step surfaces, header, output viewport and text actions.
-use super::{Drawer, agent_ui, markdown};
+//! Compact links into independently browsable child conversations.
+use super::{Drawer, agent_ui};
 use crate::ai::{subagent_card as card, subagent_view::View};
 use crate::theme::ActivePalette;
 use gpui::{
@@ -9,10 +9,7 @@ use gpui::{
 };
 use shellmate_ai::SubagentStatus;
 use std::collections::BTreeMap;
-
 impl Drawer {
-    /// Join semantic Steps with registry identities before borrowing the projected turns.
-    /// A foreground call has no result Step yet; it is shown at the pending Step position.
     pub(super) fn prepare_subagent_cards(&mut self) -> BTreeMap<(usize, usize), String> {
         let ids = card::projected(&self.state.model.conversation, &mut self.state.subagents);
         for view in self.state.subagents.values_mut() {
@@ -20,47 +17,15 @@ impl Drawer {
         }
         ids
     }
-
-    fn toggle_subagent(&mut self, id: &str, cx: &mut Context<Self>) {
-        let card = self.state.agent_cards.entry(id.into()).or_default();
-        card.open = !card.open;
-        if card.open
-            && let Some(view) = self.state.subagents.get_mut(id)
-        {
-            view.load_transcript(&self.data_root, &self.state.id);
-        }
-        cx.notify();
-    }
-    fn toggle_subagent_step(&mut self, id: &str, step_id: &str, cx: &mut Context<Self>) {
-        let card = self.state.agent_cards.entry(id.into()).or_default();
-        card.toggle_step(step_id);
-        if card.step.is_some()
-            && let Some(output) = self
-                .state
-                .output_panes
-                .get(&super::output_ui::child_key(id, step_id))
-        {
-            output.update(cx, |s, cx| s.open(cx));
-        }
-        cx.notify();
-    }
-    fn stop_subagent(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(tasks) = &self.tasks {
-            tasks.stop(id);
-        }
-        cx.notify();
-    }
-
     pub(super) fn subagent_card(
         &self,
         view: &View,
-        window: &mut Window,
+        w: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = cx.palette().clone();
-        let id = &view.id;
-        let scope = format!("{}:subagent:{id}", self.state.id);
         let running = view.status == SubagentStatus::Running;
+        let scope = format!("{}:subagent:{}", self.state.id, view.id);
         let seconds = if running && !self.fixture {
             view.started.elapsed().as_secs()
         } else {
@@ -68,224 +33,84 @@ impl Drawer {
         };
         let (status, color) = card::status(&view.status, view.steps, seconds);
         let color = color.resolve(&p);
-        let expansion = self.state.agent_cards.get(id);
-        let expanded = expansion.is_some_and(|c| c.open);
+        let target = view.id.clone();
+        let title = div()
+            .id(SharedString::from(format!("{scope}:title-link")))
+            .cursor_pointer()
+            .child(selectable(
+                format!("{scope}:title"),
+                &view.description,
+                w,
+                cx,
+            ))
+            .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx)));
         let chips = div()
             .flex()
-            .items_center()
             .gap(px(5.))
             .child(agent_ui::target_chip("子任务", color))
             .when(view.background, |d| {
                 d.child(agent_ui::neutral_chip("后台", &p))
             });
-        let title = selectable(format!("{scope}:title"), &view.description, window, cx);
         let mut surface = agent_ui::step_surface(&p)
-            .flex_none()
             .min_w_0()
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(agent_ui::step_heading(title, chips, &status, color, cx))
-            .when(view.saving, |d| {
-                d.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(p.err)
-                        .child("执行记录保存失败，已暂停后续步骤，正在重试"),
-                )
-            });
-        if let Some(meta) = card::meta(view) {
-            surface = surface.child(div().text_size(px(11.)).text_color(p.tx3).child(selectable(
-                format!("{scope}:meta"),
-                &meta,
-                window,
-                cx,
-            )));
-        }
-        if expanded {
-            surface = surface.child(note(format!("执行记录 · {} 步", view.steps), &p));
-            if let Some(note_text) = card::transcript_note(view) {
-                surface = surface.child(note(note_text, &p));
-            } else {
-                let mut steps = agent_ui::command_surface(cx)
-                    .px(px(12.))
-                    .py(px(8.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.));
-                for step in &view.step_list {
-                    let step_key = format!("{scope}:step:{}", step.id);
-                    let (status, color) = card::step_status(step);
-                    let row_open =
-                        expansion.and_then(|c| c.step.as_deref()) == Some(step.id.as_str());
-                    let agent_id = id.clone();
-                    let step_id = step.id.clone();
-                    let row = div()
-                        .id(SharedString::from(step_key.clone()))
-                        .min_w_0()
-                        .h(px(28.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .flex_none()
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(color.resolve(&p)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(12.))
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(selectable(
-                                    format!("{step_key}:command"),
-                                    &card::command_line(&step.command),
-                                    window,
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(crate::theme::UI_FONT)
-                                .text_size(px(11.))
-                                .text_color(
-                                    if step.running
-                                        || matches!(
-                                            step.status,
-                                            shellmate_ai::StepStatus::Denied { .. }
-                                                | shellmate_ai::StepStatus::Background
-                                        )
-                                    {
-                                        color.resolve(&p)
-                                    } else {
-                                        p.tx3
-                                    },
-                                )
-                                .child(status),
-                        )
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            s.toggle_subagent_step(&agent_id, &step_id, cx)
-                        }));
-                    steps = steps.child(row);
-                    if row_open
-                        && let Some(output) = self
-                            .state
-                            .output_panes
-                            .get(&super::output_ui::child_key(id, &step.id))
-                    {
-                        steps = steps.child(output.clone());
-                    }
-                }
-                surface = surface.child(steps);
-            }
-            surface = surface.child(note("报告", &p));
-            surface = surface.child(markdown::drawer_view(
-                SharedString::from(format!("{scope}:report")).into(),
-                markdown::preprocess(
-                    if view.report.trim().is_empty() {
-                        card::EMPTY_REPORT
-                    } else {
-                        &view.report
-                    },
-                    &[],
-                )
-                .into(),
-                self.selection_scroll.clone(),
-                self.fixture_copy,
-                window,
-                cx,
-            ));
-        } else if running {
-            let command = view
-                .step_list
-                .last()
-                .map(|s| card::command_line(&s.command));
-            surface = surface.child(
-                agent_ui::command_surface(cx)
-                    .when(command.is_none(), |d| {
-                        d.font_family(crate::theme::UI_FONT).text_color(p.tx3)
-                    })
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(selectable(
-                        format!("{scope}:activity"),
-                        command.as_deref().unwrap_or("正在分析任务…"),
-                        window,
-                        cx,
-                    )),
-            );
-        } else {
-            let preview = card::preview(&view.report);
+            .child(agent_ui::step_heading(title, chips, &status, color, cx));
+        if view.saving {
             surface = surface.child(
                 div()
-                    .min_w_0()
-                    .w_full()
-                    .text_size(px(13.))
-                    .line_height(px(20.8))
-                    .text_color(if preview == card::EMPTY_REPORT {
-                        p.tx3
-                    } else {
-                        p.tx
-                    })
-                    .text_ellipsis()
-                    .whitespace_normal()
-                    .line_clamp(3)
-                    .child(selectable(format!("{scope}:preview"), &preview, window, cx)),
+                    .text_size(px(12.))
+                    .text_color(p.err)
+                    .child("执行记录保存失败，正在重试"),
             );
         }
-        let agent_id = id.clone();
-        let mut actions = agent_ui::step_actions().child(
-            agent_ui::step_action(
-                SharedString::from(format!("{scope}:expand")),
-                if expanded { "收起" } else { "展开" },
-                cx,
-            )
-            .on_click(cx.listener(move |s, _, _, cx| s.toggle_subagent(&agent_id, cx))),
+        let preview = if running {
+            card::command_line(&view.latest_activity)
+        } else {
+            card::preview(&view.report)
+        };
+        surface = surface.child(
+            selectable(format!("{scope}:preview"), &preview, w, cx)
+                .text_size(px(12.5))
+                .text_color(p.tx2)
+                .line_clamp(3)
+                .whitespace_normal()
+                .overflow_hidden(),
         );
-        let target = id.clone();
-        actions = actions.child(
-            agent_ui::step_action(
-                SharedString::from(format!("{scope}:message")),
-                "追加消息",
-                cx,
+        let target = view.id.clone();
+        let message = view.id.clone();
+        let mut actions = agent_ui::step_actions()
+            .flex_wrap()
+            .child(
+                agent_ui::step_action(SharedString::from(format!("{scope}:open")), "查看过程", cx)
+                    .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx))),
             )
-            .on_click(cx.listener(move |s, _, w, cx| {
-                s.state.message_target = Some(target.clone());
-                s.input.focus_handle(cx).focus(w, cx);
-                cx.notify();
-            })),
-        );
-        if expanded || !running {
-            let copy = card::copy_report(view);
-            actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{scope}:copy")), "复制报告", cx)
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                    }),
+            .child(
+                agent_ui::step_action(
+                    SharedString::from(format!("{scope}:message")),
+                    "追加消息",
+                    cx,
+                )
+                .on_click(cx.listener(move |s, _, w, cx| {
+                    s.open_child(&message, w, cx);
+                    s.input.focus_handle(cx).focus(w, cx);
+                })),
             );
-        }
         if running && !self.state.readonly {
-            let agent_id = id.clone();
+            let id = view.id.clone();
             actions = actions.child(
                 agent_ui::step_action(SharedString::from(format!("{scope}:stop")), "停止任务", cx)
-                    .on_click(cx.listener(move |s, _, _, cx| s.stop_subagent(&agent_id, cx))),
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if let Some(tasks) = &s.tasks {
+                            tasks.stop(&id);
+                        }
+                        cx.notify();
+                    })),
             );
         }
         surface.child(actions).into_any_element()
     }
-}
-
-fn note(text: impl Into<SharedString>, p: &crate::theme::Palette) -> Div {
-    div()
-        .text_size(px(11.))
-        .text_color(p.tx3)
-        .child(text.into())
 }
 struct Selection {
     handle: TextSelectionHandle,
@@ -294,7 +119,7 @@ struct Selection {
 }
 /// Uses the same window selection participants as Markdown/code; inherits the
 /// surrounding typography and native line clamp/ellipsis for compact card text.
-fn selectable(id: String, text: &str, w: &mut Window, cx: &mut App) -> Div {
+pub(super) fn selectable(id: String, text: &str, w: &mut Window, cx: &mut App) -> Div {
     let state = w.use_keyed_state(
         SharedString::from(format!("{id}:selection")),
         cx,

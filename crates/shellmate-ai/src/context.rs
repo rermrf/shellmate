@@ -407,7 +407,7 @@ impl Conversation {
                 continue;
             }
             match &entries[i] {
-                Entry::User { text, context } => push_message(
+                Entry::User { text, context, .. } => push_message(
                     &mut messages,
                     Message::user(crate::UserTurn::new(text, context.clone()).wire_text()),
                 ),
@@ -530,7 +530,7 @@ impl Conversation {
         let mut tool_results = 0;
         for entry in &self.entries()[self.view_start()..] {
             match entry {
-                Entry::User { text, context } => {
+                Entry::User { text, context, .. } => {
                     // Count this snapshot once. Assign the question and protocol
                     // message overhead to Messages, without re-counting the wire.
                     let wire = crate::UserTurn::new(text, context.clone()).wire_text();

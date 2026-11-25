@@ -94,6 +94,15 @@ impl Drawer {
         cx: &mut Context<Self>,
     ) {
         let composer_focused = self.input.focus_handle(cx).contains_focused(w, cx);
+        if self.state.child_page.selected.is_some()
+            && (action as &dyn Action).as_any().is::<input::Escape>()
+            && !self.input_composing(w, cx)
+        {
+            self.back_to_main(w, cx);
+            cx.stop_propagation();
+            w.prevent_default();
+            return;
+        }
         if !composer_focused && !self.context_focus.contains_focused(w, cx) {
             cx.propagate();
             return;

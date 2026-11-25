@@ -30,6 +30,14 @@ pub struct ViewHandle {
     id: u64,
 }
 impl ViewHandle {
+    pub fn configure(&self, log: &shellmate_ai::Conversation, cwd: &Option<String>) {
+        if let Some(registry) = self.registry.upgrade()
+            && let Some(task) = registry.state.lock().unwrap().agents.get_mut(&self.id)
+        {
+            task.view.cwd = cwd.clone();
+            task.view.event(SubagentEvent::Snapshot(log.entries()));
+        }
+    }
     pub fn event(&self, event: SubagentEvent<'_>) {
         // Publish terminal status only after reports/transcripts and final result are ready.
         if matches!(event, SubagentEvent::Finished(_)) {
@@ -121,6 +129,19 @@ impl Ticket {
         if let Some(registry) = self.registry.upgrade() {
             let mut state = registry.state.lock().unwrap();
             if let Some(task) = state.agents.get_mut(&self.id) {
+                task.view.pending_inputs = task
+                    .child_outputs
+                    .upgrade()
+                    .map(|child| {
+                        child
+                            .control
+                            .snapshot()
+                            .inputs
+                            .into_iter()
+                            .filter(|i| !i.claimed)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 task.view.event(SubagentEvent::Finished(&out));
                 task.view.output_id = result.output_id.clone();
                 task.view.transcript_id = result

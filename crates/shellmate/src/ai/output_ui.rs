@@ -413,9 +413,6 @@ fn compact(text: &str, incomplete: bool) -> String {
     }
 }
 
-pub(super) fn child_key(agent: &str, step: &str) -> String {
-    format!("child:{agent}:{step}")
-}
 fn source(key: String, output: Option<String>, text: &str, running: bool) -> Source {
     let view = crate::ai::output_view::display(text);
     let output = output.or_else(|| view.output_id.map(str::to_owned));

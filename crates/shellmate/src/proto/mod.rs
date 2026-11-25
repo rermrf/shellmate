@@ -78,6 +78,7 @@ pub const SCENES: &[&str] = &[
     "ai-mode-popover",
     "ai-live-queue", "ai-live-waiting", "ai-live-approval", "ai-live-restored", "ai-live-target", "ai-live-btw",
     "ai-timing-running", "ai-timing-waiting", "ai-timing-done", "ai-timing-paused", "ai-timing-interrupted",
+    "ai-child-thread","ai-child-running","ai-child-approval","ai-child-restored","ai-child-long-prompt",
     "ai-output-short", "ai-output-expanded", "ai-output-history", "ai-output-missing", "ai-output-retained", "ai-output-running", "ai-output-giant",
     "ai-slash", "ai-slash-filter", "ai-slash-context", "ai-slash-tasks", "set-ai-advanced",
     "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
@@ -313,7 +314,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 151 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 156 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

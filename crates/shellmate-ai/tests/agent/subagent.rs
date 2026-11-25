@@ -20,6 +20,7 @@ fn delegation() -> Value {
 }
 fn context() -> SubagentContext {
     SubagentContext {
+        origin: None,
         id: "agent-test".into(),
         snapshot: ContextSnapshot {
             label: "prod-web-01".into(),

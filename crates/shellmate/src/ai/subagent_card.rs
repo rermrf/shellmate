@@ -154,21 +154,6 @@ pub fn step_status(step: &StepView) -> (String, Color) {
         StepStatus::Failed(_) => ("失败".into(), Color::Error),
     }
 }
-/// Kept outside View: the one-second registry refresh cannot reset UI choices.
-#[derive(Default)]
-pub struct Expansion {
-    pub open: bool,
-    pub step: Option<String>,
-}
-impl Expansion {
-    pub fn toggle_step(&mut self, id: &str) {
-        self.step = if self.step.as_deref() == Some(id) {
-            None
-        } else {
-            Some(id.into())
-        };
-    }
-}
 pub fn transcript_note(view: &View) -> Option<&'static str> {
     (view.history && view.transcript.is_none()).then_some(EXPIRED)
 }
@@ -211,6 +196,10 @@ pub fn projected(
                 step.result.inline.clone(),
             );
             view.call_id = step.call.id.clone();
+            view.prompt = step.call.args_json["prompt"]
+                .as_str()
+                .unwrap_or_default()
+                .into();
             view
         });
         ids.push(id);

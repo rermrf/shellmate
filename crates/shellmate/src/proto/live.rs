@@ -1,4 +1,9 @@
 pub const SCENES: &[&str] = &[
+    "ai-child-thread",
+    "ai-child-running",
+    "ai-child-approval",
+    "ai-child-restored",
+    "ai-child-long-prompt",
     "ai-live-queue",
     "ai-live-waiting",
     "ai-live-approval",
@@ -16,6 +21,11 @@ pub fn base(scene: &str) -> Option<&'static str> {
         return None;
     }
     Some(match scene {
+        "ai-child-thread"
+        | "ai-child-running"
+        | "ai-child-approval"
+        | "ai-child-restored"
+        | "ai-child-long-prompt" => "ai-subagent-done",
         "ai-live-queue" => "ai-agent-run",
         "ai-live-waiting" => "ai-subagent-running",
         "ai-live-approval" => "ai-subagent-approval",

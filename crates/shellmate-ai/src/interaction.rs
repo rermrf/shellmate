@@ -44,6 +44,8 @@ impl Phase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct Input {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::MessageOrigin>,
     pub id: String,
     pub text: String,
     pub context: ContextSnapshot,
@@ -128,6 +130,16 @@ impl Control {
         context: ContextSnapshot,
         save: impl FnOnce(&Input) -> Result<(), E>,
     ) -> Result<bool, E> {
+        self.enqueue_from(id, text, context, None, save)
+    }
+    pub fn enqueue_from<E>(
+        &self,
+        id: String,
+        text: String,
+        context: ContextSnapshot,
+        origin: Option<crate::MessageOrigin>,
+        save: impl FnOnce(&Input) -> Result<(), E>,
+    ) -> Result<bool, E> {
         if text.trim().is_empty() {
             return Ok(false);
         }
@@ -139,6 +151,7 @@ impl Control {
             return Ok(false);
         }
         let input = Input {
+            origin,
             id,
             text,
             context,

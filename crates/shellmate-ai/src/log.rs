@@ -195,6 +195,8 @@ pub enum Entry {
     User {
         text: String,
         context: ContextSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
     },
     Assistant {
         text: String,
@@ -211,6 +213,9 @@ pub enum Entry {
         text: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde", rename_all = "snake_case")]
+pub enum MessageOrigin { Delegation, Parent, User }
 impl Entry {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -316,7 +321,11 @@ impl Conversation {
         }
     }
     pub fn push_user(&mut self, user: UserTurn) {
+        self.push_user_from(user, None);
+    }
+    pub fn push_user_from(&mut self, user: UserTurn, origin: Option<MessageOrigin>) {
         self.append(Entry::User {
+            origin,
             text: user.question,
             context: user.context,
         });
@@ -453,7 +462,7 @@ impl Conversation {
                 crate::context::portable_id(&step.call.id, self.entries.len(), &mut used);
         }
         match &entry {
-            Entry::User { text, context } => self.turns.push(Turn {
+            Entry::User { text, context, .. } => self.turns.push(Turn {
                 user: UserTurn::new(text, context.clone()),
                 answer: None,
             }),
@@ -467,9 +476,7 @@ impl Conversation {
                             answer.items.push(AnswerItem::Command(card.clone()))
                         }
                         Entry::Step(s) => {
-                            if s.result.subagent.is_some() || s.display.is_some() || matches!(s.call.name.as_str(), "memory" | "read_output" | "stop_task") {
-                                self.displayed_steps.insert((turn_index, answer.items.len()), self.entries.len());
-                            }
+                            self.displayed_steps.insert((turn_index, answer.items.len()), self.entries.len());
                             if let Some(display) = &s.result.subagent {
                                 answer.items.push(AnswerItem::Subagent {
                                     display: display.clone(),
@@ -508,6 +515,8 @@ impl Conversation {
                                 answer
                                     .items
                                     .push(AnswerItem::Notice(format!("{label} · {id}{status}")));
+                            } else {
+                                answer.items.push(AnswerItem::Notice(format!("工具 · {}",s.call.name)));
                             }
                         }
                         Entry::Compaction(c) => {
@@ -563,9 +572,9 @@ mod display_source_tests {
         let display=StepDisplay{command:"pwd".into(),target:Target::Background,purpose:"inspect".into(),class:crate::policy::Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1,automatic:true,output:"/tmp".into()};
         c.append(step("run","run_command",Some(display)));
         c.push_user(UserTurn::new("followup",Default::default()));c.push_text("answer");
-        assert!(c.displayed_step(0,0).is_none());assert_eq!(c.displayed_step(0,1).unwrap().call.id,"read");
-        assert_eq!(c.displayed_step(0,2).unwrap().result.output_id.as_deref(),Some("out-run"));
+        assert!(c.displayed_step(0,0).is_none());assert_eq!(c.displayed_step(0,1).unwrap().call.id,"invalid");assert_eq!(c.displayed_step(0,2).unwrap().call.id,"read");
+        assert_eq!(c.displayed_step(0,3).unwrap().result.output_id.as_deref(),Some("out-run"));
         assert!(c.displayed_step(1,0).is_none());
-        let reopened=Conversation::from_entries(c.entries().to_vec());assert_eq!(reopened.displayed_step(0,2),c.displayed_step(0,2));
+        let reopened=Conversation::from_entries(c.entries().to_vec());assert_eq!(reopened.displayed_step(0,3),c.displayed_step(0,3));
     }
 }

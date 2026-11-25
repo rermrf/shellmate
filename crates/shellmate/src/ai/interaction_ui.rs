@@ -11,6 +11,10 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-child-") {
+            self.child_fixture(scene, w, cx);
+            return;
+        }
         if scene.starts_with("ai-timing-") {
             self.timing_fixture(scene, cx);
             return;
@@ -76,7 +80,27 @@ impl Drawer {
         let Some(id) = self.state.message_target.clone() else {
             return;
         };
+        if text.trim().is_empty() && immediate {
+            if let Some(children) = self
+                .tasks
+                .as_ref()
+                .and_then(|t| t.latest_agent(&id))
+                .and_then(|(_, _, t)| t)
+            {
+                children.control().resume();
+                children.control().request(Intent::SendNow);
+                cx.notify();
+            }
+            return;
+        }
         let Some(service) = self.subagent_service.clone() else {
+            if let Some(scope) = &self.state.interaction_scope
+                && (scope["host"].as_str() != self.host.as_deref()
+                    || scope["local"].as_bool() != self.binding.as_ref().map(|b| b.local))
+            {
+                self.child_error("请回到原主机会话后继续子任务".into(), cx);
+                return;
+            }
             if self.state.readonly {
                 let local = self
                     .state
@@ -90,10 +114,7 @@ impl Drawer {
                     self.host == self.state.history_memory_host
                 };
                 if !valid {
-                    self.local(
-                        slash_ui::LocalBody::Hint("请回到原主机会话后继续子任务".into()),
-                        cx,
-                    );
+                    self.child_error("请回到原主机会话后继续子任务".into(), cx);
                     return;
                 }
             }
@@ -117,7 +138,7 @@ impl Drawer {
                                     s.send_to_child(text, immediate, w, cx);
                                 }
                             }
-                            Err(e) => s.local(slash_ui::LocalBody::Hint(e.to_string()), cx),
+                            Err(e) => s.child_error(e.to_string(), cx),
                         }
                     })
                     .ok();
@@ -136,17 +157,42 @@ impl Drawer {
         let conversation = self.state.id.clone();
         let label = text.clone();
         let target = id.clone();
+        let child_page = self.state.child_page.selected.clone();
+        if let Some(id) = &child_page {
+            self.state
+                .child_page
+                .pages
+                .entry(id.clone())
+                .or_default()
+                .error = None;
+        }
         let timing_started = timing::Moment::now();
         self.input.update(cx, |i, cx| i.set_value("", w, cx));
-        self.state.message_target = None;
+        self.state.message_target = self.state.child_page.selected.clone();
         self.state.control.resume();
-        let job = runtime
-            .spawn(async move { service.message(&id, &text, immediate, true, &call_id).await });
+        let job = runtime.spawn(async move {
+            service
+                .message_from(
+                    &id,
+                    &text,
+                    immediate,
+                    true,
+                    &call_id,
+                    shellmate_ai::MessageOrigin::User,
+                )
+                .await
+        });
         cx.spawn_in(w,async move|this,cx|{
             let Ok(result)=job.await else{return;};
             this.update_in(cx,|s,w,cx|{
                 if s.state.id!=conversation{return;}
                 if result.is_error{
+                    if let Some(id)=&child_page{
+                        let same=s.state.child_page.selected.as_ref()==Some(id);
+                        if same&&s.input.read(cx).value().trim().is_empty(){s.set_composer_text(label.clone(),w,cx);}
+                        else{s.state.child_page.pages.entry(id.clone()).or_default().unsent.push(label.clone());}
+                        s.state.child_page.pages.entry(id.clone()).or_default().error=Some(result.inline);cx.notify();return;
+                    }
                     if s.input.read(cx).value().trim().is_empty(){s.state.message_target=Some(target.clone());s.set_composer_text(label.clone(),w,cx);}
                     s.local(slash_ui::LocalBody::Hint(result.inline),cx);return;
                 }
@@ -186,7 +232,7 @@ impl Drawer {
         let Some(binding) = binding.filter(|b| {
             b.capabilities.background && b.alive.load(std::sync::atomic::Ordering::Acquire)
         }) else {
-            self.local(slash_ui::LocalBody::Hint("原会话连接不可用".into()), cx);
+            self.child_error("原会话连接不可用".into(), cx);
             return false;
         };
         self.ensure_tasks();
@@ -238,6 +284,9 @@ impl Drawer {
     }
     fn send_now(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
+        if let Some(id) = self.state.child_page.selected.clone() {
+            self.state.message_target = Some(id);
+        }
         if self.state.message_target.is_some() {
             self.send_to_child(text, true, w, cx);
             return;
