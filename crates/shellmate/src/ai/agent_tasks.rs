@@ -218,7 +218,7 @@ impl Tasks {
                 if state.agents.contains_key(&n) {
                     continue;
                 }
-                let mut view = View::reopened(
+                let view = View::reopened(
                     id.clone(),
                     display,
                     step.call.args_json["run_in_background"]
@@ -226,10 +226,6 @@ impl Tasks {
                         .unwrap_or(false),
                     step.result.inline.clone(),
                 );
-                // Historical interrupted runs have no worker to resume/cancel.
-                if view.status == SubagentStatus::Running {
-                    view.status = SubagentStatus::Stopped;
-                }
                 let (sender, result) = watch::channel(None);
                 drop(sender);
                 state.agents.insert(

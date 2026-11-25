@@ -119,7 +119,9 @@ pub fn preview(report: &str) -> String {
     if first.is_empty() {
         EMPTY_REPORT.into()
     } else {
-        first.join("\n")
+        // One paragraph lets the text renderer clamp the whole preview to three
+        // visual lines; explicit newlines get a separate wrap budget in GPUI.
+        first.join(" ")
     }
 }
 pub fn command_line(command: &str) -> String {

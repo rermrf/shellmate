@@ -87,12 +87,12 @@ fn meta_only_shows_overrides_and_known_usage_with_error_before_usage() {
 fn preview_strips_markers_and_clamps_nonempty_lines() {
     assert_eq!(
         preview("\n## **结论**\n\n> - **证据**\n1. 已检查\n* 风险"),
-        "结论\n证据\n已检查…"
+        "结论 证据 已检查…"
     );
     assert_eq!(preview("# \n  \n> \n"), EMPTY_REPORT);
     assert_eq!(
         preview("1.2 秒\n- 已完成\n**没有变更**"),
-        "1.2 秒\n已完成\n没有变更"
+        "1.2 秒 已完成 没有变更"
     );
 }
 #[test]
@@ -215,6 +215,45 @@ fn pending_card_becomes_the_same_projected_step_and_history_gets_its_scope() {
     assert!(reopened["agent-1"].history);
     assert!(reopened["agent-1"].background);
     assert!(reopened["agent-1"].transcript.is_none());
+}
+
+#[test]
+fn interrupted_history_is_stopped_without_changing_live_tasks_or_the_saved_log() {
+    let mut live = view();
+    live.status = SubagentStatus::Running;
+    live.history = false;
+    live.call_id = "interrupted-call".into();
+    let mut log = shellmate_ai::Conversation::default();
+    log.push_user(shellmate_ai::UserTurn::new("检查", Default::default()));
+    log.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
+        message_id: 1,
+        call: shellmate_ai::LoggedCall {
+            id: live.call_id.clone(),
+            name: "agent".into(),
+            args_json: serde_json::json!({"run_in_background":true}),
+        },
+        result: shellmate_ai::LoggedResult {
+            subagent: Some(Box::new(live.display())),
+            inline: "partial report".into(),
+            output_id: live.output_id.clone(),
+            cleared: false,
+            is_error: false,
+        },
+        display: None,
+    }));
+    let saved = log.entries().to_vec();
+    let mut history = BTreeMap::new();
+    projected(&log, &mut history);
+    let reopened = &history["agent-1"];
+    assert_eq!(reopened.status, SubagentStatus::Stopped);
+    assert_eq!(reopened.latest_activity, "已停止");
+    assert_eq!(reopened.report, "partial report");
+    assert_eq!(log.entries(), saved);
+
+    let mut views = BTreeMap::from([(live.id.clone(), live)]);
+    projected(&log, &mut views);
+    assert_eq!(views["agent-1"].status, SubagentStatus::Running);
+    assert!(!views["agent-1"].history);
 }
 
 #[test]

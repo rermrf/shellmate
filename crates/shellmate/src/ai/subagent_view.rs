@@ -185,6 +185,13 @@ impl View {
         background: bool,
         report: String,
     ) -> Self {
+        // A saved in-flight snapshot has no worker after reopening history.
+        // Normalize here so both the drawer and the task registry agree.
+        let status = if display.status == SubagentStatus::Running {
+            SubagentStatus::Stopped
+        } else {
+            display.status.clone()
+        };
         Self {
             id,
             call_id: String::new(),
@@ -195,14 +202,14 @@ impl View {
             reasoning: display.reasoning,
             model_overridden: display.model_overridden,
             reasoning_overridden: display.reasoning_overridden,
-            status: display.status.clone(),
+            status: status.clone(),
             duration_ms: display.duration_ms,
             started: Instant::now()
                 .checked_sub(Duration::from_millis(display.duration_ms))
                 .unwrap_or_else(Instant::now),
             steps: display.steps,
             step_list: vec![],
-            latest_activity: status_label(&display.status).into(),
+            latest_activity: status_label(&status).into(),
             usage: display.usage,
             report,
             output_id: display.output_id.clone(),

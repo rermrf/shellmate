@@ -235,3 +235,30 @@ Pending subagent approvals render inside the card, using the normal approval car
 - `send_message` / resume of a finished subagent.
 - Agent teams.
 - Enabling provider parallel tool calls.
+
+## Delivery and verification (2026-11-25)
+
+M1, M2 and M3 are implemented. The final UI review covered running, completed,
+expanded, failed, stopped, step-limited and background subagents, multiple
+approvals, the task list and the concurrency setting in both themes.
+
+Review fixes:
+- Reopening an interrupted subagent now shows **已停止** immediately, including
+  read-only history before a task registry exists. Live tasks keep their running
+  status, and the stored conversation is unchanged.
+- Collapsed report previews join their first three non-empty source lines into
+  one paragraph so the renderer's three-line limit also applies after wrapping.
+  Expanded Markdown and copying retain the complete report.
+
+Validation:
+- Workspace/all-target Clippy with `-D warnings` and the app build pass offline.
+- Tests: app **751**, AI **121**, store **103**, core **79** passed (**1,054**
+  total; five existing tests requiring external services or OS integrations remain
+  ignored).
+- Eight existing scenes in both themes match the M2 screenshots pixel for pixel:
+  `ai-chat`, `ai-agent`, `ai-agent-run`, `ai-tasks`, `ai-tasks-subagents`,
+  `ai-context-popover`, `ai-mode-popover`, and `set-ai-advanced`.
+- Native fixture interaction verified expansion and copying the complete Markdown
+  report in both themes. Clipboard contents were restored after the checks.
+- GUI fixtures use temporary data/log/cache directories and an in-memory database.
+  No live provider or SSH session was used; those paths are covered by mock tests.
