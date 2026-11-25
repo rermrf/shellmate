@@ -240,6 +240,19 @@ impl Drawer {
             )
             .on_click(cx.listener(move |s, _, _, cx| s.toggle_subagent(&agent_id, cx))),
         );
+        let target = id.clone();
+        actions = actions.child(
+            agent_ui::step_action(
+                SharedString::from(format!("{scope}:message")),
+                "追加消息",
+                cx,
+            )
+            .on_click(cx.listener(move |s, _, w, cx| {
+                s.state.message_target = Some(target.clone());
+                s.input.focus_handle(cx).focus(w, cx);
+                cx.notify();
+            })),
+        );
         if expanded || !running {
             let copy = card::copy_report(view);
             actions = actions.child(
@@ -252,7 +265,7 @@ impl Drawer {
         if running && !self.state.readonly {
             let agent_id = id.clone();
             actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{scope}:stop")), "停止", cx)
+                agent_ui::step_action(SharedString::from(format!("{scope}:stop")), "停止任务", cx)
                     .on_click(cx.listener(move |s, _, _, cx| s.stop_subagent(&agent_id, cx))),
             );
         }

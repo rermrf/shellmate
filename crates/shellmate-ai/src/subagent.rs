@@ -29,7 +29,8 @@ pub struct SubagentRef {
     pub description: String,
     pub kind: SubagentKind,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde")]
 pub struct SubagentRequest {
     pub description: String,
     pub prompt: String,
@@ -47,7 +48,7 @@ impl SubagentRequest {
             prompt: String,
             #[serde(rename = "type")]
             kind: Option<String>,
-            #[serde(default)]
+            #[serde(default = "default_background")]
             run_in_background: bool,
             model: Option<String>,
             reasoning: Option<String>,
@@ -99,6 +100,16 @@ impl SubagentRequest {
         })
     }
 }
+fn default_background() -> bool {
+    true
+}
+pub fn message_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        ToolName::new("send_agent_message").unwrap(),
+        "向本会话已有子任务追加消息。运行中会排队，immediate=true 尽快处理并让它等待中的命令继续运行；已结束时 resume=true 用原上下文继续。用户停止的任务只有用户明确要求继续时才可 resume。",
+        serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"},"immediate":{"type":"boolean","default":false},"resume":{"type":"boolean","default":false}},"required":["id","message"],"additionalProperties":false}),
+    )
+}
 pub fn agent_tool(main: &Config) -> ToolDefinition {
     let reasoning: Vec<_> = ReasoningLevel::options(&main.provider)
         .iter()
@@ -113,7 +124,7 @@ pub fn agent_tool(main: &Config) -> ToolDefinition {
         ),
         serde_json::json!({"type":"object","properties":{
             "description":{"type":"string","description":"一句话标题，最多 30 字"},"prompt":{"type":"string","description":"完整、自包含的任务说明"},
-            "run_in_background":{"type":"boolean","default":false},
+            "run_in_background":{"type":"boolean","default":true,"description":"默认后台执行；需要结果时用 wait_tasks 等待，等待期间用户仍可补充指令"},
             "model":{"type":"string","description":"仅用户要求时指定同一服务商下的模型 ID","maxLength":256},
             "reasoning":{"type":"string","enum":reasoning}
         },"required":["description","prompt"],"additionalProperties":false}),
@@ -161,7 +172,8 @@ pub struct SubagentOutcome {
 }
 /// Explicit child context: no parent messages. Use the main session label/protocol/cwd;
 /// id is assigned by the caller (normally the tool call id or M2's agent-N).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde")]
 pub struct SubagentContext {
     pub id: String,
     pub snapshot: ContextSnapshot,
@@ -170,6 +182,7 @@ pub struct SubagentContext {
 /// Borrowed events avoid handing ownership of an interactive Resume to a child UI.
 /// Agent forwards all existing events (text, proposals/results, compaction, retries, pauses).
 pub enum SubagentEvent<'a> {
+    Updates(&'a [LogUpdate]),
     Started {
         source: &'a SubagentRef,
         model: &'a str,
@@ -235,6 +248,9 @@ impl<'a> ChildHost<'a> {
     }
 }
 impl ToolHost for ChildHost<'_> {
+    fn control(&self) -> Option<crate::interaction::Control> {
+        self.inner.control()
+    }
     fn run(&self, mut call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
             call.target = Target::Background;
@@ -266,6 +282,9 @@ impl ToolHost for ChildHost<'_> {
                         || self.tasks.lock().unwrap().contains(&args.id)
                 }
                 LocalTool::StopTask { id } => self.tasks.lock().unwrap().contains(id),
+                LocalTool::WaitTasks { ids, .. } => {
+                    ids.iter().all(|id| self.tasks.lock().unwrap().contains(id))
+                }
             };
             if !allowed {
                 return LocalResult::error(
@@ -345,10 +364,35 @@ pub async fn run_with_cancel(
     client: &RigClient,
     request: SubagentRequest,
     context: SubagentContext,
+    snapshot: crate::memory::Snapshot,
+    child_host: &dyn ToolHost,
+    limits: Limits,
+    cancel: &Cancellation,
+    on_event: impl FnMut(SubagentEvent<'_>),
+) -> SubagentOutcome {
+    run_from_history(
+        client,
+        request,
+        context,
+        snapshot,
+        child_host,
+        limits,
+        cancel,
+        Conversation::default(),
+        on_event,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+pub async fn run_from_history(
+    client: &RigClient,
+    request: SubagentRequest,
+    context: SubagentContext,
     mut snapshot: crate::memory::Snapshot,
     child_host: &dyn ToolHost,
     limits: Limits,
     cancel: &Cancellation,
+    mut transcript: Conversation,
     mut on_event: impl FnMut(SubagentEvent<'_>),
 ) -> SubagentOutcome {
     let start = Instant::now();
@@ -360,10 +404,17 @@ pub async fn run_with_cancel(
     let _finish = Finish(child_host, source.clone());
     snapshot.auto_memory = limits.auto_memory;
     let host = ChildHost::new(child_host, source.clone(), snapshot.clone());
-    let mut transcript = Conversation::default();
+    for entry in transcript.entries() {
+        if let Entry::Step(step) = entry
+            && let Some(id) = &step.result.output_id
+        {
+            host.outputs.lock().unwrap().insert(id.clone());
+        }
+    }
     transcript.child = Some(source.clone());
     transcript.memory = Some(snapshot);
     transcript.push_user(UserTurn::new(&request.prompt, context.snapshot));
+    let initial_entries = transcript.entries().len();
     let caps = Capabilities {
         background: true,
         cwd: context.cwd,
@@ -374,9 +425,19 @@ pub async fn run_with_cancel(
         model: &client.config.model,
         reasoning: client.config.reasoning,
     });
-    let status = {
-        let result = agent::run(client, &mut transcript, caps, &host, limits);
-        match result {
+    let status = loop {
+        let used = transcript
+            .entries()
+            .iter()
+            .skip(initial_entries)
+            .filter(|e| matches!(e, Entry::Step(_)))
+            .count();
+        let remaining = Limits {
+            max_steps: limits.max_steps.map(|max| max.saturating_sub(used)),
+            ..limits
+        };
+        let result = agent::run(client, &mut transcript, caps.clone(), &host, remaining);
+        let status = match result {
             Err(error) => SubagentStatus::Failed(error),
             Ok(mut stream) => {
                 let mut steps = 0;
@@ -404,7 +465,18 @@ pub async fn run_with_cancel(
                         _ => None,
                     };
                     on_event(SubagentEvent::Agent(&event));
-                    for update in stream.take_updates() {
+                    let updates = stream.take_updates();
+                    on_event(SubagentEvent::Updates(&updates));
+                    // The owner checkpoints the user entries before we remove
+                    // their input IDs, so concurrent arrivals cannot erase them.
+                    if let Some(c) = host.control() {
+                        match &event {
+                            AgentEvent::InputsAccepted(ids) => c.acknowledge(ids),
+                            AgentEvent::CompletionsAccepted(ids) => c.acknowledge_completions(ids),
+                            _ => {}
+                        }
+                    }
+                    for update in updates {
                         match update {
                             LogUpdate::RequestUsage(u) => usage.add(u),
                             LogUpdate::Append(entry) if matches!(*entry, Entry::Step(_)) => {
@@ -421,7 +493,16 @@ pub async fn run_with_cancel(
                 drop(stream);
                 status
             }
+        };
+        if status == SubagentStatus::Completed
+            && host.control().is_some_and(|c| !c.finish_if_empty())
+        {
+            continue;
         }
+        if let Some(control) = host.control() {
+            control.seal();
+        }
+        break status;
     };
     let mut report = partial_report(&transcript);
     if status == SubagentStatus::StepLimit {

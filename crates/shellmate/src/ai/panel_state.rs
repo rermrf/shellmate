@@ -18,6 +18,15 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) save_error: Option<String>,
     pub(super) pending: bool,
     pub(super) queued: Option<UserTurn>,
+    pub(super) control: shellmate_ai::interaction::Control,
+    pub(super) accepted_inputs: Vec<String>,
+    pub(super) accepted_events: Vec<String>,
+    pub(super) reenter: bool,
+    pub(super) interaction_scope: Option<serde_json::Value>,
+    pub(super) btw: super::btw_ui::SideQuestion,
+    pub(super) message_target: Option<String>,
+    pub(super) editing_message: Option<String>,
+    pub(super) queue_expanded: bool,
     pub(super) follow_bottom: bool,
     pub(super) active_steps: crate::ai::approvals::Queue<ActiveStep>,
     pub(super) subagents: std::collections::BTreeMap<String, crate::ai::subagent_view::View>,
@@ -53,6 +62,15 @@ impl<R> Default for ConversationState<R> {
             save_error: None,
             pending: false,
             queued: None,
+            control: Default::default(),
+            accepted_inputs: vec![],
+            accepted_events: vec![],
+            reenter: false,
+            interaction_scope: None,
+            btw: Default::default(),
+            message_target: None,
+            editing_message: None,
+            queue_expanded: false,
             follow_bottom: true,
             active_steps: Default::default(),
             subagents: Default::default(),
@@ -99,7 +117,21 @@ impl<R> ConversationState<R> {
         provider: &str,
         model: &str,
     ) {
-        let Some(first) = self.model.conversation.turns().first() else {
+        let snapshot = self.control.snapshot();
+        let first = self
+            .model
+            .conversation
+            .turns()
+            .first()
+            .map(|t| t.user.clone())
+            .or_else(|| self.queued.clone())
+            .or_else(|| {
+                snapshot
+                    .inputs
+                    .front()
+                    .map(|i| UserTurn::new(&i.text, i.context.clone()))
+            });
+        let Some(first) = first else {
             return;
         };
         let saved = SavedConversation {
@@ -108,29 +140,40 @@ impl<R> ConversationState<R> {
             label: self
                 .model
                 .conversation
-                .turns()
-                .last()
-                .unwrap()
-                .user
+                .latest_user()
+                .unwrap_or(&first)
                 .context
                 .label
                 .clone(),
-            title: first.user.question.chars().take(48).collect(),
+            title: first.question.chars().take(48).collect(),
             provider: provider.into(),
             model: model.into(),
             created_at: self.created,
             updated_at: crate::ai::now(),
             conversation: self.model.conversation.clone(),
         };
-        match db.save_ai_conversation(&saved) {
-            Ok(true) => self.save_error = None,
+        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context}))});
+        match db.save_ai_conversation_with_runtime(&saved, Some(&runtime)) {
+            Ok(true) => {
+                self.save_error = None;
+                self.control
+                    .acknowledge(&std::mem::take(&mut self.accepted_inputs));
+                self.control
+                    .acknowledge_completions(&std::mem::take(&mut self.accepted_events));
+            }
             // Saving being disabled is not evidence that a failed save recovered.
-            Ok(false) => {}
+            Ok(false) => {
+                self.control
+                    .acknowledge(&std::mem::take(&mut self.accepted_inputs));
+                self.control
+                    .acknowledge_completions(&std::mem::take(&mut self.accepted_events));
+            }
             Err(_) => self.save_error = Some("对话未能保存到本机，请检查主机库".into()),
         }
     }
     pub fn new_conversation_action(&self, history_open: bool) -> NewConversation {
         let has_content = !self.model.conversation.turns().is_empty()
+            || !self.control.snapshot().inputs.is_empty()
             || self.queued.is_some()
             || self.model.error.is_some()
             || self.save_error.is_some();

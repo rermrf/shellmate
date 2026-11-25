@@ -221,6 +221,11 @@ pub fn run_command_tool_with_limits(
 pub fn output_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new(
+            ToolName::new("wait_tasks").unwrap(),
+            "等待本会话后台任务完成。无需循环读取输出或 sleep；等待不消耗模型请求，用户可随时补充指令或结束等待。完成、失败或停止均算结束。",
+            serde_json::json!({"type":"object","properties":{"ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},"mode":{"type":"string","enum":["any","all"],"default":"all"}},"required":["ids"],"additionalProperties":false}),
+        ),
+        ToolDefinition::new(
             ToolName::new("read_output").unwrap(),
             "在这台 Mac 上读取运行中或已结束任务的落盘输出；id 可为输出 id 或任务 id。无需审批。grep 是区分大小写的普通子串（不是正则），最多返回 2000 个匹配行；长输出按预览规则截断。",
             serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"offset_line":{"type":"integer","minimum":0,"default":0,"description":"从第几行开始，0 起算，先偏移再筛选"},"limit_lines":{"type":"integer","minimum":1,"maximum":2000,"default":2000},"grep":{"type":"string","maxLength":4096}},"required":["id"],"additionalProperties":false}),

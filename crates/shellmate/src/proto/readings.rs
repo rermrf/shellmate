@@ -13,6 +13,18 @@ pub struct Reading {
     pub docker_cpu: &'static [(&'static str, f64)],
 }
 pub const READINGS: &[Reading] = &[
+Reading {scene:"ai-live-queue",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-queue",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-waiting",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-waiting",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-approval",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-approval",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-restored",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-restored",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-target",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-target",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-btw",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-live-btw",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-output-short",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-output-short",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-output-expanded",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},

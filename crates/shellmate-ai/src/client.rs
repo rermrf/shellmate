@@ -199,6 +199,25 @@ impl ResponseStream<'_> {
     }
 }
 impl RigClient {
+    /// Independent context-only side question. No executable tools are sent and the
+    /// supplied conversation is immutable, including its usage/accounting state.
+    pub async fn side_question(
+        &self,
+        conversation: &Conversation,
+        question: &str,
+    ) -> Result<(String, Usage), AiError> {
+        let mut request = conversation.prepare(&Default::default())?;
+        request.tools.clear();
+        crate::context::add_prompt(
+            &mut request,
+            format!(
+                "这是独立侧问，只根据已有对话回答，不执行命令或调用工具，不改变主任务。问题：{question}"
+            ),
+        );
+        let mut usage = Usage::default();
+        let answer = self.summarize(request, |u| usage.add(u)).await?;
+        Ok((answer, usage))
+    }
     pub(crate) async fn summarize(
         &self,
         request: CompletionRequest,
@@ -363,6 +382,8 @@ impl ProviderClient for RigClient {
         let inner =
             futures::stream::poll_fn(move |cx| Pin::new(&mut stream).poll_next(cx)).map(|event| {
                 match event {
+                    crate::AgentEvent::InputsAccepted(_)
+                    | crate::AgentEvent::CompletionsAccepted(_) => Event::TextDelta(String::new()),
                     crate::AgentEvent::Thinking => Event::Thinking,
                     crate::AgentEvent::TextDelta(t) => Event::TextDelta(t),
                     crate::AgentEvent::Command(c) => Event::Command(c),

@@ -101,7 +101,7 @@ impl Drawer {
                             .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx)))
                     ))
                     .child(
-                        Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止").h(px(24.)).text_size(px(11.5))
+                        Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止任务").h(px(24.)).text_size(px(11.5))
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 if s.fixture {
                                     s.fixture_tasks.retain(|t| t.id != stop_id);
@@ -123,6 +123,8 @@ impl Drawer {
             && !self.state.pending
             && self.state.continuation.is_none()
             && !self.has_running_tasks()
+            && self.state.control.snapshot().inputs.is_empty()
+            && !self.state.control.pending_completions()
             && let Some(context) = self.next_context.take()
         {
             self.sync_context(context, cx);
@@ -134,6 +136,8 @@ impl Drawer {
             self.state.model.retrying = None;
         }
         match event {
+            AgentEvent::InputsAccepted(ids)=>self.state.accepted_inputs.extend(ids),
+            AgentEvent::CompletionsAccepted(ids)=>self.state.accepted_events.extend(ids),
             AgentEvent::Retrying { attempt, max, delay, error } => {
                 self.state.model.retrying = Some(format!("{error}，{} 秒后重试（第 {attempt}/{max} 次）", delay.as_secs()));
             }
@@ -152,9 +156,10 @@ impl Drawer {
             AgentEvent::Done(u) => {
                 self.state.model.event(Event::Done(u));
                 self.state.model.manual_compaction = false;
-                if self.state.continuation.is_none() { self.state.run_config = None; }
+                // Retain the run configuration for queued input and background-result delivery.
             }
             AgentEvent::Error(e) => {
+                self.state.control.hold();self.state.control.release_claims();
                 self.state.model.event(Event::Error(e));
                 self.state.model.manual_compaction = false;
                 if self.state.continuation.is_none() { self.state.run_config = None; }
@@ -163,6 +168,7 @@ impl Drawer {
             AgentEvent::StepProposed(_) => self.state.model.thinking = false,
             AgentEvent::StepFinished { .. } => { self.state.active_steps.clear_main(); }
             AgentEvent::Paused { reason, steps, resume } => {
+                self.state.control.hold();
                 self.state.model.pause(reason);
                 self.state.continuation = Some(resume);
                 self.state.resume_steps = steps;
@@ -174,6 +180,7 @@ impl Drawer {
             return;
         }
         if let Some(config) = self.state.run_config.clone() {
+            self.state.control.resume();self.state.control.reset_budget();
             self.state.model.busy = true;
             self.state.model.error = None;
             self.state.model.pause_reason = None;
@@ -411,7 +418,7 @@ impl Drawer {
                 card = card.child(output.clone());
             }
             card = card.child(gpui::component::spinner::Spinner::new()).child(
-                dialogs::button("ai-step-stop", "停止", Tone::Plain, true)
+                dialogs::button("ai-step-stop", "停止任务", Tone::Plain, true)
                     .on_click(cx.listener(|s, _, _, cx| s.stop(cx))),
             );
         } else {

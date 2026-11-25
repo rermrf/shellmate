@@ -1009,3 +1009,44 @@ async fn terminal_directory_change_persists_after_timeout_or_background() {
         assert_eq!(out.stdout().trim(), "/");
     }
 }
+
+#[tokio::test]
+async fn live_interaction_promotes_a_real_command_without_restarting_or_killing_it() {
+    use shellmate_ai::interaction::Intent;
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "live".into());
+    let command =
+        "printf 'started\\n'; while [ ! -f release ]; do sleep 0.01; done; printf 'finished\\n'";
+    let mut run = Box::pin(run_local(
+        &tasks,
+        call(command, Target::Background, Duration::from_secs(10)),
+        temp.0.clone(),
+        "/bin/sh",
+        Some(&temp.0),
+    ));
+    tokio::select! {_=&mut run=>panic!("command must wait"),_=tokio::time::sleep(Duration::from_millis(50))=>{}}
+    let before = tasks.list();
+    assert_eq!(before.len(), 1);
+    let id = before[0].id.clone();
+    let output = before[0].output_id.clone();
+    tasks.control().request(Intent::Detach);
+    let out = completed(
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap(),
+    );
+    assert!(out.task_id.is_some());
+    assert!(tasks.has_running());
+    tasks.control().take_intent();
+    assert_eq!(tasks.list()[0].output_id, output);
+    std::fs::write(temp.0.join("release"), "").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), tasks.wait_tasks(vec![id], true))
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    let text =
+        std::fs::read_to_string(shellmate_core::ai_output::path(&temp.0, "live", &output).unwrap())
+            .unwrap();
+    assert_eq!(text, "started\nfinished\n");
+    assert_eq!(tasks.control().snapshot().completions.len(), 1);
+}

@@ -52,7 +52,7 @@ fn migration_v9_v10_keeps_display_ids_timestamps_and_old_rows_unchanged() {
     v9(&mut conn, &json);
     drop(conn);
     let mut db = HostStore::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 10);
+    assert_eq!(db.schema_version().unwrap(), 11);
     let loaded = db.ai_conversation("legacy").unwrap().unwrap();
     assert_eq!(loaded.conversation.turns()[0].user.question, "question");
     assert_eq!(loaded.conversation.turns()[0].user.context.text, "snapshot");
@@ -266,4 +266,65 @@ async fn native_signed_reasoning_replays_in_run_but_never_reaches_sqlite_or_next
     let request = String::from_utf8(http.requests()[2].body.to_vec()).unwrap();
     assert!(!request.contains("SIGNED-BYTES-ONLY") && !request.contains("MEMORY-ONLY-THINKING"));
     assert!(request.contains("tool_use") && request.contains("tool_result"));
+}
+
+#[test]
+fn live_queue_and_completion_receipts_are_atomic_scoped_and_deleted_with_the_conversation() {
+    let mut db = HostStore::open_in_memory().unwrap();
+    let mut log = Conversation::default();
+    log.push_user(UserTurn::new("task", Default::default()));
+    let mut saved = SavedConversation {
+        id: "live".into(),
+        host_id: None,
+        label: "local".into(),
+        title: "task".into(),
+        provider: "openai".into(),
+        model: "fixture".into(),
+        created_at: 1,
+        updated_at: 1,
+        conversation: log,
+    };
+    let c = shellmate_ai::interaction::Control::default();
+    c.resume();
+    c.enqueue("message".into(), "queued".into(), Default::default());
+    let runtime = serde_json::json!({"queue":c.snapshot(),"scope":{"local":true,"cwd":"/project"}});
+    db.save_ai_conversation_with_runtime(&saved, Some(&runtime))
+        .unwrap();
+    assert_eq!(db.ai_runtime("live").unwrap(), Some(runtime));
+    assert!(db.ai_runtime("other").unwrap().is_none());
+    db.save_ai_task_event("live", "event", "agent-1", "done")
+        .unwrap();
+    db.save_ai_task_event("live", "event", "agent-1", "done")
+        .unwrap();
+    assert_eq!(db.ai_task_events("live").unwrap().len(), 1);
+    c.publish("event".into(), "agent-1".into(), "done".into());
+    c.claim_completions();
+    c.acknowledge_completions(&["event".into()]);
+    let input = c.claim_first().unwrap();
+    saved
+        .conversation
+        .push_user(UserTurn::new(&input.text, input.context));
+    c.acknowledge(&[input.id]);
+    db.save_ai_conversation_with_runtime(&saved, Some(&serde_json::json!({"queue":c.snapshot()})))
+        .unwrap();
+    assert!(db.ai_task_events("live").unwrap().is_empty());
+    assert_eq!(
+        db.ai_conversation("live")
+            .unwrap()
+            .unwrap()
+            .conversation
+            .turns()
+            .len(),
+        2
+    );
+    db.delete_ai_conversation("live").unwrap();
+    db.save_ai_task_event("live", "late", "agent-1", "done")
+        .unwrap();
+    assert!(db.ai_task_events("live").unwrap().is_empty());
+    assert!(db.ai_runtime("live").unwrap().is_none());
+    db.set_setting(SAVE_CONVERSATIONS, "0").unwrap();
+    assert!(
+        !db.save_ai_conversation_with_runtime(&saved, Some(&serde_json::json!({})))
+            .unwrap()
+    );
 }

@@ -2131,3 +2131,6 @@ mod memory_tests;
 
 #[path = "agent/subagent.rs"]
 mod subagent_tests;
+
+#[path = "agent/interaction.rs"]
+mod interaction_tests;

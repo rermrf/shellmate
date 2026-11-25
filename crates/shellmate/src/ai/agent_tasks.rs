@@ -6,6 +6,7 @@ use shellmate_ai::{
     subagent::{Cancellation, SubagentEvent},
 };
 pub(super) struct AgentTask {
+    pub stable_id: String,
     pub view: View,
     pub call_id: String,
     pub cancel: Cancellation,
@@ -129,8 +130,14 @@ impl Ticket {
                 self.sender.send_replace(Some(result.clone()));
                 if task.view.background {
                     let notice = format!("子任务 {} {}", task.view.id, status_label(&out.status));
+                    registry.publish(
+                        format!("agent:{}:{}", task.view.id, task.call_id),
+                        task.view.id.clone(),
+                        notice.clone(),
+                    );
                     state.notices.push(notice);
                 }
+                registry.changed.send_modify(|n| *n = n.wrapping_add(1));
             }
         }
         self.sender.send_replace(Some(result.clone()));
@@ -138,6 +145,43 @@ impl Ticket {
     }
 }
 impl Tasks {
+    pub fn latest_agent(&self, id: &str) -> Option<(View, String, Option<Tasks>)> {
+        let state = self.0.state.lock().unwrap();
+        let stable = &state.agents.values().find(|t| t.view.id == id)?.stable_id;
+        let task = state
+            .agents
+            .values()
+            .rev()
+            .find(|t| &t.stable_id == stable)?;
+        Some((
+            task.view.clone(),
+            task.stable_id.clone(),
+            task.child_outputs.upgrade().map(Tasks),
+        ))
+    }
+    pub fn promote_agent(&self, id: &str) -> bool {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(task) = state.agents.values_mut().find(|t| t.view.id == id) else {
+            return false;
+        };
+        let newly = !task.view.background;
+        task.view.background = true;
+        if newly && task.view.status != SubagentStatus::Running {
+            let text = format!(
+                "子任务 {} {}",
+                task.view.id,
+                status_label(&task.view.status)
+            );
+            self.0.publish(
+                format!("agent:{}:{}", task.view.id, task.call_id),
+                task.view.id.clone(),
+                text.clone(),
+            );
+            state.notices.push(text);
+        }
+        true
+    }
+    #[cfg(test)]
     pub fn reserve_agent(
         &self,
         call_id: &str,
@@ -145,9 +189,27 @@ impl Tasks {
         config: &shellmate_ai::Config,
         limit: usize,
     ) -> Result<Ticket, String> {
+        self.reserve_agent_family(call_id, request, config, limit, None)
+    }
+    pub fn reserve_agent_family(
+        &self,
+        call_id: &str,
+        request: &SubagentRequest,
+        config: &shellmate_ai::Config,
+        limit: usize,
+        stable: Option<&str>,
+    ) -> Result<Ticket, String> {
         let mut state = self.0.state.lock().unwrap();
         if state.retired {
             return Err("会话已关闭".into());
+        }
+        if stable.is_some_and(|id| {
+            state
+                .agents
+                .values()
+                .any(|a| a.stable_id == id && a.view.status == SubagentStatus::Running)
+        }) {
+            return Err("该子任务已恢复运行，请向运行中的子任务追加消息".into());
         }
         let running = state
             .agents
@@ -178,6 +240,7 @@ impl Tasks {
         state.agents.insert(
             id,
             AgentTask {
+                stable_id: stable.map(str::to_owned).unwrap_or_else(|| view.id.clone()),
                 view: view.clone(),
                 call_id: call_id.into(),
                 cancel: cancel.clone(),
@@ -233,6 +296,12 @@ impl Tasks {
                 state.agents.insert(
                     n,
                     AgentTask {
+                        stable_id: crate::ai::subagents::saved_family(
+                            &self.0.root,
+                            &self.0.conversation,
+                            &view.id,
+                        )
+                        .unwrap_or_else(|| view.id.clone()),
                         view,
                         call_id: step.call.id.clone(),
                         cancel: Default::default(),
@@ -258,6 +327,10 @@ impl Tasks {
         {
             task.child_outputs = Arc::downgrade(&tasks.0);
         }
+    }
+    pub fn while_retained<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let deleted = self.0.discarded.lock().unwrap();
+        if *deleted { None } else { Some(work()) }
     }
     pub fn agent_views(&self) -> Vec<View> {
         let views: Vec<_> = self
@@ -326,6 +399,9 @@ impl Tasks {
         }
         for task in state.agents.values() {
             if task.view.status == SubagentStatus::Running && !task.view.background {
+                if let Some(child) = task.child_outputs.upgrade() {
+                    child.control.seal();
+                }
                 task.cancel.cancel();
                 agent = true;
             }

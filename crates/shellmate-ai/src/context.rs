@@ -305,12 +305,13 @@ impl Conversation {
         let mut offered = if summarizing {
             Vec::new()
         } else if caps.available() {
-            let mut names = vec!["run_command", "read_output", "stop_task"];
+            let mut names = vec!["run_command", "read_output", "stop_task", "wait_tasks"];
             if memory.auto_memory {
                 names.push("memory");
             }
             if self.child.is_none() && caps.background && self.agent_tool.is_some() {
                 names.push("agent");
+                names.push("send_agent_message");
             }
             names
         } else {
@@ -461,6 +462,7 @@ impl Conversation {
                     && let Some(tool) = &self.agent_tool
                 {
                     request = request.tool(tool.clone());
+                    request = request.tool(crate::subagent::message_tool());
                 }
                 for tool in crate::conversation::output_tools() {
                     request = request.tool(tool);

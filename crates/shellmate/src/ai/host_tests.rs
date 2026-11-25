@@ -412,3 +412,41 @@ async fn child_and_main_have_identical_approval_decisions_in_all_modes() {
         }
     }
 }
+
+#[tokio::test]
+async fn immediate_input_retracts_unapproved_command_instead_of_executing_it() {
+    use shellmate_ai::interaction::{Control, Intent};
+    struct Controlled {
+        control: Control,
+    }
+    impl Executor for Controlled {
+        fn control(&self) -> Option<Control> {
+            Some(self.control.clone())
+        }
+        fn execute(&self, _: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+            panic!("unapproved command executed")
+        }
+    }
+    let (ui, rx) = async_channel::unbounded();
+    let control = Control::default();
+    control.resume();
+    let host = Host {
+        compaction: Default::default(),
+        mode: Default::default(),
+        ui,
+        executor: Box::new(Controlled {
+            control: control.clone(),
+        }),
+        alive: Arc::new(AtomicBool::new(true)),
+        resolved: Default::default(),
+    };
+    let mut run = host.run(call(Class::Other));
+    let Ui::Approval { reply, .. } = (tokio::select! {event=rx.recv()=>event.unwrap(),_=&mut run=>panic!("must await approval")})
+    else {
+        panic!("approval")
+    };
+    control.request(Intent::SendNow);
+    assert!(matches!(run.await, ToolOutcome::Denied { .. }));
+    assert!(reply.is_closed());
+    assert!(matches!(rx.recv().await.unwrap(), Ui::CancelApproval(_)));
+}

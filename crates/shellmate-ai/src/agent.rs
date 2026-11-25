@@ -22,6 +22,8 @@ use std::{
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
+#[path = "agent_interaction.rs"]
+mod interaction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde", rename_all = "lowercase")]
@@ -226,6 +228,7 @@ pub enum LocalTool {
     Memory(crate::memory::Command),
     ReadOutput(ReadOutput),
     StopTask { id: String },
+    WaitTasks { ids: Vec<String>, all: bool },
 }
 #[derive(Clone, Debug)]
 pub struct LocalResult {
@@ -289,6 +292,12 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    fn take_external_steps(&self) -> Vec<crate::Step> {
+        vec![]
+    }
+    fn control(&self) -> Option<crate::interaction::Control> {
+        None
+    }
     /// Registry updates applied before the next request; never adds child usage to this context.
     fn subagent_results(&self) -> Vec<(String, crate::LoggedResult)> {
         Vec::new()
@@ -307,6 +316,16 @@ pub trait ToolHost: Send + Sync {
         _call_id: &str,
     ) -> BoxFuture<'_, LocalResult> {
         Box::pin(async { LocalResult::error("当前会话不支持子任务") })
+    }
+    fn send_agent_message(
+        &self,
+        _id: &str,
+        _text: &str,
+        _immediate: bool,
+        _resume: bool,
+        _call_id: &str,
+    ) -> BoxFuture<'_, LocalResult> {
+        Box::pin(async { LocalResult::error("当前主机不支持追加子任务消息") })
     }
     /// Source labels approvals; child commands follow the same permission policy.
     fn run_from(
@@ -400,6 +419,8 @@ pub enum PauseReason {
 }
 
 pub enum AgentEvent {
+    InputsAccepted(Vec<String>),
+    CompletionsAccepted(Vec<String>),
     Context {
         used: usize,
         window: u32,
@@ -436,6 +457,7 @@ pub enum AgentEvent {
     Error(AiError),
 }
 enum Pending {
+    AgentMessage(Box<RigCall>, String, String, bool, bool),
     Subagent(Box<RigCall>, crate::SubagentRequest),
     Local(Box<RigCall>, LocalTool),
     Call(Box<RigCall>, ToolCall),
@@ -451,6 +473,7 @@ pub struct Resume {
     guard: ThrashGuard,
     pending: VecDeque<Pending>,
     capabilities: Capabilities,
+    base_capabilities: Capabilities,
     steps: usize,
     invalid_calls: usize,
     turn: UserTurn,
@@ -488,6 +511,7 @@ pub fn run<'a>(
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
         .clone();
+    let base_capabilities = capabilities.clone();
     let capabilities = if conversation.child.is_some() {
         capabilities
     } else {
@@ -500,6 +524,7 @@ pub fn run<'a>(
         guard: ThrashGuard::default(),
         pending: VecDeque::new(),
         capabilities,
+        base_capabilities,
         steps: 0,
         invalid_calls: 0,
         turn: user,
@@ -563,6 +588,7 @@ pub fn compact_with_limits<'a>(
         model_steps: 0,
         guard: ThrashGuard::default(),
         pending: VecDeque::new(),
+        base_capabilities: capabilities.clone(),
         capabilities,
         steps: 0,
         invalid_calls: 0,
@@ -612,6 +638,11 @@ impl State<'_> {
         self.updates.lock().unwrap().push(update);
     }
     fn entry(&mut self, entry: Entry) {
+        if matches!(entry, Entry::Step(_))
+            && let Some(control) = self.host.control()
+        {
+            control.tool_finished();
+        }
         self.record(LogUpdate::Append(Box::new(entry)));
     }
     fn text(&mut self, text: &str) {
@@ -939,6 +970,12 @@ fn stream<'a>(
     let inner = futures::stream::unfold(state, |mut s| async move {
         loop {
             if let Some(event) = s.queue.pop_front() {
+                if matches!(event, AgentEvent::Done(_)) {
+                    if let Some(input) = s.receive_input() {
+                        return Some((input, s));
+                    }
+                    s.phase(crate::interaction::Phase::Idle);
+                }
                 if matches!(event, AgentEvent::Done(_))
                     && let Some(focus) = s.host.take_compaction()
                 {
@@ -954,17 +991,22 @@ fn stream<'a>(
             if s.done {
                 return None;
             }
+            if let Some(event) = s.receive_input() {
+                return Some((event, s));
+            }
             if s.host.cancelled() {
                 return Some((s.fail(AiError::Cancelled), s));
             }
             if let Some(delay) = s.retry_wait.take() {
                 // Owned by this stream: dropping it cancels the backoff future.
-                tokio::time::sleep(delay).await;
+                s.phase(crate::interaction::Phase::Retrying);
+                tokio::select! {biased; ()=interaction::urgent(s.host.control())=>{continue;}, ()=tokio::time::sleep(delay)=>{}}
             }
             if let Some(e) = s.error.take() {
                 return Some((s.fail(e), s));
             }
             if let Some(work) = s.compacting.take() {
+                s.phase(crate::interaction::Phase::Compacting);
                 if let Err(e) = s.compact_work(work).await {
                     return Some((s.fail(e), s));
                 }
@@ -975,6 +1017,7 @@ fn stream<'a>(
                 return Some((AgentEvent::Done(None), s));
             }
             if let Some((raw, call)) = s.active.take() {
+                s.phase(crate::interaction::Phase::Executing);
                 let outcome = s.host.run(call.clone()).await.cap_stored();
                 let resolved = s.host.resolved_call(&call);
                 let output_id = match &outcome {
@@ -1042,7 +1085,33 @@ fn stream<'a>(
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
                 match pending {
+                    Pending::AgentMessage(raw, id, text, immediate, resume) => {
+                        let result = s
+                            .host
+                            .send_agent_message(&id, &text, immediate, resume, &raw.id.to_string())
+                            .await;
+                        s.entry(Entry::Step(crate::Step {
+                            message_id: s.message_id,
+                            call: crate::LoggedCall {
+                                id: raw.id.to_string(),
+                                name: raw.function.name.to_string(),
+                                args_json: serde_json::Value::Object(raw.function.arguments),
+                            },
+                            result: crate::LoggedResult {
+                                inline: result.inline,
+                                output_id: result.output_id,
+                                subagent: result.subagent,
+                                cleared: false,
+                                is_error: result.is_error,
+                            },
+                            display: None,
+                        }));
+                        s.steps += 1;
+                        s.turn.as_mut().unwrap().steps += 1;
+                        continue;
+                    }
                     Pending::Subagent(raw, request) => {
+                        s.phase(crate::interaction::Phase::Executing);
                         let result = s.host.subagent(request.clone(), &raw.id.to_string()).await;
                         let display = result.subagent.or_else(|| {
                             Some(Box::new(crate::SubagentDisplay {
@@ -1163,9 +1232,23 @@ fn stream<'a>(
                 }
             }
             if s.model.is_none() {
+                for mut step in s.host.take_external_steps() {
+                    step.message_id = s.conversation.entries().len();
+                    s.entry(Entry::Step(step));
+                }
                 // Drain notices first: every completion notice observed here must have its
                 // final report applied before the next request is assembled.
-                let notices = s.host.take_notices();
+                let control = s.host.control();
+                let completions = control
+                    .as_ref()
+                    .map(|c| c.claim_completions())
+                    .unwrap_or_default();
+                let notices = if control.is_some() {
+                    let _ = s.host.take_notices();
+                    completions.iter().map(|e| e.text.clone()).collect()
+                } else {
+                    s.host.take_notices()
+                };
                 for (call_id, result) in s.host.subagent_results() {
                     if s.conversation.entries().iter().any(|e| matches!(e, Entry::Step(step) if step.call.id==call_id && !step.result.same_content(&result))) {
                         s.record(LogUpdate::SubagentResult {call_id,result});
@@ -1176,6 +1259,14 @@ fn stream<'a>(
                         kind: "task".into(),
                         text,
                     });
+                }
+                if !completions.is_empty() {
+                    return Some((
+                        AgentEvent::CompletionsAccepted(
+                            completions.into_iter().map(|e| e.id).collect(),
+                        ),
+                        s,
+                    ));
                 }
                 let request = match s.request() {
                     Ok(r) => r,
@@ -1196,6 +1287,7 @@ fn stream<'a>(
                 s.received = false;
                 s.defer_text = false;
                 s.message_id = s.conversation.entries().len();
+                s.phase(crate::interaction::Phase::Generating);
                 match s.client.agent_open(request) {
                     Ok(model) => s.model = Some(model),
                     Err(e) => {
@@ -1212,7 +1304,10 @@ fn stream<'a>(
             } else {
                 timeouts.idle
             };
-            let next = tokio::time::timeout(wait, s.model.as_mut().unwrap().next()).await;
+            let next = tokio::select! {biased;
+                ()=interaction::urgent(s.host.control())=>{s.interrupt_stream();continue;},
+                result=tokio::time::timeout(wait, s.model.as_mut().unwrap().next())=>result,
+            };
             match next {
                 Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
                 Ok(Some(Err(e))) => {
@@ -1281,17 +1376,20 @@ fn stream<'a>(
                 }
                 Ok(None) => {
                     let model = s.model.take().unwrap();
-                    let mut response =
-                        match tokio::time::timeout(timeouts.idle, model.finish()).await {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => {
-                                if s.retry_option(&e) {
-                                    continue;
-                                }
-                                return Some((s.provider_failure(e), s));
+                    let finished = tokio::select! {biased;
+                        ()=interaction::urgent(s.host.control())=>{s.interrupt_stream();continue;},
+                        result=tokio::time::timeout(timeouts.idle,model.finish())=>result,
+                    };
+                    let mut response = match finished {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            if s.retry_option(&e) {
+                                continue;
                             }
-                            Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
-                        };
+                            return Some((s.provider_failure(e), s));
+                        }
+                        Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
+                    };
                     if s.conversation.child.is_some() {
                         s.record(LogUpdate::RequestUsage(Usage {
                             input_tokens: response.usage.input_tokens,
@@ -1398,6 +1496,32 @@ fn stream<'a>(
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
+                                if raw.function.name.as_str() == "send_agent_message" {
+                                    let args =
+                                        serde_json::Value::Object(raw.function.arguments.clone());
+                                    let parsed = args["id"].as_str().filter(|s| !s.is_empty()).zip(
+                                        args["message"].as_str().filter(|s| !s.trim().is_empty()),
+                                    );
+                                    let message =
+                                        parsed.map(|(id, text)| (id.to_owned(), text.to_owned()));
+                                    pending.push_back(if s.conversation.agent_tool.is_none() {
+                                        Pending::Invalid(raw, "当前会话不支持追加子任务消息".into())
+                                    } else if let Some((id, text)) = message {
+                                        Pending::AgentMessage(
+                                            raw,
+                                            id,
+                                            text,
+                                            args["immediate"].as_bool().unwrap_or(false),
+                                            args["resume"].as_bool().unwrap_or(false),
+                                        )
+                                    } else {
+                                        Pending::Invalid(
+                                            raw,
+                                            "send_agent_message 需要 id 和非空 message".into(),
+                                        )
+                                    });
+                                    continue;
+                                }
                                 if raw.function.name.as_str() == "agent" {
                                     let request = if s.conversation.agent_tool.is_none() {
                                         Err("当前会话不支持子任务（需要主任务、后台通道和主机支持）".into())
@@ -1614,13 +1738,30 @@ fn parse_call(
 
 fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
-    if !matches!(name, "read_output" | "stop_task" | "memory") {
+    if !matches!(name, "read_output" | "stop_task" | "memory" | "wait_tasks") {
         return Ok(None);
     }
     if raw.function.invalid_arguments.is_some() {
         return Err("工具参数无效：需要 JSON 对象".into());
     }
     let args = serde_json::Value::Object(raw.function.arguments.clone());
+    if name == "wait_tasks" {
+        let ids = args["ids"]
+            .as_array()
+            .and_then(|ids| {
+                ids.iter()
+                    .map(|id| id.as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .filter(|ids| !ids.is_empty() && ids.len() <= 64)
+            .ok_or("wait_tasks：ids 必须是 1–64 个任务 ID")?;
+        let all = match args.get("mode").and_then(|s| s.as_str()).unwrap_or("all") {
+            "all" => true,
+            "any" => false,
+            _ => return Err("wait_tasks：mode 必须是 any 或 all".into()),
+        };
+        return Ok(Some(LocalTool::WaitTasks { ids, all }));
+    }
     if name == "memory" {
         if !auto_memory {
             return Err("自动记忆已关闭，memory 工具不可用".into());

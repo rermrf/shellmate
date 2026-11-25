@@ -242,6 +242,27 @@ pub struct AppExecutor {
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
+        self.tasks.take_external_steps()
+    }
+    fn send_agent_message(
+        &self,
+        id: &str,
+        text: &str,
+        immediate: bool,
+        resume: bool,
+        call_id: &str,
+    ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        match &self.subagents {
+            Some(service) => service.message(id, text, immediate, resume, call_id),
+            None => Box::pin(async {
+                shellmate_ai::agent::LocalResult::error("当前会话不支持追加子任务消息")
+            }),
+        }
+    }
+    fn control(&self) -> Option<shellmate_ai::interaction::Control> {
+        Some(self.tasks.control())
+    }
     fn subagents(&self) -> bool {
         self.subagents.as_ref().is_some_and(|s| s.supported())
     }

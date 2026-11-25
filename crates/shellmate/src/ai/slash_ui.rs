@@ -47,6 +47,7 @@ impl Drawer {
             Dispatch::Hint(text) => self.local(LocalBody::Hint(text), cx),
             Dispatch::QueueCompact(focus) => self.compact_context(focus, w, cx),
             Dispatch::Run { name, args } => match name {
+                "btw" => self.start_btw(&args, w, cx),
                 "compact" => {
                     if self.state.model.conversation.entries().is_empty() {
                         self.local(LocalBody::Hint("当前没有需要压缩的对话".into()), cx);
@@ -95,6 +96,17 @@ impl Drawer {
         let composer_focused = self.input.focus_handle(cx).contains_focused(w, cx);
         if !composer_focused && !self.context_focus.contains_focused(w, cx) {
             cx.propagate();
+            return;
+        }
+        if self.state.btw.question.is_some()
+            && !self.permission_menu
+            && !self.popup.open
+            && (action as &dyn Action).as_any().is::<input::Escape>()
+            && !self.input_composing(w, cx)
+        {
+            self.close_btw(cx);
+            cx.stop_propagation();
+            w.prevent_default();
             return;
         }
         if self.permission_menu && (action as &dyn Action).as_any().is::<input::Escape>() {
@@ -271,6 +283,18 @@ impl Drawer {
                         }
                     }
                     LocalBody::Tasks => {
+                        if self.has_running_tasks() {
+                            card = card.child(
+                                super::agent_ui::step_actions().child(
+                                    super::agent_ui::step_action(
+                                        "stop-all-tasks",
+                                        "停止全部任务",
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(|s, _, _, cx| s.stop_all_tasks(cx))),
+                                ),
+                            );
+                        }
                         let tasks = if self.fixture {
                             self.fixture_tasks.clone()
                         } else {
@@ -320,7 +344,7 @@ impl Drawer {
                                             .when(running, |d| {
                                                 d.child(
                                                     Button::new(("local-stop", i * 1000 + n))
-                                                        .label("停止")
+                                                        .label("停止任务")
                                                         .h(px(24.))
                                                         .text_size(px(11.))
                                                         .on_click(cx.listener(

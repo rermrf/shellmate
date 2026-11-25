@@ -219,6 +219,28 @@ impl HostStore {
     /// The caller invokes this only once the request is dispatched.
     /// The preference is rechecked at each write, including streamed answers.
     pub fn save_ai_conversation(&mut self, c: &SavedConversation) -> Result<bool> {
+        self.save_ai_conversation_with_runtime(c,None)
+    }
+    pub fn ai_runtime(&self,id:&str)->Result<Option<serde_json::Value>>{
+        let json:Option<String>=self.conn.query_row("SELECT json FROM ai_runtime WHERE conversation_id=?1",[id],|r|r.get(0)).optional()?;
+        json.map(|j|serde_json::from_str(&j).map_err(|_|StoreError::Corrupt("无法读取待处理消息".into()))).transpose()
+    }
+    pub fn save_ai_task_event(&mut self,conversation:&str,id:&str,task:&str,text:&str)->Result<()> {
+        if self.setting(SAVE_CONVERSATIONS)?.as_deref()==Some("0"){return Ok(());}
+        self.conn.execute("INSERT OR IGNORE INTO ai_task_events SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1)",params![conversation,id,task,text])?;Ok(())
+    }
+    pub fn ai_task_events(&self,conversation:&str)->Result<Vec<(String,String,String)>>{
+        Ok(self.conn.prepare("SELECT id,task_id,text FROM ai_task_events WHERE conversation_id=?1 ORDER BY rowid")?.query_map([conversation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn save_ai_external_step(&mut self,conversation:&str,step:&shellmate_ai::Step)->Result<()>{
+        if self.setting(SAVE_CONVERSATIONS)?.as_deref()==Some("0"){return Ok(());}
+        self.conn.execute("INSERT OR IGNORE INTO ai_external_steps SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1)",params![conversation,step.call.id,serde_json::to_string(step).map_err(|_|StoreError::Corrupt("无法保存追加消息".into()))?])?;Ok(())
+    }
+    pub fn ai_external_steps(&self,conversation:&str)->Result<Vec<shellmate_ai::Step>>{
+        let rows=self.conn.prepare("SELECT json FROM ai_external_steps WHERE conversation_id=?1 ORDER BY rowid")?.query_map([conversation],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(|json|serde_json::from_str(&json).map_err(|_|StoreError::Corrupt("无法读取追加消息".into()))).collect()
+    }
+    pub fn save_ai_conversation_with_runtime(&mut self,c:&SavedConversation,runtime:Option<&serde_json::Value>)->Result<bool>{
         if self.setting(SAVE_CONVERSATIONS)?.as_deref() == Some("0") {
             return Ok(false);
         }
@@ -233,6 +255,11 @@ impl HostStore {
             }
             let json = serde_json::to_string(entry).map_err(|_| StoreError::Corrupt("无法编码 AI 日志".into()))?;
             tx.execute("INSERT INTO ai_log(conversation_id,position,kind,json,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(conversation_id,position) DO UPDATE SET kind=excluded.kind,json=excluded.json WHERE ai_log.kind<>excluded.kind OR ai_log.json<>excluded.json", params![c.id, position as i64, entry.kind(), json, c.updated_at])?;
+            if let shellmate_ai::Entry::Step(step)=entry{tx.execute("DELETE FROM ai_external_steps WHERE conversation_id=?1 AND call_id=?2",params![c.id,step.call.id])?;}
+        }
+        if let Some(runtime)=runtime {
+            tx.execute("INSERT INTO ai_runtime VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET json=excluded.json",params![c.id,runtime.to_string()])?;
+            if let Some(ids)=runtime["queue"]["delivered"].as_array(){for id in ids.iter().filter_map(|id|id.as_str()){tx.execute("DELETE FROM ai_task_events WHERE conversation_id=?1 AND id=?2",params![c.id,id])?;}}
         }
         tx.commit()?;
         Ok(true)
@@ -240,11 +267,16 @@ impl HostStore {
     /// Background child completion may arrive after its drawer has switched conversations.
     /// Update only the original agent Step; never recreate a deleted conversation.
     pub fn finish_ai_subagent(&mut self, conversation: &str, call_id: &str, result: &shellmate_ai::LoggedResult) -> Result<()> {
+        let pending:Option<String>=self.conn.query_row("SELECT json FROM ai_external_steps WHERE conversation_id=?1 AND call_id=?2",params![conversation,call_id],|r|r.get(0)).optional()?;
+        if let Some(pending)=pending {
+            let mut step:shellmate_ai::Step=serde_json::from_str(&pending).map_err(|_|StoreError::Corrupt("追加消息记录损坏".into()))?;step.result=result.clone();
+            self.conn.execute("UPDATE ai_external_steps SET json=?3 WHERE conversation_id=?1 AND call_id=?2",params![conversation,call_id,serde_json::to_string(&step).map_err(|_|StoreError::Corrupt("无法保存子任务结果".into()))?])?;
+        }
         let rows = self.conn.prepare("SELECT position,json FROM ai_log WHERE conversation_id=?1 AND kind='step'")?
             .query_map([conversation], |row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for (position,json) in rows {
             let mut entry: shellmate_ai::Entry=serde_json::from_str(&json).map_err(|_|StoreError::Corrupt("AI 日志损坏".into()))?;
-            if let shellmate_ai::Entry::Step(step)=&mut entry && step.call.name=="agent" && step.call.id==call_id {
+            if let shellmate_ai::Entry::Step(step)=&mut entry && matches!(step.call.name.as_str(),"agent"|"send_agent_message") && step.call.id==call_id {
                 step.result=result.clone();
                 let json=serde_json::to_string(&entry).map_err(|_|StoreError::Corrupt("无法编码 AI 日志".into()))?;
                 self.conn.execute("UPDATE ai_log SET json=?3 WHERE conversation_id=?1 AND position=?2",params![conversation,position,json])?;
@@ -296,7 +328,7 @@ mod tests {
         conn.execute("INSERT INTO ai_messages VALUES('a','c1','assistant','回答','','[{\"command\":\"ls\",\"explanation\":\"列表\",\"risk\":\"low\"}]',2,1,0)", []).unwrap();
         drop(conn);
         let db = HostStore::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
         let c = db.ai_conversation("c1").unwrap().unwrap();
         assert!(
             matches!(&c.conversation.turns()[0].answer.as_ref().unwrap().items[..], [AnswerItem::Text(text),AnswerItem::Command(card)] if text=="回答" && card.command=="ls")
@@ -311,7 +343,7 @@ mod tests {
             .unwrap();
         assert_eq!(legacy, (String::new(), "[]".into(), 2));
         drop(db);
-        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 10);
+        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 11);
     }
     #[test]
     fn ordered_steps_round_trip_preserves_content_and_caps_output() {
@@ -535,7 +567,7 @@ mod tests {
         db.save_ai_conversation(&loaded).unwrap();
         let nonzero: i64 = db.conn.query_row("SELECT count(*) FROM ai_messages WHERE redactions<>0", [], |r| r.get(0)).unwrap();
         assert_eq!(nonzero, 1, "v10 saves leave v9 rows untouched");
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
     }
     #[test]
     fn crud_cascade_and_save_off() {
@@ -574,7 +606,7 @@ mod tests {
             .unwrap();
         drop(conn);
         let db = HostStore::open(path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
         assert_eq!(db.setting("fixture").unwrap().as_deref(), Some("kept"));
         assert!(db.ai_conversations().unwrap().is_empty());
     }

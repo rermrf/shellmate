@@ -393,7 +393,7 @@ impl Conversation {
         match update {
             LogUpdate::SubagentResult { call_id, result } => {
                 if let Some(Entry::Step(step)) = self.entries.iter_mut().find(
-                    |e| matches!(e,Entry::Step(s) if s.call.id==call_id && s.call.name=="agent"),
+                    |e| matches!(e,Entry::Step(s) if s.call.id==call_id && matches!(s.call.name.as_str(),"agent"|"send_agent_message")),
                 ) {
                     if step.result.same_content(&result) {
                         return;

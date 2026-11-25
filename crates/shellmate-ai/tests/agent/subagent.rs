@@ -328,7 +328,7 @@ async fn availability_requires_background_main_and_host_opt_in() {
                 assert_eq!(tool(&bodies(&http)[0], a, "agent").is_some(), offered);
                 assert_eq!(
                     log.breakdown(&client, &caps).unwrap().tool_count,
-                    if offered { 5 } else { 4 }
+                    if offered { 7 } else { 5 }
                 );
                 assert!(host.calls.lock().unwrap().is_empty());
             }
@@ -411,7 +411,7 @@ async fn isolation_tools_snapshot_and_auto_memory_on_both_wires() {
                     }
                 })
                 .collect();
-            assert_eq!(names.len(), if enabled { 4 } else { 3 });
+            assert_eq!(names.len(), if enabled { 5 } else { 4 });
             assert!(!names.contains(&"agent") && !names.contains(&"propose_command"));
             assert_eq!(
                 schema(tool(body, a, "run_command").unwrap(), a)["properties"]["target"]["enum"],
@@ -801,7 +801,7 @@ async fn main_routes_logs_replays_and_accounts_for_only_the_returned_report() {
         assert!(!main_second.to_string().contains("private-transcript-id"));
         let breakdown = log.breakdown(&client, &capabilities()).unwrap();
         assert_eq!(breakdown.total, 220);
-        assert_eq!(breakdown.tool_count, 5);
+        assert_eq!(breakdown.tool_count, 7);
         assert!(breakdown.tool_results > 0);
         let ui_breakdown = ui.breakdown(&client, &capabilities()).unwrap();
         assert_eq!(breakdown, ui_breakdown);

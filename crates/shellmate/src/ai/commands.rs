@@ -35,7 +35,7 @@ pub const COMMANDS: &[Command] = &[
         args_hint: "",
         description: "开始新对话，旧对话保留在历史中",
         kind: Kind::Local,
-        while_busy: WhileBusy::Refuse,
+        while_busy: WhileBusy::Run,
     },
     Command {
         name: "context",
@@ -69,6 +69,13 @@ pub const COMMANDS: &[Command] = &[
         name: "help",
         args_hint: "",
         description: "查看全部命令与用法",
+        kind: Kind::Local,
+        while_busy: WhileBusy::Run,
+    },
+    Command {
+        name: "btw",
+        args_hint: "<问题>",
+        description: "基于已有上下文侧问，不打断主任务",
         kind: Kind::Local,
         while_busy: WhileBusy::Run,
     },
@@ -127,11 +134,7 @@ pub fn dispatch(text: &str, busy: bool, registry: &[Command]) -> Dispatch {
         .strip_prefix('/')
         .and_then(|name| registry.iter().find(|c| c.name == name));
     let Some(c) = command else {
-        return if busy {
-            Dispatch::Hint(STOP_FIRST.into())
-        } else {
-            Dispatch::Question(text.into())
-        };
+        return Dispatch::Question(text.into());
     };
     if busy && c.while_busy == WhileBusy::Refuse {
         return Dispatch::Hint(STOP_FIRST.into());
@@ -149,13 +152,7 @@ pub fn dispatch(text: &str, busy: bool, registry: &[Command]) -> Dispatch {
         return Dispatch::OpenContext;
     }
     match c.kind {
-        Kind::Prompt(template) => {
-            if busy {
-                Dispatch::Hint(STOP_FIRST.into())
-            } else {
-                Dispatch::Question(template.replace("{args}", args))
-            }
-        }
+        Kind::Prompt(template) => Dispatch::Question(template.replace("{args}", args)),
         _ if busy && c.while_busy == WhileBusy::Queue => {
             Dispatch::QueueCompact((!args.is_empty()).then(|| args.into()))
         }
@@ -315,13 +312,13 @@ mod tests {
             dispatch("/compact 任务重点", true, COMMANDS),
             Dispatch::QueueCompact(Some("任务重点".into()))
         );
-        for text in ["/clear", "/mode", "/mode auto", "普通问题", "/compactx"] {
+        for text in ["/mode", "/mode auto"] {
             assert_eq!(
                 dispatch(text, true, COMMANDS),
                 Dispatch::Hint(STOP_FIRST.into())
             );
         }
-        for text in ["/tasks", "/help", "/memory"] {
+        for text in ["/clear", "/tasks", "/help", "/memory", "/btw question"] {
             assert!(matches!(
                 dispatch(text, true, COMMANDS),
                 Dispatch::Run { .. }
@@ -356,10 +353,10 @@ mod tests {
     fn popup_filter_wrap_completion_escape() {
         let mut p = Popup::default();
         p.changed("/");
-        assert_eq!(p.matches().len(), 7);
+        assert_eq!(p.matches().len(), 8);
         assert_eq!(p.selected, 0);
         p.navigate(false);
-        assert_eq!(p.complete().as_deref(), Some("/help"));
+        assert_eq!(p.complete().as_deref(), Some("/btw "));
         p.navigate(true);
         assert_eq!(p.complete().as_deref(), Some("/compact "));
         p.changed("/co");

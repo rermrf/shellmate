@@ -191,7 +191,7 @@ mod tests {
         popup.changed(scene("ai-slash").unwrap().input);
         assert!(popup.open);
         assert_eq!(popup.selected, 0);
-        assert_eq!(popup.matches().len(), 7);
+        assert_eq!(popup.matches().len(), 8);
         popup.changed(scene("ai-slash-filter").unwrap().input);
         assert_eq!(popup.matches().len(), 2);
         let f = scene("ai-slash-context").unwrap();

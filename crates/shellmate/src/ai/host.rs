@@ -44,6 +44,24 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
+        vec![]
+    }
+    fn send_agent_message(
+        &self,
+        _id: &str,
+        _text: &str,
+        _immediate: bool,
+        _resume: bool,
+        _call_id: &str,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        Box::pin(async {
+            shellmate_ai::agent::LocalResult::error("不支持追加子任务消息")
+        })
+    }
+    fn control(&self) -> Option<shellmate_ai::interaction::Control> {
+        None
+    }
     fn subagents(&self) -> bool {
         false
     }
@@ -122,6 +140,23 @@ impl Drop for RunningGuard {
     }
 }
 impl ToolHost for Host {
+    fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
+        self.executor.take_external_steps()
+    }
+    fn send_agent_message(
+        &self,
+        id: &str,
+        text: &str,
+        immediate: bool,
+        resume: bool,
+        call_id: &str,
+    ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        self.executor
+            .send_agent_message(id, text, immediate, resume, call_id)
+    }
+    fn control(&self) -> Option<shellmate_ai::interaction::Control> {
+        self.executor.control()
+    }
     fn subagents(&self) -> bool {
         self.executor.subagents()
     }
@@ -201,10 +236,16 @@ impl ToolHost for Host {
                     let key=approval_key(source.as_ref(),&call.id);
                     let decision = decide(*self.mode.lock().unwrap(), call.class);
                     if decision != Decision::Run {
+                        if let Some(control)=self.control(){control.set_phase(shellmate_ai::interaction::Phase::Approval);}
                         let mut guard = PendingGuard { ui: self.ui.clone(), id: key.clone(), armed: true };
                         let (reply, receive) = oneshot::channel();
                         if self.ui.send(Ui::Approval { source: source.clone(), call: call.clone(), redline: decision == Decision::AskRedLine, reply }).await.is_err() { return ToolOutcome::Disconnected; }
-                        let approval = receive.await;
+                        let approval = tokio::select!{biased;
+                            ()=async{match self.control(){Some(c)=>c.urgent().await,None=>std::future::pending().await}}=>{
+                                return ToolOutcome::Denied{reason:Some("用户更新了指令，本步骤未执行".into())};
+                            },
+                            approval=receive=>approval,
+                        };
                         guard.armed = false;
                         match approval {
                             Ok(Approval::Approve { command, target }) => {
@@ -222,6 +263,7 @@ impl ToolHost for Host {
                         }
                     }
                     *self.resolved.lock().unwrap() = Some((call.clone(), decision == Decision::Run));
+                    if let Some(control)=self.control(){control.set_phase(shellmate_ai::interaction::Phase::Executing);}
                     let (ready, receive) = oneshot::channel();
                     if self.ui.send(Ui::Running { source: source.clone(), call: call.clone(), automatic: decision == Decision::Run, ready }).await.is_err() || receive.await.is_err() { return ToolOutcome::Disconnected; }
                     let _guard=source.as_ref().map(|_|RunningGuard {ui:self.ui.clone(),key});

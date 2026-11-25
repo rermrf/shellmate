@@ -1013,3 +1013,25 @@ async fn token_fallback_precedes_generic_cache_fallback() {
         }
     }
 }
+
+#[tokio::test]
+async fn side_question_has_no_tools_and_does_not_modify_the_main_conversation() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([MockHttpResponse::success_typed(
+            sse(a, "side answer", false),
+            "text/event-stream",
+        )]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let log = conversation();
+        let before = log.clone();
+        let (answer, _) = client.side_question(&log, "SIDE QUESTION").await.unwrap();
+        assert!(answer.contains("side answer"));
+        assert!(log == before);
+        let body: Value = serde_json::from_slice(&http.requests()[0].body).unwrap();
+        assert!(
+            body.get("tools")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+        );
+        assert!(body.to_string().contains("SIDE QUESTION"));
+    }
+}

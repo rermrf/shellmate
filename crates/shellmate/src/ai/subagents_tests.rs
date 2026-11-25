@@ -961,3 +961,193 @@ async fn subagent_memory_supports_the_same_mutations_and_reports_write_conflicts
         "first" | "second"
     ));
 }
+
+#[tokio::test]
+async fn foreground_child_detaches_without_cancelling_its_pending_approval() {
+    use shellmate_ai::interaction::Intent;
+    let (_root, service, ui, _) =
+        fixture(vec![response(true, "partial"), response(false, "finished")]);
+    let mut run = service.start(request(false), "delegate");
+    let (_, reply) = tokio::select! {_=&mut run=>panic!("must wait"),a=approval(&ui)=>a};
+    service.tasks.control().request(Intent::SendNow);
+    let result = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .unwrap();
+    assert!(result.inline.contains("后台启动"));
+    assert!(!reply.is_closed());
+    assert!(service.tasks.has_running());
+    assert!(service.tasks.agent_views()[0].background);
+    service.tasks.control().take_intent();
+    reply.send(Approval::Deny { reason: None }).ok().unwrap();
+    settled(&service.tasks).await;
+    assert_eq!(service.tasks.control().snapshot().completions.len(), 1);
+    let completion = service.tasks.control().claim_completions();
+    assert_eq!(completion.len(), 1);
+    assert!(service.tasks.control().claim_completions().is_empty());
+    service
+        .tasks
+        .control()
+        .acknowledge_completions(&[completion[0].id.clone()]);
+    assert!(!service.tasks.control().pending_completions());
+}
+
+#[tokio::test]
+async fn ended_child_resumes_original_context_without_overwriting_the_previous_report() {
+    let (root, service, _ui, http) = fixture(vec![
+        response(false, "FIRST-REPORT"),
+        response(false, "SECOND-REPORT"),
+    ]);
+    let first = service.start(request(false), "first").await;
+    assert!(!first.is_error);
+    let second = service
+        .message("agent-1", "FOLLOW-UP", false, true, "second")
+        .await;
+    assert!(!second.is_error);
+    settled(&service.tasks).await;
+    let views = service.tasks.agent_views();
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0].report, "FIRST-REPORT");
+    assert_eq!(views[1].report, "SECOND-REPORT");
+    assert_eq!(
+        service.tasks.latest_agent("agent-1").unwrap().0.id,
+        "agent-2"
+    );
+    let requests = http.requests();
+    let body = String::from_utf8_lossy(&requests[1].body);
+    assert!(body.contains("FIRST-REPORT"));
+    assert!(body.contains("FOLLOW-UP"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ai-outputs/conversation/agent-1.log")).unwrap(),
+        "FIRST-REPORT"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ai-outputs/conversation/agent-2.log")).unwrap(),
+        "SECOND-REPORT"
+    );
+}
+
+#[tokio::test]
+async fn running_child_receives_messages_and_only_one_resume_can_reserve_its_family() {
+    let (_root, service, ui, http) = fixture(vec![
+        response(true, "checking"),
+        response(false, "after-message"),
+    ]);
+    service.start(request(true), "initial").await;
+    let (_, reply) = approval(&ui).await;
+    let sent = service
+        .message("agent-1", "ADDITIONAL-REQUIREMENT", false, false, "message")
+        .await;
+    assert!(!sent.is_error);
+    assert!(!reply.is_closed());
+    reply.send(Approval::Deny { reason: None }).ok().unwrap();
+    settled(&service.tasks).await;
+    assert!(String::from_utf8_lossy(&http.requests()[1].body).contains("ADDITIONAL-REQUIREMENT"));
+    let tasks = service.tasks.clone();
+    let first = tasks
+        .reserve_agent_family("new1", &request(true), &config(), 3, Some("agent-1"))
+        .unwrap();
+    assert!(
+        tasks
+            .reserve_agent_family("new2", &request(true), &config(), 3, Some("agent-1"))
+            .is_err()
+    );
+    first.fail(shellmate_ai::AiError::Cancelled, Default::default());
+}
+
+#[tokio::test]
+async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint() {
+    let (root, service, _ui, _) = fixture(vec![response(false, "SAVED-FIRST")]);
+    let first = service.start(request(false), "first").await;
+    assert!(!first.is_error);
+    let mut saved = Conversation::default();
+    saved.push_user(UserTurn::new("delegate", Default::default()));
+    saved.append(Entry::Step(Step {
+        message_id: 1,
+        call: LoggedCall {
+            id: "first".into(),
+            name: "agent".into(),
+            args_json: json!({"run_in_background":false}),
+        },
+        result: LoggedResult {
+            inline: first.inline,
+            output_id: first.output_id,
+            subagent: first.subagent,
+            cleared: false,
+            is_error: false,
+        },
+        display: None,
+    }));
+    let (restored_root, mut restored, _ui, http) =
+        fixture(vec![response(false, "RESTORED-SECOND")]);
+    restored.tasks = Tasks::new(root.path().into(), "conversation".into());
+    restored.tasks.remember_outputs(&saved);
+    let mut checkpoint =
+        super::super::subagent_files::read_checkpoint(root.path(), "conversation", "agent-1")
+            .unwrap();
+    checkpoint
+        .inbox
+        .inputs
+        .push_back(shellmate_ai::interaction::Input {
+            id: "pending".into(),
+            text: "RECOVERED-PENDING".into(),
+            context: Default::default(),
+            claimed: false,
+            editing: false,
+        });
+    super::super::subagent_files::checkpoint(
+        root.path(),
+        "conversation",
+        "agent-1",
+        Some(&checkpoint.entries),
+        checkpoint.inbox,
+    )
+    .unwrap();
+    let result = restored
+        .message("agent-1", "CONTINUE", false, true, "second")
+        .await;
+    assert!(!result.is_error);
+    settled(&restored.tasks).await;
+    let body = String::from_utf8_lossy(&http.requests()[0].body).into_owned();
+    assert!(body.contains("SAVED-FIRST"));
+    assert!(body.contains("RECOVERED-PENDING"));
+    assert!(body.contains("CONTINUE"));
+    assert!(!body.contains(restored_root.path().to_str().unwrap()));
+    assert_eq!(
+        restored.tasks.latest_agent("agent-1").unwrap().0.report,
+        "RESTORED-SECOND"
+    );
+}
+
+#[tokio::test]
+async fn failed_message_checkpoint_does_not_deliver_the_child_instruction() {
+    let (root, service, ui, http) = fixture(vec![
+        response(true, "checking"),
+        response(false, "finished"),
+    ]);
+    service.start(request(true), "initial").await;
+    let (_, reply) = approval(&ui).await;
+    std::fs::remove_file(
+        root.path()
+            .join("ai-outputs/conversation/agent-1.checkpoint.json"),
+    )
+    .unwrap();
+    let sent = service
+        .message("agent-1", "UNSAVED-INSTRUCTION", false, false, "message")
+        .await;
+    assert!(sent.is_error);
+    assert!(
+        service
+            .tasks
+            .latest_agent("agent-1")
+            .unwrap()
+            .2
+            .unwrap()
+            .control()
+            .snapshot()
+            .inputs
+            .is_empty()
+    );
+    reply.send(Approval::Deny { reason: None }).ok().unwrap();
+    settled(&service.tasks).await;
+    assert!(!String::from_utf8_lossy(&http.requests()[1].body).contains("UNSAVED-INSTRUCTION"));
+}

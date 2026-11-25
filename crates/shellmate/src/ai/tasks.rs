@@ -87,6 +87,7 @@ enum Stop {
     Timeout,
 }
 struct State {
+    external_steps: Vec<shellmate_ai::Step>,
     next_agent: u64,
     agents: BTreeMap<u64, agents::AgentTask>,
     retired: bool,
@@ -96,10 +97,26 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    store: std::sync::OnceLock<shellmate_store::SharedStore>,
+    control: shellmate_ai::interaction::Control,
+    changed: watch::Sender<u64>,
     discarded: Arc<Mutex<bool>>,
     root: PathBuf,
     conversation: String,
     state: Mutex<State>,
+}
+impl Inner {
+    fn publish(&self, id: String, task: String, text: String) {
+        if let Some(store) = self.store.get()
+            && let Err(e) =
+                store
+                    .borrow_mut()
+                    .save_ai_task_event(&self.conversation, &id, &task, &text)
+        {
+            log::warn!("save task event: {e}");
+        }
+        self.control.publish(id, task, text);
+    }
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -113,13 +130,39 @@ impl Drop for Inner {
 }
 #[derive(Clone)]
 pub struct Tasks(Arc<Inner>);
+#[derive(Clone)]
+pub struct Retained(std::sync::Weak<Inner>);
+impl Retained {
+    pub fn while_retained<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let inner = self.0.upgrade()?;
+        let deleted = inner.discarded.lock().unwrap();
+        if *deleted { None } else { Some(work()) }
+    }
+}
 impl Tasks {
+    pub fn retained(&self) -> Retained {
+        Retained(Arc::downgrade(&self.0))
+    }
+    pub fn root(&self) -> PathBuf {
+        self.0.root.clone()
+    }
     pub fn new(root: PathBuf, conversation: String) -> Self {
+        Self::with_control(root, conversation, Default::default())
+    }
+    pub fn with_control(
+        root: PathBuf,
+        conversation: String,
+        control: shellmate_ai::interaction::Control,
+    ) -> Self {
         Self(Arc::new(Inner {
+            store: Default::default(),
+            control,
+            changed: watch::channel(0).0,
             discarded: Arc::new(Mutex::new(false)),
             root,
             conversation,
             state: Mutex::new(State {
+                external_steps: vec![],
                 next: 1,
                 next_agent: 1,
                 agents: BTreeMap::new(),
@@ -145,6 +188,70 @@ impl Tasks {
             .collect();
         list.sort_by_key(|t| t.started);
         list
+    }
+    pub fn control(&self) -> shellmate_ai::interaction::Control {
+        self.0.control.clone()
+    }
+    pub fn external_step(&self, step: shellmate_ai::Step) {
+        if let Some(db) = self.0.store.get()
+            && let Err(e) = db
+                .borrow_mut()
+                .save_ai_external_step(&self.0.conversation, &step)
+        {
+            log::warn!("save external step: {e}");
+        }
+        self.0.state.lock().unwrap().external_steps.push(step);
+    }
+    pub fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
+        std::mem::take(&mut self.0.state.lock().unwrap().external_steps)
+    }
+    pub fn set_store(&self, store: shellmate_store::SharedStore) {
+        let _ = self.0.store.set(store);
+    }
+    pub fn promote_foreground(&self) {
+        self.0
+            .control
+            .request(shellmate_ai::interaction::Intent::Detach);
+    }
+    pub async fn wait_tasks(&self, ids: Vec<String>, all: bool) -> LocalResult {
+        let mut changed = self.0.changed.subscribe();
+        self.0
+            .control
+            .set_phase(shellmate_ai::interaction::Phase::Waiting(ids.clone()));
+        loop {
+            let list = self.list();
+            let Some(selected) = ids
+                .iter()
+                .map(|id| list.iter().find(|t| &t.id == id))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return LocalResult::error("未找到本会话中的等待任务");
+            };
+            let ended = selected
+                .iter()
+                .filter(|t| t.status != Status::Running)
+                .count();
+            if (all && ended == selected.len()) || (!all && ended > 0) {
+                return LocalResult::text(
+                    selected
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "任务 {} · {} · 输出 id {}",
+                                t.id,
+                                t.status_text(),
+                                t.output_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+            tokio::select! {biased;
+                ()=self.0.control.urgent()=>return LocalResult::text("已结束等待，尚未完成的任务继续在后台运行"),
+                event=changed.changed()=>if event.is_err(){return LocalResult::error("会话已关闭");},
+            }
+        }
     }
     pub fn has_running(&self) -> bool {
         self.list().iter().any(|t| t.status == Status::Running)
@@ -269,6 +376,9 @@ impl Tasks {
     }
     pub fn stop_all(&self) {
         for task in self.0.state.lock().unwrap().agents.values() {
+            if let Some(child) = task.child_outputs.upgrade() {
+                child.control.seal();
+            }
             task.cancel.cancel();
         }
         for task in self.0.state.lock().unwrap().tasks.values() {
@@ -285,6 +395,9 @@ impl Tasks {
         {
             return state.agents.get(&number).is_some_and(|t| {
                 if t.view.status == shellmate_ai::SubagentStatus::Running {
+                    if let Some(child) = t.child_outputs.upgrade() {
+                        child.control.seal();
+                    }
                     t.cancel.cancel();
                     true
                 } else {
@@ -302,6 +415,7 @@ impl Tasks {
             return result;
         }
         match tool {
+            LocalTool::WaitTasks { ids, all } => self.wait_tasks(ids, all).await,
             LocalTool::Memory(_) => LocalResult {
                 subagent: None,
                 inline: "记忆工具必须由会话主机处理".into(),
@@ -542,6 +656,17 @@ impl Tasks {
         }
         tokio::select! {
             out = wait_result(&mut result) => { guard.detached = true; out }
+            () = self.0.control.urgent() => {
+                let mut state=self.0.state.lock().unwrap();
+                let task=state.tasks.get_mut(&number).unwrap();task.info.background=true;
+                if task.info.status!=Status::Running {
+                    let text=notice(&task.info);
+                    self.0.publish(format!("output:{}",task.info.output_id),task.info.id.clone(),text.clone());
+                    state.notices.push(text);
+                }
+                guard.detached=true;
+                if let Some(out)=result.borrow().clone(){out}else{background(&call,&oid,number,false)}
+            }
             () = tokio::time::sleep(call.timeout) => {
                 if shellmate_ai::policy::command_words(&call.command).first().is_some_and(|w| w == "sleep") {
                     let _ = guard.cancel.send(Some(Stop::Timeout));
@@ -555,6 +680,7 @@ impl Tasks {
                     task.info.background = true;
                     if task.info.status != Status::Running {
                         let notice = notice(&task.info);
+                        self.0.publish(format!("output:{}",task.info.output_id),task.info.id.clone(),notice.clone());
                         state.notices.push(notice);
                     }
                     guard.detached = true;
@@ -617,9 +743,15 @@ fn finish_task(weak: &Weak<Inner>, number: u64, status: Status, _: &ToolOutcome)
             task.result = None;
             if task.info.background {
                 let text = notice(&task.info);
+                inner.publish(
+                    format!("output:{}", task.info.output_id),
+                    task.info.id.clone(),
+                    text.clone(),
+                );
                 state.notices.push(text);
             }
         }
+        inner.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 struct Foreground {
