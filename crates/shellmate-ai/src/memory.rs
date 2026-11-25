@@ -60,6 +60,7 @@ impl Command {
         match result {
             Ok(text) => LocalResult::text(text),
             Err(error) => LocalResult {
+                subagent: None,
                 inline: format!("memory：{error}"),
                 output_id: None,
                 is_error: true,
@@ -78,6 +79,14 @@ pub fn tool() -> ToolDefinition {
             "insert_line":{"type":"integer","minimum":0},"insert_text":{"type":"string"},
             "old_path":{"type":"string"},"new_path":{"type":"string"}
         },"required":["command"],"additionalProperties":false}),
+    )
+}
+
+pub(crate) fn view_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        ToolName::new("memory").unwrap(),
+        "查看本机说明与记忆，只读；子任务不能创建、修改、删除或重命名文件。",
+        serde_json::json!({"type":"object","properties":{"command":{"type":"string","enum":["view"]},"path":{"type":"string"},"view_range":{"type":"array","items":{"type":"integer","minimum":1},"minItems":2,"maxItems":2}},"required":["command","path"],"additionalProperties":false}),
     )
 }
 

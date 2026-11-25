@@ -38,6 +38,7 @@ impl ToolHost for OutputHost {
         Box::pin(async move {
             self.locals.lock().unwrap().push(tool);
             LocalResult {
+                subagent: None,
                 inline: "本机工具结果".into(),
                 output_id: Some("spool-fixture".into()),
                 is_error: false,
@@ -173,6 +174,7 @@ async fn suggestion_sessions_offer_no_output_tools_and_replay_them_as_text() {
                 args_json: json!({"id":"old"}),
             },
             result: LoggedResult {
+                subagent: None,
                 inline: "old data".into(),
                 output_id: Some("old".into()),
                 cleared: false,

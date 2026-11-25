@@ -1,4 +1,5 @@
 use crate::AiError;
+use rig_core::serde::{Serialize, Deserialize};
 use std::{fmt, time::Duration};
 use zeroize::Zeroizing;
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +48,8 @@ impl Provider {
     }
 }
 type Uri = rig_core::http_client::Uri;
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde", rename_all = "lowercase")]
 pub enum ReasoningLevel {
     #[default]
     Default,
@@ -182,12 +184,21 @@ pub struct Config {
     pub timeouts: Timeouts,
 }
 impl Config {
+    /// Overrides identity/effort only. The caller must resolve the effective model's
+    /// context/output settings before constructing its RigClient (M2 store integration).
+    pub fn with_override(&self, model: Option<&str>, reasoning: Option<ReasoningLevel>) -> Self {
+        let mut config = self.clone();
+        if let Some(model) = model { config.model = model.trim().into(); }
+        config.reasoning = reasoning.unwrap_or(self.reasoning).for_provider(&config.provider);
+        config
+    }
+
     pub fn validate(&self) -> Result<(), AiError> {
         if self.model.trim().is_empty() || self.api_key.is_empty() {
             return Err(AiError::NotConfigured);
         }
         self.provider.destination()?;
-        if self.model.len() > 256
+        if self.model.chars().count() > 256
             || self.model.chars().any(char::is_control)
             || self.timeouts.first.is_zero()
             || self.timeouts.idle.is_zero()

@@ -229,13 +229,22 @@ pub enum LocalTool {
 }
 #[derive(Clone, Debug)]
 pub struct LocalResult {
+    pub subagent: Option<Box<crate::SubagentDisplay>>,
     pub inline: String,
     pub output_id: Option<String>,
     pub is_error: bool,
 }
 impl LocalResult {
+    pub fn error(inline: impl Into<String>) -> Self {
+        Self {
+            is_error: true,
+            ..Self::text(inline)
+        }
+    }
+
     pub fn text(inline: impl Into<String>) -> Self {
         Self {
+            subagent: None,
             inline: inline.into(),
             output_id: None,
             is_error: false,
@@ -280,6 +289,28 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    /// M1 is opt-in; the live app stays false until M2 provides a scoped registry.
+    fn subagents(&self) -> bool {
+        false
+    }
+    fn subagent(
+        &self,
+        _request: crate::SubagentRequest,
+        _call_id: &str,
+    ) -> BoxFuture<'_, LocalResult> {
+        Box::pin(async { LocalResult::error("当前会话不支持子任务") })
+    }
+    /// Source labels approvals. M2 must preserve background/explore restrictions on edits.
+    fn run_from(
+        &self,
+        call: ToolCall,
+        _source: Option<crate::SubagentRef>,
+    ) -> BoxFuture<'_, ToolOutcome> {
+        self.run(call)
+    }
+    /// Called once when a child finishes or its runner is dropped; M2 cancels its own tasks/approvals here.
+    fn finish_subagent(&self, _source: &crate::SubagentRef) {}
+
     fn memory_snapshot(&self, auto_memory: bool) -> crate::memory::Snapshot {
         crate::memory::Snapshot {
             auto_memory,
@@ -294,6 +325,7 @@ pub trait ToolHost: Send + Sync {
     fn local_tool(&self, _tool: LocalTool, _limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async {
             LocalResult {
+                subagent: None,
                 inline: "此主机不支持输出工具".into(),
                 output_id: None,
                 is_error: true,
@@ -396,6 +428,7 @@ pub enum AgentEvent {
     Error(AiError),
 }
 enum Pending {
+    Subagent(Box<RigCall>, crate::SubagentRequest),
     Local(Box<RigCall>, LocalTool),
     Call(Box<RigCall>, ToolCall),
     Invalid(Box<RigCall>, String),
@@ -447,7 +480,11 @@ pub fn run<'a>(
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
         .clone();
-    let capabilities = capabilities.for_question(&user.question);
+    let capabilities = if conversation.child.is_some() {
+        capabilities
+    } else {
+        capabilities.for_question(&user.question)
+    };
     conversation.prepare(&capabilities)?;
     let state = Resume {
         native: NativeMessages::new(),
@@ -770,7 +807,12 @@ impl State<'_> {
                 prompt.push_str(&format!("\n额外要求：{focus}"));
             }
             crate::context::add_prompt(&mut request, prompt);
-            match self.client.summarize(request).await {
+            let mut usage = Usage::default();
+            let summary = self.client.summarize(request, |u| usage.add(u)).await;
+            if self.conversation.child.is_some() {
+                self.record(LogUpdate::RequestUsage(usage));
+            }
+            match summary {
                 Ok(text) => break crate::context::extract_summary(&text),
                 Err(AiError::ContextTooLong)
                     if self.conversation.entries().len().saturating_sub(start) > 1 =>
@@ -835,6 +877,13 @@ fn stream<'a>(
     manual_focus: Option<Option<String>>,
 ) -> AgentStream<'a> {
     let mut initial_updates = Vec::new();
+    let offered =
+        (conversation.child.is_none() && turn.capabilities.background && host.subagents())
+            .then(|| crate::subagent::agent_tool(&client.config));
+    if conversation.agent_tool != offered {
+        conversation.agent_tool = offered.clone();
+        initial_updates.push(LogUpdate::AgentTool(offered));
+    }
     if conversation
         .memory
         .as_ref()
@@ -951,6 +1000,7 @@ fn stream<'a>(
                         args_json: serde_json::Value::Object(raw.function.arguments),
                     },
                     result: crate::LoggedResult {
+                        subagent: None,
                         inline: wire,
                         output_id,
                         cleared: false,
@@ -981,6 +1031,55 @@ fn stream<'a>(
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
                 match pending {
+                    Pending::Subagent(raw, request) => {
+                        let result = s.host.subagent(request.clone(), &raw.id.to_string()).await;
+                        let display = result.subagent.or_else(|| {
+                            Some(Box::new(crate::SubagentDisplay {
+                                description: request.description,
+                                kind: request.kind,
+                                model: request
+                                    .model
+                                    .clone()
+                                    .unwrap_or_else(|| s.client.config.model.clone()),
+                                reasoning: request.reasoning.unwrap_or(s.client.config.reasoning),
+                                model_overridden: request.model.is_some(),
+                                reasoning_overridden: request.reasoning.is_some(),
+                                status: if result.is_error {
+                                    crate::SubagentStatus::Failed(AiError::Unavailable)
+                                } else if request.background {
+                                    crate::SubagentStatus::Running
+                                } else {
+                                    crate::SubagentStatus::Completed
+                                },
+                                steps: 0,
+                                duration_ms: 0,
+                                usage: Usage::default(),
+                                output_id: result.output_id.clone(),
+                                transcript_id: None,
+                            }))
+                        });
+                        s.entry(Entry::Step(crate::Step {
+                            message_id: s.message_id,
+                            call: crate::LoggedCall {
+                                id: raw.id.to_string(),
+                                name: "agent".into(),
+                                args_json: serde_json::Value::Object(raw.function.arguments),
+                            },
+                            result: crate::LoggedResult {
+                                inline: result.inline,
+                                output_id: result.output_id,
+                                cleared: false,
+                                is_error: result.is_error,
+                                subagent: display,
+                            },
+                            display: None,
+                        }));
+                        s.steps += 1;
+                        let turn = s.turn.as_mut().unwrap();
+                        turn.steps += 1;
+                        turn.invalid_calls = 0;
+                        continue;
+                    }
                     Pending::Local(raw, tool) => {
                         let result = s.host.local_tool(tool, s.limits.exec).await;
                         s.entry(Entry::Step(crate::Step {
@@ -991,6 +1090,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
+                                subagent: None,
                                 inline: result.inline,
                                 output_id: result.output_id,
                                 cleared: false,
@@ -1017,6 +1117,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
+                                subagent: None,
                                 inline: error,
                                 output_id: None,
                                 cleared: false,
@@ -1172,6 +1273,12 @@ fn stream<'a>(
                             }
                             Err(_) => return Some((s.failure(AiError::Timeout, None), s)),
                         };
+                    if s.conversation.child.is_some() {
+                        s.record(LogUpdate::RequestUsage(Usage {
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                        }));
+                    }
                     if response.error.is_some() || response.aborted.is_some() {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
@@ -1272,18 +1379,43 @@ fn stream<'a>(
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
-                                pending.push_back(match parse_local(&raw, s.limits.auto_memory) {
-                                    Ok(Some(tool)) => Pending::Local(raw, tool),
-                                    Err(error) => Pending::Invalid(raw, error),
-                                    Ok(None) => match parse_call(
-                                        &raw,
-                                        &s.turn.as_ref().unwrap().capabilities,
-                                        s.limits.exec,
-                                    ) {
-                                        Ok(call) => Pending::Call(raw, call),
+                                if raw.function.name.as_str() == "agent" {
+                                    let request = if s.conversation.agent_tool.is_none() {
+                                        Err("当前会话不支持子任务（需要主任务、后台通道和主机支持）".into())
+                                    } else if raw.function.invalid_arguments.is_some() {
+                                        Err("子任务参数无效：需要 JSON 对象".into())
+                                    } else {
+                                        crate::SubagentRequest::parse(
+                                            serde_json::Value::Object(
+                                                raw.function.arguments.clone(),
+                                            ),
+                                            &s.client.config.provider,
+                                        )
+                                    };
+                                    pending.push_back(match request {
+                                        Ok(request) => Pending::Subagent(raw, request),
                                         Err(error) => Pending::Invalid(raw, error),
+                                    });
+                                    continue;
+                                }
+                                pending.push_back(
+                                    match parse_local(
+                                        &raw,
+                                        s.limits.auto_memory,
+                                        s.conversation.child.is_some(),
+                                    ) {
+                                        Ok(Some(tool)) => Pending::Local(raw, tool),
+                                        Err(error) => Pending::Invalid(raw, error),
+                                        Ok(None) => match parse_call(
+                                            &raw,
+                                            &s.turn.as_ref().unwrap().capabilities,
+                                            s.limits.exec,
+                                        ) {
+                                            Ok(call) => Pending::Call(raw, call),
+                                            Err(error) => Pending::Invalid(raw, error),
+                                        },
                                     },
-                                });
+                                );
                             }
                             AssistantContent::Text(text) if after_call => {
                                 pending.push_back(Pending::Text(text.text.clone()))
@@ -1467,7 +1599,7 @@ fn parse_call(
     })
 }
 
-fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, String> {
+fn parse_local(raw: &RigCall, auto_memory: bool, child: bool) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
     if !matches!(name, "read_output" | "stop_task" | "memory") {
         return Ok(None);
@@ -1480,9 +1612,12 @@ fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, St
         if !auto_memory {
             return Err("自动记忆已关闭，memory 工具不可用".into());
         }
-        return serde_json::from_value(args)
-            .map(|command| Some(LocalTool::Memory(command)))
-            .map_err(|e| format!("memory 参数无效：{e}"));
+        let command: crate::memory::Command =
+            serde_json::from_value(args).map_err(|e| format!("memory 参数无效：{e}"))?;
+        if child && !matches!(command, crate::memory::Command::View { .. }) {
+            return Err("子任务记忆只允许 view，不能写入".into());
+        }
+        return Ok(Some(LocalTool::Memory(command)));
     }
     if name == "read_output" {
         let a: ReadOutput = serde_json::from_value(args).map_err(|_| "read_output 参数无效")?;

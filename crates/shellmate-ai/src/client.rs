@@ -1,5 +1,6 @@
 use crate::{AiError, CommandCard, Config, Conversation, Provider, ReasoningLevel, Risk, Timeouts};
 use futures::{Stream, StreamExt};
+use rig_core::serde::{Deserialize, Serialize};
 use rig_core::{
     DynModel,
     completion::{CacheRetention, CompletionRequest, Effort, Reasoning},
@@ -18,10 +19,23 @@ use std::{
     },
     task::{Context, Poll},
 };
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde")]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+impl Usage {
+    pub(crate) fn add(&mut self, other: Self) {
+        fn sum(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+            match (a, b) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        self.input_tokens = sum(self.input_tokens, other.input_tokens);
+        self.output_tokens = sum(self.output_tokens, other.output_tokens);
+    }
 }
 pub enum Event {
     Context {
@@ -51,6 +65,7 @@ pub trait ProviderClient: Send + Sync {
 }
 #[derive(Clone)]
 pub struct RigClient {
+    pub(crate) config: Config,
     model: Arc<DynModel<Completion>>,
     timeouts: Timeouts,
     reasoning: Option<Reasoning>,
@@ -98,6 +113,7 @@ impl RigClient {
         };
         let (reasoning, max_tokens) = reasoning_options(config)?;
         Ok(Self {
+            config: config.clone(),
             model: Arc::new(model),
             timeouts: config.timeouts.clone(),
             reasoning,
@@ -183,7 +199,11 @@ impl ResponseStream<'_> {
     }
 }
 impl RigClient {
-    pub(crate) async fn summarize(&self, request: CompletionRequest) -> Result<String, AiError> {
+    pub(crate) async fn summarize(
+        &self,
+        request: CompletionRequest,
+        mut on_usage: impl FnMut(Usage),
+    ) -> Result<String, AiError> {
         loop {
             let mut request = request
                 .clone()
@@ -236,6 +256,10 @@ impl RigClient {
                 Ok(Err(e)) => return Err(map_error(e)),
                 Ok(Ok(r)) => r,
             };
+            on_usage(Usage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+            });
             if response.error.is_some() || response.aborted.is_some() {
                 return Err(AiError::InvalidResponse);
             }

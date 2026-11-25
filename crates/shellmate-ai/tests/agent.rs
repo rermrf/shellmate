@@ -2142,3 +2142,6 @@ mod execution_tests;
 
 #[path = "agent/memory.rs"]
 mod memory_tests;
+
+#[path = "agent/subagent.rs"]
+mod subagent_tests;

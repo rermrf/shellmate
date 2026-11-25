@@ -39,7 +39,8 @@ pub struct CommandCard {
     pub explanation: String,
     pub risk: Risk,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde")]
 pub enum AiError {
     #[error("尚未配置 AI 助手，请先设置服务商、模型和 API Key")]
     NotConfigured,
@@ -80,3 +81,6 @@ pub use output::{ToolOutput, shape};
 pub use policy::PermissionMode;
 
 pub mod memory;
+
+pub mod subagent;
+pub use subagent::{SubagentRequest, SubagentKind, SubagentRef, SubagentDisplay, SubagentStatus, SubagentOutcome};

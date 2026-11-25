@@ -69,7 +69,7 @@ pub fn conversation() -> shellmate_ai::Conversation {
         "记住：部署前先告诉我变更的影响范围。",
         ContextSnapshot::default(),
     ));
-    c.append(Entry::Step(Step {message_id:1,call:LoggedCall {id:"memory-fixture".into(),name:"memory".into(),args_json:serde_json::json!({"command":"create","path":"/memories/global/deploy.md","file_text":"部署前先解释影响范围"})},result:LoggedResult {inline:"已保存记忆 · global/deploy.md".into(),output_id:None,cleared:false,is_error:false},display:None}));
+    c.append(Entry::Step(Step {message_id:1,call:LoggedCall {id:"memory-fixture".into(),name:"memory".into(),args_json:serde_json::json!({"command":"create","path":"/memories/global/deploy.md","file_text":"部署前先解释影响范围"})},result:LoggedResult {subagent: None,inline:"已保存记忆 · global/deploy.md".into(),output_id:None,cleared:false,is_error:false},display:None}));
     c.push_text("已记住。以后部署前，我会先说明影响范围。");
     c
 }

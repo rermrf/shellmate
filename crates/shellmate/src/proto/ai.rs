@@ -86,7 +86,7 @@ pub fn compaction_scene(scene: &str) -> Option<CompactionScene> {
                 name: "run_command".into(),
                 args_json: serde_json::json!({"command":command,"purpose":purpose,"target":"background"}),
             },
-            result: LoggedResult { inline: output.into(), output_id: None, cleared, is_error: false },
+            result: LoggedResult { subagent: None, inline: output.into(), output_id: None, cleared, is_error: false },
             display: Some(StepDisplay {
                 command: command.into(), target: Target::Background, purpose: purpose.into(),
                 class: Class::ReadOnly, status: StepStatus::Completed, exit_code: Some(0),
@@ -279,6 +279,7 @@ pub fn execution_scene(scene: &str) -> Option<ExecutionScene> {
                 args_json: serde_json::json!({"command":command,"target":"background"}),
             },
             result: LoggedResult {
+                subagent: None,
                 inline: output.into(),
                 output_id: Some(format!("output-{n}")),
                 cleared: false,
@@ -342,6 +343,7 @@ pub fn execution_scene(scene: &str) -> Option<ExecutionScene> {
                 args_json: serde_json::json!({"id":"output-1","grep":"error"}),
             },
             result: LoggedResult {
+                subagent: None,
                 inline: "error: connection refused".into(),
                 output_id: Some("output-1".into()),
                 cleared: false,

@@ -55,6 +55,10 @@ pub enum StepStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub enum AnswerItem {
+    Subagent {
+        display: Box<crate::SubagentDisplay>,
+        report: String,
+    },
     Text(String),
     Compaction(crate::Compaction),
     Notice(String),
@@ -76,6 +80,7 @@ pub enum AnswerItem {
 impl AnswerItem {
     pub fn wire_text(&self) -> String {
         match self {
+            Self::Subagent { report, .. } => report.clone(),
             Self::Text(text) | Self::Notice(text) => text.clone(),
             Self::Compaction(c) => c.summary.clone().unwrap_or_default(),
             Self::Command(card) => format!(

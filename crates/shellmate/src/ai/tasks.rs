@@ -221,6 +221,7 @@ impl Tasks {
     pub async fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> LocalResult {
         match tool {
             LocalTool::Memory(_) => LocalResult {
+                subagent: None,
                 inline: "记忆工具必须由会话主机处理".into(),
                 output_id: None,
                 is_error: true,
@@ -235,6 +236,7 @@ impl Tasks {
                 };
                 let Some((cancel, result, oid)) = task else {
                     return LocalResult {
+                        subagent: None,
                         inline: format!("未找到任务 #{id}"),
                         output_id: None,
                         is_error: true,
@@ -246,6 +248,7 @@ impl Tasks {
                     wait_result(&mut result).await;
                 }
                 LocalResult {
+                    subagent: None,
                     inline: format!(
                         "{} #{id} · 输出 id {oid}",
                         if running {
@@ -307,6 +310,7 @@ impl Tasks {
                         );
                         out.total_bytes = w.total;
                         LocalResult {
+                            subagent: None,
                             inline: out.wire_text(),
                             output_id: Some(oid),
                             is_error: false,
@@ -316,6 +320,7 @@ impl Tasks {
                         LocalResult::text(ai_output::CLEARED)
                     }
                     Err(e) => LocalResult {
+                        subagent: None,
                         inline: format!("读取输出失败：{e}"),
                         output_id: Some(oid),
                         is_error: true,
@@ -645,6 +650,7 @@ mod tests {
                 args_json: serde_json::json!({"command":"pwd"}),
             },
             result: shellmate_ai::LoggedResult {
+                subagent: None,
                 inline: out.wire_text(),
                 output_id: out.output_id,
                 cleared: true,
@@ -660,6 +666,7 @@ mod tests {
                 args_json: serde_json::json!({"id":"old-output"}),
             },
             result: shellmate_ai::LoggedResult {
+                subagent: None,
                 inline: "old output".into(),
                 output_id: Some("old-output".into()),
                 cleared: false,

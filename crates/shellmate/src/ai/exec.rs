@@ -229,6 +229,7 @@ impl Executor for AppExecutor {
             return Box::pin(async move {
                 self.memory.as_ref().map_or_else(
                     || shellmate_ai::agent::LocalResult {
+                        subagent: None,
                         inline: "记忆存储不可用".into(),
                         output_id: None,
                         is_error: true,

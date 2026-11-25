@@ -33,6 +33,7 @@ fn step(cleared: bool) -> Entry {
             args_json: serde_json::json!({"command":"uname -s","target":"background"}),
         },
         result: LoggedResult {
+            subagent: None,
             inline: "line1\nline2\nline3\nline4\nline5\nline6\nline7".repeat(100),
             output_id: Some("output1".into()),
             cleared,

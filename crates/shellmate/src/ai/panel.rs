@@ -645,7 +645,7 @@ impl Drawer {
             self.state.model.conversation.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
                 message_id: self.state.model.conversation.entries().len(),
                 call: shellmate_ai::LoggedCall { id: step.call.id, name: "run_command".into(), args_json: serde_json::json!({"command":step.call.command,"target":step.call.target.id(),"run_in_background":step.call.run_in_background}) },
-                result: shellmate_ai::LoggedResult { inline, output_id, cleared: false, is_error: true },
+                result: shellmate_ai::LoggedResult { subagent: None, inline, output_id, cleared: false, is_error: true },
                 display,
             }));
         }
@@ -1278,6 +1278,7 @@ impl Render for Drawer {
                         .gap(px(8.));
                     for (n, item) in answer.items.iter().enumerate() {
                         let card = match item {
+                            shellmate_ai::AnswerItem::Subagent { .. } => continue, // M2/M3 opt-in; no live tool or UI yet.
                             shellmate_ai::AnswerItem::Compaction(c) => {
                                 let key = (index, n);
                                 let expanded = self.state.expanded_summaries.contains(&key);

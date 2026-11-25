@@ -17,6 +17,9 @@ pub struct LoggedCall {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct LoggedResult {
+    /// UI metadata only; never included in provider tool results. Absent in pre-P13 logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<Box<crate::SubagentDisplay>>,
     pub inline: String,
     /// Local spool id; absent for calls that never executed.
     pub output_id: Option<String>,
@@ -222,6 +225,8 @@ impl Entry {
 }
 #[derive(Clone, Debug)]
 pub enum LogUpdate {
+    AgentTool(Option<rig_core::completion::ToolDefinition>),
+    RequestUsage(Usage),
     Memory(crate::memory::Snapshot),
     Append(Box<Entry>),
     ClearResults(Vec<usize>),
@@ -233,6 +238,9 @@ pub(crate) struct Accounting {
 }
 #[derive(Clone, Default)]
 pub struct Conversation {
+    pub(crate) child: Option<crate::SubagentRef>,
+    pub(crate) agent_tool: Option<rig_core::completion::ToolDefinition>,
+    pub(crate) request_usage: Usage,
     memory_actions: std::collections::BTreeMap<(usize, usize), crate::memory::Action>,
     pub(crate) memory: Option<crate::memory::Snapshot>,
     entries: Vec<Entry>,
@@ -303,6 +311,25 @@ impl Conversation {
             AnswerItem::Text(text) => Entry::Assistant { text, message_id },
             AnswerItem::Command(card) => Entry::CommandCard { card, message_id },
             AnswerItem::Compaction(c) => Entry::Compaction(c),
+            AnswerItem::Subagent { display, report } => Entry::Step(Step {
+                message_id,
+                call: LoggedCall {
+                    id: format!("subagent_{message_id}"),
+                    name: "agent".into(),
+                    args_json: serde_json::json!({"description":display.description,"type":display.kind}),
+                },
+                result: LoggedResult {
+                    inline: report,
+                    output_id: display.output_id.clone(),
+                    cleared: false,
+                    is_error: matches!(
+                        display.status,
+                        crate::SubagentStatus::Failed(_) | crate::SubagentStatus::Stopped
+                    ),
+                    subagent: Some(display),
+                },
+                display: None,
+            }),
             AnswerItem::Notice(text) => Entry::Notice {
                 kind: "notice".into(),
                 text,
@@ -323,6 +350,7 @@ impl Conversation {
                         args_json: serde_json::json!({"command":display.command,"purpose":display.purpose,"target":display.target.id()}),
                     },
                     result: LoggedResult {
+                        subagent: None,
                         inline,
                         output_id: None,
                         cleared: true,
@@ -339,6 +367,8 @@ impl Conversation {
     }
     pub fn apply(&mut self, update: LogUpdate) {
         match update {
+            LogUpdate::AgentTool(tool) => self.agent_tool = tool,
+            LogUpdate::RequestUsage(usage) => self.request_usage.add(usage),
             LogUpdate::Memory(snapshot) => self.memory = Some(snapshot),
             LogUpdate::Append(e) => self.append(*e),
             LogUpdate::ClearResults(positions) => {
@@ -393,7 +423,12 @@ impl Conversation {
                             answer.items.push(AnswerItem::Command(card.clone()))
                         }
                         Entry::Step(s) => {
-                            if let Some(display) = &s.display {
+                            if let Some(display) = &s.result.subagent {
+                                answer.items.push(AnswerItem::Subagent {
+                                    display: display.clone(),
+                                    report: s.result.inline.clone(),
+                                });
+                            } else if let Some(display) = &s.display {
                                 answer.items.push(display.item());
                             } else if s.call.name == "memory" {
                                 if let Some(action) =
