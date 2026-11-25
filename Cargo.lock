@@ -7598,6 +7598,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest",
  "rig-core",
+ "rusqlite",
  "semver",
  "serde",
  "serde_json",

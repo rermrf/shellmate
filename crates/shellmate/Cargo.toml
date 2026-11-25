@@ -47,5 +47,6 @@ markdown = "=1.0.0"
 unicode-width = "=0.2.3"
 
 [dev-dependencies]
+rusqlite.workspace = true
 rig-core = { workspace = true, features = ["test-utils"] }
 shellmate-core = { workspace = true, features = ["test-support"] }

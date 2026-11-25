@@ -1151,3 +1151,85 @@ async fn failed_message_checkpoint_does_not_deliver_the_child_instruction() {
     settled(&service.tasks).await;
     assert!(!String::from_utf8_lossy(&http.requests()[1].body).contains("UNSAVED-INSTRUCTION"));
 }
+
+#[tokio::test]
+async fn checkpoint_failure_pauses_at_tool_boundary_and_retries_without_reexecution() {
+    let (root, service, ui, http) = fixture(vec![
+        response(true, "checking"),
+        response(false, "finished"),
+    ]);
+    service.start(request(true), "initial").await;
+    let (_, reply) = approval(&ui).await;
+    assert!(
+        !service
+            .message("agent-1", "KEEP-THIS-INPUT", false, false, "followup")
+            .await
+            .is_error
+    );
+    let path = root
+        .path()
+        .join("ai-outputs/conversation/agent-1.checkpoint.json");
+    let backup = path.with_extension("backup");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    reply.send(Approval::Deny { reason: None }).ok().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if service.tasks.agent_views()[0]
+                .latest_activity
+                .contains("保存失败")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(http.requests().len(), 1);
+    let child = service.tasks.latest_agent("agent-1").unwrap().2.unwrap();
+    assert_eq!(child.control().snapshot().inputs.len(), 1);
+    assert!(service.tasks.has_running());
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    settled(&service.tasks).await;
+    assert_eq!(http.requests().len(), 2);
+    assert!(String::from_utf8_lossy(&http.requests()[1].body).contains("KEEP-THIS-INPUT"));
+    let checkpoint =
+        super::super::subagent_files::read_checkpoint(root.path(), "conversation", "agent-1")
+            .unwrap();
+    assert_eq!(
+        checkpoint
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Step(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        checkpoint
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::User { text, .. } if text == "KEEP-THIS-INPUT"))
+            .count(),
+        1
+    );
+    assert!(child.control().snapshot().inputs.is_empty());
+}
+
+#[tokio::test]
+async fn initial_checkpoint_failure_does_not_start_a_model_request() {
+    let (root, service, _, http) = fixture(vec![]);
+    std::fs::create_dir_all(
+        root.path()
+            .join("ai-outputs/conversation/agent-1.checkpoint.json"),
+    )
+    .unwrap();
+    let result = service.start(request(false), "initial").await;
+    assert!(result.is_error);
+    assert_eq!(
+        service.tasks.agent_views()[0].status,
+        SubagentStatus::Failed(shellmate_ai::AiError::Persistence)
+    );
+    assert!(http.requests().is_empty());
+}

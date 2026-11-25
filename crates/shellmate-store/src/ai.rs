@@ -227,7 +227,11 @@ impl HostStore {
     }
     pub fn save_ai_task_event(&mut self,conversation:&str,id:&str,task:&str,text:&str)->Result<()> {
         if self.setting(SAVE_CONVERSATIONS)?.as_deref()==Some("0"){return Ok(());}
+        if self.ai_runtime(conversation)?.is_some_and(|runtime|runtime["queue"]["delivered"].as_array().is_some_and(|ids|ids.iter().any(|v|v.as_str()==Some(id)))){return Ok(());}
         self.conn.execute("INSERT OR IGNORE INTO ai_task_events SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1)",params![conversation,id,task,text])?;Ok(())
+    }
+    pub fn ai_conversation_exists(&self,id:&str)->Result<bool>{
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1)",[id],|r|r.get(0))?)
     }
     pub fn ai_task_events(&self,conversation:&str)->Result<Vec<(String,String,String)>>{
         Ok(self.conn.prepare("SELECT id,task_id,text FROM ai_task_events WHERE conversation_id=?1 ORDER BY rowid")?.query_map([conversation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)

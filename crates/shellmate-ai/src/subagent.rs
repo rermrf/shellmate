@@ -183,6 +183,10 @@ pub struct SubagentContext {
 /// Agent forwards all existing events (text, proposals/results, compaction, retries, pauses).
 pub enum SubagentEvent<'a> {
     Updates(&'a [LogUpdate]),
+    /// The owner saves the current transcript and inbox before the runner can
+    /// acknowledge inputs or execute another step. Retries do not replay Updates.
+    Checkpoint(&'a mut Result<(), AiError>),
+    Saving(bool),
     Started {
         source: &'a SubagentRef,
         model: &'a str,
@@ -467,6 +471,36 @@ pub async fn run_from_history(
                     on_event(SubagentEvent::Agent(&event));
                     let updates = stream.take_updates();
                     on_event(SubagentEvent::Updates(&updates));
+                    let durable = status.is_some()
+                        || updates.iter().any(|u| match u {
+                            LogUpdate::Append(e) => !matches!(&**e, Entry::Assistant { .. }),
+                            LogUpdate::ClearResults(_) => true,
+                            _ => false,
+                        });
+                    if durable {
+                        let mut retrying = false;
+                        loop {
+                            let mut saved = Ok(());
+                            on_event(SubagentEvent::Checkpoint(&mut saved));
+                            if saved.is_ok() {
+                                if retrying {
+                                    on_event(SubagentEvent::Saving(false));
+                                }
+                                break;
+                            }
+                            if !retrying {
+                                on_event(SubagentEvent::Saving(true));
+                                retrying = true;
+                            }
+                            tokio::select! { biased;
+                                () = cancel.cancelled() => break,
+                                () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                        if cancel.is_cancelled() {
+                            break SubagentStatus::Stopped;
+                        }
+                    }
                     // The owner checkpoints the user entries before we remove
                     // their input IDs, so concurrent arrivals cannot erase them.
                     if let Some(c) = host.control() {

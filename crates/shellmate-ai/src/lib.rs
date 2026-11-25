@@ -67,6 +67,8 @@ pub enum AiError {
     Network,
     #[error("服务暂时不可用，请稍后重试")]
     Unavailable,
+    #[error("执行记录未能保存到本机，请检查存储空间后重试")]
+    Persistence,
     #[error("服务返回了无法识别的回答，请重试")]
     InvalidResponse,
     #[error("会话已断开")]

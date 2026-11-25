@@ -2,6 +2,8 @@
 //! dropping the registry cancels every worker and its process/channel/PTY guard.
 #[path = "agent_tasks.rs"]
 mod agents;
+#[path = "task_events.rs"]
+mod events;
 use futures::future::BoxFuture;
 use shellmate_ai::{
     agent::{ExecLimits, LocalResult, LocalTool, Target, ToolCall, ToolOutcome},
@@ -97,6 +99,8 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    events: Mutex<events::Outbox>,
+    event_retrying: std::sync::atomic::AtomicBool,
     store: std::sync::OnceLock<shellmate_store::SharedStore>,
     control: shellmate_ai::interaction::Control,
     changed: watch::Sender<u64>,
@@ -104,19 +108,6 @@ struct Inner {
     root: PathBuf,
     conversation: String,
     state: Mutex<State>,
-}
-impl Inner {
-    fn publish(&self, id: String, task: String, text: String) {
-        if let Some(store) = self.store.get()
-            && let Err(e) =
-                store
-                    .borrow_mut()
-                    .save_ai_task_event(&self.conversation, &id, &task, &text)
-        {
-            log::warn!("save task event: {e}");
-        }
-        self.control.publish(id, task, text);
-    }
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -155,6 +146,8 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            events: Default::default(),
+            event_retrying: Default::default(),
             store: Default::default(),
             control,
             changed: watch::channel(0).0,
@@ -206,7 +199,9 @@ impl Tasks {
         std::mem::take(&mut self.0.state.lock().unwrap().external_steps)
     }
     pub fn set_store(&self, store: shellmate_store::SharedStore) {
-        let _ = self.0.store.set(store);
+        if self.0.store.set(store).is_ok() {
+            self.retry_completions();
+        }
     }
     pub fn promote_foreground(&self) {
         self.0

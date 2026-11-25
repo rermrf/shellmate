@@ -151,6 +151,7 @@ impl Drawer {
                     .update_in(cx, |s, w, cx| {
                         for pane in s.state.output_panes.values(){pane.update(cx,|s,cx|s.tick(cx));}
                         if let Some(tasks)=&s.tasks {
+                            if let Some(runtime)=crate::runtime::get(cx){tasks.schedule_completion_retry(&runtime);}
                             for view in tasks.agent_views(){
                                 if let Some(old)=s.state.subagents.get_mut(&view.id){old.refresh(view);}else{s.state.subagents.insert(view.id.clone(),view);}
                             }
@@ -783,6 +784,7 @@ impl Drawer {
                 }
                 if let Ok(steps)=self.db.borrow().ai_external_steps(&self.state.id){for step in steps{if !self.state.model.conversation.entries().iter().any(|e|matches!(e,shellmate_ai::Entry::Step(s)if s.call.id==step.call.id)){self.state.model.conversation.append(shellmate_ai::Entry::Step(step));}}}
                 if let Ok(events)=self.db.borrow().ai_task_events(&self.state.id){for (id,task,text) in events{self.state.control.publish(id,task,text);}}
+                self.ensure_tasks();
                 self.history = false;
                 self.state.readonly = true;
                 cx.notify();
@@ -1166,20 +1168,23 @@ impl Render for Drawer {
             .pr(px(12.))
             .child(
                 div()
-                    .h(px(26.))
+                    .min_h(px(26.))
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
+                            .min_w(px(64.))
+                            .whitespace_nowrap()
                             .text_size(px(15.))
                             .line_height(px(20.))
                             .font_weight(FontWeight::BOLD)
                             .child("AI 助手"),
                     )
                     .child(
+                        div().flex_none().flex().items_center().gap(px(8.)).ml_auto().child(
                         Button::new("ai-history")
                             .icon(crate::icons::AppIcon::History.at(14.))
                             .w(px(26.))
@@ -1187,8 +1192,7 @@ impl Render for Drawer {
                             .p_0()
                             .rounded(px(8.))
                             .tooltip("历史对话")
-                            .on_click(cx.listener(|s, _, _, cx| s.history(cx))),
-                    )
+                            .on_click(cx.listener(|s, _, _, cx| s.history(cx))))
                     .child(
                         Button::new("ai-new")
                             .icon(crate::icons::AppIcon::Plus.at(14.))
@@ -1218,7 +1222,7 @@ impl Render for Drawer {
                                 w.defer(cx, move |_, cx| {
                                     ws.update(cx, |s, cx| s.close_ai(cx)).ok();
                                 });
-                            })),
+                            }))),
                     ),
             )
             .child(context);
@@ -1584,6 +1588,9 @@ impl Render for Drawer {
         }
         if let Some(e) = &self.state.save_error {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e.clone()));
+        }
+        if let Some(e) = self.tasks.as_ref().and_then(|t|t.completion_save_error()) {
+            body = body.child(div().text_size(px(12.)).text_color(p.err).child(e));
         }
         // Keep the blocking card last so following the bottom reveals all its actions.
         if !self.history {

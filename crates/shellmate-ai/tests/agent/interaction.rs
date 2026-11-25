@@ -23,6 +23,77 @@ impl ToolHost for Interactive {
         })
     }
 }
+
+#[tokio::test]
+async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknowledged() {
+    use shellmate_ai::subagent::{self, Cancellation, SubagentContext, SubagentEvent};
+    for stop in [false, true] {
+        let http = SequencedHttpClient::new([response(false, &[], "answer", false)]);
+        let client = RigClient::with_http(&config(false), http.clone()).unwrap();
+        let control = Control::default();
+        control.resume();
+        control.enqueue(
+            "followup".into(),
+            "durable instruction".into(),
+            Default::default(),
+        );
+        let host = Interactive {
+            inner: Host::new([]),
+            control: control.clone(),
+            enqueue_on_run: false,
+        };
+        let cancel = Cancellation::default();
+        let mut accepted = false;
+        let mut failed_once = false;
+        let outcome = subagent::run_with_cancel(
+            &client,
+            shellmate_ai::SubagentRequest {
+                description: "test".into(),
+                prompt: "initial".into(),
+                kind: shellmate_ai::SubagentKind::General,
+                background: true,
+                model: None,
+                reasoning: None,
+            },
+            SubagentContext {
+                id: "agent-test".into(),
+                snapshot: Default::default(),
+                cwd: None,
+            },
+            Default::default(),
+            &host,
+            fast_limits(),
+            &cancel,
+            |event| match event {
+                SubagentEvent::Agent(AgentEvent::InputsAccepted(_)) => accepted = true,
+                SubagentEvent::Checkpoint(saved) if accepted && !failed_once => {
+                    assert_eq!(control.snapshot().inputs.len(), 1);
+                    assert!(control.snapshot().inputs[0].claimed);
+                    failed_once = true;
+                    *saved = Err(AiError::Persistence);
+                }
+                SubagentEvent::Saving(true) => {
+                    assert_eq!(control.snapshot().inputs.len(), 1);
+                    if stop {
+                        cancel.cancel();
+                    }
+                }
+                _ => {}
+            },
+        )
+        .await;
+        assert!(failed_once);
+        if stop {
+            assert_eq!(outcome.status, shellmate_ai::SubagentStatus::Stopped);
+            assert_eq!(control.snapshot().inputs.len(), 1);
+        } else {
+            assert_eq!(outcome.status, shellmate_ai::SubagentStatus::Completed);
+            assert!(control.snapshot().inputs.is_empty());
+            assert_eq!(http.requests().len(), 1);
+        }
+        assert!(host.inner.calls.lock().unwrap().is_empty());
+    }
+}
 #[tokio::test]
 async fn queued_input_closes_unexecuted_calls_before_the_next_request_on_both_wires() {
     for a in [false, true] {

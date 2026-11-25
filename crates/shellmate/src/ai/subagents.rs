@@ -255,7 +255,7 @@ impl Service {
                 )),
                 Some(Ok(()))
             ) {
-                return ticket.fail(shellmate_ai::AiError::Unavailable, self.limits.exec);
+                return ticket.fail(shellmate_ai::AiError::Persistence, self.limits.exec);
             }
             let transcript = history.map(|(history, _, _)| history).unwrap_or_default();
             let mut checkpoint_log = transcript.clone();
@@ -263,7 +263,7 @@ impl Service {
                 &request.prompt,
                 context.snapshot.clone(),
             ));
-            self.tasks.while_retained(|| {
+            let saved = self.tasks.while_retained(|| {
                 super::subagent_files::checkpoint(
                     &self.tasks.root(),
                     self.tasks.conversation_id(),
@@ -272,6 +272,9 @@ impl Service {
                     child_tasks.control().snapshot(),
                 )
             });
+            if !matches!(saved, Some(Ok(()))) {
+                return ticket.fail(shellmate_ai::AiError::Persistence, self.limits.exec);
+            }
             let checkpoint_owner = self.tasks.retained();
             let checkpoint_root = self.tasks.root();
             let checkpoint_id = source.id.clone();
@@ -299,14 +302,25 @@ impl Service {
                     limits,
                     &token,
                     transcript,
-                    |event| {
+                    |mut event| {
                         if let subagent::SubagentEvent::Updates(updates) = &event {
                             for update in *updates {
                                 checkpoint_log.apply(update.clone());
                             }
-                            if updates.iter().any(|u|matches!(u,shellmate_ai::LogUpdate::Append(e) if matches!(&**e,shellmate_ai::Entry::Step(_)|shellmate_ai::Entry::User{..}))) {
-                                checkpoint_owner.while_retained(||super::subagent_files::checkpoint(&checkpoint_root,&checkpoint_conversation,&checkpoint_id,Some(checkpoint_log.entries()),child_tasks.control().snapshot()));
-                            }
+                        }
+                        if let subagent::SubagentEvent::Checkpoint(saved) = &mut event {
+                            **saved = match checkpoint_owner.while_retained(|| {
+                                super::subagent_files::checkpoint(
+                                    &checkpoint_root,
+                                    &checkpoint_conversation,
+                                    &checkpoint_id,
+                                    Some(checkpoint_log.entries()),
+                                    child_tasks.control().snapshot(),
+                                )
+                            }) {
+                                Some(Ok(())) => Ok(()),
+                                _ => Err(shellmate_ai::AiError::Persistence),
+                            };
                         }
                         weak.event(event)
                     },

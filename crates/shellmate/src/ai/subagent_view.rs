@@ -32,6 +32,7 @@ pub struct View {
     pub steps: usize,
     pub step_list: Vec<StepView>,
     pub latest_activity: String,
+    pub saving: bool,
     pub usage: Usage,
     pub report: String,
     pub output_id: Option<String>,
@@ -59,6 +60,7 @@ impl View {
             steps: 0,
             step_list: vec![],
             latest_activity: "正在启动".into(),
+            saving: false,
             usage: Usage::default(),
             report: String::new(),
             output_id: None,
@@ -124,11 +126,21 @@ impl View {
             SubagentEvent::Agent(AgentEvent::Retrying { .. }) => {
                 self.latest_activity = "正在重试".into()
             }
+            SubagentEvent::Saving(waiting) => {
+                self.saving = waiting;
+                self.latest_activity = if waiting {
+                    "执行记录保存失败，等待重试"
+                } else {
+                    "执行记录已保存，继续处理"
+                }
+                .into();
+            }
             SubagentEvent::Progress { steps, usage } => {
                 self.steps = steps;
                 self.usage = usage;
             }
             SubagentEvent::Finished(out) => {
+                self.saving = false;
                 self.duration_ms = out.duration.as_millis().min(u64::MAX as u128) as u64;
                 self.status = out.status.clone();
                 self.steps = out.steps;
@@ -210,6 +222,7 @@ impl View {
             steps: display.steps,
             step_list: vec![],
             latest_activity: status_label(&status).into(),
+            saving: false,
             usage: display.usage,
             report,
             output_id: display.output_id.clone(),

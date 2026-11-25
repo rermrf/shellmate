@@ -85,7 +85,15 @@ impl Drawer {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(agent_ui::step_heading(title, chips, &status, color, cx));
+            .child(agent_ui::step_heading(title, chips, &status, color, cx))
+            .when(view.saving, |d| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.err)
+                        .child("执行记录保存失败，已暂停后续步骤，正在重试"),
+                )
+            });
         if let Some(meta) = card::meta(view) {
             surface = surface.child(div().text_size(px(11.)).text_color(p.tx3).child(selectable(
                 format!("{scope}:meta"),
