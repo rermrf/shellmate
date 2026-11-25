@@ -1,5 +1,7 @@
 #[path = "subagent_ui.rs"]
 mod subagent_ui;
+#[path = "output_ui.rs"]
+mod output_ui;
 #[path = "mode_ui.rs"]
 mod mode_ui;
 #[path = "agent_ui.rs"]
@@ -43,6 +45,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 const CONTEXT_POPOVER_KEYS: &str = "AiContextPopover";
 pub fn init(cx: &mut App) {
+    output_ui::init(cx);
     // The popover owns focus outside the textarea's Input key context.
     cx.bind_keys([KeyBinding::new("escape", input::Escape, Some(CONTEXT_POPOVER_KEYS))]);
 }
@@ -63,6 +66,8 @@ pub struct Drawer {
     task_ui: Option<async_channel::Sender<super::host::Ui>>,
     main_cancel: shellmate_ai::subagent::Cancellation,
     fixture_tasks: Vec<super::tasks::TaskInfo>,
+    #[cfg(debug_assertions)]
+    output_fixture_root: Option<tempfile::TempDir>,
     fixture_context: Option<shellmate_ai::ContextBreakdown>,
     save_conversations: bool,
     workspace: WeakEntity<Workspace>,
@@ -138,6 +143,7 @@ impl Drawer {
                     .await;
                 if this
                     .update_in(cx, |s, _, cx| {
+                        for pane in s.state.output_panes.values(){pane.update(cx,|s,cx|s.tick(cx));}
                         if let Some(tasks)=&s.tasks {
                             for view in tasks.agent_views(){
                                 if let Some(old)=s.state.subagents.get_mut(&view.id){old.refresh(view);}else{s.state.subagents.insert(view.id.clone(),view);}
@@ -182,6 +188,8 @@ impl Drawer {
             task_ui: None,
             main_cancel: Default::default(),
             fixture_tasks: Vec::new(),
+            #[cfg(debug_assertions)]
+            output_fixture_root: None,
             fixture_context: None,
             state: state::ConversationState::default(),
             save_conversations,
@@ -849,6 +857,21 @@ impl Drawer {
         self.fixture_tasks.clear();
         self.fixture_context = None;
         self.fixture_copy = Default::default();
+        if let Some(fixture)=crate::proto::output::scene(scene,&self.state.id) {
+            self.data_root=fixture.root.path().to_owned();self.output_fixture_root=Some(fixture.root);
+            self.state.model.clear();self.state.model.conversation=fixture.conversation;
+            self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;self.state.readonly=fixture.readonly;
+            self.state.follow_bottom=false;self.fixture_tasks=fixture.tasks;
+            if fixture.expanded{self.state.expanded.insert((0,0));}
+            if let Some(spool)=fixture.spool {
+                cx.spawn(async move |_,cx| {
+                    for n in 0..20 {
+                        cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                        let _=spool.write(format!("live update {n}\n").as_bytes(),false);
+                    }
+                }).detach();
+            }
+        }
         if crate::proto::subagents::SCENES.contains(&scene) {
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;
             self.state.model.clear();self.capabilities=Capabilities {terminal:true,background:true,..Default::default()};
@@ -1082,6 +1105,7 @@ fn ago(time: i64) -> String {
 impl Render for Drawer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_items = self.prepare_subagent_cards();
+        self.prepare_output_views(cx);
         let p = cx.palette().clone();
         // Only the session label may shrink; the context prefix and line count
         // keep their intrinsic widths below the title/actions row.
@@ -1352,7 +1376,8 @@ impl Render for Drawer {
                             }
                             shellmate_ai::AnswerItem::Notice(text) => {
                                 let action = self.state.model.conversation.memory_action(index,n).cloned();
-                                let line = div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(text.clone());
+                                let label = output_ui::notice_label(text, self.state.model.conversation.displayed_step(index,n));
+                                let line = div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(label);
                                 reply = reply.child(if let Some(action)=action {
                                     line.flex().items_center().flex_wrap().gap(px(5.)).child("·").child(agent_ui::step_action(("ai-memory-view",index*1000+n),"查看",cx).on_click(cx.listener(move|s,_,w,cx|s.open_memory(Some(action.clone()),w,cx))))
                                 } else { line });

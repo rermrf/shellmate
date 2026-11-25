@@ -42,6 +42,8 @@ similar.workspace = true
 tempfile.workspace = true
 # Already used by gpui-component; reuse the locked parser for safe Markdown preprocessing.
 markdown = "=1.0.0"
+# Already locked by GPUI; column indexing for virtualized literal command output.
+unicode-width = "=0.2.3"
 
 [dev-dependencies]
 rig-core = { workspace = true, features = ["test-utils"] }

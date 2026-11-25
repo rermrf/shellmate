@@ -42,6 +42,7 @@ pub(super) struct ScrollArea {
     max_height: Option<Pixels>,
     vertical: bool,
     selection: Option<gpui::Entity<super::selection_scroll::SelectionScroll>>,
+    retained: Option<gpui::Entity<State>>,
 }
 
 impl ScrollArea {
@@ -53,6 +54,7 @@ impl ScrollArea {
             max_height: None,
             vertical: false,
             selection: None,
+            retained: None,
         }
     }
 
@@ -69,11 +71,17 @@ impl ScrollArea {
         self.vertical = scroll;
         self
     }
+    pub fn retained(mut self, state: gpui::Entity<State>) -> Self {
+        self.retained = Some(state);
+        self
+    }
 }
 
 impl RenderOnce for ScrollArea {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| State::default());
+        let state = self.retained.unwrap_or_else(|| {
+            window.use_keyed_state(self.id.clone(), cx, |_, _| State::default())
+        });
         if let Some(selection) = &self.selection {
             selection.update(cx, |s, _| s.register(&state));
         }

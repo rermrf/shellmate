@@ -68,6 +68,7 @@ impl Service {
             };
             let source = ticket.source();
             let child_tasks = self.tasks.child_tasks();
+            self.tasks.attach_child_outputs(&source.id, &child_tasks);
             let mut binding = self.binding.clone();
             binding.capabilities.terminal = false;
             let host = Host {

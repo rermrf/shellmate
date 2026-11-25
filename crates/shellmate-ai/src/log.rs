@@ -255,6 +255,7 @@ pub struct Conversation {
     pub(crate) agent_tool: Option<rig_core::completion::ToolDefinition>,
     pub(crate) request_usage: Usage,
     memory_actions: std::collections::BTreeMap<(usize, usize), crate::memory::Action>,
+    displayed_steps: std::collections::BTreeMap<(usize, usize), usize>,
     pub(crate) memory: Option<crate::memory::Snapshot>,
     entries: Vec<Entry>,
     turns: Vec<Turn>,
@@ -267,6 +268,13 @@ impl PartialEq for Conversation {
 }
 impl Eq for Conversation {}
 impl Conversation {
+    /// Structured source of a projected card; shares the exact append traversal with the UI.
+    pub fn displayed_step(&self, turn: usize, item: usize) -> Option<&Step> {
+        match self.entries.get(*self.displayed_steps.get(&(turn, item))?)? {
+            Entry::Step(step) => Some(step),
+            _ => None,
+        }
+    }
     pub fn memory_snapshot(&self) -> Option<&crate::memory::Snapshot> {
         self.memory.as_ref()
     }
@@ -396,6 +404,7 @@ impl Conversation {
                     let entries = std::mem::take(&mut self.entries);
                     self.turns.clear();
                     self.memory_actions.clear();
+                    self.displayed_steps.clear();
                     self.accounting.usage = None;
                     for entry in entries {
                         self.append(entry);
@@ -458,6 +467,9 @@ impl Conversation {
                             answer.items.push(AnswerItem::Command(card.clone()))
                         }
                         Entry::Step(s) => {
+                            if s.result.subagent.is_some() || s.display.is_some() || matches!(s.call.name.as_str(), "memory" | "read_output" | "stop_task") {
+                                self.displayed_steps.insert((turn_index, answer.items.len()), self.entries.len());
+                            }
                             if let Some(display) = &s.result.subagent {
                                 answer.items.push(AnswerItem::Subagent {
                                     display: display.clone(),
@@ -534,5 +546,26 @@ impl Conversation {
         positions.truncate(positions.len().saturating_sub(5));
         positions.retain(|i| matches!(&self.entries[*i], Entry::Step(s) if !s.result.cleared));
         positions
+    }
+}
+
+#[cfg(test)]
+mod display_source_tests {
+    use super::*;
+    #[test]
+    fn displayed_sources_follow_the_real_projection_across_text_notices_and_reopening() {
+        let mut c=Conversation::default();c.push_user(UserTurn::new("inspect",Default::default()));
+        c.push_text("first ");c.push_text("second");
+        let step=|id:&str,name:&str,display|Entry::Step(Step{message_id:1,call:LoggedCall{id:id.into(),name:name.into(),args_json:serde_json::json!({"id":"output"})},
+            result:LoggedResult{inline:"body".into(),output_id:Some(format!("out-{id}")),is_error:false,cleared:false,subagent:None},display});
+        c.append(step("invalid","invalid",None));
+        c.append(step("read","read_output",None));
+        let display=StepDisplay{command:"pwd".into(),target:Target::Background,purpose:"inspect".into(),class:crate::policy::Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1,automatic:true,output:"/tmp".into()};
+        c.append(step("run","run_command",Some(display)));
+        c.push_user(UserTurn::new("followup",Default::default()));c.push_text("answer");
+        assert!(c.displayed_step(0,0).is_none());assert_eq!(c.displayed_step(0,1).unwrap().call.id,"read");
+        assert_eq!(c.displayed_step(0,2).unwrap().result.output_id.as_deref(),Some("out-run"));
+        assert!(c.displayed_step(1,0).is_none());
+        let reopened=Conversation::from_entries(c.entries().to_vec());assert_eq!(reopened.displayed_step(0,2),c.displayed_step(0,2));
     }
 }

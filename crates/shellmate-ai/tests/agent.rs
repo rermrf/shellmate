@@ -1546,13 +1546,7 @@ async fn transient_after_text_pauses_without_retry_and_preserves_partial_answer(
         test_utils::SequencedStreamingHttpClient,
     };
     for a in [false, true] {
-        let full = wire(a, &[], "partial", false);
-        let marker = if a {
-            "event: content_block_stop"
-        } else {
-            "data: {\"choices\":[{\"delta\":{},"
-        };
-        let prefix = full.split(marker).next().unwrap().to_owned();
+        let prefix = support::before_completion(&wire(a, &[], "partial", false), a);
         let client = RigClient::with_http(
             &config(a),
             SequencedStreamingHttpClient::new(vec![
@@ -1920,15 +1914,7 @@ async fn agent_stream_has_no_total_cap_but_first_and_idle_still_pause() {
             9
         );
         assert!(start.elapsed() >= Duration::from_secs(6000));
-        let prefix = wire(a, &[], "partial", false)
-            .split(if a {
-                "event: content_block_stop"
-            } else {
-                "data: {\"choices\":[{\"delta\":{},"
-            })
-            .next()
-            .unwrap()
-            .to_owned();
+        let prefix = support::before_completion(&wire(a, &[], "partial", false), a);
         let client = RigClient::with_http(
             &config(a),
             support::TimedStream {

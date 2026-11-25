@@ -283,6 +283,7 @@ impl Drawer {
                             let running = task.status == Status::Running;
                             let status = task.status_text();
                             let id = task.id.clone();
+                            let output_id = task.output_id.clone();
                             card = card.child(
                                 div()
                                     .flex()
@@ -299,6 +300,23 @@ impl Drawer {
                                                 task.id,
                                                 task.target_label()
                                             )))
+                                            .when(
+                                                task.kind == crate::ai::tasks::Kind::Command,
+                                                |d| {
+                                                    d.child(
+                                                        super::agent_ui::step_action(
+                                                            ("local-output", i * 1000 + n),
+                                                            "查看输出",
+                                                            cx,
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |s, _, w, cx| {
+                                                                s.reveal_output(&output_id, w, cx)
+                                                            },
+                                                        )),
+                                                    )
+                                                },
+                                            )
                                             .when(running, |d| {
                                                 d.child(
                                                     Button::new(("local-stop", i * 1000 + n))

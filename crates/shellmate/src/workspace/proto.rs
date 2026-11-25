@@ -380,6 +380,7 @@ impl Workspace {
             | "ai-compacting" | "ai-compacted-tier1" | "ai-history" | "ai-error"
             | "ai-memory-chip" | "ai-mode-popover" | "ai-subagent-approval" | "ai-tasks-subagents"
             | "ai-subagent-running" | "ai-subagent-done" | "ai-subagent-expanded" | "ai-subagent-states" | "ai-subagent-background"
+            | "ai-output-short" | "ai-output-expanded" | "ai-output-history" | "ai-output-missing" | "ai-output-retained" | "ai-output-running" | "ai-output-giant"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
                 if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),"h1");}
                 self.open_ai(window, cx);

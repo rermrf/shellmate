@@ -7,6 +7,7 @@ pub mod slash;
 pub mod memory;
 pub mod mode;
 pub mod subagents;
+pub mod output;
 pub mod stress;
 pub use data::DATA;
 use std::ops::Index;
@@ -74,6 +75,7 @@ pub const SCENES: &[&str] = &[
     "ai-subagent-approval", "ai-tasks-subagents",
     "ai-subagent-running", "ai-subagent-done", "ai-subagent-expanded", "ai-subagent-states", "ai-subagent-background",
     "ai-mode-popover",
+    "ai-output-short", "ai-output-expanded", "ai-output-history", "ai-output-missing", "ai-output-retained", "ai-output-running", "ai-output-giant",
     "ai-slash", "ai-slash-filter", "ai-slash-context", "ai-slash-tasks", "set-ai-advanced",
     "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
     "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
@@ -308,7 +310,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 133 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 140 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

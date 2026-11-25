@@ -43,3 +43,22 @@ impl HttpClientExt for TimedStream {
         }
     }
 }
+
+// GPUI enables serde_json/preserve_order in combined app/AI test builds. Match SSE
+// event semantics so the partial fixture cannot accidentally include completion.
+pub fn before_completion(input: &str, anthropic: bool) -> String {
+    input
+        .split_inclusive("\n\n")
+        .take_while(|event| {
+            if anthropic {
+                !event.starts_with("event: content_block_stop")
+            } else {
+                !event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                    .any(|data| !data["choices"][0]["finish_reason"].is_null())
+            }
+        })
+        .collect()
+}

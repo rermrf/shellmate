@@ -1,9 +1,6 @@
 //! Subagent cards reuse command-step surfaces, header, output viewport and text actions.
 use super::{Drawer, agent_ui, markdown};
-use crate::ai::{
-    subagent_card as card,
-    subagent_view::{View, saved_output},
-};
+use crate::ai::{subagent_card as card, subagent_view::View};
 use crate::theme::ActivePalette;
 use gpui::{
     base::{SelectableText, TextSelectionHandle},
@@ -38,22 +35,12 @@ impl Drawer {
         let card = self.state.agent_cards.entry(id.into()).or_default();
         card.toggle_step(step_id);
         if card.step.is_some()
-            && !card.outputs.contains_key(step_id)
-            && let Some(step) = self
+            && let Some(output) = self
                 .state
-                .subagents
-                .get(id)
-                .and_then(|v| v.step_list.iter().find(|s| s.id == step_id))
+                .output_panes
+                .get(&super::output_ui::child_key(id, step_id))
         {
-            let output = step
-                .output_id
-                .as_deref()
-                .and_then(|id| saved_output(&self.data_root, &self.state.id, id))
-                .unwrap_or_else(|| step.output.clone());
-            // A running command may acquire more output; don't cache an incomplete read.
-            if !step.running {
-                card.outputs.insert(step_id.into(), output);
-            }
+            output.update(cx, |s, cx| s.open(cx));
         }
         cx.notify();
     }
@@ -185,51 +172,13 @@ impl Drawer {
                             s.toggle_subagent_step(&agent_id, &step_id, cx)
                         }));
                     steps = steps.child(row);
-                    if row_open {
-                        let output = expansion
-                            .and_then(|c| c.outputs.get(&step.id))
-                            .unwrap_or(&step.output);
-                        let output_view = crate::ai::output_view::display_step(output, false);
-                        let (stdout, stderr) = agent_ui::output_sections(output_view.preview);
-                        let content = agent_ui::output_content(
-                            stdout,
-                            stderr,
-                            SharedString::from(format!("{step_key}:stdout")).into(),
-                            SharedString::from(format!("{step_key}:stderr")).into(),
-                            &p,
-                        );
-                        let copy = output.clone();
-                        steps = steps.child(
-                            div()
-                                .font_family(crate::theme::UI_FONT)
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.))
-                                .child(agent_ui::output_scroll(
-                                    format!("{step_key}:output").into(),
-                                    div().flex_none().child(content),
-                                    true,
-                                    self.selection_scroll.clone(),
-                                    &p,
-                                ))
-                                .children(output_view.saved.map(|text| note(text, &p)))
-                                .child(
-                                    agent_ui::step_actions().child(
-                                        agent_ui::step_action(
-                                            SharedString::from(format!("{step_key}:copy")),
-                                            "复制",
-                                            cx,
-                                        )
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    copy.clone(),
-                                                ))
-                                            },
-                                        ),
-                                    ),
-                                ),
-                        );
+                    if row_open
+                        && let Some(output) = self
+                            .state
+                            .output_panes
+                            .get(&super::output_ui::child_key(id, &step.id))
+                    {
+                        steps = steps.child(output.clone());
                     }
                 }
                 surface = surface.child(steps);

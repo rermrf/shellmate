@@ -159,7 +159,6 @@ pub fn step_status(step: &StepView) -> (String, Color) {
 pub struct Expansion {
     pub open: bool,
     pub step: Option<String>,
-    pub outputs: BTreeMap<String, String>,
 }
 impl Expansion {
     pub fn toggle_step(&mut self, id: &str) {

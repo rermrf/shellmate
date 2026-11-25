@@ -878,15 +878,7 @@ async fn active_stream_has_no_total_cap_and_first_and_idle_deadlines_still_apply
         ));
         assert_eq!(started.elapsed(), Duration::from_secs(600));
         // A partial answer arrives, then the body stays open forever.
-        let prefix = sse(a, "partial", false)
-            .split(if a {
-                "event: content_block_stop"
-            } else {
-                "data: {\"choices\":[{\"delta\":{},"
-            })
-            .next()
-            .unwrap()
-            .to_owned();
+        let prefix = support::before_completion(&sse(a, "partial", false), a);
         let client = RigClient::with_http(
             &cfg,
             support::TimedStream {

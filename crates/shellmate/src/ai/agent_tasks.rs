@@ -10,6 +10,7 @@ pub(super) struct AgentTask {
     pub call_id: String,
     pub cancel: Cancellation,
     pub result: watch::Receiver<Option<LocalResult>>,
+    pub child_outputs: Weak<Inner>,
 }
 pub struct Ticket {
     root: PathBuf,
@@ -181,6 +182,7 @@ impl Tasks {
                 call_id: call_id.into(),
                 cancel: cancel.clone(),
                 result: result.clone(),
+                child_outputs: Weak::new(),
             },
         );
         Ok(Ticket {
@@ -235,6 +237,7 @@ impl Tasks {
                         call_id: step.call.id.clone(),
                         cancel: Default::default(),
                         result,
+                        child_outputs: Weak::new(),
                     },
                 );
             }
@@ -243,14 +246,44 @@ impl Tasks {
     pub fn child_tasks(&self) -> Self {
         Self::new(self.0.root.clone(), self.0.conversation.clone())
     }
+    pub fn attach_child_outputs(&self, id: &str, tasks: &Self) {
+        if let Some(task) = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .values_mut()
+            .find(|t| t.view.id == id)
+        {
+            task.child_outputs = Arc::downgrade(&tasks.0);
+        }
+    }
     pub fn agent_views(&self) -> Vec<View> {
-        self.0
+        let views: Vec<_> = self
+            .0
             .state
             .lock()
             .unwrap()
             .agents
             .values()
-            .map(|t| t.view.clone())
+            .map(|t| (t.view.clone(), t.child_outputs.upgrade()))
+            .collect();
+        views
+            .into_iter()
+            .map(|(mut view, children)| {
+                if let Some(children) = children {
+                    let state = children.state.lock().unwrap();
+                    for step in &mut view.step_list {
+                        if let Some(task) = state.tasks.values().find(|t| t.info.call_id == step.id)
+                        {
+                            step.output_id = Some(task.info.output_id.clone());
+                            step.running = task.info.status == Status::Running;
+                        }
+                    }
+                }
+                view
+            })
             .collect()
     }
     pub fn agent_updates(&self) -> Vec<(String, shellmate_ai::LoggedResult)> {

@@ -65,6 +65,7 @@ impl Drawer {
         for task in running {
             let id = task.id.clone();
             let stop_id = id.clone();
+            let output_id = task.output_id.clone();
             strip = strip.child(
                 div()
                     .flex()
@@ -95,6 +96,10 @@ impl Drawer {
                             .flex_none()
                             .child(format!("{}s", task.started.elapsed().as_secs())),
                     )
+                    .when(task.kind == crate::ai::tasks::Kind::Command, |d| d.child(
+                        step_action(SharedString::from(format!("task-output-{id}")), "查看输出", cx)
+                            .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx)))
+                    ))
                     .child(
                         Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止").h(px(24.)).text_size(px(11.5))
                             .on_click(cx.listener(move |s, _, _, cx| {
@@ -412,6 +417,11 @@ impl Drawer {
             ))
         };
         if step.started.is_some() {
+            if let Some(id) = self.tasks.as_ref().and_then(|tasks| tasks.output_id_for(&step.call.id))
+                && let Some(output) = self.state.output_panes.get(&format!("output:{id}"))
+            {
+                card = card.child(output.clone());
+            }
             card = card.child(gpui::component::spinner::Spinner::new()).child(
                 dialogs::button("ai-step-stop", "停止", Tone::Plain, true)
                     .on_click(cx.listener(|s, _, _, cx| s.stop(cx))),
@@ -518,14 +528,13 @@ impl Drawer {
             exit_code,
             duration_ms,
             automatic,
-            output,
             ..
         } = item
         else {
             unreachable!()
         };
         let p = cx.palette().clone();
-        let state = match status {
+        let mut state = match status {
             StepStatus::Completed => format!(
                 "退出码 {} · {:.1} s",
                 exit_code.map_or_else(|| "未知".into(), |n| n.to_string()),
@@ -538,7 +547,7 @@ impl Drawer {
             StepStatus::Disconnected => "会话已断开".into(),
             StepStatus::Failed(_) => "失败".into(),
         };
-        let color = if *status == StepStatus::Background {
+        let mut color = if *status == StepStatus::Background {
             p.acc
         } else if *status == StepStatus::Completed
             && shellmate_ai::output::successful(command, *exit_code)
@@ -547,6 +556,18 @@ impl Drawer {
         } else {
             p.err
         };
+        if *status == StepStatus::Background
+            && let Some(output_id) = self.state.model.conversation.displayed_step(key.0,key.1).and_then(|s|s.result.output_id.as_deref())
+            && let Some(task) = self.tasks.as_ref().and_then(|tasks|tasks.list().into_iter().find(|t|t.output_id==output_id))
+        {
+            state=task.status_text();
+            color=match task.status {
+                crate::ai::tasks::Status::Running=>p.acc,
+                crate::ai::tasks::Status::Exited(code) if shellmate_ai::output::successful(command,code)=>p.ok,
+                crate::ai::tasks::Status::Stopped=>p.tx2,
+                _=>p.err,
+            };
+        }
         let mut card = step_surface(&p)
             .flex_none()
             .flex()
@@ -568,91 +589,8 @@ impl Drawer {
             }
             _ => {}
         }
-        if !output.is_empty() || matches!(status, StepStatus::Completed | StepStatus::TimedOut) {
-            let output_view = crate::ai::output_view::display_step(output, !matches!(status, StepStatus::Completed | StepStatus::TimedOut));
-            let (stdout, stderr) = output_sections(output_view.preview);
-            let has_output = !stdout.is_empty() || !stderr.is_empty();
-            let expanded = self.state.expanded.contains(&key);
-            let overflowing = self.state.overflowing_output.contains(&key);
-            let drawer = cx.entity().downgrade();
-            let epoch = self.epoch;
-            let content = output_content(
-                stdout, stderr,
-                ("step-stdout",key.0*1000+key.1).into(),
-                ("step-stderr",key.0*1000+key.1).into(), &p,
-            );
-            if output_view.prose {
-                card = card.child(div().w_full().min_w_0().text_size(px(12.)).line_height(px(18.))
-                    .text_color(p.tx2).whitespace_normal().child(output_view.preview.to_owned()));
-            } else {
-            // Measure the complete content, including section labels and gaps. The cap
-            // clips by rendered height; it never slices or reflows command output.
-            let measured =
-                div()
-                    .flex_none()
-                    .child(content)
-                    .on_children_prepainted(move |bounds, _, cx| {
-                        let over = bounds.first().is_some_and(|b| b.size.height > px(8. * 18.));
-                        if over != overflowing {
-                            let drawer = drawer.clone();
-                            cx.defer(move |cx| {
-                                drawer
-                                    .update(cx, |s, cx| {
-                                        if s.epoch != epoch {
-                                            return;
-                                        }
-                                        let changed = if over {
-                                            s.state.overflowing_output.insert(key)
-                                        } else {
-                                            s.state.overflowing_output.remove(&key)
-                                        };
-                                        if changed {
-                                            cx.notify();
-                                        }
-                                    })
-                                    .ok();
-                            });
-                        }
-                    });
-            card = card.child(
-                output_scroll(
-                    SharedString::from(format!(
-                        "{}:ai-step-output-{}-{}-{expanded}",
-                        self.state.id, key.0, key.1
-                    )), measured, expanded, self.selection_scroll.clone(), &p,
-                )
-            );
-            }
-            if let Some(saved) = output_view.saved {
-                card = card.child(div().text_size(px(11.)).text_color(p.tx3).child(saved));
-            }
-            if has_output && !self.state.readonly && !output_view.prose {
-                let copy = output.clone();
-                let mut actions = step_actions();
-                if overflowing {
-                    actions = actions.child(
-                        step_action(
-                            ("ai-step-expand", key.0 * 1000 + key.1),
-                            if expanded { "收起" } else { "展开" },
-                            cx,
-                        )
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            if !s.state.expanded.remove(&key) {
-                                s.state.expanded.insert(key);
-                            }
-                            cx.notify();
-                        })),
-                    );
-                }
-                actions = actions.child(
-                    step_action(("ai-step-copy", key.0 * 1000 + key.1), "复制", cx).on_click(
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                        },
-                    ),
-                );
-                card = card.child(actions);
-            }
+        if let Some(output) = self.output_for_step(key) {
+            card = card.child(output);
         }
         card.into_any_element()
     }
@@ -719,7 +657,7 @@ impl Drawer {
                 } else {
                     viewport.height_limit(3. * 18., false)
                 }));
-        if overflowing || !self.state.readonly {
+        {
             let mut actions = step_actions();
             if overflowing {
                 actions = actions.child(
@@ -736,12 +674,12 @@ impl Drawer {
                     })),
                 );
             }
-            if !self.state.readonly {
+            {
                 let copy = command.to_owned();
                 actions = actions.child(
                     step_action(
                         markdown::element_id(&format!("{}:command-copy", self.state.id), key.0, key.1),
-                        "复制",
+                        "复制命令",
                         cx,
                     )
                     .on_click(move |_, _, cx| {
@@ -789,13 +727,6 @@ pub(super) fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &Ap
         )
 }
 
-// Keep the persisted v9 output representation compatible; labels are presentation only.
-pub(super) fn output_sections(output: &str) -> (&str, &str) {
-    match output.strip_prefix("标准输出：\n") {
-        Some(output) => output.split_once("\n标准错误：\n").unwrap_or((output, "")),
-        None => (output, ""),
-    }
-}
 pub(super) fn target_chip(label: &str, color: Hsla) -> Div {
     div().flex_none().font_weight(FontWeight::MEDIUM).px(px(5.)).py(px(2.)).rounded(px(5.)).bg(color.opacity(0.1)).child(label.to_owned())
 }
@@ -825,15 +756,6 @@ pub(super) fn step_heading(purpose: impl IntoElement, chips: Div, state: &str, c
         .child(div().flex().items_center().justify_between().gap(px(5.)).text_size(px(11.))
             .child(chips).child(div().flex_none().text_color(color).child(state.to_owned())))
         .child(div().w_full().text_color(p.tx).text_size(px(13.)).line_height(px(20.8)).whitespace_normal().child(purpose))
-}
-/// Shared literal stdout/stderr and viewport used by command and child-step output.
-pub(super) fn output_content(stdout: &str, stderr: &str, stdout_id: ElementId, stderr_id: ElementId, p: &crate::theme::Palette) -> Div {
-    div().flex_none().flex().flex_col().items_start().gap(px(8.))
-        .when(!stdout.is_empty(), |d|d.child(div().child(crate::ai::markdown::plain(stdout_id,stdout.to_owned()))))
-        .when(!stderr.is_empty(), |d|d.child(div().flex().flex_col().gap(px(8.))
-            .child(div().text_color(p.err).child("标准错误"))
-            .child(div().child(crate::ai::markdown::plain(stderr_id,stderr.to_owned())))))
-        .when(stdout.is_empty() && stderr.is_empty(), |d|d.child("（无输出）"))
 }
 pub(super) fn output_scroll(id: SharedString, content: Div, expanded: bool, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, p: &crate::theme::Palette) -> ScrollArea {
     ScrollArea::new(id, div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content), p.card2)

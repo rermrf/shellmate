@@ -387,7 +387,8 @@ mod execution_tests {
             .items;
         if let AnswerItem::Step { output, .. } = &items[0] {
             let view = crate::ai::output_view::display(output);
-            assert_eq!(view.saved.as_deref(), Some("完整输出 1.0 MB 已保存 · output-1"));
+            assert_eq!(view.total_bytes, Some(1024 * 1024));
+            assert_eq!(view.output_id, Some("output-1"));
             assert!(!view.preview.contains("输出 id"));
             assert!(!view.preview.contains("read_output"));
             assert!(output.starts_with("输出 id output-1 · 总计 1048576 字节"));
