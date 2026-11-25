@@ -388,6 +388,7 @@ impl ProviderClient for RigClient {
                     crate::AgentEvent::TextDelta(t) => Event::TextDelta(t),
                     crate::AgentEvent::Command(c) => Event::Command(c),
                     crate::AgentEvent::Done(u) => Event::Done(u),
+                    crate::AgentEvent::Released(_) => Event::Done(None),
                     crate::AgentEvent::Error(e) => Event::Error(e),
                     crate::AgentEvent::Context {
                         used,

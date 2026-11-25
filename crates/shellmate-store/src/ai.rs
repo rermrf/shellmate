@@ -233,6 +233,17 @@ impl HostStore {
     pub fn ai_conversation_exists(&self,id:&str)->Result<bool>{
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_conversations WHERE id=?1)",[id],|r|r.get(0))?)
     }
+    /// Timing heartbeats must not change the semantic log, queue receipts or history sort time.
+    pub fn update_ai_run_timing(&mut self,id:&str,timing:&serde_json::Value)->Result<bool>{
+        if self.setting(SAVE_CONVERSATIONS)?.as_deref()==Some("0"){return Ok(false);}
+        let tx=self.conn.transaction()?;
+        let json:Option<String>=tx.query_row("SELECT json FROM ai_runtime WHERE conversation_id=?1",[id],|r|r.get(0)).optional()?;
+        let Some(json)=json else{return Ok(false);};
+        let mut runtime:serde_json::Value=serde_json::from_str(&json).map_err(|_|StoreError::Corrupt("运行记录损坏".into()))?;
+        runtime.as_object_mut().ok_or_else(||StoreError::Corrupt("运行记录损坏".into()))?.insert("timing".into(),timing.clone());
+        tx.execute("UPDATE ai_runtime SET json=?2 WHERE conversation_id=?1",params![id,runtime.to_string()])?;
+        tx.commit()?;Ok(true)
+    }
     pub fn ai_task_events(&self,conversation:&str)->Result<Vec<(String,String,String)>>{
         Ok(self.conn.prepare("SELECT id,task_id,text FROM ai_task_events WHERE conversation_id=?1 ORDER BY rowid")?.query_map([conversation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
     }

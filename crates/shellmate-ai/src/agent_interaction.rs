@@ -77,7 +77,7 @@ impl State<'_> {
             });
             self.done = true;
             control.set_phase(Phase::Idle);
-            return Some(AgentEvent::Done(None));
+            return Some(AgentEvent::Released(ReleaseReason::Stopped));
         }
         let inputs = control.claim();
         if inputs.is_empty() {
@@ -88,7 +88,7 @@ impl State<'_> {
                 });
                 self.done = true;
                 control.set_phase(Phase::Idle);
-                return Some(AgentEvent::Done(None));
+                return Some(AgentEvent::Released(ReleaseReason::Detached));
             }
             return None;
         }

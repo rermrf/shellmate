@@ -19,6 +19,7 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) pending: bool,
     pub(super) queued: Option<UserTurn>,
     pub(super) control: shellmate_ai::interaction::Control,
+    pub(super) timing: super::timing::Timeline,
     pub(super) accepted_inputs: Vec<String>,
     pub(super) accepted_events: Vec<String>,
     pub(super) reenter: bool,
@@ -63,6 +64,7 @@ impl<R> Default for ConversationState<R> {
             pending: false,
             queued: None,
             control: Default::default(),
+            timing: Default::default(),
             accepted_inputs: vec![],
             accepted_events: vec![],
             reenter: false,
@@ -152,7 +154,7 @@ impl<R> ConversationState<R> {
             updated_at: crate::ai::now(),
             conversation: self.model.conversation.clone(),
         };
-        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context}))});
+        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"timing":self.timing.snapshot(super::timing::Moment::now()),"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context}))});
         match db.save_ai_conversation_with_runtime(&saved, Some(&runtime)) {
             Ok(true) => {
                 self.save_error = None;

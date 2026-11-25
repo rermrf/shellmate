@@ -453,6 +453,12 @@ pub async fn run_from_history(
                     };
                     let status = match &event {
                         AgentEvent::Done(_) => Some(SubagentStatus::Completed),
+                        AgentEvent::Released(agent::ReleaseReason::Detached) => {
+                            Some(SubagentStatus::Completed)
+                        }
+                        AgentEvent::Released(agent::ReleaseReason::Stopped) => {
+                            Some(SubagentStatus::Stopped)
+                        }
                         AgentEvent::Error(AiError::Cancelled) => Some(SubagentStatus::Stopped),
                         AgentEvent::Error(error) => Some(SubagentStatus::Failed(*error)),
                         AgentEvent::Paused {

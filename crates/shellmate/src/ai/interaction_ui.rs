@@ -11,6 +11,10 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-timing-") {
+            self.timing_fixture(scene, cx);
+            return;
+        }
         self.state.control.resume();
         self.state.model.busy = !matches!(scene, "ai-live-restored" | "ai-live-target");
         self.state.control.set_phase(match scene {
@@ -132,6 +136,7 @@ impl Drawer {
         let conversation = self.state.id.clone();
         let label = text.clone();
         let target = id.clone();
+        let timing_started = timing::Moment::now();
         self.input.update(cx, |i, cx| i.set_value("", w, cx));
         self.state.message_target = None;
         self.state.control.resume();
@@ -145,6 +150,7 @@ impl Drawer {
                     if s.input.read(cx).value().trim().is_empty(){s.state.message_target=Some(target.clone());s.set_composer_text(label.clone(),w,cx);}
                     s.local(slash_ui::LocalBody::Hint(result.inline),cx);return;
                 }
+                s.state.timing.start(s.state.model.conversation.turns().len().saturating_sub(1),s.state.model.conversation.entries().len(),timing_started);
                 if result.subagent.is_some(){
                     let step=shellmate_ai::Step{
                         message_id:s.state.model.conversation.entries().len(),call:shellmate_ai::LoggedCall{id:saved_call,name:"send_agent_message".into(),args_json:serde_json::json!({"id":target,"message":label,"resume":true})},
@@ -153,6 +159,13 @@ impl Drawer {
                     if s.state.model.busy {if let Some(tasks)=&s.tasks{tasks.external_step(step);}}
                     else{s.state.model.conversation.append(shellmate_ai::Entry::Step(step));}
                 }else{s.local(slash_ui::LocalBody::Hint("已向子任务追加消息".into()),cx);}
+                if let Some(tasks)=&s.tasks && let Some((view,_,_))=tasks.latest_agent(&target) {
+                    let pending=s.state.control.snapshot().completions.iter().map(|e|e.task_id.clone()).collect::<Vec<_>>();
+                    if view.status==shellmate_ai::SubagentStatus::Running || pending.contains(&view.id) {
+                        s.state.timing.await_tasks(&[view.id],&tasks.list(),&pending);
+                    }
+                }
+                if !s.state.model.busy {s.state.timing.done(timing::Moment::now());}
                 s.persist();cx.notify();
             }).ok();
         }).detach();
@@ -310,6 +323,9 @@ impl Drawer {
                     ),
                     cx,
                 );
+                self.state
+                    .timing
+                    .finish(timing::Status::Interrupted, timing::Moment::now());
                 self.persist();
                 return;
             }
@@ -324,6 +340,11 @@ impl Drawer {
         if self.state.pending {
             self.stop(cx);
             return;
+        }
+        if !self.state.model.busy {
+            self.state
+                .timing
+                .finish(timing::Status::Stopped, timing::Moment::now());
         }
         self.state.control.request(Intent::StopReply);
         self.persist();
@@ -340,7 +361,9 @@ impl Drawer {
     pub(super) fn interaction_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let p = cx.palette();
         let snapshot = self.state.control.snapshot();
-        let running = self.state.model.busy || self.state.pending;
+        let running = self.state.model.busy
+            || self.state.pending
+            || (self.state.timing.live() && !self.state.timing.paused());
         if !running && snapshot.inputs.is_empty() && self.state.message_target.is_none() {
             return None;
         }
@@ -471,7 +494,13 @@ impl Drawer {
         }
         if running {
             let phase = self.state.control.phase();
-            bar = bar.child(div().text_color(p.tx3).child(phase.label()));
+            bar = bar.child(div().text_color(p.tx3).child(
+                if self.state.model.busy || self.state.pending {
+                    phase.label()
+                } else {
+                    "等待后台任务"
+                },
+            ));
             if matches!(phase, Phase::Executing | Phase::Waiting(_)) {
                 actions = actions.child(
                     agent_ui::step_action("input-detach", "转后台", cx).on_click(cx.listener(

@@ -99,6 +99,7 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    released_waits: Mutex<Vec<String>>,
     events: Mutex<events::Outbox>,
     event_retrying: std::sync::atomic::AtomicBool,
     store: std::sync::OnceLock<shellmate_store::SharedStore>,
@@ -146,6 +147,7 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            released_waits: Default::default(),
             events: Default::default(),
             event_retrying: Default::default(),
             store: Default::default(),
@@ -208,6 +210,9 @@ impl Tasks {
             .control
             .request(shellmate_ai::interaction::Intent::Detach);
     }
+    pub fn take_released_waits(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.released_waits.lock().unwrap())
+    }
     pub async fn wait_tasks(&self, ids: Vec<String>, all: bool) -> LocalResult {
         let mut changed = self.0.changed.subscribe();
         self.0
@@ -243,7 +248,10 @@ impl Tasks {
                 );
             }
             tokio::select! {biased;
-                ()=self.0.control.urgent()=>return LocalResult::text("已结束等待，尚未完成的任务继续在后台运行"),
+                ()=self.0.control.urgent()=>{
+                    self.0.released_waits.lock().unwrap().extend(selected.iter().filter(|t| t.status==Status::Running).map(|t|t.id.clone()));
+                    return LocalResult::text("已结束等待，尚未完成的任务继续在后台运行");
+                },
                 event=changed.changed()=>if event.is_err(){return LocalResult::error("会话已关闭");},
             }
         }

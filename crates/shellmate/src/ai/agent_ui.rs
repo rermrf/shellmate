@@ -121,6 +121,7 @@ impl Drawer {
     pub(super) fn release_context(&mut self, cx: &mut Context<Self>) {
         if !self.state.model.busy
             && !self.state.pending
+            && !self.state.timing.live()
             && self.state.continuation.is_none()
             && !self.has_running_tasks()
             && self.state.control.snapshot().inputs.is_empty()
@@ -132,6 +133,7 @@ impl Drawer {
     }
 
     pub(super) fn agent_event(&mut self, event: AgentEvent) {
+        self.timing_event(&event);
         if !matches!(event, AgentEvent::Retrying { .. }) {
             self.state.model.retrying = None;
         }
@@ -157,6 +159,10 @@ impl Drawer {
                 self.state.model.event(Event::Done(u));
                 self.state.model.manual_compaction = false;
                 // Retain the run configuration for queued input and background-result delivery.
+            }
+            AgentEvent::Released(_) => {
+                self.state.model.event(Event::Done(None));
+                self.state.model.manual_compaction = false;
             }
             AgentEvent::Error(e) => {
                 self.state.control.hold();self.state.control.release_claims();

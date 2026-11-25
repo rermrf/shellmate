@@ -2,6 +2,10 @@
 mod interaction_ui;
 #[path = "btw_ui.rs"]
 mod btw_ui;
+#[path = "run_timing.rs"]
+mod timing;
+#[path = "timing_ui.rs"]
+mod timing_ui;
 #[path = "subagent_ui.rs"]
 mod subagent_ui;
 #[path = "output_ui.rs"]
@@ -149,6 +153,7 @@ impl Drawer {
                     .await;
                 if this
                     .update_in(cx, |s, w, cx| {
+                        s.checkpoint_timing();
                         for pane in s.state.output_panes.values(){pane.update(cx,|s,cx|s.tick(cx));}
                         if let Some(tasks)=&s.tasks {
                             if let Some(runtime)=crate::runtime::get(cx){tasks.schedule_completion_retry(&runtime);}
@@ -230,7 +235,7 @@ impl Drawer {
         if self.fixture {
             return;
         }
-        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks()
+        if self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks() || self.state.timing.live()
             || !self.state.control.snapshot().inputs.is_empty() || self.state.control.pending_completions() {
             self.next_context = Some(context);
             return;
@@ -303,6 +308,7 @@ impl Drawer {
             self.queue_message(question,w,cx);self.state.control.resume();if self.state.continuation.is_some(){self.resume(w,cx);}else{self.drive_interaction(w,cx);}return;
         }
         self.state.control.resume();self.state.control.reset_budget();
+        if self.state.timing.paused() { self.state.timing.finish(timing::Status::Stopped, timing::Moment::now()); }
         self.state.continuation = None;
         self.state.run_config = None;
         self.state.run_budget = None;
@@ -475,8 +481,13 @@ impl Drawer {
             self.state.interaction_scope=self.binding.as_ref().map(|b|serde_json::json!({"host":self.host,"local":b.local,"cwd":b.capabilities.cwd}));
         }
         let reenter=std::mem::take(&mut self.state.reenter);
+        if !self.state.model.manual_compaction {
+            self.state.timing.start(self.state.model.conversation.turns().len().saturating_sub(1), self.state.model.conversation.entries().len(), timing::Moment::now());
+        }
         let Some(runtime) = crate::runtime::get(cx) else {
+            self.state.timing.finish(timing::Status::Failed, timing::Moment::now());
             self.state.model.event(Event::Error(AiError::Unavailable));
+            self.persist();
             cx.notify();
             return;
         };
@@ -591,6 +602,7 @@ impl Drawer {
                                 if durable { s.persist(); }
                                 if s.state.save_error.is_some() && (!s.state.accepted_inputs.is_empty()||!s.state.accepted_events.is_empty()) {
                                     s.state.control.hold();if let Some(abort)=s.abort.take(){abort.abort();}s.state.model.busy=false;
+                                    s.state.timing.finish(timing::Status::Interrupted, timing::Moment::now());
                                 }
                                 let _ = ready.send(());
                                 if !s.state.model.busy {
@@ -598,7 +610,7 @@ impl Drawer {
                                     s.abort = None;
                                     s.persist();
                                     s.drive_interaction(w,cx);
-                                    if s.state.continuation.is_none() && !s.has_running_tasks() && !s.state.control.pending_completions() && !s.state.control.pending() {
+                                    if !s.state.timing.live() && s.state.continuation.is_none() && !s.has_running_tasks() && !s.state.control.pending_completions() && !s.state.control.pending() {
                                         s.binding=None;s.release_context(cx);
                                     }
                                 }
@@ -666,6 +678,7 @@ impl Drawer {
         );
     }
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
+        if self.state.timing.finish(timing::Status::Stopped, timing::Moment::now()) { self.persist(); }
         self.state.control.hold();self.main_cancel.cancel();
         if self.tasks.as_ref().is_some_and(|tasks|tasks.stop_foreground()) {
             self.state.active_steps.clear_main();cx.notify();return;
@@ -774,6 +787,7 @@ impl Drawer {
                 self.model_id = c.model;
                 self.state.model.conversation = c.conversation;
                 if let Ok(Some(runtime))=self.db.borrow().ai_runtime(&self.state.id) {
+                    if let Ok(records)=serde_json::from_value::<Vec<timing::Record>>(runtime["timing"].clone()) { self.state.timing.restore(records); }
                     if let Ok(mut queue)=serde_json::from_value::<shellmate_ai::interaction::Snapshot>(runtime["queue"].clone()) {
                         if self.state.model.conversation.turns().is_empty() && let Some(text)=runtime["preparing"]["text"].as_str() {
                             queue.inputs.push_front(shellmate_ai::interaction::Input{id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
@@ -1093,6 +1107,7 @@ enum Worker {
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
+        if self.state.timing.finish(timing::Status::Interrupted, timing::Moment::now()) { self.persist(); }
         self.close_outputs();
         if let Some(abort) = self.abort.take() {
             abort.abort();
@@ -1341,6 +1356,8 @@ impl Render for Drawer {
             );
         }
         if !self.history {
+            let timing_now=timing::Moment::now();
+            let timing_records=self.state.timing.snapshot(timing_now);
             for (index, turn) in self.state.model.conversation.turns().iter().enumerate() {
                 body = body.children(self.local_cards_at(index, cx));
                 body = body.child(
@@ -1518,6 +1535,9 @@ impl Render for Drawer {
                         );
                     }
                     body = body.child(reply);
+                }
+                for record in timing_records.iter().filter(|r| r.turn==index) {
+                    body=body.child(timing_ui::footer(record,timing_now,&self.state.control.phase(),cx));
                 }
             }
             // The awaited foreground call has not produced its Step yet. Keep its

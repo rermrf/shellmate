@@ -328,3 +328,43 @@ fn live_queue_and_completion_receipts_are_atomic_scoped_and_deleted_with_the_con
             .unwrap()
     );
 }
+
+#[test]
+fn timing_heartbeat_preserves_log_queue_and_updated_at_and_never_recreates_history() {
+    let mut db = HostStore::open_in_memory().unwrap();
+    let mut log = Conversation::default();
+    log.push_user(UserTurn::new("task", Default::default()));
+    let saved = SavedConversation {
+        id: "timed".into(),
+        host_id: None,
+        label: "local".into(),
+        title: "task".into(),
+        provider: "openai".into(),
+        model: "fixture".into(),
+        created_at: 10,
+        updated_at: 20,
+        conversation: log,
+    };
+    let runtime = serde_json::json!({"queue":{"inputs":[{"id":"queued","text":"next"}],"delivered":["done"]},"scope":{"cwd":"/original"}});
+    db.save_ai_conversation_with_runtime(&saved, Some(&runtime))
+        .unwrap();
+    let timing = serde_json::json!([{"id":"round","started_at_ms":10000,"ended_at_ms":null,"duration_ms":1500,"status":"running"}]);
+    assert!(db.update_ai_run_timing("timed", &timing).unwrap());
+    let restored = db.ai_runtime("timed").unwrap().unwrap();
+    assert_eq!(restored["timing"], timing);
+    assert_eq!(restored["queue"], runtime["queue"]);
+    assert_eq!(restored["scope"], runtime["scope"]);
+    let history = db.ai_conversation("timed").unwrap().unwrap();
+    assert_eq!(history.updated_at, 20);
+    assert!(history.conversation == saved.conversation);
+    db.set_setting(SAVE_CONVERSATIONS, "0").unwrap();
+    assert!(
+        !db.update_ai_run_timing("timed", &serde_json::json!([]))
+            .unwrap()
+    );
+    assert_eq!(db.ai_runtime("timed").unwrap().unwrap()["timing"], timing);
+    db.set_setting(SAVE_CONVERSATIONS, "1").unwrap();
+    db.delete_ai_conversation("timed").unwrap();
+    assert!(!db.update_ai_run_timing("timed", &timing).unwrap());
+    assert!(db.ai_runtime("timed").unwrap().is_none());
+}

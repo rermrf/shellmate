@@ -1039,11 +1039,16 @@ async fn live_interaction_promotes_a_real_command_without_restarting_or_killing_
     assert!(tasks.has_running());
     tasks.control().take_intent();
     assert_eq!(tasks.list()[0].output_id, output);
+    tasks.control().request(Intent::SendNow);
+    assert!(!tasks.wait_tasks(vec![id.clone()], true).await.is_error);
+    assert_eq!(tasks.take_released_waits(), std::slice::from_ref(&id));
+    tasks.control().take_intent();
     std::fs::write(temp.0.join("release"), "").unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), tasks.wait_tasks(vec![id], true))
         .await
         .unwrap();
     assert!(!result.is_error);
+    assert!(tasks.take_released_waits().is_empty());
     let text =
         std::fs::read_to_string(shellmate_core::ai_output::path(&temp.0, "live", &output).unwrap())
             .unwrap();

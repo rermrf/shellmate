@@ -198,11 +198,38 @@ async fn stop_reply_holds_queued_messages_and_does_not_request_another_response(
     c.enqueue("later".into(), "later".into(), Default::default());
     c.request(Intent::StopReply);
     let events = stream.collect::<Vec<_>>().await;
-    assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Released(agent::ReleaseReason::Stopped))
+    ));
     assert_eq!(http.requests().len(), 1);
     assert!(!c.pending());
     assert!(!c.auto_continue());
     assert_eq!(c.snapshot().inputs.len(), 1);
+}
+
+#[tokio::test]
+async fn releasing_a_wait_has_a_distinct_reason_from_natural_completion() {
+    let http = SequencedHttpClient::new([response(false, &[], "partial", false)]);
+    let client = RigClient::with_http(&config(false), http.clone()).unwrap();
+    let c = Control::default();
+    c.resume();
+    let host = Interactive {
+        inner: Host::new([]),
+        control: c.clone(),
+        enqueue_on_run: false,
+    };
+    let mut log = conversation();
+    let mut stream = agent::run(&client, &mut log, capabilities(), &host, fast_limits()).unwrap();
+    while !matches!(stream.next().await, Some(AgentEvent::TextDelta(_))) {}
+    c.request(Intent::Detach);
+    let events = stream.collect::<Vec<_>>().await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Released(agent::ReleaseReason::Detached))
+    ));
+    assert!(c.auto_continue());
+    assert_eq!(http.requests().len(), 1);
 }
 
 #[tokio::test]

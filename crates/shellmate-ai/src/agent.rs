@@ -454,7 +454,13 @@ pub enum AgentEvent {
         error: AiError,
     },
     Done(Option<Usage>),
+    Released(ReleaseReason),
     Error(AiError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseReason {
+    Detached,
+    Stopped,
 }
 enum Pending {
     AgentMessage(Box<RigCall>, String, String, bool, bool),
