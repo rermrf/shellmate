@@ -68,6 +68,7 @@ pub const SCENES: &[&str] = &[
     "side-scrolled", "cmds-scrolled", "ai-scrolled", "mon-proc-scrolled", "files-scrolled",
     "ai-agent", "ai-agent-run", "ai-new-confirm", "ai-agent-redline", "ai-agent-full",
     "ai-tasks", "ai-output-large", "ai-input-multiline", "ai-context-popover", "ai-context-amber", "ai-code-copy", "ai-code-copied", "ai-code-select",
+    "memory-manager-empty", "memory-manager-edit", "memory-manager-agents", "memory-manager-new",
     "set-ai-memory", "memory-manager", "host-editor-ai-note", "ai-memory-chip",
     "ai-mode-popover",
     "ai-slash", "ai-slash-filter", "ai-slash-context", "ai-slash-tasks", "set-ai-advanced",
@@ -304,7 +305,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 122 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 126 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

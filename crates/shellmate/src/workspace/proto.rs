@@ -361,12 +361,16 @@ impl Workspace {
                 }
                 *self.hub.records_window.borrow_mut() = Some(panel);
             }
-            "memory-manager" | "host-editor-ai-note" => {
+            "memory-manager" | "memory-manager-empty" | "memory-manager-edit" | "memory-manager-agents" | "memory-manager-new" | "host-editor-ai-note" => {
                 let host=self.hub.book.borrow().hosts.iter().find(|h|h.id.as_str()=="h1").unwrap().clone();
-                crate::proto::memory::seed(&self.memory_root(),host.id.as_str());
-                if scene=="memory-manager" {
-                    self.open_memory_manager(Some(crate::ai::memory_model::Focus {host:Some(host.id.to_string()),path:Some("/memories/host/deploy.md".into())}),window,cx).unwrap();
-                } else {crate::dialogs::host_editor::HostEditor::open(cx.weak_entity(),crate::dialogs::host_editor::EditorMode::Edit(host),&self.hub.book.borrow(),&self.memory_root(),window,cx);}
+                if let Some((focus,create,seed))=crate::proto::memory::manager_focus(scene,host.id.as_str()) {
+                    if seed {crate::proto::memory::seed(&self.memory_root(),host.id.as_str());}
+                    let manager=self.open_memory_manager(Some(focus),window,cx).unwrap();
+                    if create {manager.update(cx,|s,cx|s.new_file(window,cx));}
+                } else {
+                    crate::proto::memory::seed(&self.memory_root(),host.id.as_str());
+                    crate::dialogs::host_editor::HostEditor::open(cx.weak_entity(),crate::dialogs::host_editor::EditorMode::Edit(host),&self.hub.book.borrow(),&self.memory_root(),window,cx);
+                }
             }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),

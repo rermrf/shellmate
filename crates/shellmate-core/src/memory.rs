@@ -269,6 +269,17 @@ impl Memory {
         } else {
             stamp(text, &local_time(SystemTime::now()))
         };
+        self.write_text(target, &text, new_slot, verb)
+    }
+    /// Common guarded/atomic writer. Raw editor fallback deliberately preserves all source bytes.
+    fn write_text(
+        &self,
+        target: &Resolved,
+        text: &str,
+        new_slot: bool,
+        verb: &str,
+    ) -> io::Result<String> {
+        let name = target.path.file_name().unwrap();
         if text.len() > FILE_BYTES {
             return Err(invalid("记忆文件最多 64 KB（包含 modified）"));
         }
@@ -289,7 +300,7 @@ impl Memory {
         }
         result?;
         let warning = if name == "MEMORY.md" {
-            index_warning(&text)
+            index_warning(text)
         } else {
             String::new()
         };

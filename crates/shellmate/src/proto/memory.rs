@@ -4,6 +4,10 @@ use std::path::Path;
 pub const SCENES: &[&str] = &[
     "set-ai-memory",
     "memory-manager",
+    "memory-manager-empty",
+    "memory-manager-edit",
+    "memory-manager-agents",
+    "memory-manager-new",
     "host-editor-ai-note",
     "ai-memory-chip",
 ];
@@ -35,6 +39,28 @@ pub fn seed(root: &Path, host: &str) {
     }
     memory.save("/memories/host/MEMORY.md","- [部署约定](deploy.md) — Docker Compose 部署方式\n- [排障反馈](feedback.md) — 先读日志\n- [监控入口](dashboard.md) — 外部参考资料\n").unwrap();
     memory.save("/memories/global/deploy.md","---\nname: 部署偏好\ndescription: 先解释变更影响，再执行部署\ntype: user\n---\n先解释变更影响，再执行部署。\n").unwrap();
+}
+/// Manager routes also drive pure fixture tests; other memory scenes keep their setup.
+pub fn manager_focus(
+    scene: &str,
+    host: &str,
+) -> Option<(crate::ai::memory_model::Focus, bool, bool)> {
+    use crate::ai::memory_model::Focus;
+    Some(match scene {
+        "memory-manager" => (Focus::current(Some(host)), false, true),
+        "memory-manager-empty" => (Focus::default(), false, false),
+        "memory-manager-edit" => (
+            Focus {
+                host: Some(host.into()),
+                path: Some("/memories/host/deploy.md".into()),
+            },
+            false,
+            true,
+        ),
+        "memory-manager-agents" => (Focus::global_instructions(), false, false),
+        "memory-manager-new" => (Focus::default(), true, false),
+        _ => return None,
+    })
 }
 pub fn conversation() -> shellmate_ai::Conversation {
     use shellmate_ai::*;
@@ -87,5 +113,72 @@ mod tests {
             conversation().memory_action(0, 0).unwrap().path,
             "/memories/global/deploy.md"
         );
+    }
+    #[test]
+    fn manager_scenes_cover_list_empty_structured_agents_and_creation() {
+        use crate::ai::{
+            memory_edit::{Content, Page},
+            memory_model::Model,
+        };
+        for scene in [
+            "memory-manager",
+            "memory-manager-empty",
+            "memory-manager-edit",
+            "memory-manager-agents",
+            "memory-manager-new",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut db = HostStore::open_in_memory().unwrap();
+            let host = shellmate_core::Host::new("prod-web-01", "127.0.0.1");
+            db.save_host(&host).unwrap();
+            let (focus, create, populated) = manager_focus(scene, host.id.as_str()).unwrap();
+            if populated {
+                seed(root.path(), host.id.as_str());
+            }
+            let model =
+                Model::new(root.path().into(), &db, Some(host.id.as_str()), &focus).unwrap();
+            let mut page = Page::from_focus(&model, focus.path.as_deref()).unwrap();
+            if create {
+                page.create();
+            }
+            assert!(!page.dirty());
+            match scene {
+                "memory-manager" => {
+                    assert!(page.detail.is_none());
+                    assert_eq!(model.topics().count(), 3);
+                    assert!(model.index().is_some() && model.instructions_exist());
+                }
+                "memory-manager-empty" => {
+                    assert!(page.detail.is_none());
+                    assert!(model.memories_empty());
+                    assert!(!model.instructions_exist());
+                    assert_eq!(model.selected, 0);
+                }
+                "memory-manager-edit" => {
+                    let detail = page.detail.as_ref().unwrap();
+                    assert!(
+                        matches!(&detail.draft.content, Content::Topic(t) if t.kind == 2 && t.name == "部署约定")
+                    );
+                    assert!(detail.exists);
+                }
+                "memory-manager-agents" => {
+                    let detail = page.detail.as_ref().unwrap();
+                    assert!(
+                        matches!(&detail.draft.content, Content::Instructions(text) if text.is_empty())
+                    );
+                    assert!(!detail.exists);
+                }
+                "memory-manager-new" => {
+                    let detail = page.detail.as_ref().unwrap();
+                    assert!(detail.path.is_none() && !detail.exists);
+                    assert!(matches!(&detail.draft.content, Content::Topic(t) if t.kind == 2));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                super::super::request(&format!("{scene}@1100x700")),
+                (scene, Some((1100, 700)))
+            );
+        }
     }
 }

@@ -25,6 +25,13 @@ impl Memory {
             },
         )
     }
+    /// Raw-editor fallback: retain unknown/malformed frontmatter verbatim, including modified.
+    /// Tool writes and structured editor saves continue to stamp through `save`/`create`.
+    pub fn save_verbatim(&self, path: &str, text: &str) -> io::Result<String> {
+        let _lock = WRITES.lock().unwrap();
+        let target = self.resolve(path, true)?;
+        self.write_text(&target, text, !target.path.exists(), "已更新记忆")
+    }
     pub fn scope_exists(&self, host: bool) -> io::Result<bool> {
         let path = if host {
             "/memories/host"

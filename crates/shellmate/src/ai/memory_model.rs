@@ -119,6 +119,26 @@ impl Model {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+    pub fn instructions_exist(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.path == format!("{}/AGENTS.md", self.prefix()))
+    }
+    pub fn topics(&self) -> impl Iterator<Item = &FileInfo> {
+        self.files.iter().filter(|file| {
+            file.path != format!("{}/AGENTS.md", self.prefix())
+                && file.path != format!("{}/MEMORY.md", self.prefix())
+        })
+    }
+    pub fn index(&self) -> Option<&FileInfo> {
+        self.files
+            .iter()
+            .find(|file| file.path == format!("{}/MEMORY.md", self.prefix()))
+    }
+    pub fn memories_empty(&self) -> bool {
+        self.topics().next().is_none() && self.index().is_none()
+    }
+    #[cfg(test)]
     pub fn read(&self, path: &str) -> Result<String, String> {
         match self.memory().read(path) {
             Ok(text) => Ok(text),
@@ -154,6 +174,7 @@ impl Model {
     }
 }
 
+#[cfg(test)]
 pub const TEMPLATE: &str = "---\nname: 新记忆\ndescription: 一句话说明\ntype: project\n---\n\n";
 pub fn clear_all(root: &Path) -> Result<(), String> {
     Memory::new(root, None)

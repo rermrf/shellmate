@@ -1,5 +1,8 @@
-//! Modal memory browser/editor using the app's host-editor shell and field surfaces.
-use super::memory_model::{self, Focus, Model};
+//! Fixed-shell memory list and detail pages, using the app's existing settings/editor controls.
+use super::{
+    memory_edit::{self, Content, Navigation, NavigationResult, Page},
+    memory_model::{self, Focus, Model},
+};
 use crate::{
     dialogs::{self, DialogBody, Tone},
     theme::{ActivePalette, MONO_FONT},
@@ -7,8 +10,9 @@ use crate::{
 };
 use gpui::{
     component::{
-        button::Button,
-        input::{InputState, Textarea, TextareaState},
+        Sizable, Size,
+        button::{Button, ButtonVariants},
+        input::{InputEvent, InputState, Textarea, TextareaState},
     },
     prelude::*,
     *,
@@ -19,13 +23,15 @@ use std::{path::PathBuf, time::SystemTime};
 pub struct MemoryManager {
     db: SharedStore,
     model: Model,
-    path: Option<String>,
+    page: Page,
     editor: Entity<TextareaState>,
     filename: Entity<InputState>,
-    creating: bool,
+    name: Entity<InputState>,
+    description: Entity<InputState>,
     error: Option<String>,
     saved: Option<String>,
-    _subscription: Subscription,
+    modal: Option<dialogs::modal::Handle>,
+    _subscriptions: Vec<Subscription>,
 }
 impl MemoryManager {
     pub fn open(
@@ -37,33 +43,53 @@ impl MemoryManager {
         cx: &mut App,
     ) -> Result<Entity<Self>, String> {
         let model = Model::new(root, &db.borrow(), current, &focus)?;
+        let page = Page::from_focus(&model, focus.path.as_deref())?;
         let body = cx.new(|cx| {
-            let editor = cx.new(|cx| TextareaState::new(w, cx).auto_grow(8, 8).soft_wrap(true));
-            let subscription = cx.subscribe(
-                &editor,
-                |s: &mut Self, _, _: &gpui::component::input::InputEvent, cx| {
-                    s.saved = None;
-                    cx.notify();
-                },
+            let editor = cx.new(|cx| TextareaState::new(w, cx).soft_wrap(true));
+            let filename = cx.new(|cx| InputState::new(w, cx).placeholder("deploy.md"));
+            let name = cx.new(|cx| InputState::new(w, cx).placeholder("部署约定"));
+            let description =
+                cx.new(|cx| InputState::new(w, cx).placeholder("用一句话概括这条记忆"));
+            let mut subscriptions = Vec::new();
+            for field in [&filename, &name, &description] {
+                subscriptions.push(cx.subscribe(
+                    field,
+                    |s: &mut Self, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            s.sync_draft(cx);
+                            s.saved = None;
+                            cx.notify();
+                        }
+                    },
+                ));
+            }
+            subscriptions.push(
+                cx.subscribe(&editor, |s: &mut Self, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        s.sync_draft(cx);
+                        s.saved = None;
+                        cx.notify();
+                    }
+                }),
             );
             Self {
                 db,
                 model,
-                path: None,
+                page,
                 editor,
-                filename: cx.new(|cx| InputState::new(w, cx).placeholder("deploy.md")),
-                creating: false,
+                filename,
+                name,
+                description,
                 error: None,
                 saved: None,
-                _subscription: subscription,
+                modal: None,
+                _subscriptions: subscriptions,
             }
         });
-        if let Some(path) = focus.path {
-            body.update(cx, |s, cx| s.select_file(path, w, cx));
-        }
+        body.update(cx, |s, cx| s.load_fields(w, cx));
         let first = std::cell::Cell::new(true);
         let modal_body = body.clone();
-        dialogs::open_modal(w, cx, move |dialog, w, cx| {
+        let handle = dialogs::open_modal(w, cx, move |dialog, w, cx| {
             if first.replace(false) {
                 modal_body.update(cx, |s, cx| s.focus(w, cx));
             }
@@ -87,77 +113,144 @@ impl MemoryManager {
                 .overlay_closable(false)
                 .on_ok(|_, _, _| false)
                 .on_cancel(move |_, w, cx| {
-                    close.update(cx, |s, cx| s.cancel(w, cx));
-                    true
+                    close.update(cx, |s, cx| s.navigate(Navigation::Close, w, cx));
+                    false
                 })
                 .map(|d| dialogs::fixed_shell(d, modal_body.clone(), height))
         });
+        body.update(cx, |s, _| s.modal = Some(handle));
         Ok(body)
     }
-    fn select_file(&mut self, path: String, w: &mut Window, cx: &mut Context<Self>) {
-        match self.model.read(&path) {
-            Ok(text) => {
-                self.path = Some(path);
-                self.creating = false;
+    fn sync_draft(&mut self, cx: &App) {
+        let Some(detail) = &mut self.page.detail else {
+            return;
+        };
+        if detail.path.is_none() {
+            detail.draft.filename = self.filename.read(cx).value().to_string();
+        }
+        if let Content::Topic(topic) = &mut detail.draft.content {
+            topic.name = self.name.read(cx).value().to_string();
+            topic.description = self.description.read(cx).value().to_string();
+        }
+        *detail.draft.content.body_mut() = self.editor.read(cx).value().to_string();
+    }
+    fn load_fields(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(detail) = &self.page.detail else {
+            return;
+        };
+        let (name, description) = match &detail.draft.content {
+            Content::Topic(t) => (t.name.clone(), t.description.clone()),
+            _ => (String::new(), String::new()),
+        };
+        let text = detail.draft.content.body().to_owned();
+        let filename = detail.draft.filename.clone();
+        let placeholder = if matches!(detail.draft.content, Content::Instructions(_)) {
+            memory_edit::AGENTS_PLACEHOLDER
+        } else {
+            ""
+        };
+        self.filename
+            .update(cx, |e, cx| e.set_value(filename, w, cx));
+        self.name.update(cx, |e, cx| e.set_value(name, w, cx));
+        self.description
+            .update(cx, |e, cx| e.set_value(description, w, cx));
+        self.editor.update(cx, |e, cx| {
+            e.set_placeholder(placeholder, w, cx);
+            e.set_value(text, w, cx);
+        });
+    }
+    fn select_file(&mut self, path: &str, w: &mut Window, cx: &mut Context<Self>) {
+        match self.page.open(&self.model, path) {
+            Ok(()) => {
                 self.error = None;
                 self.saved = None;
-                self.editor.update(cx, |e, cx| e.set_value(text, w, cx));
+                self.load_fields(w, cx);
+                self.focus(w, cx);
             }
             Err(e) => self.error = Some(e),
         }
         cx.notify();
     }
-    fn scope(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.model.selected = index;
-        self.path = None;
-        self.creating = false;
-        self.saved = None;
-        self.error = self.model.reload().err();
-        cx.notify();
-    }
-    fn save(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor.read(cx).value().to_string();
-        let result = if self.creating {
-            self.model
-                .create(&self.filename.read(cx).value(), &text)
-                .map(|path| {
-                    self.path = Some(path);
-                    self.creating = false;
-                    "记忆已创建".into()
-                })
-        } else {
-            self.path
-                .as_ref()
-                .ok_or_else(|| "请先选择文件".into())
-                .and_then(|path| self.model.save(path, &text))
-        };
-        match result {
-            Ok(message) => {
-                if let Some(path) = self.path.clone() {
-                    self.select_file(path, w, cx);
-                }
-                self.error = self.model.reload().err();
-                self.saved = Some(message);
-            }
-            Err(e) => self.error = Some(e),
-        }
-        cx.notify();
-    }
-    fn new_file(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        self.path = None;
-        self.creating = true;
+    pub(crate) fn new_file(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.page.create();
         self.error = None;
         self.saved = None;
-        self.filename.update(cx, |e, cx| e.set_value("", w, cx));
-        self.editor
-            .update(cx, |e, cx| e.set_value(memory_model::TEMPLATE, w, cx));
+        self.load_fields(w, cx);
         self.filename.focus_handle(cx).focus(w, cx);
         cx.notify();
     }
+    fn navigate(&mut self, action: Navigation, w: &mut Window, cx: &mut Context<Self>) {
+        self.sync_draft(cx);
+        match self.page.navigate(&mut self.model, action, false) {
+            Ok(NavigationResult::NeedsConfirmation) => {
+                let this = cx.weak_entity();
+                dialogs::confirm::ConfirmDialog::open(
+                    "放弃未保存的修改？",
+                    "修改尚未保存，离开后将丢失。",
+                    "放弃修改",
+                    true,
+                    move |w, cx| {
+                        // The confirm dialog closes itself first; then close/switch the underlying page.
+                        let this = this.clone();
+                        w.defer(cx, move |w, cx| {
+                            this.update(cx, |s, cx| {
+                                let result = s.page.navigate(&mut s.model, action, true);
+                                s.finish_navigation(result, w, cx);
+                            })
+                            .ok();
+                        });
+                        Ok(())
+                    },
+                    w,
+                    cx,
+                );
+            }
+            result => self.finish_navigation(result, w, cx),
+        }
+    }
+    fn finish_navigation(
+        &mut self,
+        result: Result<NavigationResult, String>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(NavigationResult::Close) => {
+                if let Some(handle) = &self.modal {
+                    handle.close(w, cx);
+                }
+            }
+            Ok(_) => {
+                self.error = None;
+                self.saved = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+        cx.notify();
+    }
+    fn save(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.sync_draft(cx);
+        if !self.page.dirty() {
+            return;
+        }
+        match self.page.save(&mut self.model) {
+            Ok(message) => {
+                self.error = None;
+                self.load_fields(w, cx);
+                self.saved = Some(message.split_once('\n').map_or_else(
+                    || "已保存".into(),
+                    |(_, warning)| format!("已保存\n{warning}"),
+                ));
+            }
+            Err(e) => self.error = Some(e),
+        }
+        cx.notify();
+    }
     fn delete(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.path.clone() else {
+        let Some(detail) = self.page.detail.as_ref().filter(|d| d.exists) else {
             return;
         };
+        let path = detail.path.as_ref().unwrap().clone();
         let this = cx.weak_entity();
         dialogs::confirm::ConfirmDialog::open(
             "删除这份记忆？",
@@ -166,10 +259,9 @@ impl MemoryManager {
             true,
             move |_, cx| {
                 this.update(cx, |s, cx| {
-                    s.model.delete(&path)?;
-                    s.path = None;
+                    s.page.delete(&mut s.model)?;
+                    s.error = None;
                     s.saved = None;
-                    s.model.reload()?;
                     cx.notify();
                     Ok(())
                 })
@@ -185,68 +277,318 @@ impl MemoryManager {
         title: String,
         detail: String,
         kind: Option<String>,
+        missing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = cx.palette();
-        let active = self.path.as_ref() == Some(&path);
         div()
             .id(SharedString::from(format!("memory-file-{path}")))
             .flex_none()
             .min_h(px(56.))
-            // The card's 18 px inset leaves a 6 px gutter around this neutral selection.
             .mx(px(-12.))
             .my(px(2.))
             .px(px(12.))
             .py(px(12.))
             .rounded(px(12.))
             .min_w_0()
-            .when(active, |d| d.bg(p.card2))
             .cursor_pointer()
-            .when(!active, |d| d.hover(|d| d.bg(p.card2.opacity(0.55))))
+            .hover(|d| d.bg(p.card2.opacity(0.55)))
+            .flex()
+            .items_center()
+            .gap(px(8.))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
+                    .flex_1()
+                    .min_w_0()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
                             .text_ellipsis()
                             .text_size(px(13.5))
                             .line_height(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                    .children(kind.map(|kind| neutral_chip(kind, p))),
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .whitespace_normal()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(if missing { p.tx3 } else { p.tx2 })
+                            .child(detail),
+                    ),
             )
-            .when(!detail.is_empty(), |d| {
+            .children(kind.map(|kind| neutral_chip(kind, p)))
+            .child(crate::icons::group_chevron(false).text_color(p.tx2))
+            .on_click(cx.listener(move |s, _, w, cx| s.select_file(&path, w, cx)))
+    }
+    fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = cx.palette().clone();
+        let p = &palette;
+        let prefix = self.model.prefix();
+        let missing = !self.model.instructions_exist();
+        let description = if missing {
+            "未填写 · 点击编写"
+        } else if self.model.scopes[self.model.selected].key.is_some() {
+            "仅对此主机生效 · AGENTS.md"
+        } else {
+            "对所有主机生效 · AGENTS.md"
+        };
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(7.))
+            .child(section("说明", p))
+            .child(grouped_card(p).child(self.file_row(
+                format!("{prefix}/AGENTS.md"),
+                "AI 说明".into(),
+                description.into(),
+                None,
+                missing,
+                cx,
+            )))
+            .child(
+                div()
+                    .mt(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(section("记忆", p))
+                    .child(
+                        Button::new("memory-new")
+                            .label("新建记忆")
+                            .on_click(cx.listener(|s, _, w, cx| s.new_file(w, cx))),
+                    ),
+            );
+        let mut memories = grouped_card(p);
+        for file in self.model.topics() {
+            let modified = memory_model::relative_time(file.modified, SystemTime::now());
+            let description = if file.description.is_empty() {
+                modified
+            } else {
+                format!("{} · {modified}", file.description)
+            };
+            memories = memories.child(self.file_row(
+                file.path.clone(),
+                file.name.clone(),
+                description,
+                type_label(&file.kind).map(str::to_owned),
+                false,
+                cx,
+            ));
+        }
+        if let Some(index) = self.model.index() {
+            memories = memories.child(self.file_row(
+                index.path.clone(),
+                "索引".into(),
+                "MEMORY.md · AI 自动维护".into(),
+                None,
+                false,
+                cx,
+            ));
+        }
+        if self.model.memories_empty() {
+            memories = memories.child(
+                div()
+                    .py(px(12.))
+                    .min_h(px(56.))
+                    .whitespace_normal()
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.tx3)
+                    .child("还没有记忆。对话中让 AI「记住…」，或点「新建记忆」手动添加。"),
+            );
+        }
+        list = list.child(memories);
+        dialogs::scroll_body("memory-files", list)
+            .surface(p.win)
+            .bottom_padding(px(8.))
+    }
+    fn detail(&self, w: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = cx.palette();
+        let detail = self.page.detail.as_ref().unwrap();
+        let creating = detail.path.is_none();
+        let mut body = div().flex_1().min_h_0().flex().flex_col().gap(px(10.));
+        if let Content::Topic(topic) = &detail.draft.content {
+            if creating {
+                body = body.child(form_field(
+                    "文件名",
+                    ui::field_input(&self.filename, ui::Surface::Window, true),
+                    p,
+                ));
+            }
+            body = body
+                .child(form_field(
+                    "名称",
+                    ui::field_input(&self.name, ui::Surface::Window, false),
+                    p,
+                ))
+                .child(form_field(
+                    "描述",
+                    ui::field_input(&self.description, ui::Surface::Window, false),
+                    p,
+                ));
+            let this = cx.weak_entity();
+            let picker = ui::segmented(
+                "memory-type",
+                memory_edit::TYPES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, label))| ui::SegmentItem::new(*label, i == topic.kind))
+                    .collect(),
+                move |index, _, cx| {
+                    this.update(cx, |s, cx| {
+                        if let Some(detail) = &mut s.page.detail
+                            && let Content::Topic(topic) = &mut detail.draft.content
+                        {
+                            topic.kind = index;
+                            s.saved = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                },
+                cx,
+            );
+            body = body.child(form_field("类型", picker, p));
+        }
+        let hint = match detail.draft.content {
+            Content::Raw(_) => Some(memory_edit::RAW_HINT),
+            Content::Index(_) => Some(memory_edit::INDEX_HINT),
+            _ => None,
+        };
+        body = body.children(hint.map(|hint| {
+            div()
+                .flex_none()
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(p.tx3)
+                .whitespace_normal()
+                .child(hint)
+        }));
+        let mut content = div().flex_1().min_h_0().flex().flex_col().gap(px(6.));
+        if matches!(detail.draft.content, Content::Topic(_)) {
+            content = content.child(section("内容", p));
+        }
+        body = body.child(
+            content.child(
+                div().relative().flex_1().min_h_0().child(
+                    div().absolute().inset_0().child(
+                        ui::field_box(
+                            Textarea::new(&self.editor)
+                                .xsmall()
+                                .appearance(false)
+                                .bordered(false),
+                            ui::Surface::Window,
+                            p,
+                            self.editor.focus_handle(cx).is_focused(w),
+                        )
+                        // Textarea adds 4 px internally at XSmall. Keep the same total
+                        // 12 px horizontal / 0 px vertical inset as field_input.
+                        .px(px(12.) - Size::XSmall.input_px())
+                        .h(relative(1.))
+                        .w_full()
+                        .min_h_0()
+                        .max_h(relative(1.))
+                        .font_family(MONO_FONT),
+                    ),
+                ),
+            ),
+        );
+        let back = Button::new("memory-back")
+            .ghost()
+            .label(format!("‹ {}", detail.section()))
+            .h(px(28.))
+            .on_click(cx.listener(|s, _, w, cx| s.navigate(Navigation::Back, w, cx)));
+        let heading = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().flex().items_start().child(back))
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .line_height(px(24.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .whitespace_normal()
+                    .child(detail.title().to_owned()),
+            )
+            .child(
+                ui::ellipsis("memory-detail-path", self.page.subtitle(&self.model))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(p.tx3),
+            );
+        let footer = div()
+            .h(px(75.))
+            .flex_none()
+            .border_t_1()
+            .border_color(p.line)
+            .pt(px(14.))
+            .pb(px(20.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .when(detail.exists, |d| {
                 d.child(
-                    div()
-                        .mt(px(4.))
-                        .whitespace_normal()
-                        .text_size(px(12.))
-                        .line_height(px(18.))
-                        .text_color(p.tx2)
-                        .child(detail),
+                    dialogs::button("memory-delete", "删除", Tone::Plain, true)
+                        .h(px(40.))
+                        .rounded(px(13.))
+                        .text_color(p.err)
+                        .on_click(cx.listener(|s, _, w, cx| s.delete(w, cx))),
                 )
             })
-            .on_click(cx.listener(move |s, _, w, cx| s.select_file(path.clone(), w, cx)))
+            .child(div().flex_1())
+            .child(
+                dialogs::button("memory-save", "保存", Tone::Primary, detail.dirty())
+                    .h(px(40.))
+                    .w(px(70.))
+                    .rounded(px(13.))
+                    .on_click(cx.listener(|s, _, w, cx| s.save(w, cx))),
+            );
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(heading)
+            .child(body)
+            .children(self.saved.clone().map(|text| {
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(p.tx2)
+                    .whitespace_normal()
+                    .child(text)
+            }))
+            .children(
+                self.error
+                    .clone()
+                    .map(|e| dialogs::notice(dialogs::Notice::Error, e, p)),
+            )
+            .child(footer)
     }
 }
 impl DialogBody for MemoryManager {
     fn confirm(&mut self, _: &mut Window, _: &mut Context<Self>) -> bool {
         false
     }
-    fn cancel(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn cancel(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Navigation::Close, w, cx);
+    }
+    fn dismiss(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Navigation::Close, w, cx);
+    }
     fn focus(&self, w: &mut Window, cx: &mut Context<Self>) {
-        if self.path.is_some() {
+        if self.page.detail.is_some() {
             self.editor.focus_handle(cx).focus(w, cx);
         }
     }
 }
 impl Render for MemoryManager {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let enabled = self
             .db
@@ -309,146 +651,28 @@ impl Render for MemoryManager {
                         ("memory-scope-name", index),
                         scope.label.clone(),
                     ))
-                    .on_click(cx.listener(move |s, _, _, cx| s.scope(index, cx))),
-            );
-        }
-        let prefix = self.model.prefix();
-        let mut files = div()
-            .flex()
-            .flex_col()
-            .gap(px(7.))
-            .child(section("说明", &p))
-            .child(grouped_card(&p).child(self.file_row(
-                format!("{prefix}/AGENTS.md"),
-                "AGENTS.md".into(),
-                "随 AI 请求发送的说明".into(),
-                None,
-                cx,
-            )))
-            .child(
-                div()
-                    .mt(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(section("记忆", &p))
-                    .child(
-                        Button::new("memory-new")
-                            .label("新建记忆")
-                            .on_click(cx.listener(|s, _, w, cx| s.new_file(w, cx))),
+                    .on_click(
+                        cx.listener(move |s, _, w, cx| s.navigate(Navigation::Scope(index), w, cx)),
                     ),
             );
-        let mut memories = grouped_card(&p);
-        let mut has_index = false;
-        for file in &self.model.files {
-            if file.path == format!("{prefix}/AGENTS.md") {
-                continue;
-            }
-            let index = file.path == format!("{prefix}/MEMORY.md");
-            has_index |= index;
-            let modified = memory_model::relative_time(file.modified, SystemTime::now());
-            let description = if file.description.is_empty() {
-                modified
-            } else {
-                format!("{} · {modified}", file.description)
-            };
-            memories = memories.child(
-                self.file_row(
-                    file.path.clone(),
-                    if index {
-                        "MEMORY.md".into()
-                    } else {
-                        file.name.clone()
-                    },
-                    description,
-                    if index {
-                        Some("索引")
-                    } else {
-                        type_label(&file.kind)
-                    }
-                    .map(str::to_owned),
-                    cx,
-                ),
-            );
         }
-        if !has_index {
-            memories = memories.child(self.file_row(
-                format!("{prefix}/MEMORY.md"),
-                "MEMORY.md".into(),
-                "尚未创建".into(),
-                Some("索引".into()),
-                cx,
-            ));
-        }
-        files = files.child(memories);
-        let mut right = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(
-                dialogs::scroll_body("memory-files", files)
-                    .surface(p.win)
-                    .bottom_padding(px(8.)),
-            );
-        if self.path.is_some() || self.creating {
-            let title = self
-                .path
-                .as_deref()
-                .and_then(|p| p.rsplit('/').next())
-                .unwrap_or("新建记忆");
-            let mut editor = div()
-                .flex_none()
+        let right = if self.page.detail.is_some() {
+            self.detail(w, cx).into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .flex_col()
-                .gap(px(7.))
-                .child(section(title, &p));
-            if self.creating {
-                editor = editor.child(ui::field_input(&self.filename, ui::Surface::Window, true));
-            }
-            editor = editor
-                .child(
-                    Textarea::new(&self.editor)
-                        .bordered(false)
-                        .h(px(190.))
-                        .font_family(MONO_FONT)
-                        .text_size(px(12.))
-                        .bg(p.card)
-                        .rounded(px(11.)),
+                .gap(px(10.))
+                .child(self.list(cx))
+                .children(
+                    self.error
+                        .clone()
+                        .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            dialogs::button("memory-delete", "删除", Tone::Plain, true)
-                                .text_color(p.err)
-                                .when(self.creating, |b| b.invisible())
-                                .on_click(cx.listener(|s, _, w, cx| s.delete(w, cx))),
-                        )
-                        .child(
-                            dialogs::button("memory-save", "保存", Tone::Primary, true)
-                                .on_click(cx.listener(|s, _, w, cx| s.save(w, cx))),
-                        ),
-                );
-            right = right.child(editor);
-        }
-        right = right
-            .children(
-                self.error
-                    .clone()
-                    .map(|e| dialogs::notice(dialogs::Notice::Error, e, &p)),
-            )
-            .children(self.saved.clone().map(|s| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(p.tx2)
-                    .whitespace_normal()
-                    .child(s)
-            }));
+                .into_any_element()
+        };
         div()
             .size_full()
             .flex()
@@ -471,18 +695,35 @@ impl Render for MemoryManager {
                             .flex_none()
                             .w(px(128.)),
                     )
-                    .child(right),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .child(right),
+                    ),
             )
     }
 }
 fn section(text: &str, p: &crate::theme::Palette) -> Div {
     div()
+        .flex_none()
         .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.tx)
         .child(text.to_owned())
 }
-
+fn form_field(label: &str, control: impl IntoElement, p: &crate::theme::Palette) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(section(label, p))
+        .child(control)
+}
 fn grouped_card(p: &crate::theme::Palette) -> Div {
     div()
         .flex_none()
@@ -505,13 +746,9 @@ fn neutral_chip(label: impl Into<SharedString>, p: &crate::theme::Palette) -> Di
         .child(label.into())
 }
 fn type_label(kind: &str) -> Option<&'static str> {
-    match kind {
-        "user" => Some("用户"),
-        "feedback" => Some("反馈"),
-        "project" => Some("项目"),
-        "reference" => Some("参考"),
-        _ => None,
-    }
+    memory_edit::TYPES
+        .iter()
+        .find_map(|(value, label)| (*value == kind).then_some(*label))
 }
 #[cfg(test)]
 mod style_tests {
