@@ -50,16 +50,17 @@ impl Workspace {
         } else {
             terminal.agent_liveness()
         };
+        let local = matches!(session.kind, SessionKind::Local);
         Some(crate::ai::exec::Binding {
             session: session.id,
             connection,
-            local: matches!(session.kind, SessionKind::Local),
+            local,
             alive,
             capabilities: shellmate_ai::agent::Capabilities {
                 background,
                 terminal: can_terminal,
                 terminal_busy: terminal.agent_busy(),
-                cwd: terminal.cwd().map(str::to_owned),
+                cwd: crate::ai::exec::session_cwd(local, terminal.child_pid(), terminal.cwd()),
             },
         })
     }

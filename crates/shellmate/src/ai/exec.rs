@@ -195,6 +195,39 @@ pub struct Binding {
     pub local: bool,
     pub alive: Arc<AtomicBool>,
 }
+/// Capture the bound session's directory, not the app process or focused tab.
+/// Local shells need not emit OSC 7; even a reported path can be stale after cd.
+pub fn session_cwd(local: bool, shell_pid: Option<i32>, reported: Option<&str>) -> Option<String> {
+    if local {
+        #[cfg(target_os = "macos")]
+        {
+            shell_pid
+                .filter(|pid| *pid > 0)
+                .and_then(shellmate_term::process_cwd)
+                .and_then(|path| path.into_os_string().into_string().ok())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = shell_pid;
+            None
+        }
+    } else {
+        reported
+            .filter(|path| std::path::Path::new(path).is_absolute())
+            .map(str::to_owned)
+    }
+}
+impl Binding {
+    /// The model and all delegated commands use this same per-turn snapshot.
+    fn local_directory(&self) -> Result<PathBuf, &'static str> {
+        self.capabilities
+            .cwd
+            .as_deref()
+            .filter(|path| std::path::Path::new(path).is_absolute())
+            .map(PathBuf::from)
+            .ok_or("无法确定当前终端的工作目录，命令未执行；请确认该终端仍然打开后重试")
+    }
+}
 pub async fn disconnected(alive: &AtomicBool) {
     while alive.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -286,6 +319,16 @@ impl Executor for AppExecutor {
             if !self.binding.alive.load(Ordering::Acquire) {
                 return ToolOutcome::Disconnected;
             }
+            // Refuse before reserving a task or running a process. Never replace
+            // an unknown terminal directory with HOME or the application cwd.
+            let cwd = if call.target == Target::Background && self.binding.local {
+                match self.binding.local_directory() {
+                    Ok(path) => Some(path),
+                    Err(error) => return ToolOutcome::Failed(error.into()),
+                }
+            } else {
+                None
+            };
             // Workers own the binding and bridge, but never a strong registry reference.
             let binding = self.binding.clone();
             let ui = self.ui.clone();
@@ -305,13 +348,8 @@ impl Executor for AppExecutor {
                         match worker_call.target {
                             Target::Terminal => terminal(&binding, &ui, &worker_call, spool, ready_tx).await,
                             Target::Background if binding.local => {
-                                let (reply, receive) = oneshot::channel();
-                                if ui.send(Ui::LocalCwd { session: binding.session, reply }).await.is_err() { return ToolOutcome::Disconnected; }
-                                let directory = match receive.await { Ok(path) => path, Err(_) => return ToolOutcome::Disconnected };
-                                let cwd = directory.map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-                                let Some(cwd) = cwd else { return ToolOutcome::Failed("无法确定本机工作目录".into()); };
                                 let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
-                                local(&worker_call, cwd, &shell, None, &spool).await
+                                local(&worker_call, cwd.expect("local directory validated before scheduling"), &shell, None, &spool).await
                             }
                             Target::Background => match &binding.connection { Some(c) => ssh(c, &worker_call, &spool).await, None => ToolOutcome::Disconnected },
                         }

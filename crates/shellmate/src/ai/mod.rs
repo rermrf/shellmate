@@ -4,6 +4,8 @@ pub(crate) mod commands;
 pub(crate) mod output_view;
 pub(crate) mod output_document;
 pub mod exec;
+#[cfg(all(test, target_os = "macos"))]
+mod cwd_tests;
 pub mod host;
 pub(crate) mod markdown;
 mod scroll;

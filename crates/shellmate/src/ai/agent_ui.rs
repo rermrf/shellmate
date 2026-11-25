@@ -207,18 +207,6 @@ impl Drawer {
                             })
                             .ok();
                     }
-                    Ui::LocalCwd { session, reply } => {
-                        if !reply.is_closed() {
-                            let directory = workspace
-                                .update_in(cx, |s, _, cx| {
-                                    s.ai_binding(Some(session), cx)
-                                        .and_then(|b| b.capabilities.cwd)
-                                })
-                                .ok()
-                                .flatten();
-                            let _ = reply.send(directory);
-                        }
-                    }
                     Ui::TerminalStart {
                         session,
                         command,

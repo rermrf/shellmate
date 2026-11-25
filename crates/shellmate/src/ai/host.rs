@@ -30,10 +30,6 @@ pub enum Ui {
     CancelApproval(String),
     CancelSource(String),
     Finished(String),
-    LocalCwd {
-        session: usize,
-        reply: oneshot::Sender<Option<String>>,
-    },
     TerminalStart {
         session: usize,
         command: String,

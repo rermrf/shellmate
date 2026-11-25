@@ -286,3 +286,31 @@ References: [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration
 Inheritance validation: **1073 tests passed** (app 766, AI 122, core 82, store 103); five pre-existing external-integration tests remain ignored. Workspace/all-target Clippy and the application build pass offline with zero warnings. New tests cover the full parent/child approval matrix, real local project inspection using temporary files, all memory mutations, and conflicting concurrent replacements. No live provider or SSH host was contacted.
 
 Visual validation: running, ended, expanded and multi-approval subagent scenes were inspected in light and dark themes. The settings scene is pixel-identical in both themes. The mode-popover drawer is unchanged; the full-window diff is confined to a sidebar row under the mouse pointer.
+
+## Local working-directory fix (2026-11-25)
+
+The AI binding previously used only the terminal's last OSC 7 report. With a
+shell that does not emit OSC 7, local background execution silently fell back to
+HOME. The child therefore inspected the home directory while a `pwd` sent to
+the visible terminal still returned the project directory.
+
+Local bindings now capture the directory of the bound PTY shell process through
+macOS `proc_pidinfo`. This takes precedence over an absent or stale OSC 7 report.
+The model's capabilities, child context and background executor share that same
+per-turn directory snapshot. Background commands no longer ask the UI for a
+second directory or fall back to HOME. Unknown/invalid directories fail before
+creating a task; directories removed after capture produce a real spawn failure.
+A new user turn captures the latest directory. Existing work stays bound to its
+original session and directory when the visible terminal moves or another tab is
+selected. Remote bindings still use the remote shell's reported directory and
+never inspect the local SSH transport process as though it were the remote cwd.
+
+The regression test launches a real `/bin/sh -i` PTY with no OSC 7 integration,
+changes into a temporary project containing Chinese characters, spaces, quotes
+and literal shell metacharacters, and passes the captured path through both the
+main agent and child service with mock model responses. It checks model prompts,
+actual background output, immediate background tasks, concurrent terminals,
+per-turn pinning, fresh next-turn capture, missing/deleted directories and remote
+scope separation. No real provider, SSH server or user database is used.
+
+Directory-fix validation: **1076 tests passed** (app 769, AI 122, core 82, store 103), with 5 pre-existing external-integration tests ignored. Workspace/all-target Clippy `-D warnings` and the application build pass offline without warnings. No UI layout changed, so verification focuses on real PTYs, model request bodies and actual local command output.

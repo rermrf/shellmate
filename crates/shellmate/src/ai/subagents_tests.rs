@@ -857,7 +857,6 @@ async fn project_investigation_executes_real_local_commands_with_inherited_full_
             result=&mut run=>break result,
             event=ui.recv()=>match event.unwrap(){
                 Ui::Running{ready,source,..}=>{assert!(source.is_some());ready.send(()).unwrap();}
-                Ui::LocalCwd{reply,..}=>{reply.send(Some(root.path().to_string_lossy().into())).unwrap();}
                 Ui::Approval{..}=>panic!("Full mode must match the main agent for ordinary commands"),
                 _=>{}
             }
