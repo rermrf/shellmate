@@ -468,7 +468,7 @@ impl MemoryManager {
         }));
         let mut content = div().flex_1().min_h_0().flex().flex_col().gap(px(6.));
         if matches!(detail.draft.content, Content::Topic(_)) {
-            content = content.child(section("内容", p));
+            content = content.child(caption("内容", p));
         }
         body = body.child(
             content.child(
@@ -484,8 +484,10 @@ impl MemoryManager {
                             self.editor.focus_handle(cx).is_focused(w),
                         )
                         // Textarea adds 4 px internally at XSmall. Keep the same total
-                        // 12 px horizontal / 0 px vertical inset as field_input.
+                        // 12 px horizontal inset as field_input; multi-line text also
+                        // needs a vertical inset so the first line doesn't touch the edge.
                         .px(px(12.) - Size::XSmall.input_px())
+                        .py(px(8.))
                         .h(relative(1.))
                         .w_full()
                         .min_h_0()
@@ -679,7 +681,8 @@ impl Render for MemoryManager {
             .flex_col()
             .min_h_0()
             .overflow_hidden()
-            .bg(p.win)
+            // No fill here: the rounded dialog already paints `win`; a square
+            // fill on this root would cover its corners.
             .text_color(p.tx)
             .child(div().flex_none().px(px(24.)).py(px(18.)).child(header))
             .child(
@@ -721,8 +724,17 @@ fn form_field(label: &str, control: impl IntoElement, p: &crate::theme::Palette)
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(section(label, p))
+        .child(caption(label, p))
         .child(control)
+}
+/// Field caption, same as `dialogs::field` in the host editor (名称 / 分组 / 端口).
+fn caption(text: &str, p: &crate::theme::Palette) -> Div {
+    div()
+        .flex_none()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.tx2)
+        .child(text.to_owned())
 }
 fn grouped_card(p: &crate::theme::Palette) -> Div {
     div()
