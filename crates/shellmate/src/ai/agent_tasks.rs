@@ -166,6 +166,18 @@ impl Ticket {
     }
 }
 impl Tasks {
+    pub fn child_registry(&self, id: &str) -> Option<Tasks> {
+        self.0
+            .state
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .find(|t| t.view.id == id)?
+            .child_outputs
+            .upgrade()
+            .map(Tasks)
+    }
     pub fn latest_agent(&self, id: &str) -> Option<(View, String, Option<Tasks>)> {
         let state = self.0.state.lock().unwrap();
         let stable = &state.agents.values().find(|t| t.view.id == id)?.stable_id;

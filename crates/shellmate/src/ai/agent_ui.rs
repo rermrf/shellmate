@@ -134,7 +134,14 @@ impl Drawer {
     }
 
     pub(super) fn agent_event(&mut self, event: AgentEvent) {
-        self.state.active_tools.retain(|call|!self.state.model.conversation.entries().iter().any(|e|matches!(e,shellmate_ai::Entry::Step(step) if step.call.id==call.id)));
+        match &event{
+            AgentEvent::StepProposed(call)=>self.state.tool_ids.start(&call.id),
+            AgentEvent::ToolStarted(call)=>self.state.tool_ids.start(&call.id),
+            AgentEvent::StepFinished{call,..}=>{if let Some(shellmate_ai::Entry::Step(step))=self.state.model.conversation.entries().iter().rev().find(|e|matches!(e,shellmate_ai::Entry::Step(_))){self.state.tool_ids.finish(&call.id,&step.call.id);}}
+            AgentEvent::ToolFinished(id)=>{if let Some(shellmate_ai::Entry::Step(step))=self.state.model.conversation.entries().iter().rev().find(|e|matches!(e,shellmate_ai::Entry::Step(_))){self.state.tool_ids.finish(id,&step.call.id);}}
+            AgentEvent::Done(_)|AgentEvent::Released(_)|AgentEvent::Error(_)|AgentEvent::Paused{..}=>self.state.tool_ids.clear_active(),
+            _=>{}
+        }
         self.timing_event(&event);
         if !matches!(event, AgentEvent::Retrying { .. }) {
             self.state.model.retrying = None;
@@ -382,35 +389,15 @@ impl Drawer {
             .as_ref()
             .map(|i| classify(&i.read(cx).value()) == Class::RedLine)
             .unwrap_or(step.redline);
-        let mut card = step_surface(&p)
-            .id(SharedString::from(key.clone()))
-            .flex_none()
-            .bg(if red { p.errs } else { p.card2 })
-            .flex()
-            .flex_col()
-            .gap(px(8.));
-        if red {
-            card = card.child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(p.err)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("高危命令，需要确认"),
-            );
-        }
-        let state = step
-            .started
-            .map(|t| format!("运行中 · {} s", t.elapsed().as_secs()))
-            .unwrap_or_else(|| "等待批准".into());
-        card = card.child(step_header(
-            &step.call.purpose,
-            step.call.target,
-            step.automatic,
-            &state,
-            p.tx2,
-            step.source.as_ref(),
-            cx,
-        ));
+        let scope=step.source.as_ref().map(|s|format!("child:{}",s.id)).unwrap_or_else(||"main".into());
+        let display_key=self.tool_key(&scope,&step.call.id,true);
+        let status=if step.started.is_some(){crate::ai::tool_model::Status::Running}else{crate::ai::tool_model::Status::Approval};
+        let expanded=self.tool_open(&display_key,status);
+        let detail=format!("{}执行{}{}",step.call.target.label(),if step.automatic{" · 自动批准"}else{""},step.source.as_ref().map(|s|format!(" · 子任务：{}",s.description)).unwrap_or_default());
+        let model=super::tool_ui::Card{key:display_key.clone(),title:"执行命令".into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
+        let mut card=self.tool_shell(&model,cx);
+        if red&&step.started.is_none(){card=card.child(div().text_size(px(12.)).text_color(p.err).font_weight(FontWeight::SEMIBOLD).child("高危命令，需要确认"));}
+        if expanded {card=card.child(super::tool_ui::section("输入",&p));
         card = if let Some(edit) = &step.edit {
             card.child(
                 Textarea::new(edit)
@@ -420,21 +407,16 @@ impl Drawer {
         } else {
             card.child(command_block(
                 &step.call.command,
-                SharedString::from(if step.source.is_some(){format!("{}:{key}:active-command",self.state.id)}else{format!("{}:active-command", self.state.id)}),
+                SharedString::from(format!("{display_key}:command")),
                 self.selection_scroll.clone(),
                 cx,
             ))
         };
+        }
         if step.started.is_some() {
-            if let Some(id) = self.tasks.as_ref().and_then(|tasks| tasks.output_id_for(&step.call.id))
-                && let Some(output) = self.state.output_panes.get(&format!("output:{id}"))
-            {
-                card = card.child(output.clone());
-            }
-            card = card.child(gpui::component::spinner::Spinner::new()).child(
-                dialogs::button("ai-step-stop", "停止任务", Tone::Plain, true)
-                    .on_click(cx.listener(|s, _, _, cx| s.stop(cx))),
-            );
+            if expanded && let Some(output)=self.state.output_panes.get(&display_key){card=card.child(super::tool_ui::section("输出",&p)).child(output.clone());}
+            let scope=scope.clone();let call_id=step.call.id.clone();
+            card=card.child(step_actions().child(step_action(SharedString::from(format!("{display_key}:stop")),"停止任务",cx).on_click(cx.listener(move|s,_,_,cx|{if let Some(tasks)=s.tool_tasks(&scope)&&let Some(task)=s.tool_task(&scope,&call_id,None){tasks.stop(&task.id);}cx.notify();}))));
         } else {
             if step.source.is_none() && self.capabilities.terminal && self.capabilities.background {
                 let mut row = div().flex().gap(px(4.));
@@ -523,183 +505,6 @@ impl Drawer {
         }
         card.into_any_element()
     }
-    pub(super) fn step_card(
-        &self,
-        item: &AnswerItem,
-        key: (usize, usize),
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let AnswerItem::Step {
-            command,
-            target,
-            purpose,
-            status,
-            exit_code,
-            duration_ms,
-            automatic,
-            ..
-        } = item
-        else {
-            unreachable!()
-        };
-        let p = cx.palette().clone();
-        let mut state = match status {
-            StepStatus::Completed => format!(
-                "退出码 {} · {:.1} s",
-                exit_code.map_or_else(|| "未知".into(), |n| n.to_string()),
-                *duration_ms as f64 / 1000.
-            ),
-            StepStatus::Background => "已转后台".into(),
-            StepStatus::TimedOut => "超时".into(),
-            StepStatus::Denied { .. } => "已拒绝".into(),
-            StepStatus::Busy => "终端正忙".into(),
-            StepStatus::Disconnected => "会话已断开".into(),
-            StepStatus::Failed(_) => "失败".into(),
-        };
-        let mut color = if *status == StepStatus::Background {
-            p.acc
-        } else if *status == StepStatus::Completed
-            && shellmate_ai::output::successful(command, *exit_code)
-        {
-            p.ok
-        } else {
-            p.err
-        };
-        if *status == StepStatus::Background
-            && let Some(output_id) = self.state.model.conversation.displayed_step(key.0,key.1).and_then(|s|s.result.output_id.as_deref())
-            && let Some(task) = self.tasks.as_ref().and_then(|tasks|tasks.list().into_iter().find(|t|t.output_id==output_id))
-        {
-            state=task.status_text();
-            color=match task.status {
-                crate::ai::tasks::Status::Running=>p.acc,
-                crate::ai::tasks::Status::Exited(code) if shellmate_ai::output::successful(command,code)=>p.ok,
-                crate::ai::tasks::Status::Stopped=>p.tx2,
-                _=>p.err,
-            };
-        }
-        let mut card = step_surface(&p)
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(step_header(purpose, *target, *automatic, &state, color, None, cx))
-            .child(self.ended_command(command, key, cx));
-        match status {
-            StepStatus::Denied {
-                reason: Some(reason),
-            }
-            | StepStatus::Failed(reason) => {
-                card = card.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(p.tx2)
-                        .child(reason.clone()),
-                );
-            }
-            _ => {}
-        }
-        if let Some(output) = self.output_for_step(key) {
-            card = card.child(output);
-        }
-        card.into_any_element()
-    }
-
-    /// Only persisted/ended steps use this cap. Active approval always uses command_block.
-    fn ended_command(&self, command: &str, key: (usize, usize), cx: &mut Context<Self>) -> Div {
-        let expanded = self.state.expanded_commands.contains(&key);
-        let overflowing = self.state.overflowing_commands.contains(&key);
-        let drawer = cx.entity().downgrade();
-        let epoch = self.epoch;
-        let conversation = self.state.id.clone();
-        // Measure all physical lines before applying the collapsed height cap.
-        let measured = div()
-            .flex_none()
-            .child(div().child(crate::ai::markdown::plain(("ended-command",key.0*1000+key.1),command.to_owned())))
-            .on_children_prepainted(move |bounds, _, cx| {
-                let over = bounds
-                    .first()
-                    .is_some_and(|b| b.size.height > px(3. * 18. + 0.5));
-                if over != overflowing {
-                    let drawer = drawer.clone();
-                    let conversation = conversation.clone();
-                    cx.defer(move |cx| {
-                        drawer
-                            .update(cx, |s, cx| {
-                                if s.epoch != epoch || s.state.id != conversation {
-                                    return;
-                                }
-                                let changed = if over {
-                                    s.state.overflowing_commands.insert(key)
-                                } else {
-                                    s.state.overflowing_commands.remove(&key)
-                                };
-                                if changed {
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                    });
-                }
-            });
-        let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);
-        let viewport = ScrollArea::new(
-            SharedString::from(format!(
-                "{}:command:{}:{}:{expanded}",
-                self.state.id, key.0, key.1
-            )),
-            div()
-                .flex()
-                .flex_col()
-                .items_start()
-                .whitespace_nowrap()
-                .child(measured),
-            bg,
-        ).selection(self.selection_scroll.clone());
-        let mut block =
-            div()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(command_surface(cx).child(if expanded {
-                    viewport
-                } else {
-                    viewport.height_limit(3. * 18., false)
-                }));
-        {
-            let mut actions = step_actions();
-            if overflowing {
-                actions = actions.child(
-                    step_action(
-                        markdown::element_id(&format!("{}:command-toggle", self.state.id), key.0, key.1),
-                        if expanded { "收起" } else { "展开" },
-                        cx,
-                    )
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        if !s.state.expanded_commands.remove(&key) {
-                            s.state.expanded_commands.insert(key);
-                        }
-                        cx.notify();
-                    })),
-                );
-            }
-            {
-                let copy = command.to_owned();
-                actions = actions.child(
-                    step_action(
-                        markdown::element_id(&format!("{}:command-copy", self.state.id), key.0, key.1),
-                        "复制命令",
-                        cx,
-                    )
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                    }),
-                );
-            }
-            block = block.child(actions);
-        }
-        block
-    }
 }
 
 pub(super) fn step_surface(p: &crate::theme::Palette) -> Div {
@@ -736,41 +541,7 @@ pub(super) fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &Ap
         )
 }
 
-pub(super) fn target_chip(label: &str, color: Hsla) -> Div {
-    div().flex_none().font_weight(FontWeight::MEDIUM).px(px(5.)).py(px(2.)).rounded(px(5.)).bg(color.opacity(0.1)).child(label.to_owned())
-}
-pub(super) fn neutral_chip(label: &str, p: &crate::theme::Palette) -> Div {
-    div().flex_none().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_size(px(10.5)).text_color(p.tx2).child(label.to_owned())
-}
-fn step_header(
-    purpose: &str,
-    target: Target,
-    automatic: bool,
-    state: &str,
-    color: Hsla,
-    source: Option<&shellmate_ai::SubagentRef>,
-    cx: &App,
-) -> Div {
-    let p = cx.palette();
-    let chips = div().flex().items_center().gap(px(5.))
-        .when(source.is_some(),|d|d.min_w_0().flex_1())
-        .children(source.map(|source|div().min_w_0().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).text_color(p.tx2).font_weight(FontWeight::MEDIUM).overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("子任务 · {}",source.description))))
-        .child(target_chip(target.label(),color))
-        .when(automatic, |d|d.child(neutral_chip("自动执行",p)));
-    step_heading(purpose.to_owned(), chips, state, color, cx)
-}
-pub(super) fn step_heading(purpose: impl IntoElement, chips: Div, state: &str, color: Hsla, cx: &App) -> Div {
-    let p = cx.palette();
-    div().flex().flex_col().min_w_0().gap(px(6.))
-        .child(div().flex().items_center().justify_between().gap(px(5.)).text_size(px(11.))
-            .child(chips).child(div().flex_none().text_color(color).child(state.to_owned())))
-        .child(div().w_full().text_color(p.tx).text_size(px(13.)).line_height(px(20.8)).whitespace_normal().child(purpose))
-}
-pub(super) fn output_scroll(id: SharedString, content: Div, expanded: bool, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, p: &crate::theme::Palette) -> ScrollArea {
-    ScrollArea::new(id, div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content), p.card2)
-        .selection(selection).height_limit(if expanded {320.} else {8.*18.},expanded)
-}
-fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, cx: &App) -> Div {
+pub(super) fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, cx: &App) -> Div {
     let bg = shellmate_term::colors::to_hsla(cx.terminal_style().palette.background);
     command_surface(cx).child(ScrollArea::new(
         id,
@@ -782,6 +553,9 @@ fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::s
             .child(div().flex_none().child(crate::ai::markdown::plain("command", command.to_owned()))),
         bg,
     ).selection(selection))
+}
+pub(super) fn output_scroll(id:SharedString,content:Div,expanded:bool,selection:Entity<crate::ai::selection_scroll::SelectionScroll>,p:&crate::theme::Palette)->ScrollArea{
+    ScrollArea::new(id,div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content),p.card2).selection(selection).height_limit(if expanded{320.}else{8.*18.},expanded)
 }
 pub(super) fn command_surface(cx: &App) -> Div {
     div()
@@ -849,10 +623,6 @@ impl Drawer {
         self.state.readonly = false;
         self.state.model.clear();
         self.state.active_steps.clear_main();
-        self.state.expanded.clear();
-        self.state.overflowing_output.clear();
-        self.state.expanded_commands.clear();
-        self.state.overflowing_commands.clear();
         let redline = scene == "ai-agent-redline";
         *self.mode.lock().unwrap() = if redline {
             PermissionMode::Full

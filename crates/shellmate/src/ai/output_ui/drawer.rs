@@ -5,9 +5,20 @@ impl Drawer {
         let mut sources = Vec::new();
         let mut initially_open = BTreeSet::new();
         let mut generic = Vec::new();
+        for (_, step) in self.state.active_steps.iter() {
+            if step.started.is_none() {
+                let scope = step
+                    .source
+                    .as_ref()
+                    .map(|s| format!("child:{}", s.id))
+                    .unwrap_or_else(|| "main".into());
+                self.state
+                    .tool_expanded
+                    .insert(self.tool_key(&scope, &step.call.id, true));
+            }
+        }
         for e in self.state.model.conversation.entries() {
             if let shellmate_ai::Entry::Step(step) = e
-                && step.display.is_none()
                 && step.result.subagent.is_none()
             {
                 generic.push(("main".to_owned(), step));
@@ -26,8 +37,11 @@ impl Drawer {
             if step.call.name == "web_search" {
                 continue;
             }
-            let key = super::super::tool_ui::key(&scope, &step.call.id);
-            if self.state.tool_expanded.contains(&key) || step.result.is_error {
+            let key = self.tool_key(&scope, &step.call.id, false);
+            if self.tool_open(
+                &key,
+                crate::ai::tool_model::command_status(step.display.as_ref(), Some(&step.result)),
+            ) {
                 initially_open.insert(key.clone());
             }
             let preview = if step.call.name == "web_fetch" {
@@ -43,28 +57,45 @@ impl Drawer {
             } else {
                 None
             };
+            let running = self
+                .tool_task(&scope, &step.call.id, step.result.output_id.as_deref())
+                .is_some_and(|t| t.status == crate::ai::tasks::Status::Running);
             sources.push(source(
                 key,
                 step.result.output_id.clone(),
                 preview.as_deref().unwrap_or(&step.result.inline),
-                false,
+                running,
             ));
         }
-        for (turn, t) in self.state.model.conversation.turns().iter().enumerate() {
-            if let Some(answer) = &t.answer {
-                for (item, entry) in answer.items.iter().enumerate() {
-                    if let shellmate_ai::AnswerItem::Step { output, .. } = entry {
-                        let step = self.state.model.conversation.displayed_step(turn, item);
-                        let id = step.and_then(|s| s.result.output_id.clone());
-                        let key = id
-                            .as_ref()
-                            .map(|id| format!("output:{id}"))
-                            .unwrap_or_else(|| format!("step:{turn}:{item}"));
-                        if self.state.expanded.contains(&(turn, item)) {
-                            initially_open.insert(key.clone());
-                        }
-                        sources.push(source(key, id, output, false));
-                    }
+        let mut active = vec![];
+        for (_, step) in self.state.active_steps.iter() {
+            let scope = step
+                .source
+                .as_ref()
+                .map(|s| format!("child:{}", s.id))
+                .unwrap_or_else(|| "main".into());
+            active.push((scope, step.call.id.clone()));
+        }
+        for view in self.state.subagents.values() {
+            for call in &view.active_tools {
+                if call.name == "run_command" {
+                    active.push((format!("child:{}", view.id), call.id.clone()));
+                }
+            }
+        }
+        for (scope, id) in active {
+            if let Some(task) = self.tool_task(&scope, &id, None) {
+                let key = self.tool_key(&scope, &id, true);
+                if self.state.tool_expanded.contains(&key) {
+                    initially_open.insert(key.clone());
+                }
+                if !sources.iter().any(|s| s.key == key) {
+                    sources.push(source(
+                        key,
+                        Some(task.output_id),
+                        "",
+                        task.status == crate::ai::tasks::Status::Running,
+                    ));
                 }
             }
         }
@@ -94,7 +125,12 @@ impl Drawer {
         for source in sources {
             let key = source.key.clone();
             if let Some(pane) = self.state.output_panes.get(&key) {
-                pane.update(cx, |s, cx| s.update_source(source, cx));
+                pane.update(cx, |s, cx| {
+                    s.update_source(source, cx);
+                    if initially_open.contains(&key) && !s.expanded {
+                        s.open(cx);
+                    }
+                });
             } else {
                 let pane = cx.new(|cx| {
                     OutputPane::new(
@@ -118,31 +154,25 @@ impl Drawer {
             }
         }
     }
-    pub(in crate::ai::panel) fn output_for_step(
-        &self,
-        key: (usize, usize),
-    ) -> Option<Entity<OutputPane>> {
-        let id = self
-            .state
-            .model
-            .conversation
-            .displayed_step(key.0, key.1)
-            .and_then(|s| s.result.output_id.as_ref());
-        self.state
-            .output_panes
-            .get(
-                &id.map(|id| format!("output:{id}"))
-                    .unwrap_or_else(|| format!("step:{}:{}", key.0, key.1)),
-            )
-            .cloned()
-    }
     pub(in crate::ai::panel) fn reveal_output(
         &mut self,
         id: &str,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = format!("output:{id}");
+        let key = self
+            .state
+            .output_panes
+            .iter()
+            .find(|(key, p)| {
+                key.starts_with(&format!("tool:{}:main:", self.state.id))
+                    && p.read(cx).source.output.as_deref() == Some(id)
+            })
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| format!("output:{id}"));
+        self.state.tool_expanded.insert(key.clone());
+        self.state.tool_collapsed.remove(&key);
+        self.state.follow_bottom = false;
         if let Some(pane) = self.state.output_panes.get(&key) {
             pane.update(cx, |s, cx| s.open(cx));
         }

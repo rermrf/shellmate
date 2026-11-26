@@ -23,41 +23,6 @@ fn view() -> View {
     )
 }
 #[test]
-fn status_colors_and_duration_boundaries() {
-    for (seconds, text) in [
-        (0, "0s"),
-        (59, "59s"),
-        (60, "1m00s"),
-        (62, "1m02s"),
-        (3599, "59m59s"),
-        (3600, "1h00m"),
-        (3720, "1h02m"),
-    ] {
-        assert_eq!(duration(seconds), text);
-    }
-    for (s, text, color) in [
-        (
-            SubagentStatus::Running,
-            "运行中 · 3 步 · 18s",
-            Color::Accent,
-        ),
-        (SubagentStatus::Completed, "已结束 · 3 步 · 18s", Color::Ok),
-        (
-            SubagentStatus::StepLimit,
-            "达到步数上限 · 3 步",
-            Color::Warning,
-        ),
-        (
-            SubagentStatus::Failed(AiError::Disconnected),
-            "失败 · 3 步",
-            Color::Error,
-        ),
-        (SubagentStatus::Stopped, "已停止 · 3 步", Color::Quiet),
-    ] {
-        assert_eq!(status(&s, 3, 18), (text.into(), color));
-    }
-}
-#[test]
 fn meta_only_shows_overrides_and_known_usage_with_error_before_usage() {
     let mut v = view();
     assert_eq!(meta(&v), None);
@@ -137,36 +102,6 @@ fn copy_and_expanded_report_use_full_spool_without_loading_transcript() {
     v.load_report(root.path(), "conversation");
     assert_eq!(copy_report(&v), report);
 }
-#[test]
-fn live_step_states_and_output_survive_projection() {
-    assert_eq!(
-        command_line("printf first\nprintf second"),
-        "printf first printf second"
-    );
-    let mut step = StepView {
-        id: "s".into(),
-        command: "cat /etc/hosts".into(),
-        exit_code: Some(0),
-        duration_ms: 1300,
-        output_id: None,
-        status: StepStatus::Completed,
-        running: false,
-        output: "localhost".into(),
-    };
-    assert_eq!(step_status(&step), ("0 · 1.3s".into(), Color::Ok));
-    step.exit_code = Some(1);
-    assert_eq!(step_status(&step).1, Color::Error);
-    step.running = true;
-    assert_eq!(step_status(&step), ("运行中".into(), Color::Accent));
-    step.running = false;
-    step.status = StepStatus::Background;
-    assert_eq!(step_status(&step), ("已转后台".into(), Color::Accent));
-    step.status = StepStatus::Denied {
-        reason: Some("不允许".into()),
-    };
-    assert_eq!(step_status(&step), ("已拒绝".into(), Color::Error));
-}
-
 #[test]
 fn pending_card_becomes_the_same_projected_step_and_history_gets_its_scope() {
     let mut live = view();

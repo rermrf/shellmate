@@ -14,6 +14,7 @@ pub mod panel;
 pub mod settings;
 pub(crate) mod web;
 pub(crate) mod tasks;
+pub(crate) mod tool_model;
 use crate::dialogs::{self, DialogBody, Tone};
 use gpui::{prelude::*, *};
 use shellmate_ai::{AiError, Config};

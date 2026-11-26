@@ -373,7 +373,12 @@ impl Drawer {
         } else {
             view.duration_ms / 1000
         };
-        let status = crate::ai::subagent_card::status(&view.status, view.steps, secs).0;
+        let status = format!(
+            "{} · {} 步 · {}",
+            crate::ai::tool_model::child_status(&view.status).label(),
+            view.steps,
+            crate::ai::tool_model::elapsed(secs * 1000)
+        );
         let mut header = div()
             .flex_none()
             .p(px(12.))
@@ -586,7 +591,7 @@ impl Drawer {
             body = body.child(if let Some(key) = approval {
                 self.active_card(&key, cx)
             } else {
-                self.tool_card(&format!("{scope}:active"), call, None, None, w, cx)
+                self.tool_card(&scope, call, None, None, w, cx)
             });
         }
         for (key, step) in self

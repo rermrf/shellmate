@@ -609,7 +609,11 @@ impl Drawer {
                             Worker::Event(event, updates, ready) => {
                                 let event = *event;
                                 let durable = matches!(&event, AgentEvent::Context { .. }) || updates.iter().any(|u| !matches!(u, shellmate_ai::LogUpdate::Append(e) if matches!(&**e, shellmate_ai::Entry::Assistant { .. })));
-                                for update in updates { s.state.model.conversation.apply(update); }
+                                for update in updates {
+                                    let raw=match &update{shellmate_ai::LogUpdate::Append(e)=>if let shellmate_ai::Entry::Step(step)=&**e{Some(step.call.id.clone())}else{None},_=>None};
+                                    s.state.model.conversation.apply(update);
+                                    if let Some(raw)=raw&&let Some(shellmate_ai::Entry::Step(step))=s.state.model.conversation.entries().last(){s.state.tool_ids.finish(&raw,&step.call.id);}
+                                }
                                 s.agent_event(event);
                                 if durable { s.persist(); }
                                 if s.state.save_error.is_some() && (!s.state.accepted_inputs.is_empty()||!s.state.accepted_events.is_empty()) {
@@ -918,7 +922,7 @@ impl Drawer {
             self.state.model.clear();self.state.model.conversation=fixture.conversation;
             self.label="prod-web-01".into();self.protocol="SSH".into();self.history=false;self.state.readonly=fixture.readonly;
             self.state.follow_bottom=false;self.fixture_tasks=fixture.tasks;
-            if fixture.expanded{self.state.expanded.insert((0,0));}
+            if fixture.expanded&&let Some(step)=self.state.model.conversation.displayed_step(0,0){self.state.tool_expanded.insert(self.tool_key("main",&step.call.id,false));}
             if let Some(spool)=fixture.spool {
                 cx.spawn(async move |_,cx| {
                     for n in 0..20 {
@@ -938,7 +942,7 @@ impl Drawer {
                 self.state.subagents = fixture.views.into_iter().map(|v|(v.id.clone(),v)).collect();
                 self.fixture_tasks = fixture.tasks;
                 if let Some((id,step)) = fixture.expanded {
-                    self.state.tool_expanded.insert(tool_ui::key(&format!("child:{id}"),&step));self.open_child(&id,w,cx);
+                    self.state.tool_expanded.insert(self.tool_key(&format!("child:{id}"),&step,false));self.open_child(&id,w,cx);
                 }
             }
             if scene=="ai-subagent-approval" {
@@ -1446,8 +1450,8 @@ impl Render for Drawer {
                                 } else { line });
                                 continue;
                             }
-                            item @ shellmate_ai::AnswerItem::Step { .. } => {
-                                reply = reply.child(self.step_card(item, (index, n), cx));
+                            shellmate_ai::AnswerItem::Step { .. } => {
+                                if let Some(step)=self.state.model.conversation.displayed_step(index,n){reply=reply.child(self.tool_card("main",&step.call,Some(&step.result),step.display.as_ref(),window,cx));}
                                 continue;
                             }
                             shellmate_ai::AnswerItem::Command(card) => card.clone(),

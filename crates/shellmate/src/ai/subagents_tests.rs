@@ -1257,6 +1257,7 @@ async fn live_child_transcript_preserves_delegation_and_message_sources_before_a
             .any(|e| matches!(e,Entry::Assistant{text,..} if text.contains("checking live")))
     );
     assert_eq!(running.active_tools.len(), 1);
+    let running_key = running.tool_ids.active(&running.active_tools[0].id);
     service
         .message("agent-1", "parent followup", false, false, "parent-message")
         .await;
@@ -1275,6 +1276,21 @@ async fn live_child_transcript_preserves_delegation_and_message_sources_before_a
     let completed = service.tasks.agent_views().remove(0);
     assert!(completed.active_tools.is_empty());
     let entries = completed.transcript.as_ref().unwrap();
+    let step = entries
+        .iter()
+        .find_map(|e| {
+            if let Entry::Step(step) = e {
+                Some(step)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        completed.tool_ids.saved(&step.call.id),
+        running_key,
+        "completed tool keeps its active card identity"
+    );
     assert!(entries.iter().any(|e|matches!(e,Entry::User{text,origin:Some(MessageOrigin::Parent),..} if text=="parent followup")));
     assert!(entries.iter().any(|e|matches!(e,Entry::User{text,origin:Some(MessageOrigin::User),..} if text=="user followup")));
     let mut restored = subagent_view::View::reopened(
@@ -1318,4 +1334,46 @@ async fn stopped_child_keeps_undelivered_user_messages_visible_after_reopening()
     );
     restored.load_transcript(root.path(), "conversation");
     assert_eq!(restored.pending_inputs, stopped.pending_inputs);
+}
+
+#[tokio::test]
+async fn reused_child_call_ids_keep_distinct_cards_during_stream_and_after_finish() {
+    let (_root, service, ui, _) = fixture(vec![
+        response(true, "first"),
+        response(true, "second"),
+        response(true, "third"),
+        response(false, "finished"),
+    ]);
+    service.start(request(true), "initial").await;
+    let (_, first) = approval(&ui).await;
+    let first_view = service.tasks.agent_views().remove(0);
+    let first_key = first_view.tool_ids.active(&first_view.active_tools[0].id);
+    first.send(Approval::Deny { reason: None }).ok().unwrap();
+    let (_, second) = approval(&ui).await;
+    let second_view = service.tasks.agent_views().remove(0);
+    let second_key = second_view.tool_ids.active(&second_view.active_tools[0].id);
+    assert_ne!(first_key, second_key);
+    second.send(Approval::Deny { reason: None }).ok().unwrap();
+    let (_, third) = approval(&ui).await;
+    let live = service.tasks.agent_views().remove(0);
+    let entries = live.transcript.as_ref().unwrap();
+    let ids: Vec<_> = entries
+        .iter()
+        .filter_map(|e| {
+            if let Entry::Step(s) = e {
+                Some(s.call.id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(live.tool_ids.saved(&ids[0]), first_key);
+    assert_eq!(live.tool_ids.saved(&ids[1]), second_key);
+    third.send(Approval::Deny { reason: None }).ok().unwrap();
+    settled(&service.tasks).await;
+    let ended = service.tasks.agent_views().remove(0);
+    assert_eq!(ended.tool_ids.saved(&ids[0]), first_key);
+    assert_eq!(ended.tool_ids.saved(&ids[1]), second_key);
 }

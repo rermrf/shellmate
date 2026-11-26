@@ -250,10 +250,16 @@ impl OutputPane {
         cx.notify();
     }
     pub(super) fn open(&mut self, cx: &mut Context<Self>) {
+        if self.expanded {
+            return;
+        }
         self.expanded = true;
         self.follow = self.source.running;
         self.load(cx);
         cx.notify();
+    }
+    pub(super) fn copy_all(&mut self, cx: &mut Context<Self>) {
+        self.copy(None, cx);
     }
     fn toggle(&mut self, cx: &mut Context<Self>) {
         self.expanded = !self.expanded;

@@ -17,6 +17,8 @@ pub struct StepView {
 }
 #[derive(Clone, Debug)]
 pub struct View {
+    pub tool_ids: super::tool_model::Identities,
+    finishing_tool: Option<String>,
     pub pending_inputs: Vec<shellmate_ai::interaction::Input>,
     pub prompt: String,
     pub cwd: Option<String>,
@@ -50,6 +52,8 @@ pub struct View {
 impl View {
     pub fn new(id: String, request: &SubagentRequest, config: &shellmate_ai::Config) -> Self {
         Self {
+            tool_ids: Default::default(),
+            finishing_tool: None,
             pending_inputs: vec![],
             prompt: request.prompt.clone(),
             cwd: None,
@@ -94,10 +98,24 @@ impl View {
                 for update in updates {
                     match update {
                         shellmate_ai::LogUpdate::Append(e) => {
+                            let mut entry = *e.clone();
+                            if matches!(entry, Entry::Step(_)) {
+                                let mut log =
+                                    shellmate_ai::Conversation::from_entries(entries.clone());
+                                log.append(entry);
+                                entry = log.entries().last().unwrap().clone();
+                            }
                             if let Entry::Step(step) = &**e {
+                                let raw = self
+                                    .finishing_tool
+                                    .take()
+                                    .unwrap_or_else(|| step.call.id.clone());
+                                if let Entry::Step(saved) = &entry {
+                                    self.tool_ids.finish(&raw, &saved.call.id);
+                                }
                                 self.active_tools.retain(|c| c.id != step.call.id);
                             }
-                            entries.push(*e.clone());
+                            entries.push(entry);
                         }
                         shellmate_ai::LogUpdate::ClearResults(indices) => {
                             for index in indices {
@@ -111,10 +129,12 @@ impl View {
                 }
             }
             SubagentEvent::Agent(AgentEvent::ToolStarted(call)) => {
+                self.tool_ids.start(&call.id);
                 self.latest_activity = call.name.clone();
                 self.active_tools.push(call.clone());
             }
             SubagentEvent::Agent(AgentEvent::ToolFinished(id)) => {
+                self.finishing_tool = Some(id.clone());
                 self.active_tools.retain(|c| c.id != *id);
             }
             SubagentEvent::Agent(AgentEvent::InputsAccepted(_)) => {
@@ -127,6 +147,7 @@ impl View {
                 self.reasoning = reasoning;
             }
             SubagentEvent::Agent(AgentEvent::StepProposed(call)) => {
+                self.tool_ids.start(&call.id);
                 self.active_tools.push(shellmate_ai::LoggedCall{id:call.id.clone(),name:"run_command".into(),args_json:serde_json::json!({"command":call.command,"purpose":call.purpose,"target":call.target.id(),"cwd":self.cwd})});
                 self.latest_activity = call.command.clone();
                 self.step_list.push(StepView {
@@ -141,6 +162,7 @@ impl View {
                 });
             }
             SubagentEvent::Agent(AgentEvent::StepFinished { call, outcome }) => {
+                self.finishing_tool = Some(call.id.clone());
                 self.active_tools.retain(|c| c.id != call.id);
                 let display = shellmate_ai::StepDisplay::from_item(outcome.item(call)).unwrap();
                 let output_id = if let shellmate_ai::ToolOutcome::Completed(out) = outcome {
@@ -255,6 +277,8 @@ impl View {
             display.status.clone()
         };
         Self {
+            tool_ids: Default::default(),
+            finishing_tool: None,
             pending_inputs: vec![],
             prompt: String::new(),
             cwd: None,

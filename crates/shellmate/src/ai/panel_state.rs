@@ -34,15 +34,13 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
     pub(super) active_tools: Vec<shellmate_ai::LoggedCall>,
     pub(super) child_page: super::thread_ui::Navigation,
     pub(super) tool_expanded: HashSet<String>,
+    pub(super) tool_ids: crate::ai::tool_model::Identities,
+    pub(super) tool_raw: HashSet<String>,
     pub(super) tool_collapsed: HashSet<String>,
     pub(super) output_panes:
         std::collections::BTreeMap<String, gpui::Entity<super::output_ui::OutputPane>>,
     pub(super) output_subscriptions: Vec<gpui::Subscription>,
     pub(super) output_lifetime: crate::ai::output_document::Lifetime,
-    pub(super) expanded: HashSet<(usize, usize)>,
-    pub(super) overflowing_output: HashSet<(usize, usize)>,
-    pub(super) expanded_commands: HashSet<(usize, usize)>,
-    pub(super) overflowing_commands: HashSet<(usize, usize)>,
     pub(super) markdown: MarkdownCache,
     pub(super) readonly: bool,
     pub(super) history_memory_host: Option<String>,
@@ -82,14 +80,12 @@ impl<R> Default for ConversationState<R> {
             active_tools: vec![],
             child_page: Default::default(),
             tool_expanded: Default::default(),
+            tool_ids: Default::default(),
+            tool_raw: Default::default(),
             tool_collapsed: Default::default(),
             output_panes: Default::default(),
             output_subscriptions: Default::default(),
             output_lifetime: Default::default(),
-            expanded: HashSet::new(),
-            overflowing_output: HashSet::new(),
-            expanded_commands: HashSet::new(),
-            overflowing_commands: HashSet::new(),
             markdown: MarkdownCache::default(),
             readonly: false,
             history_memory_host: None,
@@ -391,10 +387,10 @@ mod tests {
         });
         state.persist(&mut db, None, "openai", "fixture");
         state.save_error = Some("previous error".into());
-        state.expanded.insert((0, 0));
-        state.expanded_commands.insert((0, 0));
-        state.overflowing_output.insert((0, 0));
-        state.overflowing_commands.insert((0, 0));
+        state.tool_expanded.insert("main:call".into());
+        state.tool_collapsed.insert("child:call".into());
+        state.tool_raw.insert("main:call".into());
+        state.tool_ids.start("call");
         let old_id = state.id.clone();
         let before = crate::ai::now();
 
@@ -414,9 +410,12 @@ mod tests {
         assert!(
             state.queued.is_none() && state.active_steps.is_empty() && state.run_config.is_none()
         );
-        assert!(state.expanded.is_empty() && state.expanded_commands.is_empty());
-        assert!(state.overflowing_output.is_empty() && state.overflowing_commands.is_empty());
         assert!(state.follow_bottom);
+        assert!(
+            state.tool_expanded.is_empty()
+                && state.tool_collapsed.is_empty()
+                && state.tool_raw.is_empty()
+        );
         state.persist(&mut db, None, "openai", "fixture");
         assert!(db.ai_conversations().unwrap().is_empty());
         state.model.start("new", ContextSnapshot::default());

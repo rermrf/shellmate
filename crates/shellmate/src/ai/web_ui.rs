@@ -42,7 +42,7 @@ impl Drawer {
         if scene == "ai-web-fetch" {
             self.state
                 .tool_expanded
-                .insert(super::tool_ui::key("main", "web-fixture"));
+                .insert(self.tool_key("main", "web-fixture", false));
         }
         self.state.model.busy = false;
         cx.notify();
@@ -59,29 +59,23 @@ impl Drawer {
         let mut body = div().min_w_0().flex().flex_col().gap(px(8.));
         match data {
             ResultData::Search {
-                query,
+                query: _,
                 provider,
                 results,
                 searched_at,
                 cached,
                 note,
             } => {
-                body = body
-                    .child(
-                        super::subagent_ui::selectable(format!("{key}:query"), query, w, cx)
-                            .text_size(px(12.5))
-                            .whitespace_normal(),
+                body = body.child(div().text_size(px(11.)).text_color(p.tx3).child(format!(
+                    "{provider} · {} 条结果{} · {}",
+                    results.len(),
+                    if *cached { " · 缓存" } else { "" },
+                    timing::timestamp(
+                        searched_at.saturating_mul(1000),
+                        timing::Moment::now().wall_ms,
+                        false
                     )
-                    .child(div().text_size(px(11.)).text_color(p.tx3).child(format!(
-                        "{provider} · {} 条结果{} · {}",
-                        results.len(),
-                        if *cached { " · 缓存" } else { "" },
-                        timing::timestamp(
-                            searched_at.saturating_mul(1000),
-                            timing::Moment::now().wall_ms,
-                            false
-                        )
-                    )));
+                )));
                 if let Some(note) = note {
                     body = body.child(
                         div()
@@ -149,22 +143,6 @@ impl Drawer {
                         .whitespace_normal(),
                     );
                     body = body.child(row);
-                }
-                if !expanded && results.len() > 2 {
-                    let target = key.to_owned();
-                    body = body.child(
-                        agent_ui::step_action(
-                            SharedString::from(format!("{key}:all")),
-                            "展开全部来源",
-                            cx,
-                        )
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            s.state.tool_expanded.insert(target.clone());
-                            s.state.tool_collapsed.remove(&target);
-                            s.state.follow_bottom = false;
-                            cx.notify();
-                        })),
-                    );
                 }
             }
             ResultData::Page {

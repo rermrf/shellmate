@@ -1,4 +1,6 @@
 pub const SCENES: &[&str] = &[
+    "ai-tools-unified",
+    "ai-tools-expanded",
     "ai-web-search",
     "ai-web-fetch",
     "ai-web-fallback",
@@ -25,6 +27,7 @@ pub fn base(scene: &str) -> Option<&'static str> {
         return None;
     }
     Some(match scene {
+        "ai-tools-unified" | "ai-tools-expanded" => "ai-chat",
         "ai-web-search" | "ai-web-fetch" | "ai-web-fallback" | "ai-web-error" => "ai-chat",
         "ai-child-thread"
         | "ai-child-running"

@@ -25,85 +25,144 @@ impl Drawer {
     ) -> AnyElement {
         let p = cx.palette().clone();
         let running = view.status == SubagentStatus::Running;
-        let scope = format!("{}:subagent:{}", self.state.id, view.id);
-        let seconds = if running && !self.fixture {
-            view.started.elapsed().as_secs()
+        let key = super::tool_ui::key(
+            &format!("{}:main", self.state.id),
+            &format!("agent:{}", view.id),
+        );
+        let awaiting = self.state.active_steps.iter().any(|(_, s)| {
+            s.source.as_ref().is_some_and(|source| source.id == view.id) && s.started.is_none()
+        });
+        let status = if awaiting {
+            crate::ai::tool_model::Status::Approval
+        } else if view.saving {
+            crate::ai::tool_model::Status::Paused
         } else {
-            view.duration_ms / 1000
+            crate::ai::tool_model::child_status(&view.status)
         };
-        let (status, color) = card::status(&view.status, view.steps, seconds);
-        let color = color.resolve(&p);
-        let target = view.id.clone();
-        let title = div()
-            .id(SharedString::from(format!("{scope}:title-link")))
-            .cursor_pointer()
-            .child(selectable(
-                format!("{scope}:title"),
-                &view.description,
-                w,
-                cx,
-            ))
-            .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx)));
-        let chips = div()
-            .flex()
-            .gap(px(5.))
-            .child(agent_ui::target_chip("子任务", color))
-            .when(view.background, |d| {
-                d.child(agent_ui::neutral_chip("后台", &p))
-            });
-        let mut surface = agent_ui::step_surface(&p)
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(agent_ui::step_heading(title, chips, &status, color, cx));
-        if view.saving {
-            surface = surface.child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(p.err)
-                    .child("执行记录保存失败，正在重试"),
-            );
-        }
-        let preview = if running {
-            card::command_line(&view.latest_activity)
+        let elapsed = if running && !self.fixture {
+            view.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+        } else {
+            view.duration_ms
+        };
+        let activity = if running {
+            view.latest_activity.clone()
         } else {
             card::preview(&view.report)
         };
-        surface = surface.child(
-            selectable(format!("{scope}:preview"), &preview, w, cx)
+        let model = super::tool_ui::Card {
+            key: key.clone(),
+            title: "委派子任务".into(),
+            status,
+            duration: (elapsed > 0).then_some(elapsed),
+            summary: view.description.clone(),
+            detail: format!(
+                "{} 步{} · {}",
+                view.steps,
+                if view.background {
+                    " · 后台执行"
+                } else {
+                    ""
+                },
+                activity
+            ),
+        };
+        let open = self.tool_open(&key, status);
+        let mut surface = self.tool_shell(&model, cx);
+        if open {
+            surface = surface.child(super::tool_ui::section("输入", &p));
+            let prompt = if !view.prompt.is_empty() {
+                Some(view.prompt.clone())
+            } else {
+                view.transcript.as_ref().and_then(|entries| {
+                    entries.iter().find_map(|e| {
+                        if let shellmate_ai::Entry::User { text, .. } = e {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            };
+            surface = surface.child(
+                selectable(
+                    format!("{key}:prompt"),
+                    prompt
+                        .as_deref()
+                        .unwrap_or("原始任务说明未保存在此历史记录中"),
+                    w,
+                    cx,
+                )
                 .text_size(px(12.5))
-                .text_color(p.tx2)
-                .line_clamp(3)
-                .whitespace_normal()
-                .overflow_hidden(),
-        );
+                .line_height(px(19.))
+                .whitespace_normal(),
+            );
+            surface = surface.child(super::tool_ui::section(
+                if running { "进展" } else { "结果" },
+                &p,
+            ));
+            if running {
+                surface = surface.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.tx2)
+                        .whitespace_normal()
+                        .child(view.latest_activity.clone()),
+                );
+            } else {
+                surface = surface.child(super::markdown::drawer_view(
+                    SharedString::from(format!("{}:{key}:report", self.state.id)).into(),
+                    view.report.clone().into(),
+                    self.selection_scroll.clone(),
+                    self.fixture_copy,
+                    w,
+                    cx,
+                ));
+            }
+            if let Some(meta) = card::meta(view) {
+                surface = surface.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(p.tx3)
+                        .whitespace_normal()
+                        .child(meta),
+                );
+            }
+        }
         let target = view.id.clone();
         let message = view.id.clone();
         let mut actions = agent_ui::step_actions()
             .flex_wrap()
             .child(
-                agent_ui::step_action(SharedString::from(format!("{scope}:open")), "查看过程", cx)
+                agent_ui::step_action(SharedString::from(format!("{key}:open")), "查看对话 →", cx)
                     .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx))),
             )
             .child(
+                agent_ui::step_action(SharedString::from(format!("{key}:message")), "追加消息", cx)
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        s.open_child(&message, w, cx);
+                        s.input.focus_handle(cx).focus(w, cx);
+                    })),
+            );
+        if open {
+            let report = view.report.clone();
+            actions = actions.child(
                 agent_ui::step_action(
-                    SharedString::from(format!("{scope}:message")),
-                    "追加消息",
+                    SharedString::from(format!("{key}:copy-result")),
+                    "复制结果",
                     cx,
                 )
-                .on_click(cx.listener(move |s, _, w, cx| {
-                    s.open_child(&message, w, cx);
-                    s.input.focus_handle(cx).focus(w, cx);
-                })),
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(report.clone()))
+                }),
             );
+        }
         if running && !self.state.readonly {
             let id = view.id.clone();
             actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{scope}:stop")), "停止任务", cx)
+                agent_ui::step_action(SharedString::from(format!("{key}:stop")), "停止任务", cx)
                     .on_click(cx.listener(move |s, _, _, cx| {
-                        if let Some(tasks) = &s.tasks {
-                            tasks.stop(&id);
+                        if let Some(t) = &s.tasks {
+                            t.stop(&id);
                         }
                         cx.notify();
                     })),
@@ -112,6 +171,7 @@ impl Drawer {
         surface.child(actions).into_any_element()
     }
 }
+
 struct Selection {
     handle: TextSelectionHandle,
     focus: FocusHandle,

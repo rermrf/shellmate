@@ -308,7 +308,7 @@ impl Render for OutputPane {
                 || self.source.running
                 || self.source.preview.lines().count() > 8
                 || self.doc.as_ref().is_some_and(|d| d.rows > 8);
-            if expanded || more {
+            if !self.source.key.starts_with("tool:") && (expanded || more) {
                 actions = actions.child(
                     agent_ui::step_action(
                         "output-expand",
@@ -336,10 +336,12 @@ impl Render for OutputPane {
                     )),
                 );
             }
-            actions = actions.child(
-                agent_ui::step_action("output-copy", self.copy_label(), cx)
-                    .on_click(cx.listener(|s, _, _, cx| s.copy(None, cx))),
-            );
+            if !self.source.key.starts_with("tool:") {
+                actions = actions.child(
+                    agent_ui::step_action("output-copy", self.copy_label(), cx)
+                        .on_click(cx.listener(|s, _, _, cx| s.copy(None, cx))),
+                );
+            }
             body = body.child(actions);
         }
         let anchor = self.anchor.clone();

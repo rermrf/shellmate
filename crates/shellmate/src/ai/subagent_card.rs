@@ -1,59 +1,11 @@
 //! Pure presentation decisions and drawer-local expansion state. Never alters the log.
-use super::subagent_view::{StepView, View};
-use shellmate_ai::{StepStatus, SubagentStatus};
+use super::subagent_view::View;
+use shellmate_ai::SubagentStatus;
 use std::collections::BTreeMap;
 
 pub const EXPIRED: &str = "执行记录已过期，仅保留报告";
 pub const EMPTY_REPORT: &str = "（没有报告）";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Color {
-    Accent,
-    Ok,
-    Warning,
-    Error,
-    Quiet,
-}
-impl Color {
-    pub fn resolve(self, p: &crate::theme::Palette) -> gpui::Hsla {
-        match self {
-            Self::Accent => p.acc,
-            Self::Ok => p.ok,
-            Self::Warning => p.warn,
-            Self::Error => p.err,
-            Self::Quiet => p.tx2,
-        }
-    }
-}
-pub fn duration(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m{:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
-    }
-}
-pub fn status(status: &SubagentStatus, steps: usize, seconds: u64) -> (String, Color) {
-    let (label, color, time) = match status {
-        SubagentStatus::Running => ("运行中", Color::Accent, true),
-        SubagentStatus::Completed => ("已结束", Color::Ok, true),
-        SubagentStatus::StepLimit => ("达到步数上限", Color::Warning, false),
-        SubagentStatus::Failed(_) => ("失败", Color::Error, false),
-        SubagentStatus::Stopped => ("已停止", Color::Quiet, false),
-    };
-    (
-        format!(
-            "{label} · {steps} 步{}",
-            if time {
-                format!(" · {}", duration(seconds))
-            } else {
-                String::new()
-            }
-        ),
-        color,
-    )
-}
 fn tokens(n: Option<u64>) -> String {
     n.map_or_else(
         || "未知".into(),
@@ -122,36 +74,6 @@ pub fn preview(report: &str) -> String {
         // One paragraph lets the text renderer clamp the whole preview to three
         // visual lines; explicit newlines get a separate wrap budget in GPUI.
         first.join(" ")
-    }
-}
-pub fn command_line(command: &str) -> String {
-    command.replace(['\r', '\n'], " ")
-}
-
-pub fn step_status(step: &StepView) -> (String, Color) {
-    if step.running {
-        return ("运行中".into(), Color::Accent);
-    }
-    match &step.status {
-        StepStatus::Completed => (
-            format!(
-                "{} · {:.1}s",
-                step.exit_code
-                    .map_or_else(|| "未知".into(), |n| n.to_string()),
-                step.duration_ms as f64 / 1000.
-            ),
-            if shellmate_ai::output::successful(&step.command, step.exit_code) {
-                Color::Ok
-            } else {
-                Color::Error
-            },
-        ),
-        StepStatus::Background => ("已转后台".into(), Color::Accent),
-        StepStatus::Denied { .. } => ("已拒绝".into(), Color::Error),
-        StepStatus::TimedOut => ("超时".into(), Color::Error),
-        StepStatus::Busy => ("终端正忙".into(), Color::Error),
-        StepStatus::Disconnected => ("会话已断开".into(), Color::Error),
-        StepStatus::Failed(_) => ("失败".into(), Color::Error),
     }
 }
 pub fn transcript_note(view: &View) -> Option<&'static str> {
