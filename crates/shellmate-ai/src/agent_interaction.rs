@@ -73,7 +73,7 @@ impl State<'_> {
         if intent == Intent::StopReply {
             self.entry(Entry::Notice {
                 kind: "interaction".into(),
-                text: "回复已停止；已经转入后台的任务继续运行".into(),
+                text: "回复已停止；已经启动的异步任务继续在原通道运行".into(),
             });
             self.done = true;
             control.set_phase(Phase::Idle);
@@ -84,7 +84,7 @@ impl State<'_> {
             if intent == Intent::Detach {
                 self.entry(Entry::Notice {
                     kind: "interaction".into(),
-                    text: "已结束等待，任务在后台继续运行".into(),
+                    text: "已结束等待，任务在原执行通道继续运行".into(),
                 });
                 self.done = true;
                 control.set_phase(Phase::Idle);
@@ -103,13 +103,7 @@ impl State<'_> {
         let turn = self.turn.as_mut().unwrap();
         turn.turn = self.conversation.latest_user().unwrap().clone();
         turn.turns = self.conversation.turns().len();
-        turn.capabilities = if self.conversation.child.is_some() {
-            turn.base_capabilities.clone()
-        } else {
-            turn.base_capabilities
-                .clone()
-                .for_question(&turn.turn.question)
-        };
+        turn.capabilities = turn.base_capabilities.clone();
         turn.invalid_calls = 0;
         self.done = false;
         self.manual = false;

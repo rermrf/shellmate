@@ -397,7 +397,7 @@ impl Executor for AppExecutor {
     }
     fn execute(&self, call: ToolCall) -> futures::future::BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
-            if call.cwd.is_some() && call.target!=Target::Background {return ToolOutcome::Failed("此步骤指定了后台工作目录，请保留后台执行或重新提出命令".into());}
+            if call.cwd.is_some() && call.target!=Target::Background {return ToolOutcome::Failed("此步骤指定了独立通道工作目录，请保留该通道或重新提出命令".into());}
             if !self.binding.capabilities.offers(call.target) {
                 return ToolOutcome::Failed("此会话不支持该执行目标".into());
             }
@@ -491,7 +491,7 @@ async fn terminal(
 ) -> ToolOutcome {
     // Literal terminal input must never contain Enter/escape/control injection.
     if call.command.chars().any(char::is_control) {
-        return ToolOutcome::Failed("终端命令须为单行且不能含控制字符，请改用后台执行".into());
+        return ToolOutcome::Failed("终端命令须为单行且不能含控制字符，需要使用独立通道执行".into());
     }
     let started = Instant::now();
     let nonce = terminal_nonce();

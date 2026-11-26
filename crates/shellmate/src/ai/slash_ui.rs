@@ -248,7 +248,7 @@ impl Drawer {
                 let title = match &c.body {
                     LocalBody::Hint(_) => "本地提示",
                     LocalBody::Help => "/help · 命令",
-                    LocalBody::Tasks => "/tasks · 后台任务",
+                    LocalBody::Tasks => "/tasks · 任务",
                 };
                 let mut card = super::agent_ui::step_surface(&p)
                     .flex_none()
@@ -314,7 +314,7 @@ impl Drawer {
                             self.tasks.as_ref().map(|t| t.list()).unwrap_or_default()
                         };
                         if tasks.is_empty() {
-                            card = card.child("暂无后台任务");
+                            card = card.child("暂无任务");
                         }
                         for (n, task) in tasks.into_iter().enumerate() {
                             let running = task.status == Status::Running;

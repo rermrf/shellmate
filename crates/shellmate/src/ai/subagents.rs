@@ -255,7 +255,6 @@ impl Service {
                 .and_then(|r| r.resolve(None).ok())
                 .map(|e| e.binding)
                 .unwrap_or_else(|| self.binding.clone());
-            binding.capabilities.terminal = false;
             if let Some(context) = &restored {
                 binding.capabilities.cwd = context.cwd.clone();
             }
@@ -298,7 +297,7 @@ impl Service {
                     self.limits.auto_memory,
                 );
                 snapshot.instructions.push_str(&format!(
-                    "\n子任务终端范围：{}。每次调用指定准确 session_id。",
+                    "\n子任务默认终端与已引用终端：{}。全部应用终端均可通过 list_sessions 发现和使用；这些记录不是资源限制。根据委派要求选择目标和执行通道，每次调用指定准确 session_id。",
                     serde_json::to_string(&scope).unwrap()
                 ));
                 snapshot

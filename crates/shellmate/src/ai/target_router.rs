@@ -20,13 +20,13 @@ pub struct Scope {
     pub default: Option<String>,
     #[serde(default)]
     pub rebindings: BTreeMap<String, String>,
+    /// Previously referenced terminals and per-run directory snapshots, not an allowlist.
     pub targets: BTreeMap<String, Destination>,
 }
 #[derive(Clone)]
 pub struct Router {
     pub catalog: Catalog,
     pub scope: Arc<Mutex<Scope>>,
-    pub requested: Arc<Mutex<std::collections::BTreeSet<String>>>,
     pub db: SharedStore,
     pub root: PathBuf,
     pub ui: async_channel::Sender<Ui>,
@@ -41,7 +41,6 @@ impl Router {
         Self {
             catalog,
             scope: Default::default(),
-            requested: Default::default(),
             db,
             root,
             ui,
@@ -49,10 +48,9 @@ impl Router {
     }
     pub fn add(&self, id: &str, default: bool) -> Result<(), String> {
         let e = self.catalog.resolve(id)?;
-        self.requested.lock().unwrap().remove(id);
         let mut scope = self.scope.lock().unwrap();
         scope.targets.entry(id.into()).or_insert(e.target);
-        if default || scope.default.is_none() {
+        if default {
             scope.default = Some(id.into());
         }
         Ok(())
@@ -62,7 +60,7 @@ impl Router {
         let endpoint = self.catalog.resolve(new)?;
         let mut scope = self.scope.lock().unwrap();
         if !scope.targets.contains_key(old) {
-            return Err("原目标不在此对话中".into());
+            return Err("此对话没有记录该终端".into());
         }
         if self.catalog.resolve(old).is_ok() {
             return Err("原终端仍可用，请直接选择目标".into());
@@ -110,34 +108,16 @@ impl Router {
             }
         }
     }
-    pub fn grant_named(&self, text: &str) {
-        let entries = self.catalog.list();
-        for e in &entries {
-            let label = &e.target.label;
-            if label.len() > 1
-                && text.contains(label)
-                && entries
-                    .iter()
-                    .filter(|other| other.target.label == *label)
-                    .count()
-                    == 1
-            {
-                let _ = self.add(&e.target.session_id, false);
-            }
-        }
-    }
     pub fn resolve(&self, id: Option<&str>) -> Result<Endpoint, String> {
-        let scope = self.scope.lock().unwrap();
+        let mut scope = self.scope.lock().unwrap();
         let id = id
             .or(scope.default.as_deref())
-            .ok_or("请先选择默认终端或显式提供 session_id")?;
-        let target = scope.targets.get(id).ok_or_else(|| {
-            if self.catalog.resolve(id).is_ok() {
-                self.requested.lock().unwrap().insert(id.into());
-            }
-            "目标不在本轮范围，已在界面提出目标选择请求；请等待用户加入后继续，不要重复尝试"
-        })?;
-        let mut endpoint = self.catalog.resolve(id)?;
+            .ok_or("没有默认终端，请用 list_sessions 查找并明确提供 session_id")?
+            .to_owned();
+        // The model chooses a live resource. Never remap an expired reference or
+        // infer authorization from substrings in user text.
+        let mut endpoint = self.catalog.resolve(&id)?;
+        let target = scope.targets.entry(id).or_insert_with(|| endpoint.target.clone());
         endpoint.binding.capabilities.cwd = target.cwd.clone();
         endpoint.target = target.clone();
         Ok(endpoint)
@@ -150,7 +130,7 @@ impl Router {
                 .map(|t| t.label.clone())
                 .unwrap_or_else(|| "多终端任务".into()),
             protocol: target.map(|t| t.protocol.clone()).unwrap_or_default(),
-            text: format!("任务目标：{}", serde_json::to_string(&*scope).unwrap()),
+            text: format!("默认终端与已引用终端（不是可用资源限制）：{}。应用内其他终端可通过 list_sessions 发现并直接使用。", serde_json::to_string(&*scope).unwrap()),
         }
     }
     pub fn policy(&self, e: &Endpoint) -> PermissionMode {
@@ -170,7 +150,7 @@ impl Router {
                 || !cwd.starts_with('/')
                 || cwd.contains('\0')
             {
-                return Err("显式目录仅支持后台命令的绝对路径".into());
+                return Err("显式目录仅支持独立通道命令的绝对路径".into());
             }
             e.target.cwd = Some(cwd.clone());
             e.binding.capabilities.cwd = Some(cwd.clone());
@@ -209,34 +189,30 @@ impl Router {
         })
     }
     pub fn subset(&self, ids: &[String], default: Option<&str>) -> Result<Self, String> {
-        let selected = if ids.is_empty() {
-            self.scope
-                .lock()
-                .unwrap()
-                .targets
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
+        let inherited = self.scope.lock().unwrap().clone();
+        let mut scope = if ids.is_empty() {
+            // Context may mention a disconnected terminal. That does not prevent
+            // discovering or using other resources; resolve validates each actual call.
+            inherited.clone()
         } else {
-            ids.to_vec()
+            Scope::default()
         };
-        let mut scope = Scope::default();
-        for id in &selected {
+        for id in ids {
             let e = self.resolve(Some(id))?;
             scope.targets.insert(id.clone(), e.target);
         }
-        let chosen = default.map(str::to_owned).or_else(|| {
-            if selected.len() == 1 {
-                selected.first().cloned()
-            } else {
-                self.scope.lock().unwrap().default.clone()
-            }
+        let chosen = default.map(str::to_owned).or_else(|| if ids.len() == 1 {
+            ids.first().cloned()
+        } else {
+            inherited.default.clone()
         });
-        if chosen
-            .as_ref()
-            .is_some_and(|id| !scope.targets.contains_key(id))
-        {
-            return Err("子任务默认终端不在目标范围".into());
+        if let Some(id) = default {
+            scope.targets.insert(id.into(), self.resolve(Some(id))?.target);
+        } else if let Some(id) = &chosen
+            && let Some(target) = inherited.targets.get(id) {
+            scope.targets.entry(id.clone()).or_insert_with(|| target.clone());
+        } else if let Some(id) = &chosen {
+            scope.targets.insert(id.clone(), self.resolve(Some(id))?.target);
         }
         scope.default = chosen;
         let mut child = self.clone();
@@ -249,8 +225,9 @@ impl Router {
             Request::List(args) => {
                 let scope = self.scope.lock().unwrap().clone();
                 let entries = self.catalog.list();
-                let rows:Vec<_>=entries.iter().filter(|e|args.query.is_empty()||e.target.label.contains(&args.query)||e.target.protocol.contains(&args.query)).skip(args.offset).take(50).map(|e|serde_json::json!({"session_id":e.target.session_id,"name":e.target.label,"protocol":e.target.protocol,"window":e.window,"connected":e.connected,"cwd":e.target.cwd,"terminal_busy":e.binding.capabilities.terminal_busy,"terminal":e.binding.capabilities.terminal,"background":e.binding.capabilities.background,"in_scope":scope.targets.contains_key(&e.target.session_id),"default":scope.default.as_ref()==Some(&e.target.session_id)})).collect();
-                LocalResult::text(serde_json::json!({"sessions":rows,"offset":args.offset,"next_offset":(rows.len()==50).then_some(args.offset+50)}).to_string())
+                let matching: Vec<_> = entries.iter().filter(|e|args.query.is_empty()||e.target.label.contains(&args.query)||e.target.protocol.contains(&args.query)).collect();
+                let rows:Vec<_>=matching.iter().enumerate().skip(args.offset).take(50).map(|(index,e)|serde_json::json!({"number":index+1,"session_id":e.target.session_id,"name":e.target.label,"protocol":e.target.protocol,"window":e.window,"connected":e.connected,"cwd":e.target.cwd,"terminal_busy":e.binding.capabilities.terminal_busy,"terminal":e.binding.capabilities.terminal,"background":e.binding.capabilities.background,"default":scope.default.as_ref()==Some(&e.target.session_id)})).collect();
+                LocalResult::text(serde_json::json!({"sessions":rows,"sampled_at":super::now(),"offset":args.offset,"next_offset":(args.offset+rows.len()<matching.len()).then_some(args.offset+rows.len()),"note":"number 只对应本次列表。用户说第几个时按对话中对应列表映射 session_id，不能用最新列表位置替换。default 是对话默认终端，不是当前选中标签。terminal_busy=false 仅表示未检测到占用，不保证 shell 空闲。全部已连接终端均可按任务使用，无需加入。"}).to_string())
             }
             Request::Read(args) => {
                 let e = match self.resolve(Some(&args.session_id)) {
@@ -361,9 +338,13 @@ mod tests {
         (root, router, rx)
     }
     #[test]
-    fn named_targets_are_unambiguous_and_default_and_generation_do_not_follow_focus() {
+    fn available_resources_need_no_enrollment_and_default_does_not_follow_them() {
         let (_root, r, _) = fixture();
-        r.grant_named("比较 terminal-1 和 terminal-2");
+        let one = r.catalog.session(1).unwrap().target.session_id;
+        let two = r.catalog.session(2).unwrap().target.session_id;
+        assert!(r.resolve(None).is_err());
+        r.add(&one, true).unwrap();
+        assert_eq!(r.resolve(Some(&two)).unwrap().target.session_id, two);
         let scope = r.scope.lock().unwrap().clone();
         assert_eq!(scope.targets.len(), 2);
         let default = scope.default.unwrap();
@@ -387,7 +368,7 @@ mod tests {
         assert!(r.resolve(Some(&default)).is_err());
     }
     #[tokio::test]
-    async fn approval_cannot_execute_after_target_is_removed() {
+    async fn approval_cannot_execute_after_terminal_is_closed() {
         let (root, r, rx) = fixture();
         let id = r.catalog.session(1).unwrap().target.session_id;
         r.add(&id, true).unwrap();
@@ -408,7 +389,7 @@ mod tests {
         let host = r.host(&mut call, tasks).unwrap();
         let mut run = Box::pin(host.run(call));
         let reply = tokio::select! {_=&mut run=>panic!("approval required"),message=rx.recv()=>match message.unwrap(){Ui::Approval{reply,..}=>reply,_=>panic!("approval")}};
-        r.remove(&id);
+        r.catalog.update(vec![]);
         reply
             .send(Approval::Approve {
                 command: "touch should-not-exist".into(),
@@ -421,15 +402,17 @@ mod tests {
         assert!(!root.path().join("should-not-exist").exists());
     }
     #[test]
-    fn child_scope_cannot_expand_parent_and_memory_stays_targeted() {
+    fn child_inherits_resources_with_an_independent_default() {
         let (_root, r, _) = fixture();
         let one = r.catalog.session(1).unwrap().target.session_id;
         let two = r.catalog.session(2).unwrap().target.session_id;
         r.add(&one, true).unwrap();
-        assert!(r.subset(std::slice::from_ref(&two), None).is_err());
+        let remote_child = r.subset(std::slice::from_ref(&two), None).unwrap();
+        assert_eq!(remote_child.resolve(None).unwrap().target.session_id, two);
         let child = r.subset(std::slice::from_ref(&one), Some(&one)).unwrap();
         assert_eq!(child.resolve(None).unwrap().target.session_id, one);
-        assert!(child.resolve(Some(&two)).is_err());
+        assert_eq!(child.resolve(Some(&two)).unwrap().target.session_id, two);
+        assert_eq!(r.resolve(None).unwrap().target.session_id, one);
     }
     #[tokio::test]
     async fn mixed_permissions_and_ssh_directory_are_resolved_per_call() {
@@ -543,6 +526,20 @@ mod tests {
         assert!(result.inline.contains("cd '/srv/with '"));
         assert!(result.inline.contains("quote' && pwd"));
         assert_eq!(r.resolve(None).unwrap().target.session_id, local);
+    }
+
+    #[test]
+    fn stale_context_does_not_block_a_new_child_or_silently_replace_its_default() {
+        let (_root, r, _) = fixture();
+        let one = r.catalog.session(1).unwrap().target.session_id;
+        let two = r.catalog.session(2).unwrap().target.session_id;
+        r.add(&one, true).unwrap();
+        r.catalog.session(1).unwrap().binding.alive.store(false, Ordering::Release);
+        let child = r.subset(&[], None).unwrap();
+        assert!(child.resolve(None).is_err());
+        assert_eq!(child.resolve(Some(&two)).unwrap().target.session_id, two);
+        assert_eq!(child.scope.lock().unwrap().default.as_deref(), Some(one.as_str()));
+        assert!(r.subset(&[], Some(&one)).is_err(), "explicit stale selection must fail");
     }
 
     #[test]

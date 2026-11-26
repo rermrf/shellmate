@@ -286,7 +286,6 @@ impl ToolHost for Host {
                 biased;
                 () = super::exec::disconnected(&self.alive) => ToolOutcome::Disconnected,
                 out = async {
-                    if source.is_some(){call.target=Target::Background;}
                     call.class = classify(&call.command);
                     let key=approval_key(source.as_ref(),&call.id);
                     let decision = decide(*self.mode.lock().unwrap(), call.class);
@@ -309,9 +308,6 @@ impl ToolHost for Host {
                                 call.target = target;
                                 call.timeout = call.exec_limits.timeout(Some(call.timeout.as_secs()));
                                 call.class = classify(&call.command);
-                                if source.is_some() {
-                                    call.target=Target::Background;
-                                }
                             }
                             Ok(Approval::Deny { reason }) => return ToolOutcome::Denied { reason },
                             Err(_) => return ToolOutcome::Denied { reason: Some("审批已取消".into()) },

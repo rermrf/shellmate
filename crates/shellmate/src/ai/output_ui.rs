@@ -424,7 +424,7 @@ fn source(key: String, output: Option<String>, text: &str, running: bool) -> Sou
     let output = output.or_else(|| view.output_id.map(str::to_owned));
     // This is a structured command's persisted result, never arbitrary log-file contents.
     let preview = if output.is_some()
-        && (text.starts_with("命令已在后台启动") || text.starts_with("命令在 "))
+        && (text.starts_with("命令已在后台启动") || text.starts_with("命令已异步启动") || text.starts_with("命令在 "))
     {
         String::new()
     } else if output.is_none()
@@ -480,7 +480,7 @@ pub(super) fn notice_label(text: &str, step: Option<&shellmate_ai::Step>) -> Str
             }
         );
     }
-    if text.starts_with("后台任务 #")
+    if (text.starts_with("后台任务 #") || text.starts_with("异步任务 #"))
         && let Some((label, _)) = text.split_once(" · 用 read_output")
     {
         return label.into();

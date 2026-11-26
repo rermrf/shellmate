@@ -40,8 +40,8 @@ impl Target {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Terminal => "终端",
-            Self::Background => "后台",
+            Self::Terminal => "终端内",
+            Self::Background => "独立通道",
         }
     }
     pub fn timeout(self, requested: Option<u64>) -> Duration {
@@ -72,61 +72,6 @@ impl Capabilities {
             Target::Terminal => self.terminal,
             Target::Background => self.background,
         }
-    }
-    /// When the user explicitly asks for the terminal or for a separate run, offer only
-    /// that target for this turn, so the model cannot pick the other one.
-    pub fn for_question(mut self, question: &str) -> Self {
-        match explicit_target(question) {
-            Some(Target::Terminal) if self.terminal => self.background = false,
-            Some(Target::Background) if self.background => self.terminal = false,
-            _ => {}
-        }
-        self
-    }
-}
-/// The target a question names explicitly, if any.
-pub fn explicit_target(question: &str) -> Option<Target> {
-    let q: String = question.chars().filter(|c| !c.is_whitespace()).collect();
-    let negated_terminal = [
-        "不要在终端",
-        "别在终端",
-        "不在终端",
-        "不要用终端",
-        "别用终端",
-    ]
-    .iter()
-    .any(|p| q.contains(p));
-    let background = negated_terminal
-        || [
-            "后台",
-            "单独执行",
-            "单独运行",
-            "独立执行",
-            "独立运行",
-            "独立通道",
-            "单独跑",
-        ]
-        .iter()
-        .any(|p| q.contains(p));
-    let terminal = !negated_terminal
-        && [
-            "在终端",
-            "当前终端",
-            "终端里",
-            "终端中",
-            "终端上",
-            "我的终端",
-            "这个终端",
-            "终端执行",
-            "终端运行",
-            "终端跑",
-        ]
-        .iter()
-        .any(|p| q.contains(p));
-    match (terminal, background) {
-        (true, false) => Some(Target::Terminal),
-        (false, true) => Some(Target::Background),
-        _ => None,
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,18 +488,13 @@ pub fn run<'a>(
     capabilities.sessions = host.sessions_enabled();
     if capabilities.sessions {
         capabilities.background=true;
-        capabilities.terminal=conversation.child.is_none();
+        capabilities.terminal=true;
     }
     let user = conversation
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
         .clone();
     let base_capabilities = capabilities.clone();
-    let capabilities = if conversation.child.is_some() {
-        capabilities
-    } else {
-        capabilities.for_question(&user.question)
-    };
     conversation.prepare(&capabilities)?;
     let state = Resume {
         native: NativeMessages::new(),
@@ -1823,7 +1763,7 @@ fn parse_call(
             )
         })?;
     if let Some(cwd)=&a.cwd && (!capabilities.sessions || target!=Target::Background || !cwd.starts_with('/') || cwd.contains('\0') || cwd.len()>8192) {
-        return Err("cwd 仅用于多终端后台命令，必须为绝对目录".into());
+        return Err("cwd 仅用于多终端独立通道命令，必须为绝对目录".into());
     }
     let timeout = a
         .timeout_secs

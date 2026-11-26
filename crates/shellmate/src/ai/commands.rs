@@ -47,7 +47,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "tasks",
         args_hint: "",
-        description: "查看后台任务，停止运行中的命令",
+        description: "查看任务，停止运行中的命令",
         kind: Kind::Local,
         while_busy: WhileBusy::Run,
     },

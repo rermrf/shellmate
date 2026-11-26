@@ -387,7 +387,7 @@ mod tests {
         let rows = tasks();
         assert_eq!(rows.len(), 3);
         assert!(rows.windows(2).all(|r| r[0].started < r[1].started));
-        assert_eq!(rows[0].target_label(), "后台");
+        assert_eq!(rows[0].target_label(), "独立通道");
         assert_eq!(rows[1].target_label(), "子任务");
         assert_eq!(rows[1].bar_id(), "1");
     }

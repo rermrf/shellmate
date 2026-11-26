@@ -102,6 +102,7 @@ struct Inner {
     outcomes: Mutex<VecDeque<ToolOutcome>>,
     finished: AtomicUsize,
     mode: PermissionMode,
+    sessions: bool,
     queue_compact: AtomicBool,
     compact_after_run: bool,
     wait: bool,
@@ -117,6 +118,7 @@ impl Inner {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             finished: AtomicUsize::new(0),
             mode: PermissionMode::Ask,
+            sessions: false,
             queue_compact: AtomicBool::new(false),
             compact_after_run: false,
             local_text: None,
@@ -127,6 +129,7 @@ impl Inner {
     }
 }
 impl ToolHost for Inner {
+    fn sessions_enabled(&self) -> bool { self.sessions }
     fn subagents(&self) -> bool {
         true
     } // ChildHost must mask even a supporting inner host.
@@ -526,7 +529,7 @@ async fn all_child_commands_reach_the_common_host_policy_in_every_mode() {
     assert_eq!(inner.seen.lock().unwrap()[0].0.class, Class::RedLine);
 }
 #[tokio::test]
-async fn general_passes_source_denial_and_background_only() {
+async fn legacy_host_passes_source_denial_and_background_capability() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([
             response(
@@ -658,7 +661,7 @@ async fn memory_writes_are_inherited_while_outputs_and_execution_targets_remain_
             class: Class::Other,
         })
         .await;
-    assert_eq!(inner.seen.lock().unwrap()[0].0.target, Target::Background);
+    assert_eq!(inner.seen.lock().unwrap()[0].0.target, Target::Terminal);
     for id in ["child-output", "child-task"] {
         assert!(
             !child
@@ -1414,5 +1417,37 @@ async fn unoffered_agent_calls_and_disabled_child_memory_never_execute() {
                 .to_string()
                 .contains("自动记忆已关闭")
         );
+    }
+}
+
+#[tokio::test]
+async fn child_can_choose_both_channels_with_async_task_on_both_providers() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(a, &[
+                ("visible", "run_command", json!({"command":"ls","session_id":"first","target":"terminal","run_in_background":true})),
+                ("separate", "run_command", json!({"command":"ls","session_id":"second","target":"background","run_in_background":false})),
+            ], "", false),
+            response(a, &[], "done", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let mut inner = Inner::new([]);
+        inner.sessions = true;
+        let mut delegated = request(SubagentKind::General);
+        delegated.background = true;
+        delegated.prompt = "在第1个终端执行 ls 让我切过去看，再通过独立通道检查第2个目录".into();
+        let out = subagent::run(&client, delegated, context(), snapshot(), &inner, fast_limits(), |_| {}).await;
+        assert_eq!(out.status, SubagentStatus::Completed);
+        let calls = inner.seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].0.target, calls[0].0.run_in_background), (Target::Terminal, true));
+        assert_eq!((calls[1].0.target, calls[1].0.run_in_background), (Target::Background, false));
+        assert_eq!(calls[0].0.session_id.as_deref(), Some("first"));
+        assert!(calls.iter().all(|(_, source)| source.is_some()));
+        let requests = bodies(&http);
+        assert_eq!(schema(tool(&requests[0], a, "run_command").unwrap(), a)["properties"]["target"]["enum"], json!(["terminal", "background"]));
+        let steps = out.transcript.entries().iter().filter_map(|entry| if let Entry::Step(s)=entry {Some(s)}else{None}).filter(|s| s.call.name == "run_command").collect::<Vec<_>>();
+        assert_eq!(steps[0].display.as_ref().unwrap().target, Target::Terminal);
+        assert_eq!(steps[1].display.as_ref().unwrap().target, Target::Background);
     }
 }

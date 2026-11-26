@@ -235,6 +235,154 @@ struct PtyHarness {
     _temp: Temp,
     pump: tokio::task::JoinHandle<()>,
 }
+
+// Uses actual shells and the production router/host. Provider responses are scripted:
+// this tests execution destinations, not a model's ability to interpret natural language.
+#[tokio::test]
+async fn discovered_resources_route_visible_and_separate_commands_for_main_and_child() {
+    use crate::ai::{session_catalog::Catalog, target_router::Router, tasks::Tasks};
+    use futures::StreamExt;
+    use rig_core::test_utils::{MockHttpResponse, SequencedHttpClient};
+    use serde_json::{Value, json};
+    use shellmate_ai::{
+        AgentEvent, Capabilities, Conversation, Entry, PermissionMode, RigClient, ToolHost,
+        UserTurn, agent, subagent::ChildHost,
+    };
+
+    fn response(calls: Vec<(&str, &str, Value)>) -> MockHttpResponse {
+        let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
+        let tools = calls.into_iter().enumerate().map(|(index, (id, name, args))| {
+            json!({"index":index,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}})
+        }).collect::<Vec<_>>();
+        let chunk = |delta: Value, finish: Value| json!({"id":"fixture","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        MockHttpResponse::success_typed(format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chunk(if tools.is_empty() { json!({"role":"assistant","content":"已完成"}) }
+                else { json!({"role":"assistant","content":"","tool_calls":tools}) }, Value::Null),
+            chunk(json!({}), json!(finish)),
+        ), "text/event-stream")
+    }
+
+    let terminals = [PtyHarness::new().await, PtyHarness::new().await, PtyHarness::new().await];
+    let (ui, events) = async_channel::unbounded();
+    let catalog = Catalog::new(ui.clone());
+    let labels = ["mqtt_device_simulator — zsh", "shellmate — zsh", "shellmate-agent — zsh"];
+    catalog.update(terminals.iter().enumerate().map(|(index, h)| {
+        std::fs::write(h._temp.0.join(format!("marker-{}", index + 1)), format!("contents-{}", index + 1)).unwrap();
+        let mut binding = h.executor.binding.clone();
+        binding.session = index + 1;
+        binding.capabilities.background = true;
+        binding.capabilities.cwd = Some(h._temp.0.to_string_lossy().into_owned());
+        (binding, labels[index].into(), "本机终端".into(), None, "窗口 1".into())
+    }).collect());
+    let root = Temp::new();
+    let db = shellmate_store::SharedStore::new(shellmate_store::HostStore::open_in_memory().unwrap());
+    db.borrow_mut().set_ai_permission("local", PermissionMode::Full).unwrap();
+    let router = Router::new(catalog, db, root.0.clone(), ui.clone());
+    let ids = (1..=3).map(|n| router.catalog.session(n).unwrap().target.session_id).collect::<Vec<_>>();
+    router.add(&ids[2], true).unwrap();
+    let tasks = Tasks::new(root.0.clone(), "resource-routing".into());
+    let host = Host {
+        compaction: Default::default(), mode: Arc::new(Mutex::new(PermissionMode::Full)),
+        ui: ui.clone(), alive: Arc::new(AtomicBool::new(true)), resolved: Default::default(),
+        executor: Box::new(AppExecutor {
+            lease: None, slots: None, router: Some(router.clone()), subagents: None, memory: None,
+            tasks: tasks.clone(), binding: terminals[2].executor.binding.clone(), ui,
+        }),
+    };
+    let senders = terminals.iter().map(|h| h.executor.ui.clone()).collect::<Vec<_>>();
+    let bridge = tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            match event {
+                Ui::TerminalStart { session, .. } | Ui::TerminalFinish { session, .. } => {
+                    senders[session - 1].send(event).await.unwrap();
+                }
+                Ui::Running { ready, .. } => { ready.send(()).ok(); }
+                Ui::Context { reply } => { reply.send(None).ok(); }
+                Ui::Approval { .. } => panic!("no enrollment or command approval expected in full mode"),
+                Ui::Finished(_) => {},
+                _ => panic!("unexpected bridge event"),
+            }
+        }
+    });
+    let http = SequencedHttpClient::new([
+        response(vec![("list", "list_sessions", json!({}))]), response(vec![]),
+        response(vec![
+            ("first", "run_command", json!({"command":"ls","session_id":ids[0],"target":"terminal"})),
+            ("second", "run_command", json!({"command":"ls","session_id":ids[1],"target":"terminal"})),
+        ]), response(vec![]),
+        response(vec![
+            ("read-first", "run_command", json!({"command":"cat marker-1","session_id":ids[0],"target":"background"})),
+            ("read-second", "run_command", json!({"command":"cat marker-2","session_id":ids[1],"target":"background"})),
+        ]), response(vec![]),
+    ]);
+    let config = shellmate_ai::Config {
+        model: "fixture".into(), api_key: shellmate_ai::ApiKey::new("fixture"),
+        provider: Default::default(), reasoning: Default::default(),
+        max_output_tokens: Default::default(), context_window: Default::default(),
+        autocompact_window: Default::default(), timeouts: Default::default(),
+    };
+    let client = RigClient::with_http(&config, http).unwrap();
+    let mut log = Conversation::default();
+    for (turn, question) in [
+        "我现在打开了哪些终端",
+        "在终端 mqtt_device_simulator 和 shellmate，也就是上面第1和第2个中执行 ls，我可以切过去看",
+        "通过独立通道比较上面第1和第2个目录中的文件内容",
+    ].into_iter().enumerate() {
+        log.push_user(UserTurn::new(question, router.context()));
+        let events = tokio::time::timeout(Duration::from_secs(10),
+            agent::run(&client, &mut log, Capabilities::default(), &host, Default::default()).unwrap().collect::<Vec<_>>()
+        ).await.unwrap();
+        for event in events {
+            if let AgentEvent::Error(error) = event { panic!("{error}"); }
+        }
+        if turn == 0 {
+            assert_eq!(router.scope.lock().unwrap().targets.len(), 1, "listing is discovery only");
+            let result = log.entries().iter().find_map(|e| match e {
+                Entry::Step(s) if s.call.name == "list_sessions" => Some(&s.result.inline), _ => None,
+            }).unwrap();
+            let value: Value = serde_json::from_str(result).unwrap();
+            for (index, row) in value["sessions"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(row["number"], index + 1);
+                assert_eq!(row["session_id"], ids[index]);
+                assert!(row.get("in_scope").is_none());
+            }
+        }
+    }
+    for (index, h) in terminals.iter().enumerate() {
+        h.settled().await;
+        assert_eq!(h.typed.lock().unwrap().len(), usize::from(index < 2));
+        let screen = String::from_utf8_lossy(&h.output.lock().unwrap()).into_owned();
+        assert_eq!(screen.contains(&format!("marker-{}", index + 1)), index < 2);
+        assert!(!screen.contains("contents-"), "independent reads must not write to terminal pages");
+    }
+    let reads = log.entries().iter().filter_map(|e| match e {
+        Entry::Step(s) if s.call.id.starts_with("read-") => Some(s), _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2);
+    for (index, s) in reads.iter().enumerate() {
+        assert!(!s.result.is_error);
+        assert!(s.result.inline.contains(&format!("contents-{}", index + 1)));
+        assert_eq!(s.display.as_ref().unwrap().target, Target::Background);
+    }
+
+    let child = ChildHost::new(&host, shellmate_ai::SubagentRef {
+        id: "child".into(), description: "visible child command".into(), kind: shellmate_ai::SubagentKind::General,
+    }, Default::default());
+    let mut command = call("sleep 0.15; printf child-done", Target::Terminal, Duration::from_secs(3));
+    command.session_id = Some(ids[1].clone());
+    command.run_in_background = true;
+    assert!(completed(child.run(command).await).task_id.is_some());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while tasks.has_running() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    terminals[1].settled().await;
+    assert!(String::from_utf8_lossy(&terminals[1].output.lock().unwrap()).contains("child-done"));
+    assert_eq!(terminals[1].typed.lock().unwrap().len(), 2);
+    assert!(terminals[2].typed.lock().unwrap().is_empty());
+    assert_eq!(router.resolve(None).unwrap().target.session_id, ids[2]);
+    bridge.abort();
+}
 impl Drop for PtyHarness {
     fn drop(&mut self) {
         self.pty.lock().unwrap().close();
@@ -675,7 +823,7 @@ async fn terminal_missing_marker_stays_busy_until_explicit_stop() {
             ))
             .await,
     );
-    assert!(out.message.as_ref().unwrap().contains("已转到后台"));
+    assert!(out.message.as_ref().unwrap().contains("已结束等待"));
     assert!(h.scan.lock().unwrap().is_some());
     let read = h
         .executor
@@ -800,7 +948,7 @@ async fn local_background_returns_immediately_read_running_then_notice_and_retai
     let out = completed(run_local(&tasks, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
     assert!(now.elapsed() < Duration::from_secs(1));
     let message = out.message.unwrap();
-    assert!(message.contains("后台启动"));
+    assert!(message.contains("异步启动"));
     assert!(message.contains("其中的 cd 不会影响后续命令"));
     assert!(!message.contains("命令仍在终端中运行"));
     let id = out.task_id.unwrap();
@@ -839,7 +987,7 @@ async fn local_background_returns_immediately_read_running_then_notice_and_retai
     }
     assert_eq!(
         tasks.take_notices(),
-        ["后台任务 #1 已结束 · 退出码 0 · 用 read_output 查看输出"]
+        ["异步任务 #1 已结束 · 退出码 0 · 用 read_output 查看输出"]
     );
     assert!(tasks.take_notices().is_empty());
     assert!(tasks.state().0.is_empty());
@@ -914,7 +1062,7 @@ async fn terminal_timeout_keeps_capture_busy_stop_task_interrupts_and_shell_reco
             ))
             .await,
     );
-    assert!(out.message.unwrap().contains("已转到后台"));
+    assert!(out.message.unwrap().contains("已结束等待"));
     assert!(h.scan.lock().unwrap().is_some());
     let read = h
         .executor
@@ -984,9 +1132,9 @@ async fn terminal_directory_change_persists_after_timeout_or_background() {
         let out = completed(h.executor.execute(c).await);
         let message = out.message.unwrap();
         assert!(message.contains(if run_in_background {
-            "后台启动"
+            "异步启动"
         } else {
-            "已转到后台"
+            "已结束等待"
         }));
         assert!(message.contains("命令仍在终端中运行"));
         assert!(message.contains("结束后终端状态（包括目录变化）会保留"));

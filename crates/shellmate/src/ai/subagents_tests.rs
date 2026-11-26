@@ -166,7 +166,7 @@ async fn background_returns_immediately_survives_main_stop_limit_and_stop_task()
     assert!(
         result
             .inline
-            .starts_with("子任务已在后台启动：agent-1（inspect）")
+            .starts_with("子任务已异步启动：agent-1（inspect）")
     );
     assert_eq!(result.subagent.unwrap().status, SubagentStatus::Running);
     let (_, reply) = approval(&ui).await;
@@ -427,11 +427,11 @@ async fn approval_edits_follow_the_parent_policy_for_current_and_legacy_children
         else {
             panic!("running")
         };
-        assert_eq!(call.target, Target::Background);
+        assert_eq!(call.target, Target::Terminal);
         assert_eq!(call.class, Class::Other);
         ready.send(()).unwrap();
         assert!(matches!(run.await, ToolOutcome::Completed(_)));
-        assert_eq!(calls.lock().unwrap()[0].target, Target::Background);
+        assert_eq!(calls.lock().unwrap()[0].target, Target::Terminal);
     }
 }
 #[tokio::test]
@@ -981,7 +981,7 @@ async fn foreground_child_detaches_without_cancelling_its_pending_approval() {
     let result = tokio::time::timeout(Duration::from_secs(1), run)
         .await
         .unwrap();
-    assert!(result.inline.contains("后台启动"));
+    assert!(result.inline.contains("异步启动"));
     assert!(!reply.is_closed());
     assert!(service.tasks.has_running());
     assert!(service.tasks.agent_views()[0].background);

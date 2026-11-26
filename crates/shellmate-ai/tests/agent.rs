@@ -848,7 +848,7 @@ async fn lenient_arguments_on_both_wires() {
                     &b[0]["tools"][0]["function"]["parameters"]
                 };
                 assert!(
-                    !schema["required"]
+                    schema["required"]
                         .as_array()
                         .unwrap()
                         .contains(&json!("target"))
@@ -1407,33 +1407,6 @@ async fn identical_consecutive_command_is_rerun_on_both_wires() {
         assert_eq!(bodies.len(), 3);
         assert!(tool_result(&bodies[2], a, "call-2").contains("web again"));
     }
-}
-#[test]
-fn explicit_target_words_narrow_the_offered_targets() {
-    use shellmate_ai::agent::{Target, explicit_target};
-    for (q, want) in [
-        ("你直接在当前终端运行命令看看", Some(Target::Terminal)),
-        ("在终端里执行 ls -la", Some(Target::Terminal)),
-        ("帮我在这个终端跑一下 top", Some(Target::Terminal)),
-        ("后台跑一下 df -h", Some(Target::Background)),
-        ("单独执行，不要在终端里", Some(Target::Background)),
-        ("别在终端 跑", Some(Target::Background)),
-        ("看看 docker 运行了哪些服务", None),
-    ] {
-        assert_eq!(explicit_target(q), want, "{q}");
-    }
-    let both = capabilities();
-    let t = both.clone().for_question("在当前终端运行");
-    assert!(t.terminal && !t.background);
-    let b = both.clone().for_question("后台执行");
-    assert!(!b.terminal && b.background);
-    assert_eq!(both.clone().for_question("看看磁盘"), both);
-    let only_bg = Capabilities {
-        terminal: false,
-        ..both
-    };
-    // Asking for an unavailable target leaves what exists.
-    assert!(only_bg.clone().for_question("在终端里执行").background);
 }
 
 fn fast_limits() -> Limits {

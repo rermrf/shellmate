@@ -98,7 +98,7 @@ pub fn summary(call: &LoggedCall) -> String {
         return "读取已保存的执行输出".into();
     }
     if call.name == "stop_task" {
-        return "停止后台任务".into();
+        return "停止异步任务".into();
     }
     let field = match call.name.as_str() {
         "run_command" => "command",

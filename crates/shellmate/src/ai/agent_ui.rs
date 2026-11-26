@@ -420,7 +420,10 @@ impl Drawer {
             let scope=scope.clone();let call_id=step.call.id.clone();
             card=card.child(step_actions().child(step_action(SharedString::from(format!("{display_key}:stop")),"停止任务",cx).on_click(cx.listener(move|s,_,_,cx|{if let Some(tasks)=s.tool_tasks(&scope)&&let Some(task)=s.tool_task(&scope,&call_id,None){tasks.stop(&task.id);}cx.notify();}))));
         } else {
-            if step.source.is_none() && self.capabilities.terminal && self.capabilities.background {
+            let caps = step.call.session_id.as_deref().and_then(|id| {
+                self.runtime.as_ref()?.router.catalog.resolve(id).ok().map(|e| e.binding.capabilities)
+            }).unwrap_or_else(|| self.capabilities.clone());
+            if caps.terminal && caps.background {
                 let mut row = div().flex().gap(px(4.));
                 for target in [Target::Terminal, Target::Background] {
                     row = row.child(

@@ -59,9 +59,6 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn queue_message(&mut self, text: String, w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(runtime) = &self.runtime {
-            runtime.router.grant_named(&text);
-        }
         if let Some(id) = self.state.editing_message.clone() {
             if self.state.control.edit(&id, Some(text)).is_some() {
                 self.state.editing_message = None;
@@ -591,12 +588,12 @@ impl Drawer {
                 if self.state.model.busy || self.state.pending {
                     phase.label()
                 } else {
-                    "等待后台任务"
+                    "等待异步任务"
                 },
             ));
             if matches!(phase, Phase::Executing | Phase::Waiting(_)) {
                 actions = actions.child(
-                    agent_ui::step_action("input-detach", "转后台", cx).on_click(cx.listener(
+                    agent_ui::step_action("input-detach", "结束等待", cx).on_click(cx.listener(
                         |s, _, _, cx| {
                             if let Some(tasks) = &s.tasks {
                                 tasks.promote_foreground();

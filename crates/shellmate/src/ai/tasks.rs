@@ -269,7 +269,7 @@ impl Tasks {
             tokio::select! {biased;
                 ()=self.0.control.urgent()=>{
                     self.0.released_waits.lock().unwrap().extend(selected.iter().filter(|t| t.status==Status::Running).map(|t|t.id.clone()));
-                    return LocalResult::text("已结束等待，尚未完成的任务继续在后台运行");
+                    return LocalResult::text("已结束等待，尚未完成的任务继续在原执行通道运行");
                 },
                 event=changed.changed()=>if event.is_err(){return LocalResult::error("会话已关闭");},
             }
@@ -759,11 +759,11 @@ fn background(call: &ToolCall, oid: &str, number: u64, timeout: bool) -> ToolOut
     out.successful = true;
     let mut text = if timeout {
         format!(
-            "命令在 {} 秒内未完成，已转到后台继续运行 · 任务 #{number} · 输出 id {oid}",
+            "命令在 {} 秒内未完成，已结束等待，命令在原通道继续运行 · 任务 #{number} · 输出 id {oid}",
             call.timeout.as_secs()
         )
     } else {
-        format!("命令已在后台启动 · 任务 #{number} · 输出 id {oid}")
+        format!("命令已异步启动 · 任务 #{number} · 输出 id {oid}")
     };
     if call.target == Target::Terminal {
         text.push_str(
@@ -793,7 +793,7 @@ fn notice(info: &TaskInfo) -> String {
         _ => "未知".into(),
     };
     format!(
-        "后台任务 #{} 已结束 · 退出码 {code} · 用 read_output 查看输出",
+        "异步任务 #{} 已结束 · 退出码 {code} · 用 read_output 查看输出",
         info.id
     )
 }

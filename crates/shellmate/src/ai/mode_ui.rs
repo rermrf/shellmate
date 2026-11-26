@@ -9,26 +9,21 @@ use shellmate_ai::PermissionMode;
 impl Drawer {
     pub(super) fn permission_chip(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = cx.palette().clone();
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|r| r.router.scope.lock().unwrap().targets.len() > 1)
-        {
-            return div()
-                .text_size(px(11.5))
-                .text_color(p.tx2)
-                .child("按终端权限")
-                .into_any_element();
-        }
+        let multiple = self.runtime.as_ref().map(|r| r.router.catalog.list().len() > 1)
+            .unwrap_or_else(|| crate::workspace::hub::Hub::ai_services(cx).0.list().len() > 1);
         if self.runtime.as_ref().is_some_and(|r|r.router.scope.lock().unwrap().default.is_none()) {
             return div().text_size(px(11.)).text_color(p.tx2).child("命令需指定终端").into_any_element();
         }
-        if !self.capabilities.available() {
+        if !self.capabilities.terminal && !self.capabilities.background {
             return div()
                 .text_size(px(11.))
                 .line_height(px(17.))
                 .text_color(p.tx2)
-                .child("此会话不支持 AI 执行命令，仅提供建议")
+                .child(if self.capabilities.sessions {
+                    "默认终端不可用，可指定其他终端"
+                } else {
+                    "此会话不支持 AI 执行命令，仅提供建议"
+                })
                 .into_any_element();
         }
         let current = *self.mode.lock().unwrap();
@@ -58,7 +53,7 @@ impl Drawer {
                         .cursor_pointer()
                         .hover(|d| d.bg(if full { p.err.opacity(0.2) } else { p.card3 }))
                         .child(crate::icons::AppIcon::Shield.icon())
-                        .child(current.label())
+                        .child(if multiple {format!("默认：{}", current.label())} else {current.label().into()})
                         .child("▾")
                         .on_click(cx.listener(|s, _, w, cx| {
                             mode_popover::toggle(

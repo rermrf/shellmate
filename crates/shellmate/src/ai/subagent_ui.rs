@@ -59,7 +59,7 @@ impl Drawer {
                 "{} 步{} · {}",
                 view.steps,
                 if view.background {
-                    " · 后台执行"
+                    " · 异步任务"
                 } else {
                     ""
                 },

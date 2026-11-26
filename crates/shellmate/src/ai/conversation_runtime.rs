@@ -218,7 +218,6 @@ impl Runtime {
         d.model.busy || d.paused || self.tasks.has_running() || !d.approvals.is_empty()
     }
     pub fn submit(&self, text: String, context: ContextSnapshot) {
-        self.router.grant_named(&text);
         self.control.enqueue(
             shellmate_core::HostId::generate().to_string(),
             text,
@@ -482,10 +481,9 @@ impl Runtime {
                     capabilities: Default::default(),
                 });
             let scope = self.router.scope.lock().unwrap().clone();
-            let has_targets = !scope.targets.is_empty();
             let caps = shellmate_ai::Capabilities {
-                terminal: has_targets,
-                background: has_targets,
+                terminal: true,
+                background: true,
                 sessions: true,
                 web: self.tasks.web_enabled(),
                 cwd: binding.capabilities.cwd.clone(),
@@ -509,7 +507,7 @@ impl Runtime {
                     .unwrap_or("无终端"),
                 state.limits.auto_memory,
             );
-            snapshot.instructions.push_str(&format!("\n本轮终端范围：{}。多目标操作每次明确 session_id；不使用当前标签焦点作为回退。主机记忆使用 memory.session_id 指定来源，跨主机内容不要混淆。",serde_json::to_string(&scope).unwrap()));
+            snapshot.instructions.push_str(&format!("\n默认终端与已引用终端：{}。这是上下文记录，不是可用资源白名单；所有打开的终端可经 list_sessions 发现并直接使用，不要求用户加入或匹配完整名称。理解用户的简称、目录和列表序号，再把对应 session_id 传给每次调用；不使用当前标签焦点作为回退。主机记忆使用 memory.session_id 指定来源，跨主机内容不要混淆。",serde_json::to_string(&scope).unwrap()));
             let cancellation = Default::default();
             let service = Arc::new(Service {
                 tasks: self.tasks.clone(),

@@ -67,7 +67,7 @@ impl Ticket {
     pub fn start_result(&self) -> LocalResult {
         LocalResult {
             inline: format!(
-                "子任务已在后台启动：{}（{}）",
+                "子任务已异步启动：{}（{}）",
                 self.initial.id, self.initial.description
             ),
             subagent: Some(Box::new(self.initial.display())),

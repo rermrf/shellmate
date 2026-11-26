@@ -256,9 +256,9 @@ impl Drawer {
             }
             let target = display.map(|d| d.target.label()).unwrap_or_else(|| {
                 if call.args_json["target"] == "terminal" {
-                    "终端"
+                    "终端内"
                 } else {
-                    "后台"
+                    "独立通道"
                 }
             });
             detail = format!("{target}执行");
@@ -299,6 +299,11 @@ impl Drawer {
                     }
                 }
             }
+        }
+        if call.name == "run_command" && (task.as_ref().is_some_and(|t| t.background)
+            || display.is_some_and(|d| d.status == StepStatus::Background)
+            || call.args_json["run_in_background"] == true) {
+            detail.push_str(" · 异步任务");
         }
         let web = result
             .filter(|r| !r.is_error)

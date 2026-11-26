@@ -14,7 +14,7 @@ pub(super) fn refresh_catalog(cx: &App) {
                         s.display_title(cx).to_string(),
                         s.host().map_or("本机终端", |h| h.protocol.label()).into(),
                         s.host().map(|h| h.id.to_string()),
-                        format!("窗口 {:?}", window.handle.window_id()),
+                        format!("窗口 {}", window.number),
                     ));
                 }
             }
@@ -296,7 +296,7 @@ impl Workspace {
         )
     }
     pub(crate) fn sync_ai_context(&mut self, cx: &mut Context<Self>) {
-        let window = format!("窗口 {:?}", self.handle.window_id());
+        let window = Hub::entry(self.handle, cx).map(|e| format!("窗口 {}", e.number)).unwrap_or_else(|| "当前窗口".into());
         let entries = self
             .sessions
             .iter()

@@ -98,38 +98,39 @@ async fn both_provider_wires_keep_targets_and_continue_after_one_terminal_discon
 }
 
 #[tokio::test]
-async fn explicit_background_request_remains_background_only_with_multiple_sessions() {
-    let http = SequencedHttpClient::new([response(false, &[], "done", false)]);
-    let client = RigClient::with_http(&config(false), http.clone()).unwrap();
-    let host = Sessions {
-        inner: Host::new([]),
-        requests: Default::default(),
-        slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-    };
-    let mut log = Conversation::default();
-    log.push_user(UserTurn::new("请在后台执行检查", Default::default()));
-    let mut stream = agent::run(
-        &client,
-        &mut log,
-        Capabilities::default(),
-        &host,
-        fast_limits(),
-    )
-    .unwrap();
-    while let Some(e) = stream.next().await {
-        if let AgentEvent::Error(e) = e {
-            panic!("{e}");
-        }
+async fn channels_are_chosen_per_call_independently_of_task_waiting_on_both_wires() {
+    for a in [false, true] {
+        let calls = [
+            ("visible-wait", "run_command", json!({"command":"ls","session_id":"first","target":"terminal","run_in_background":false})),
+            ("visible-async", "run_command", json!({"command":"make test","session_id":"second","target":"terminal","run_in_background":true})),
+            ("separate-wait", "run_command", json!({"command":"ls","session_id":"first","target":"background","run_in_background":false})),
+            ("separate-async", "run_command", json!({"command":"make check","session_id":"second","target":"background","run_in_background":true})),
+        ];
+        let http = SequencedHttpClient::new([
+            response(a, &calls, "", false), response(a, &[], "done", false)
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Sessions {
+            inner: Host::new((0..4).map(|_| completed("result"))), requests: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let mut log = Conversation::default();
+        log.push_user(UserTurn::new("在第1和第2个终端执行 ls，让后台任务继续，然后通过独立通道检查文件", Default::default()));
+        let events = agent::run(&client, &mut log, Capabilities::default(), &host, fast_limits()).unwrap().collect::<Vec<_>>().await;
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        let seen = host.inner.calls.lock().unwrap();
+        assert_eq!(seen.iter().map(|c| (c.target, c.run_in_background)).collect::<Vec<_>>(), [
+            (Target::Terminal, false), (Target::Terminal, true),
+            (Target::Background, false), (Target::Background, true),
+        ]);
+        let requests = bodies(&http);
+        let tools = &requests[0]["tools"];
+        let command = tools.as_array().unwrap().iter().map(|t| if a {t} else {&t["function"]}).find(|t| t["name"] == "run_command").unwrap();
+        let schema = &command[if a {"input_schema"} else {"parameters"}];
+        assert_eq!(schema["properties"]["target"]["enum"], json!(["terminal", "background"]));
+        assert_eq!(schema["required"], json!(["command", "target"]));
+        let system = requests[0].to_string();
+        assert!(system.contains("无需加入操作范围"));
+        assert!(system.contains("序号对应对话中用户指向的那次列表"));
     }
-    let request = bodies(&http);
-    let tool = request[0]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["function"]["name"] == "run_command")
-        .unwrap();
-    assert_eq!(
-        tool["function"]["parameters"]["properties"]["target"]["enum"],
-        json!(["background"])
-    );
 }

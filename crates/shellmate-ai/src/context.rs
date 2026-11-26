@@ -511,13 +511,6 @@ impl Conversation {
         caps: &Capabilities,
         limits: crate::agent::ExecLimits,
     ) -> Result<ContextBreakdown, AiError> {
-        let narrowed = if self.child.is_some() {
-            caps.clone()
-        } else {
-            caps.clone()
-                .for_question(&self.latest_user().ok_or(AiError::InvalidConfig)?.question)
-        };
-        let caps = &narrowed;
         let mut request = self.prepare(caps)?;
         if request
             .chat_history

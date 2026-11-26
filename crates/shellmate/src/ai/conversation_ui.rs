@@ -1,5 +1,6 @@
 use super::*;
 use shellmate_ai::Config;
+use std::collections::BTreeSet;
 impl Drawer {
     pub(super) fn session_result_content(
         &self,
@@ -17,10 +18,11 @@ impl Drawer {
             .text_size(px(12.))
             .whitespace_normal();
         if let Some(rows) = value["sessions"].as_array() {
-            for row in rows {
+            for (index, row) in rows.iter().enumerate() {
                 body = body.child(div().py(px(4.)).border_b_1().border_color(p.line).child(
                     format!(
-                        "{} · {} · {}\n{}",
+                        "{}. {} · {} · {}{}\n{}",
+                        row["number"].as_u64().unwrap_or(index as u64 + 1),
                         row["name"].as_str().unwrap_or("终端"),
                         row["protocol"].as_str().unwrap_or_default(),
                         if row["connected"] == true {
@@ -28,6 +30,7 @@ impl Drawer {
                         } else {
                             "已断开"
                         },
+                        if row["default"] == true { " · 对话默认" } else { "" },
                         row["cwd"].as_str().unwrap_or("目录未知")
                     ),
                 ));
@@ -223,7 +226,6 @@ impl Drawer {
     }
     pub(crate) fn reuse_draft(&mut self) {
         self.context_bound = false;
-        self.selected_targets.clear();
         self.composer_targets.clear();
         self.next_context = None;
     }
@@ -321,19 +323,6 @@ impl Drawer {
             {
                 let _ = router.add(&e.target.session_id, true);
             }
-            for id in &self.selected_targets {
-                let _ = router.add(id, router.resolve(None).is_err());
-            }
-            if !self.state.readonly
-                && let Some(text) = self
-                    .state
-                    .model
-                    .conversation
-                    .latest_user()
-                    .map(|u| u.question.as_str())
-            {
-                router.grant_named(text);
-            }
             let id = self.state.id.clone();
             let created = self.state.created;
             let log = self.state.model.conversation.clone();
@@ -371,17 +360,6 @@ impl Drawer {
             self.tasks = None;
             self.state.reset_conversation();
             return;
-        }
-        let requested = runtime.router.requested.lock().unwrap().clone();
-        if requested
-            .iter()
-            .any(|id| !self.target_requests_seen.contains(id))
-        {
-            self.target_requests_seen.extend(requested);
-            self.target_picker = true;
-            self.chooser = false;
-            self.state.follow_bottom = false;
-            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
         let snapshot = runtime.snapshot();
         if snapshot.revision == self.runtime_revision && !runtime.active() {
@@ -475,15 +453,8 @@ impl Drawer {
             .iter()
             .filter(|r| r.snapshot().approvals.values().any(|a| a.reply.is_some()))
             .count();
-        let count = self
-            .runtime
-            .as_ref()
-            .map(|r| r.router.scope.lock().unwrap().targets.len())
-            .unwrap_or(
-                self.selected_targets
-                    .len()
-                    .max(usize::from(self.session.is_some())),
-            );
+        let count = self.runtime.as_ref().map(|r| r.router.catalog.list().len())
+            .unwrap_or_else(|| crate::workspace::hub::Hub::ai_services(cx).0.list().len());
         let mut row = div()
             .flex()
             .flex_wrap()
@@ -512,7 +483,7 @@ impl Drawer {
             .child(
                 agent_ui::step_action(
                     "ai-targets",
-                    SharedString::from(format!("终端 · {count}")),
+                    SharedString::from(format!("可用终端 · {count}")),
                     cx,
                 )
                 .on_click(cx.listener(|s, _, _, cx| {
@@ -711,7 +682,8 @@ impl Drawer {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(div().text_size(px(12.)).child("本次任务可操作的终端"));
+            .child(div().text_size(px(12.)).child("可用终端"))
+            .child(div().text_size(px(11.)).text_color(p.tx3).whitespace_normal().child("AI 会按任务选择终端。引用可明确指向某个终端，默认终端用于未指定目标的操作。"));
         let entries = self
             .runtime
             .as_ref()
@@ -754,7 +726,7 @@ impl Drawer {
                         .child(
                             agent_ui::step_action(
                                 SharedString::from(format!("forget-{id}")),
-                                "移除",
+                                "忘记关联",
                                 cx,
                             )
                             .on_click(cx.listener(
@@ -779,179 +751,85 @@ impl Drawer {
                     .child("请选择下方终端作为原目标的新关联"),
             );
         }
+        let multiple_windows = entries.iter().map(|e| &e.window).collect::<BTreeSet<_>>().len() > 1;
         for endpoint in entries {
             let id = endpoint.target.session_id.clone();
             let default_id = id.clone();
             let default_endpoint = endpoint.clone();
-            let selected = self
-                .runtime
-                .as_ref()
-                .is_some_and(|r| r.router.scope.lock().unwrap().targets.contains_key(&id))
-                || self.selected_targets.contains(&id)
-                || self.session == Some(endpoint.binding.session);
+            let is_default = self.runtime.as_ref().map(|r| {
+                r.router.scope.lock().unwrap().default.as_ref() == Some(&id)
+            }).unwrap_or(self.session == Some(endpoint.binding.session));
             let label = endpoint.target.label.clone();
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(100.))
-                            .text_size(px(12.))
-                            .whitespace_normal()
-                            .child(format!(
-                                "{}{} · {} · {} · {}{}\n{}",
-                                if self.runtime.as_ref().is_some_and(|r| r
-                                    .router
-                                    .requested
-                                    .lock()
-                                    .unwrap()
-                                    .contains(&id))
-                                {
-                                    "请求使用 · "
-                                } else {
-                                    ""
-                                },
-                                label,
-                                endpoint.target.protocol,
-                                endpoint.window,
-                                self.runtime
-                                    .as_ref()
-                                    .map(|r| r.router.policy(&endpoint))
-                                    .unwrap_or_else(|| self
-                                        .db
-                                        .borrow()
-                                        .ai_permission(if endpoint.binding.local {
-                                            "local"
-                                        } else {
-                                            endpoint
-                                                .target
-                                                .host_id
-                                                .as_deref()
-                                                .unwrap_or("temporary")
-                                        })
-                                        .unwrap_or_default())
-                                    .label(),
-                                if endpoint.binding.capabilities.terminal_busy {
-                                    " · 终端占用中"
-                                } else {
-                                    ""
-                                },
-                                if endpoint.connected {
-                                    endpoint.target.cwd.as_deref().unwrap_or("目录未知")
-                                } else {
-                                    "已断开"
-                                }
-                            )),
-                    )
-                    .child(
-                        agent_ui::step_action(
-                            SharedString::from(format!("default-{id}")),
-                            if self.runtime.as_ref().is_some_and(|r| {
-                                r.router.scope.lock().unwrap().default.as_ref() == Some(&id)
-                            }) {
-                                "默认 ✓"
-                            } else {
-                                "设为默认"
-                            },
-                            cx,
-                        )
-                        .on_click(cx.listener(move |s, _, _, cx| {
+            let permission = self.db.borrow().ai_permission(if endpoint.binding.local {
+                "local"
+            } else {
+                endpoint.target.host_id.as_deref().unwrap_or("temporary")
+            }).unwrap_or_default();
+            let state = if !endpoint.connected { "已断开" }
+                else if endpoint.binding.capabilities.terminal_busy { "终端占用中" }
+                else { "已连接" };
+            let metadata = format!("{} · {} · {}{}", endpoint.target.protocol, state, permission.label(),
+                if multiple_windows {format!(" · {}", endpoint.window)} else {String::new()});
+            let session = endpoint.binding.session;
+            let mut actions = agent_ui::step_actions().flex_wrap()
+                .child(agent_ui::step_action(SharedString::from(format!("locate-{id}")), "定位", cx)
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        let ws = s.workspace.clone();
+                        w.defer(cx, move |w, cx| { ws.update(cx, |s, cx| s.locate_ai_terminal(session, w, cx)).ok(); });
+                    })));
+            if endpoint.connected {
+                actions = actions.child(agent_ui::step_action(
+                    SharedString::from(format!("default-{id}")), if is_default {"默认 ✓"} else {"设为默认"}, cx)
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if let Some(r) = &s.runtime {
+                            if r.active() {
+                                s.state.save_error = Some("当前任务的默认终端已固定；可引用其他终端指定后续操作".into());
+                                cx.notify();
+                                return;
+                            }
+                            if let Err(e) = r.router.add(&default_id, true) {s.state.save_error = Some(e);}
+                            r.data.lock().unwrap().revision += 1;
+                            r.save(&[], &[]);
+                        } else {
+                            s.session = Some(default_endpoint.binding.session);
+                            s.binding = Some(default_endpoint.binding.clone());
+                            s.capabilities = default_endpoint.binding.capabilities.clone();
+                            *s.mode.lock().unwrap() = permission;
+                            s.label = default_endpoint.target.label.clone();
+                            s.protocol = default_endpoint.target.protocol.clone();
+                            s.host = default_endpoint.target.host_id.clone();
+                            s.context_bound = true;
+                        }
+                        cx.notify();
+                    })))
+                    .child(agent_ui::step_action(SharedString::from(format!("mention-{id}")),
+                        if self.rebind_target.is_some() {"关联到此"} else {"引用"}, cx)
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        if let Some(old) = s.rebind_target.take() {
                             if let Some(r) = &s.runtime {
-                                if r.active() {
-                                    s.state.save_error = Some(
-                                        "当前任务的默认终端已固定，请结束后更换；也可新建对话"
-                                            .into(),
-                                    );
-                                    cx.notify();
-                                    return;
-                                }
-                                if let Err(e) = r.router.add(&default_id, true) {
-                                    s.state.save_error = Some(e);
-                                }
+                                if let Err(e) = r.router.rebind(&old, &id) {s.state.save_error = Some(e);}
                                 r.data.lock().unwrap().revision += 1;
                                 r.save(&[], &[]);
-                            } else {
-                                s.session = Some(default_endpoint.binding.session);
-                                s.binding = Some(default_endpoint.binding.clone());
-                                s.label = default_endpoint.target.label.clone();
-                                s.protocol = default_endpoint.target.protocol.clone();
-                                s.host = default_endpoint.target.host_id.clone();
-                                s.selected_targets.insert(default_id.clone());
                             }
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        agent_ui::step_action(
-                            SharedString::from(format!("target-{id}")),
-                            if self.rebind_target.is_some() {
-                                "关联到此"
-                            } else if selected {
-                                "移除"
-                            } else {
-                                "加入"
-                            },
-                            cx,
-                        )
-                        .on_click(cx.listener(move |s, _, w, cx| {
-                            let mention = s.input.read(cx).value().ends_with('@');
-                            if mention {
-                                s.composer_targets.insert(id.clone());
-                            }
-                            if let Some(r) = &s.runtime {
-                                if let Some(old) = s.rebind_target.take() {
-                                    if let Err(e) = r.router.rebind(&old, &id) {
-                                        s.state.save_error = Some(e);
-                                    }
-                                } else if selected && !mention {
-                                    r.router.remove(&id);
-                                } else if let Err(e) =
-                                    r.router.add(&id, r.router.resolve(None).is_err())
-                                {
-                                    s.state.save_error = Some(e);
-                                }
-                                r.data.lock().unwrap().revision += 1;
-                                r.save(&[], &[]);
-                            } else {
-                                if selected && !mention {
-                                    s.selected_targets.remove(&id);
-                                } else {
-                                    s.selected_targets.insert(id.clone());
-                                }
-                                if selected
-                                    && !mention
-                                    && s.session == Some(endpoint.binding.session)
-                                {
-                                    s.session = None;
-                                    s.binding = None;
-                                    s.host = None;
-                                    s.label = "无默认终端".into();
-                                }
-                                if !selected && s.session.is_none() {
-                                    s.session = Some(endpoint.binding.session);
-                                    s.host = endpoint.target.host_id.clone();
-                                    s.label = label.clone();
-                                    s.protocol = endpoint.target.protocol.clone();
-                                    s.binding = Some(endpoint.binding.clone());
-                                }
-                            }
+                        } else {
+                            s.composer_targets.insert(id.clone());
                             let draft = s.input.read(cx).value().to_string();
-                            if draft.ends_with('@') {
-                                s.set_composer_text(
-                                    format!("{}@{} ", draft.trim_end_matches('@'), label),
-                                    w,
-                                    cx,
-                                );
-                                s.target_picker = false;
-                            }
-                            cx.notify();
-                        })),
-                    ),
-            );
+                            let text = if draft.ends_with('@') {format!("{}@{label} ", draft.trim_end_matches('@'))}
+                                else {format!("{}{separator}@{label} ", draft, separator=if draft.is_empty()||draft.ends_with(char::is_whitespace){""}else{" "})};
+                            s.set_composer_text(text, w, cx);
+                            s.input.focus_handle(cx).focus(w, cx);
+                            s.target_picker = false;
+                        }
+                        cx.notify();
+                    })));
+            }
+            list = list.child(div().py(px(8.)).border_b_1().border_color(p.line)
+                .flex().flex_col().gap(px(5.)).min_w_0()
+                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).whitespace_normal().child(endpoint.target.label))
+                .child(div().text_size(px(11.)).text_color(p.tx3).whitespace_normal().child(metadata))
+                .child(div().text_size(px(11.)).text_color(p.tx2).whitespace_normal()
+                    .child(endpoint.target.cwd.unwrap_or_else(|| "目录未知".into())))
+                .child(actions));
         }
         list
     }
