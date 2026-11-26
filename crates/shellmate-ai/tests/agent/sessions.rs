@@ -132,6 +132,9 @@ async fn channels_are_chosen_per_call_independently_of_task_waiting_on_both_wire
         let system = requests[0].to_string();
         assert!(system.contains("无需加入操作范围"));
         assert!(system.contains("序号对应对话中用户指向的那次列表"));
+        assert!(system.contains("普通检查、日期计算、ping、sleep 等辅助命令优先 background"));
+        assert!(system.contains("日志读取成功不代表原命令成功"));
+        assert!(system.contains("不扫描相邻项目"));
     }
 }
 

@@ -221,6 +221,7 @@ fn schema_and_validation_cover_provider_options_and_chinese_errors() {
     for a in [false, true] {
         let cfg = config(a);
         let definition = subagent::agent_tool(&cfg);
+        assert!(definition.description.contains("不要擅自添加"));
         assert!(definition.description.contains(&cfg.model));
         assert!(definition.parameters["properties"].get("type").is_none());
         assert_eq!(
@@ -1296,7 +1297,8 @@ async fn main_agent_steps_are_cleared_by_tier_one_and_background_is_host_schedul
             assert!(request.background);
             Box::pin(async {
                 LocalResult {
-                    inline: "report\n".repeat(5700),
+                    // Leave room for system/tool guidance after retaining the newest five reports.
+                    inline: "report\n".repeat(5000),
                     output_id: Some("saved-report".into()),
                     is_error: false,
                     subagent: None,
@@ -1447,6 +1449,8 @@ async fn child_can_choose_both_channels_with_async_task_on_both_providers() {
         assert_eq!(calls[0].0.session_id.as_deref(), Some("first"));
         assert!(calls.iter().all(|(_, source)| source.is_some()));
         let requests = bodies(&http);
+        assert!(requests[0].to_string().contains("普通检查、日期计算、ping、sleep 等辅助命令优先 background"));
+        assert!(requests[0].to_string().contains("在第1个终端执行 ls 让我切过去看"));
         assert_eq!(schema(tool(&requests[0], a, "run_command").unwrap(), a)["properties"]["target"]["enum"], json!(["terminal", "background"]));
         let steps = out.transcript.entries().iter().filter_map(|entry| if let Entry::Step(s)=entry {Some(s)}else{None}).filter(|s| s.call.name == "run_command").collect::<Vec<_>>();
         assert_eq!(steps[0].display.as_ref().unwrap().target, Target::Terminal);

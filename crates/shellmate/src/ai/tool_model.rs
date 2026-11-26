@@ -9,6 +9,7 @@ pub enum Status {
     Completed,
     Failed,
     Cancelled,
+    Stopped,
     Denied,
     Paused,
     Unknown,
@@ -22,6 +23,7 @@ impl Status {
             Self::Completed => "已完成",
             Self::Failed => "失败",
             Self::Cancelled => "已取消",
+            Self::Stopped => "已停止",
             Self::Denied => "已拒绝",
             Self::Paused => "已暂停",
             Self::Unknown => "状态未知",
@@ -175,6 +177,24 @@ pub fn child_status(status: &SubagentStatus) -> Status {
         SubagentStatus::StepLimit => Status::Paused,
         SubagentStatus::Failed(_) => Status::Failed,
     }
+}
+/// Startup evidence is current only while the service is still running.
+pub fn service_detail(task: &super::tasks::TaskInfo) -> Option<String> {
+    let service = task.service?;
+    Some(if task.status == super::tasks::Status::Running {
+        format!("持续服务 · {}", service.label())
+    } else {
+        "持续服务".into()
+    })
+}
+pub fn service_history(task: &super::tasks::TaskInfo) -> Option<&'static str> {
+    use super::tasks::{ServiceState, Status};
+    if task.status == Status::Running { return None; }
+    task.service.map(|service| match service {
+        ServiceState::Ready => "启动记录：曾出现就绪信号；不代表服务当前仍可用。",
+        ServiceState::Starting | ServiceState::Failed => "启动记录：结束前未完成启动检查。",
+        ServiceState::Unverified => "启动记录：结束前未确认就绪。",
+    })
 }
 /// Live IDs survive provider call-id reuse and the normalization used in saved logs.
 #[derive(Clone, Debug, Default)]

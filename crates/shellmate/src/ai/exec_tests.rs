@@ -975,6 +975,9 @@ async fn local_background_returns_immediately_read_running_then_notice_and_retai
     }
     let running = tasks.local_tool(read(1, 1, None), Default::default()).await;
     assert!(running.inline.ends_with("one\n"));
+    assert!(running.inline.contains("日志读取成功 · 原命令：运行中"));
+    assert!(!running.inline.contains("退出码"));
+    assert!(!running.is_error);
     let (active, outputs) = tasks.state();
     assert_eq!(active.len(), 1);
     assert!(outputs[0].contains(out.output_id.as_ref().unwrap()));
@@ -988,7 +991,7 @@ async fn local_background_returns_immediately_read_running_then_notice_and_retai
     }
     assert_eq!(
         tasks.take_notices(),
-        ["异步任务 #1 已结束 · 退出码 0 · 用 read_output 查看输出"]
+        ["异步任务 #1 · 已退出 · 退出码 0 · 用 read_output 查看输出"]
     );
     assert!(tasks.take_notices().is_empty());
     assert!(tasks.state().0.is_empty());
@@ -996,6 +999,7 @@ async fn local_background_returns_immediately_read_running_then_notice_and_retai
         .local_tool(read(0, 2000, Some("match")), Default::default())
         .await;
     assert!(filtered.inline.contains("match-a\nmatch-b\n"));
+    assert!(filtered.inline.contains("原命令：已退出 · 退出码 0"));
     shellmate_core::ai_output::delete_conversation(&temp.0, "test").unwrap();
     assert_eq!(
         tasks
@@ -1190,16 +1194,50 @@ async fn service_is_owned_by_conversation_survives_child_and_has_real_http_readi
         )
         .await;
     assert!(read.inline.contains("SERVICE_READY"));
+    assert!(read.inline.contains("原命令：运行中"));
+    assert!(!read.inline.contains("退出码"));
     assert!(parent.wait_tasks(vec![id.clone()], true).await.is_error);
     assert!(
         !parent
-            .local_tool(LocalTool::StopTask { id }, Default::default())
+            .local_tool(LocalTool::StopTask { id: id.clone() }, Default::default())
             .await
             .is_error
     );
     assert_gone(&[pid]).await;
     assert!(!parent.has_running());
-    assert!(parent.take_notices().iter().any(|s| s.contains("持续服务")));
+    let notices = parent.take_notices();
+    assert!(notices.iter().any(|s| s.contains("持续服务") && s.contains("已停止")));
+    assert!(notices.iter().all(|s| !s.contains("退出码")));
+    let stopped = parent.list().into_iter().find(|t| t.id == id).unwrap();
+    assert_eq!(crate::ai::tool_model::service_detail(&stopped).as_deref(), Some("持续服务"));
+    assert!(crate::ai::tool_model::service_history(&stopped).unwrap().contains("曾出现就绪信号"));
+    let read = parent.local_tool(LocalTool::ReadOutput(ReadOutput {
+        id, offset_line: 0, limit_lines: None, grep: None,
+    }), Default::default()).await;
+    assert!(!read.is_error);
+    assert!(read.inline.contains("原命令：已停止"));
+    assert!(!read.inline.contains("退出码"));
+    assert!(read.inline.contains("SERVICE_READY"));
+}
+
+#[tokio::test]
+async fn reading_failed_command_log_reports_real_exit_and_preserves_paging() {
+    use shellmate_ai::agent::{LocalTool, ReadOutput};
+    let temp = Temp::new();
+    let tasks = super::super::tasks::Tasks::new(temp.0.clone(), "failed-read".into());
+    let out = completed(run_local(&tasks, call("printf 'line0\nline1\n'; exit 7", Target::Background,
+        Duration::from_secs(3)), temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
+    for (offset, expected) in [(0, "line0\n"), (1, "line1\n"), (987, "")] {
+        let read = tasks.local_tool(LocalTool::ReadOutput(ReadOutput {
+            id: out.output_id.clone().unwrap(), offset_line: offset,
+            limit_lines: Some(1), grep: None,
+        }), Default::default()).await;
+        assert!(!read.is_error);
+        assert!(read.inline.contains("日志读取成功 · 原命令：已退出 · 退出码 7"));
+        let view = crate::ai::output_view::display(&read.inline);
+        assert_eq!(view.preview, expected);
+        assert_eq!(view.output_id, out.output_id.as_deref());
+    }
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ pub enum Status {
     Running,
     Exited(Option<i32>),
     Stopped,
+    Busy,
     Disconnected,
     Failed,
     StepLimit,
@@ -77,12 +78,13 @@ impl TaskInfo {
             Status::Running => "运行中".into(),
             Status::Exited(code) if self.kind == Kind::Command => {
                 return format!(
-                    "已完成 · 退出码 {}",
+                    "已退出 · 退出码 {}",
                     code.map_or_else(|| "未知".into(), |n| n.to_string())
                 );
             }
             Status::Exited(_) => "已完成".into(),
             Status::Stopped => "已停止".into(),
+            Status::Busy => "未执行（终端被占用）".into(),
             Status::Disconnected => "连接已断开".into(),
             Status::Failed => "失败".into(),
             Status::StepLimit => "达到步数上限".into(),
@@ -720,15 +722,15 @@ impl Tasks {
                 }
             }
             LocalTool::ReadOutput(a) => {
-                let (oid, spool) = {
+                let (oid, spool, info) = {
                     let state = self.0.state.lock().unwrap();
                     let task =
                         a.id.parse::<u64>()
                             .ok()
                             .and_then(|n| state.tasks.get(&n))
                             .or_else(|| state.tasks.values().find(|t| t.info.output_id == a.id));
-                    task.map_or((a.id.clone(), None), |t| {
-                        (t.info.output_id.clone(), Some(t.spool.clone()))
+                    task.map_or((a.id.clone(), None, None), |t| {
+                        (t.info.output_id.clone(), Some(t.spool.clone()), Some(t.info.clone()))
                     })
                 };
                 let path = match ai_output::path(&self.0.root, &self.0.conversation, &oid) {
@@ -756,20 +758,21 @@ impl Tasks {
                 };
                 match window {
                     Ok(w) => {
-                        // Total file size is metadata, not evidence that a selected page was cut.
-                        let mut out = spooled(
-                            &oid,
-                            "read_output",
-                            &w.bytes,
-                            w.bytes.len() as u64 + u64::from(w.truncated),
-                            Some(0),
-                            Duration::ZERO,
-                            limits,
+                        // Reading a log says nothing about the original process's exit.
+                        // Keep the read result successful even when that process failed.
+                        let status = info.map_or_else(
+                            || "状态未知（仅有历史日志，不能据此判断是否仍在运行或正常退出）".into(),
+                            |info| info.status_text(),
                         );
-                        out.total_bytes = w.total;
+                        let mut preview = shellmate_ai::output::char_excerpt(
+                            &shellmate_ai::output::clean(&w.bytes), limits.output_chars(),
+                        );
+                        if w.truncated {
+                            preview.push_str("\n完整输出已保存，用 read_output 查看或搜索");
+                        }
                         LocalResult {
                             subagent: None,
-                            inline: out.wire_text(),
+                            inline: format!("输出 id {oid} · 总计 {} 字节 · 日志读取成功 · 原命令：{status}\n{preview}", w.total),
                             output_id: Some(oid),
                             is_error: false,
                         }
@@ -868,6 +871,8 @@ impl Tasks {
             let status = match (&raw, stopped) {
                 (_, Some(_)) => Status::Stopped,
                 (Some(ToolOutcome::Disconnected), _) => Status::Disconnected,
+                (Some(ToolOutcome::Busy), _) => Status::Busy,
+                (Some(ToolOutcome::Failed(_)), _) => Status::Failed,
                 (Some(ToolOutcome::Completed(out)), _) => Status::Exited(out.exit_code),
                 _ => Status::Exited(None),
             };
@@ -1030,15 +1035,9 @@ async fn wait_result(result: &mut watch::Receiver<Option<ToolOutcome>>) -> ToolO
     }
 }
 fn notice(info: &TaskInfo) -> String {
-    let code = match info.status {
-        Status::Exited(Some(n)) => n.to_string(),
-        Status::Stopped => "已停止".into(),
-        Status::Disconnected => "会话已断开".into(),
-        _ => "未知".into(),
-    };
     format!(
-        "异步任务 #{} 已结束 · 退出码 {code} · 用 read_output 查看输出",
-        info.id
+        "异步任务 #{} · {} · 用 read_output 查看输出",
+        info.id, info.status_text()
     )
 }
 fn finish_task(weak: &Weak<Inner>, number: u64, status: Status, _: &ToolOutcome) {
@@ -1229,5 +1228,36 @@ mod tests {
             )
             .await;
         assert!(result.inline.contains("old output"));
+        assert!(result.inline.contains("原命令：状态未知"));
+        assert!(!result.inline.contains("退出码"));
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn unreadable_execution_state_never_becomes_success_from_log_reading() {
+        for (raw, expected) in [
+            (ToolOutcome::Busy, "未执行（终端被占用）"),
+            (ToolOutcome::Disconnected, "连接已断开"),
+            (ToolOutcome::Failed("cannot spawn".into()), "失败"),
+            (ToolOutcome::Completed(shape([], [], None, Duration::ZERO, false, false)), "已退出 · 退出码 未知"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let tasks = Tasks::new(temp.path().into(), "read-states".into());
+            let call = ToolCall {
+                service: None, session_id: None, cwd: None, destination: None,
+                id: "attempt".into(), command: "sleep 30".into(), purpose: "test".into(),
+                target: Target::Terminal, timeout: Duration::from_secs(3), run_in_background: false,
+                exec_limits: ExecLimits::default(), class: shellmate_ai::policy::classify("sleep 30"),
+            };
+            tasks.run(call, None, |_| Box::pin(async move { raw })).await;
+            let read = tasks.local_tool(LocalTool::ReadOutput(shellmate_ai::agent::ReadOutput {
+                id: "1".into(), offset_line: 0, limit_lines: None, grep: None,
+            }), ExecLimits::default()).await;
+            assert!(!read.is_error);
+            assert!(read.inline.contains(&format!("原命令：{expected}")), "{}", read.inline);
+            assert!(!read.inline.contains("退出码 0"));
+            let view = super::super::output_view::display(&read.inline);
+            assert_eq!(view.preview, "");
+        }
     }
 }

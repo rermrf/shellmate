@@ -296,7 +296,7 @@ impl Drawer {
                         }
                     }
                     TaskStatus::Stopped => {
-                        status = model::Status::Cancelled;
+                        status = model::Status::Stopped;
                         duration = None;
                     }
                     _ => {
@@ -384,9 +384,14 @@ impl Drawer {
             card.summary.clear();
             card.detail.clear();
         }
-        if let Some(service) = task.as_ref().and_then(|t| t.service) {
-            card.detail.push_str(&format!(" · 持续服务 · {}", service.label()));
-            if service == crate::ai::tasks::ServiceState::Failed { card.status = model::Status::Failed; status = model::Status::Failed; }
+        if call.name == "run_command" && let Some(task) = &task {
+            if let Some(detail) = model::service_detail(task) {
+                card.detail.push_str(&format!(" · {detail}"));
+            }
+            if task.service == Some(crate::ai::tasks::ServiceState::Failed)
+                && matches!(task.status, TaskStatus::Exited(_)) {
+                card.status = model::Status::Failed; status = model::Status::Failed;
+            }
         }
         if let Some(label) = call.args_json["resolved_target"]["label"].as_str() {
             let target = &call.args_json["resolved_target"];
@@ -404,6 +409,9 @@ impl Drawer {
             surface = surface.bg(gpui::transparent_black()).py(px(3.)).px(px(2.));
         }
         if open {
+            if call.name == "run_command" && let Some(history) = task.as_ref().and_then(model::service_history) {
+                surface = surface.child(div().text_size(px(11.5)).text_color(p.tx3).whitespace_normal().child(history));
+            }
             surface = surface.child(section("输入", &p));
             if call.name == "run_command" {
                 surface = surface.child(agent_ui::command_block(
