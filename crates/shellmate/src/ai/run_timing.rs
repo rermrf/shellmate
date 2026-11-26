@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy)]
-pub(super) struct Moment {
+pub(crate) struct Moment {
     pub wall_ms: i64,
     pub monotonic: Instant,
 }
@@ -21,7 +21,7 @@ impl Moment {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Status {
+pub(crate) enum Status {
     Running,
     Waiting,
     Paused,
@@ -36,7 +36,7 @@ impl Status {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct Record {
+pub(crate) struct Record {
     pub id: String,
     pub turn: usize,
     pub started_at_ms: i64,
@@ -49,8 +49,8 @@ pub(super) struct Record {
     #[serde(default)]
     pub followup: bool,
 }
-#[derive(Default)]
-pub(super) struct Timeline {
+#[derive(Clone, Default)]
+pub(crate) struct Timeline {
     records: Vec<Record>,
     segment: Option<Instant>,
 }

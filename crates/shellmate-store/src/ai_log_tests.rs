@@ -52,7 +52,7 @@ fn migration_v9_v10_keeps_display_ids_timestamps_and_old_rows_unchanged() {
     v9(&mut conn, &json);
     drop(conn);
     let mut db = HostStore::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     let loaded = db.ai_conversation("legacy").unwrap().unwrap();
     assert_eq!(loaded.conversation.turns()[0].user.question, "question");
     assert_eq!(loaded.conversation.turns()[0].user.context.text, "snapshot");
@@ -367,4 +367,51 @@ fn timing_heartbeat_preserves_log_queue_and_updated_at_and_never_recreates_histo
     db.delete_ai_conversation("timed").unwrap();
     assert!(!db.update_ai_run_timing("timed", &timing).unwrap());
     assert!(db.ai_runtime("timed").unwrap().is_none());
+}
+
+#[test]
+fn multiple_target_metadata_is_atomic_and_deleted_with_conversation() {
+    let mut db = HostStore::open_in_memory().unwrap();
+    let mut c = Conversation::default();
+    c.push_user(UserTurn::new("compare", Default::default()));
+    let saved = SavedConversation {
+        id: "multi".into(),
+        host_id: None,
+        label: "local".into(),
+        title: "compare".into(),
+        provider: "openai".into(),
+        model: "fixture".into(),
+        created_at: 1,
+        updated_at: 1,
+        conversation: c,
+    };
+    let state = serde_json::json!({"targets":{"default":"one","targets":{"one":{"label":"local","host_id":null},"two":{"label":"remote","host_id":"host2"}}},"queue":{"inputs":[],"delivered":[]}});
+    db.save_ai_conversation_with_runtime(&saved, Some(&state))
+        .unwrap();
+    let count: i64 = db
+        .conn
+        .query_row(
+            "SELECT count(*) FROM ai_conversation_targets WHERE conversation_id='multi'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+    let role: String = db
+        .conn
+        .query_row(
+            "SELECT role FROM ai_conversation_targets WHERE target_key='one'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(role, "default");
+    db.delete_ai_conversation("multi").unwrap();
+    let count: i64 = db
+        .conn
+        .query_row("SELECT count(*) FROM ai_conversation_targets", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
 }

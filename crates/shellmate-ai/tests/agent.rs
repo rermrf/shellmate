@@ -1256,6 +1256,8 @@ async fn approved_edit_and_target_reach_both_wires_events_and_history() {
         }
         fn resolved_call(&self, call: &ToolCall) -> ToolCall {
             ToolCall {
+                session_id: None,
+                cwd: None, destination: None,
                 command: "pwd".into(),
                 target: Target::Terminal,
                 class: Class::ReadOnly,
@@ -2168,3 +2170,6 @@ mod subagent_tests;
 
 #[path = "agent/interaction.rs"]
 mod interaction_tests;
+
+#[path = "agent/sessions.rs"]
+mod session_tests;

@@ -427,7 +427,7 @@ mod tests {
         .unwrap();
         drop(c);
         let mut s = HostStore::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 11);
+        assert_eq!(s.schema_version().unwrap(), 12);
         let r = &s.recordings().unwrap()[0];
         assert_eq!((r.cols, r.rows), (80, 24));
         let mut new = r.clone();

@@ -346,7 +346,8 @@ impl Tasks {
         }
     }
     pub fn child_tasks(&self) -> Self {
-        let child = Self::new(self.0.root.clone(), self.0.conversation.clone());
+        let mut child = Self::new(self.0.root.clone(), self.0.conversation.clone());
+        Arc::get_mut(&mut child.0).unwrap().discarded = self.0.discarded.clone();
         if let Some(web) = self.0.web.get() {
             let _ = child.0.web.set(web.clone());
         }

@@ -126,6 +126,9 @@ fn config() -> Config {
 }
 fn executor(root: &Path, binding: Binding, ui: async_channel::Sender<Ui>) -> AppExecutor {
     AppExecutor {
+        lease: None,
+            slots: None,
+        router: None,
         subagents: None,
         memory: None,
         binding,
@@ -135,6 +138,8 @@ fn executor(root: &Path, binding: Binding, ui: async_channel::Sender<Ui>) -> App
 }
 fn call(command: &str) -> ToolCall {
     ToolCall {
+        session_id: None,
+        cwd: None, destination: None,
         id: shellmate_core::HostId::generate().to_string(),
         command: command.into(),
         purpose: "test cwd".into(),
@@ -297,6 +302,7 @@ async fn no_osc7_pty_directory_is_shared_by_main_and_child_and_pinned_for_the_tu
     let child_http = SequencedHttpClient::new([response(Some(command)), response(None)]);
     let factory_http = child_http.clone();
     let service = crate::ai::subagents::Service {
+        router: None,
         tasks: Tasks::new(root.clone(), "child-test".into()),
         config: config(),
         settings: Default::default(),
@@ -316,6 +322,8 @@ async fn no_osc7_pty_directory_is_shared_by_main_and_child_and_pinned_for_the_tu
     // Changing the visible shell after the turn starts must not silently retarget its child.
     shell.cd(&other).await;
     let request = shellmate_ai::SubagentRequest {
+        session_ids: vec![],
+        default_session_id: None,
         description: "inspect project".into(),
         prompt: "read the current project marker".into(),
         kind: shellmate_ai::SubagentKind::General,

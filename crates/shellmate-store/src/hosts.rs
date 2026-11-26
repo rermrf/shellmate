@@ -159,6 +159,12 @@ const MIGRATIONS: &[&str] = &[
         call_id TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(conversation_id,call_id)
     );",
 
+    // v12: explicit default and participant targets for multi-terminal AI conversations.
+    "CREATE TABLE ai_conversation_targets (
+        conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+        target_key TEXT NOT NULL, host_id TEXT, role TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+        PRIMARY KEY(conversation_id,target_key)
+    );",
 ];
 
 /// The host library.
@@ -717,7 +723,7 @@ mod tests {
     fn v5_to_v6_retains_ssh_and_round_trips_telnet_and_serial() {
         let mut conn=Connection::open_in_memory().unwrap();migrate(&mut conn,&MIGRATIONS[..5]).unwrap();
         conn.execute("INSERT INTO hosts(id,name,addr,port,protocol,auth) VALUES('old','ssh','example.test',22,'ssh','agent')",[]).unwrap();
-        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),11);
+        let mut store=HostStore::from_connection(conn).unwrap();assert_eq!(store.schema_version().unwrap(),12);
         let old=store.host(&HostId::from_raw("old")).unwrap().unwrap();assert_eq!(old.protocol,Protocol::Ssh);assert_eq!(old.serial,shellmate_core::SerialSettings::default());
         let mut serial=Host::new("ESP32","/dev/cu.fixture");serial.protocol=Protocol::Serial;serial.port=0;
         serial.serial=shellmate_core::SerialSettings{baud:460800,data_bits:7,parity:'E',stop_bits:2,flow:"hardware".into(),newline:shellmate_core::Newline::Lf};
@@ -817,9 +823,9 @@ mod tests {
     #[test]
     fn a_newer_database_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn.pragma_update(None, "user_version", 13).unwrap();
         let err = migrate(&mut conn, MIGRATIONS).unwrap_err();
-        assert!(matches!(err, StoreError::TooNew { found: 12, supported: 11 }), "{err}");
-        assert_eq!(err.to_string(), "主机库版本较新（v12），当前 Shellmate 只支持到 v11，请升级后再试");
+        assert!(matches!(err, StoreError::TooNew { found: 13, supported: 12 }), "{err}");
+        assert_eq!(err.to_string(), "主机库版本较新（v13），当前 Shellmate 只支持到 v12，请升级后再试");
     }
 }

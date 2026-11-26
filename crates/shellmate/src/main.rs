@@ -206,3 +206,10 @@ fn open_workspace_at(
     workspace::Hub::install(main_window, &workspace, focus, cx);
     Ok((main_window, workspace))
 }
+
+#[cfg(test)]
+#[path = "../../shellmate-ssh/tests/ssh/support.rs"]
+mod support;
+#[cfg(test)]
+#[path = "../../shellmate-sftp/tests/sftp/fixture.rs"]
+mod sftp_fixture;

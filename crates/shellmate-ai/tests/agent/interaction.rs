@@ -48,6 +48,8 @@ async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknow
         let outcome = subagent::run_with_cancel(
             &client,
             shellmate_ai::SubagentRequest {
+                session_ids: vec![],
+                default_session_id: None,
                 description: "test".into(),
                 prompt: "initial".into(),
                 kind: shellmate_ai::SubagentKind::General,
@@ -363,6 +365,8 @@ async fn web_tools_work_without_terminal_and_children_inherit_the_same_tools_on_
         let out = shellmate_ai::subagent::run(
             &client,
             shellmate_ai::SubagentRequest {
+                session_ids: vec![],
+                default_session_id: None,
                 description: "search".into(),
                 prompt: "research nginx".into(),
                 kind: shellmate_ai::SubagentKind::General,

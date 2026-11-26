@@ -57,6 +57,9 @@ pub fn elapsed(ms: u64) -> String {
 pub fn label(call: &LoggedCall) -> String {
     match call.name.as_str() {
         "run_command" => "执行命令",
+        "list_sessions" => "查看终端列表",
+        "read_terminal" => "读取终端",
+        "compare_directories" => "比较目录",
         "web_search" => "搜索网页",
         "web_fetch" => "读取网页",
         "agent" => "委派子任务",
@@ -70,6 +73,27 @@ pub fn label(call: &LoggedCall) -> String {
     .into()
 }
 pub fn summary(call: &LoggedCall) -> String {
+    match call.name.as_str() {
+        "list_sessions" => return "查看已打开的终端与连接状态".into(),
+        "read_terminal" => {
+            return format!(
+                "读取最近 {} 行输出",
+                call.args_json["lines"].as_u64().unwrap_or(40)
+            );
+        }
+        "compare_directories" => {
+            return format!(
+                "{} ↔ {}",
+                call.args_json["left"]["path"]
+                    .as_str()
+                    .unwrap_or("左侧目录"),
+                call.args_json["right"]["path"]
+                    .as_str()
+                    .unwrap_or("右侧目录")
+            );
+        }
+        _ => {}
+    }
     if call.name == "read_output" {
         return "读取已保存的执行输出".into();
     }

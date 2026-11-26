@@ -6,6 +6,12 @@ mod btw_ui;
 mod timing;
 #[path = "timing_ui.rs"]
 mod timing_ui;
+#[path="conversation_runtime.rs"]
+pub(crate) mod conversation_runtime;
+#[path="conversation_ui.rs"]
+mod conversation_ui;
+#[path="directory_compare_ui.rs"]
+mod directory_compare_ui;
 #[path = "subagent_ui.rs"]
 mod subagent_ui;
 #[path = "thread_ui.rs"]
@@ -73,6 +79,19 @@ pub struct SessionContext {
     pub binding: Option<super::exec::Binding>,
 }
 pub struct Drawer {
+    runtime:Option<Arc<conversation_runtime::Runtime>>,
+    runtime_revision:u64,
+    chooser:bool,
+    target_picker:bool,
+    rebind_target:Option<String>,
+    target_requests_seen:std::collections::BTreeSet<String>,
+    multi_fixture:bool,
+    comparison_full:std::collections::BTreeSet<String>,
+    comparison_previews:std::collections::BTreeMap<String,String>,
+    comparison_only_changes:std::collections::BTreeSet<String>,
+    selected_targets:std::collections::BTreeSet<String>,
+    context_bound:bool,
+    composer_targets:std::collections::BTreeSet<String>,
     state: state::ConversationState,
     popup: super::commands::Popup,
     context_focus: FocusHandle,
@@ -160,6 +179,7 @@ impl Drawer {
                     .await;
                 if this
                     .update_in(cx, |s, w, cx| {
+                        if s.runtime.is_some(){s.sync_runtime(cx);cx.notify();return;}
                         s.checkpoint_timing();
                         for pane in s.state.output_panes.values(){pane.update(cx,|s,cx|s.tick(cx));}
                         if let Some(tasks)=&s.tasks {
@@ -192,6 +212,7 @@ impl Drawer {
         })
         .detach();
         Self {
+            runtime:None,runtime_revision:0,chooser:false,target_picker:false,rebind_target:None,target_requests_seen:Default::default(),multi_fixture:false,comparison_full:Default::default(),comparison_previews:Default::default(),comparison_only_changes:Default::default(),selected_targets:Default::default(),context_bound:false,composer_targets:Default::default(),
             popup: Default::default(),
             context_focus: cx.focus_handle(),
             compact_queue: Default::default(),
@@ -242,6 +263,7 @@ impl Drawer {
         if self.fixture {
             return;
         }
+        if self.context_bound||self.runtime.is_some()||!self.state.model.conversation.turns().is_empty(){self.next_context=Some(context);return;}
         if self.state.child_page.selected.is_some() || self.state.model.busy || self.state.pending || self.state.continuation.is_some() || self.has_running_tasks() || self.state.timing.live()
             || !self.state.control.snapshot().inputs.is_empty() || self.state.control.pending_completions() {
             self.next_context = Some(context);
@@ -253,6 +275,7 @@ impl Drawer {
             super::mode_popover::close(&mut self.permission_menu);
             self.retire_tasks();
         }
+        self.context_bound=true;
         self.session = context.session;
         self.host = context.host;
         self.label = context.label;
@@ -283,6 +306,7 @@ impl Drawer {
         self.selection_scroll.read(cx).debug_viewport_at(position,cx)
     }
     fn input_changed(&mut self, cx: &mut Context<Self>) {
+        if self.input.read(cx).value().ends_with('@'){self.target_picker=true;self.chooser=false;self.state.follow_bottom=false;self.scroll.set_offset(gpui::point(px(0.),px(0.)));}
         if self.state.child_page.selected.is_some(){self.popup.escape();cx.notify();return;}
         self.popup.changed(&self.input.read(cx).value());
         if self.popup.open { super::mode_popover::show(super::mode_popover::Kind::Slash,&mut self.permission_menu,&mut self.state.context_popover,&mut self.popup); }
@@ -312,6 +336,11 @@ impl Drawer {
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
         if self.state.child_page.selected.is_some(){self.back_to_main(w,cx);}
         if question.trim().is_empty(){return;}
+        if self.runtime.is_none() && !self.fixture && let Some(runtime)=crate::workspace::hub::Hub::ai_services(cx).1.get(&self.state.id){self.attach_runtime(runtime,cx);}
+        if let Some(runtime)=self.runtime.clone(){
+            let context=self.message_context(runtime.router.context());runtime.submit(question,context);self.input.update(cx,|i,cx|i.set_value("",w,cx));
+            let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);self.sync_runtime(cx);}else{self.begin(None,w,cx);}return;
+        }
         if self.state.pending || self.state.model.busy {
             self.queue_message(question,w,cx);return;
         }
@@ -328,6 +357,7 @@ impl Drawer {
             .workspace
             .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
+        let context=self.message_context(context);
         let user = UserTurn::new(&question, context);
         if user.question.trim().is_empty() {
             return;
@@ -395,6 +425,14 @@ impl Drawer {
                             s.configured = true;
                             s.provider = config.provider.id().into();
                             s.model_id = config.model.clone();
+                            if let Some(runtime)=crate::workspace::hub::Hub::ai_services(cx).1.get(&s.state.id) {
+                                let user=s.state.queued.take();
+                                let queued=s.state.control.snapshot().inputs;
+                                s.attach_runtime(runtime.clone(),cx);
+                                if let Some(user)=user{runtime.submit(user.question,user.context);}
+                                for input in queued{if !input.claimed{runtime.control.enqueue(input.id,input.text,input.context);}}
+                                let settings=s.db.borrow().ai_settings().unwrap_or_default();runtime.launch(config,settings.limits(),settings);s.sync_runtime(cx);return;
+                            }
                             if let Some(user) = s.state.queued.take() {
                                 s.state
                                     .model
@@ -426,6 +464,7 @@ impl Drawer {
     }
     /// M4's /compact entry point; shares authorization and the busy lock with send.
     pub(crate) fn compact_context(&mut self, focus: Option<String>, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(runtime)=&self.runtime{*runtime.compact.lock().unwrap()=Some(focus);let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}return;}
         if self.state.model.busy || self.state.pending {
             *self.compact_queue.lock().unwrap() = Some(focus);
             self.local(slash_ui::LocalBody::Hint(super::commands::QUEUED.into()), cx);
@@ -475,6 +514,7 @@ impl Drawer {
         shellmate_core::memory::Memory::new(self.data_root.clone(), key)
     }
     fn start(&mut self, config: shellmate_ai::Config, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.fixture&&self.start_runtime(config.clone(),cx){return;}
         self.epoch += 1;
         if self.state.continuation.is_none() && !self.fixture && !self.state.reenter {
             self.binding = self
@@ -537,11 +577,15 @@ impl Drawer {
         let memory_snapshot=conversation.memory_snapshot().cloned().unwrap_or_else(||shellmate_ai::memory::Snapshot::load(&self.memory_files(),&self.label,limits.auto_memory));
         self.main_cancel=Default::default();
         let subagents=binding.as_ref().filter(|b|b.capabilities.background).map(|binding|Arc::new(super::subagents::Service {
+            router:None,
             tasks:self.tasks.as_ref().unwrap().clone(),config:config.clone(),settings,limits,db:self.db.clone(),snapshot:Arc::new(Mutex::new(memory_snapshot)),
             context:conversation.latest_user().map(|u|u.context.clone()).unwrap_or_default(),binding:binding.clone(),memory:self.memory_files(),
             ui:ui.clone(),mode:self.mode.clone(),cancel:self.main_cancel.clone(),factory:Arc::new(RigClient::new),
         }));
         let executor = super::exec::AppExecutor {
+            lease: None,
+            slots: None,
+            router:None,
             subagents:subagents.clone(),
             memory: Some((self.memory_files(), self.label.clone())),
             tasks: self.tasks.as_ref().unwrap().clone(),
@@ -679,11 +723,12 @@ impl Drawer {
     }
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.close_btw(cx);
-        if !saving_enabled(&self.db) {
+        if self.runtime.is_none()&&!saving_enabled(&self.db) {
             self.clear(cx);
         }
     }
     fn persist(&mut self) {
+        if let Some(runtime)=&self.runtime{runtime.save(&[],&[]);return;}
         if self.fixture {
             return;
         }
@@ -695,6 +740,7 @@ impl Drawer {
         );
     }
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(runtime)=&self.runtime{runtime.stop_reply();self.sync_runtime(cx);return;}
         if self.state.timing.finish(timing::Status::Stopped, timing::Moment::now()) { self.persist(); }
         self.state.control.hold();self.main_cancel.cancel();
         if self.tasks.as_ref().is_some_and(|tasks|tasks.stop_foreground()) {
@@ -737,6 +783,7 @@ impl Drawer {
         cx.notify();
     }
     pub(crate) fn discard_and_clear(&mut self, cx: &mut Context<Self>) {
+        if let Some(runtime)=self.runtime.take(){runtime.tasks.discard();runtime.retire();self.tasks=None;}
         if let Some(tasks)=&self.tasks {tasks.discard();}
         self.clear(cx);
     }
@@ -754,6 +801,7 @@ impl Drawer {
         cx.notify();
     }
     pub(crate) fn new_conversation(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.fixture||self.multi_fixture{let ws=self.workspace.clone();w.defer(cx,move|w,cx|{ws.update(cx,|s,cx|s.new_ai_conversation(w,cx)).ok();});return;}
         match self.state.new_conversation_action(self.history) {
             NewConversation::Disabled => {}
             NewConversation::Start => self.clear(cx),
@@ -789,6 +837,10 @@ impl Drawer {
         cx.notify();
     }
     fn load(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.fixture{let ws=self.workspace.clone();let id=id.to_owned();cx.defer(move|cx|{crate::workspace::hub::open_ai_conversation(ws,id,cx);});return;}
+        self.load_saved(id,cx);
+    }
+    pub(crate) fn load_saved(&mut self,id:&str,cx:&mut Context<Self>){
         let loaded = self.db.borrow().ai_conversation(id);
         match loaded {
             Ok(Some(c)) => {
@@ -818,6 +870,7 @@ impl Drawer {
                 self.ensure_tasks();
                 self.history = false;
                 self.state.readonly = true;
+                if !self.fixture { self.prepare_runtime(cx); }
                 cx.notify();
             }
             _ => {
@@ -827,6 +880,8 @@ impl Drawer {
         }
     }
     fn delete(&mut self, id: &str, cx: &mut Context<Self>) {
+        crate::workspace::hub::Hub::ai_services(cx).1.remove(id);
+        if self.runtime.as_ref().is_some_and(|r|r.id==id){self.runtime=None;}
         // Stop can persist the final partial answer; do it before deleting the row.
         if self.state.id == id {
             self.stop(cx);
@@ -1124,6 +1179,7 @@ enum Worker {
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
+        if self.runtime.is_some(){return;}
         if self.state.timing.finish(timing::Status::Interrupted, timing::Moment::now()) { self.persist(); }
         self.close_outputs();
         if let Some(abort) = self.abort.take() {
@@ -1165,6 +1221,8 @@ fn ago(time: i64) -> String {
 }
 impl Render for Drawer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.runtime.is_some(){self.sync_runtime(cx);}
+        if let Some(runtime)=&self.runtime{runtime.seen.store(self.runtime_revision,std::sync::atomic::Ordering::Release);}
         let agent_items = self.prepare_subagent_cards();
         self.prepare_output_views(cx);
         if self.state.child_page.selected.is_some(){return self.render_child(window,cx);}
@@ -1235,7 +1293,7 @@ impl Render for Drawer {
                             .rounded(px(8.))
                             .text_size(px(12.))
                             .disabled(
-                                self.state.new_conversation_action(self.history)
+                                self.fixture && self.state.new_conversation_action(self.history)
                                     == NewConversation::Disabled,
                             )
                             .tooltip(new_conversation_tooltip(
@@ -1258,9 +1316,9 @@ impl Render for Drawer {
                             }))),
                     ),
             )
-            .child(context);
+            .child(context).children(self.conversation_controls(cx));
         // GPUI applies this request during layout, using the new content height.
-        if self.state.follow_bottom && !self.history {
+        if self.state.follow_bottom && !self.history && !self.chooser && !self.target_picker {
             self.scroll.scroll_to_bottom();
         }
         let mut body = div()
@@ -1290,6 +1348,8 @@ impl Render for Drawer {
             .flex()
             .flex_col()
             .gap(px(12.));
+        if self.chooser { body = body.child(self.conversation_picker(cx)); }
+        if self.target_picker { body = body.child(self.targets_panel(cx)); }
         if self.history {
             for row in self.history_rows.clone() {
                 let id = row.id.clone();
@@ -1566,6 +1626,7 @@ impl Render for Drawer {
             }
             for call in &self.state.active_tools{body=body.child(self.tool_card("main",call,None,None,window,cx));}
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
+            if let Some(runtime)=&self.runtime&&runtime.snapshot().paused {body=body.child(agent_ui::step_action("runtime-resume","继续执行",cx).on_click(cx.listener(|s,_,_,cx|{if let Some(runtime)=&s.runtime{let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}}cx.notify();})));}
             if self.state.continuation.is_some() {
                 body = body.child(
                     crate::dialogs::button(
@@ -1628,6 +1689,9 @@ impl Render for Drawer {
         }
         if let Some(e) = &self.state.save_error {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e.clone()));
+            if self.runtime.as_ref().is_some_and(|r|r.snapshot().error.is_some()) {
+                body=body.child(agent_ui::step_action("retry-conversation-save","重试保存并继续",cx).on_click(cx.listener(|s,_,w,cx|s.begin(None,w,cx))));
+            }
         }
         if let Some(e) = self.tasks.as_ref().and_then(|t|t.completion_save_error()) {
             body = body.child(div().text_size(px(12.)).text_color(p.err).child(e));
@@ -1666,6 +1730,7 @@ impl Render for Drawer {
             .children(self.slash_popup(cx))
             .children(self.interaction_bar(window,cx))
             .children(self.btw_card(window,cx))
+            .children(self.composer_target_chips(cx))
             .child(
                 div()
                     .flex()

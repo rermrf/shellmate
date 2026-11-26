@@ -103,6 +103,10 @@ impl Drawer {
             w.prevent_default();
             return;
         }
+        if (self.chooser || self.target_picker) && !self.input_composing(w,cx)
+            && (action as &dyn Action).as_any().is::<input::Escape>() {
+            self.chooser=false;self.target_picker=false;cx.stop_propagation();w.prevent_default();cx.notify();return;
+        }
         if !composer_focused && !self.context_focus.contains_focused(w, cx) {
             cx.propagate();
             return;

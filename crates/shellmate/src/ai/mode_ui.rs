@@ -9,6 +9,20 @@ use shellmate_ai::PermissionMode;
 impl Drawer {
     pub(super) fn permission_chip(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = cx.palette().clone();
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|r| r.router.scope.lock().unwrap().targets.len() > 1)
+        {
+            return div()
+                .text_size(px(11.5))
+                .text_color(p.tx2)
+                .child("按终端权限")
+                .into_any_element();
+        }
+        if self.runtime.as_ref().is_some_and(|r|r.router.scope.lock().unwrap().default.is_none()) {
+            return div().text_size(px(11.)).text_color(p.tx2).child("命令需指定终端").into_any_element();
+        }
         if !self.capabilities.available() {
             return div()
                 .text_size(px(11.))

@@ -85,6 +85,7 @@ pub use policy::PermissionMode;
 
 pub mod memory;
 pub mod web;
+pub mod session_tools;
 
 pub mod subagent;
 pub use subagent::{SubagentRequest, SubagentKind, SubagentRef, SubagentDisplay, SubagentStatus, SubagentOutcome};

@@ -1,5 +1,5 @@
 //! Executors contain no gpui entities. Terminal I/O is serviced by the drawer's UI bridge.
-use super::host::{Executor, Ui};
+use super::host::{Executor, Host, Ui};
 use shellmate_ai::{
     agent::{Target, ToolCall, ToolOutcome},
     output::shape,
@@ -235,6 +235,9 @@ pub async fn disconnected(alive: &AtomicBool) {
 }
 #[derive(Clone)]
 pub struct AppExecutor {
+    pub lease: Option<Arc<AtomicBool>>,
+    pub slots: Option<Arc<tokio::sync::Semaphore>>,
+    pub router: Option<super::target_router::Router>,
     pub subagents: Option<Arc<super::subagents::Service>>,
     pub memory: Option<(shellmate_core::memory::Memory, String)>,
     pub binding: Binding,
@@ -242,6 +245,16 @@ pub struct AppExecutor {
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn model_slots(&self) -> Option<Arc<tokio::sync::Semaphore>> { self.router.as_ref().map(|r|r.catalog.models.clone()) }
+    fn sessions_enabled(&self) -> bool {
+        self.router.is_some()
+    }
+    fn routed_host(&self, call: &mut ToolCall) -> Result<Option<Host>, String> {
+        self.router
+            .as_ref()
+            .map(|r| r.host(call, self.tasks.clone()))
+            .transpose()
+    }
     fn web_enabled(&self) -> bool {
         self.tasks.web_enabled()
     }
@@ -294,13 +307,19 @@ impl Executor for AppExecutor {
     }
 
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
-        let snapshot = self.memory.as_ref().map_or_else(
+        let mut snapshot = self.memory.as_ref().map_or_else(
             || shellmate_ai::memory::Snapshot {
                 auto_memory,
                 ..Default::default()
             },
             |(memory, label)| shellmate_ai::memory::Snapshot::load(memory, label, auto_memory),
         );
+        if let Some(router) = &self.router {
+            let endpoint=router.resolve(None).ok();
+            let memory=shellmate_core::memory::Memory::new(&router.root,endpoint.as_ref().and_then(|e|if e.binding.local{Some("local")}else{e.target.host_id.as_deref()}));
+            snapshot=shellmate_ai::memory::Snapshot::load(&memory,endpoint.as_ref().map_or("无默认终端",|e|e.target.label.as_str()),auto_memory);
+            snapshot.instructions.push_str(&format!("\n本轮终端范围：{}。操作时明确 session_id；没有默认终端时不得回退到当前标签。主机记忆按 session_id 分开读取和更新。",serde_json::to_string(&*router.scope.lock().unwrap()).unwrap()));
+        }
         if let Some(service) = &self.subagents {
             *service.snapshot.lock().unwrap() = snapshot.clone();
         }
@@ -314,7 +333,48 @@ impl Executor for AppExecutor {
         tool: shellmate_ai::agent::LocalTool,
         limits: shellmate_ai::agent::ExecLimits,
     ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
+        match tool {
+            shellmate_ai::agent::LocalTool::Sessions(request) => {
+                return Box::pin(async move {
+                    match &self.router {
+                        Some(r) => {
+                            if matches!(&request,shellmate_ai::session_tools::Request::Compare(_)) {
+                                let result=r.local(request,&self.tasks).await;
+                                if let Some(id)=&result.output_id{self.tasks.remember_output(id.clone(),"目录比较".into());}
+                                return result;
+                            }
+                            tokio::select! {biased;()=async{self.tasks.control().urgent().await}=>shellmate_ai::agent::LocalResult::error("终端读取已取消"),result=r.local(request,&self.tasks)=>{if let Some(id)=&result.output_id{self.tasks.remember_output(id.clone(),"目录比较".into());}result}}
+                        }
+                        None => shellmate_ai::agent::LocalResult::error("终端目录不可用"),
+                    }
+                });
+            }
+            shellmate_ai::agent::LocalTool::ScopedMemory {
+                session_id,
+                command,
+            } => {
+                return Box::pin(async move {
+                    self.router
+                        .as_ref()
+                        .map(|r| r.scoped_memory(&session_id, command))
+                        .unwrap_or_else(|| {
+                            shellmate_ai::agent::LocalResult::error("目标记忆不可用")
+                        })
+                });
+            }
+            _ => {}
+        }
         if let shellmate_ai::agent::LocalTool::Memory(command) = tool {
+            if let Some(router) = &self.router {
+                return Box::pin(async move {
+                    let id = router.scope.lock().unwrap().default.clone();
+                    match id {
+                        Some(id) => router.scoped_memory(&id, command),
+                        None => command
+                            .execute(&shellmate_core::memory::Memory::new(&router.root, None)),
+                    }
+                });
+            }
             return Box::pin(async move {
                 self.memory.as_ref().map_or_else(
                     || shellmate_ai::agent::LocalResult {
@@ -337,6 +397,7 @@ impl Executor for AppExecutor {
     }
     fn execute(&self, call: ToolCall) -> futures::future::BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
+            if call.cwd.is_some() && call.target!=Target::Background {return ToolOutcome::Failed("此步骤指定了后台工作目录，请保留后台执行或重新提出命令".into());}
             if !self.binding.capabilities.offers(call.target) {
                 return ToolOutcome::Failed("此会话不支持该执行目标".into());
             }
@@ -355,8 +416,31 @@ impl Executor for AppExecutor {
             };
             // Workers own the binding and bridge, but never a strong registry reference.
             let binding = self.binding.clone();
+            let lease = self.lease.clone().unwrap_or_else(||binding.alive.clone());
+            let slots = self.slots.clone();
             let ui = self.ui.clone();
             let worker_call = call.clone();
+            let mut worker_call = worker_call;
+            if worker_call.target == Target::Background
+                && !binding.local
+                && worker_call.destination.is_some()
+            {
+                let Some(cwd) = binding
+                    .capabilities
+                    .cwd
+                    .as_deref()
+                    .filter(|p| p.starts_with('/'))
+                else {
+                    return ToolOutcome::Failed(
+                        "远端工作目录未知，请在 run_command 的 cwd 中指定绝对目录，或在目标终端中执行".into(),
+                    );
+                };
+                worker_call.command = format!(
+                    "cd '{}' && {}",
+                    cwd.replace('\'', "'\\''"),
+                    worker_call.command
+                );
+            }
             let (ready_tx, ready_rx) = if call.target == Target::Terminal && call.run_in_background
             {
                 let (tx, rx) = oneshot::channel();
@@ -368,7 +452,9 @@ impl Executor for AppExecutor {
                 tokio::select! {
                     biased;
                     () = disconnected(&binding.alive) => ToolOutcome::Disconnected,
+                    () = disconnected(&lease) => ToolOutcome::Disconnected,
                     out = async {
+                        let _permit = if let Some(slots)=slots { slots.acquire_owned().await.ok() } else { None };
                         match worker_call.target {
                             Target::Terminal => terminal(&binding, &ui, &worker_call, spool, ready_tx).await,
                             Target::Background if binding.local => {

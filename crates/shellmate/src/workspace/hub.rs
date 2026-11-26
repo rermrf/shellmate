@@ -19,6 +19,8 @@ impl Ids {
 pub(super) struct Services {
     pub store: shellmate_store::SharedStore,
     pub secrets: Arc<shellmate_store::CredentialStore>,
+    pub catalog:crate::ai::session_catalog::Catalog,
+    pub conversations:crate::ai::conversation_manager::Manager,
     pub book: RefCell<Rc<HostBook>>,
     pub preferences: RefCell<shellmate_store::Preferences>,
     pub data_root: RefCell<PathBuf>,
@@ -141,12 +143,14 @@ fn first_other<T, K: PartialEq>(entries: &[T], source: K, key: impl Fn(&T) -> K)
 }
 
 impl Hub {
+    pub(crate) fn ai_services(cx:&App)->(crate::ai::session_catalog::Catalog,crate::ai::conversation_manager::Manager){let s=&cx.global::<Self>().services;(s.catalog.clone(),s.conversations.clone())}
     pub fn init(store: HostStore, temporary: bool, cx: &mut App) {
         let preferences = store.preferences().unwrap_or_default();
         cx.set_global(theme::DefaultFontSize(f32::from(preferences.terminal_font_size)));
         let saver = crate::restore::Saver::new(preferences.get(shellmate_store::Preference::RestoreOnLaunch) && !restore::demo_run());
         let store = shellmate_store::SharedStore::new(store);
         let secrets = crate::security::coordinator(store.clone());
+        let catalog=super::ai::session_catalog(cx);
         crate::updater::init(store.clone(), cx);
         let activity = secrets.clone();
         let keys = cx.intercept_keystrokes(move |event, window, cx| {
@@ -173,10 +177,13 @@ impl Hub {
         });
         let timer = cx.spawn(async |cx| {
             let mut swept = None::<std::time::Instant>;
+            let mut ai_attention=(0,0);
+            let mut ai_status=std::collections::BTreeMap::<String,(bool,usize)>::new();
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 cx.update(|cx| {
                     let hub = cx.global::<Self>();
+                    super::ai::refresh_catalog(cx);
                     if swept.is_none_or(|last| last.elapsed() >= Duration::from_secs(86400)) {
                         let root = hub.services.data_root.borrow().clone();
                         // Demo/temp libraries never inspect the production app directory.
@@ -195,12 +202,37 @@ impl Hub {
                         swept = Some(std::time::Instant::now());
                     }
                     let locked = hub.services.secrets.tick();
+                    let mut ai_notices=Vec::new();
+                    let live=hub.services.conversations.list();
+                    ai_status.retain(|id,_|live.iter().any(|r|&r.id==id));
+                    for runtime in live {
+                        let data=runtime.data.lock().unwrap();
+                        let approvals=data.approvals.values().filter(|a|a.reply.as_ref().is_some_and(|r|!r.is_closed())).count();
+                        let active=data.model.busy||runtime.tasks.has_running();
+                        let previous=ai_status.insert(runtime.id.clone(),(active,approvals));
+                        let title=data.model.conversation.turns().first().map(|t|t.user.question.chars().take(28).collect::<String>()).unwrap_or_else(||"AI 对话".into());
+                        if approvals>previous.map_or(0,|s|s.1) {
+                            let target=data.approvals.values().find_map(|a|a.call.destination.as_ref()).map(|t|t.label.as_str()).unwrap_or("任务目标");
+                            ai_notices.push((runtime.id.clone(),format!("{title} · {target} 等待批准")));
+                        }else if previous.is_some_and(|s|s.0)&&!active&&!data.paused&&data.error.is_none(){
+                            ai_notices.push((runtime.id.clone(),format!("{title} · {}",if data.model.error.is_some(){"需要处理"}else{"任务已结束"})));
+                        }
+                    }
+                    let current_attention=hub.services.conversations.attention();
+                    let ai_changed=ai_attention!=current_attention;
+                    ai_attention=current_attention;
                     for (ix, entry) in hub.windows.clone().into_iter().enumerate() {
                         entry.update(cx, |s, w, cx| {
                             if ix == 0 && locked {
                                 w.push_notification(Notification::info("凭据库已锁定"), cx);
                             }
                             s.tick_archives(w, cx);
+                            if ix==0 {for(id,message)in &ai_notices{
+                                if s.ai_open && s.ai_drawer.as_ref().is_some_and(|d|d.read(cx).conversation_id()==id){continue;}
+                                let id=id.clone();let workspace=cx.entity().downgrade();
+                                w.push_notification(Notification::info(message.clone()).on_click(move|_,w,cx|{let id=id.clone();let workspace=workspace.clone();w.defer(cx,move|_,cx|open_ai_conversation(workspace,id,cx));}),cx);
+                            }}
+                            if ai_changed { cx.notify(); }
                         });
                     }
                     // A change that was marked since the last look is written (at most every few seconds).
@@ -214,6 +246,7 @@ impl Hub {
         cx.on_system_notification_response(|response, cx| Self::notification_clicked(&response.tag, cx));
         // The record of the session is written once more as the app quits.
         cx.on_app_quit(|cx| {
+            cx.global::<Self>().services.conversations.stop_all();
             Self::save_snapshot_at_quit(cx);
             Self::update(cx, |s, _, cx| {
                 if let Some(drawer) = &s.ai_drawer {
@@ -232,6 +265,8 @@ impl Hub {
             services: Rc::new(Services {
                 store,
                 secrets,
+                catalog,
+                conversations:Default::default(),
                 preferences: preferences.into(),
                 book: Default::default(),
                 library_is_temporary: temporary,
@@ -384,6 +419,8 @@ impl Workspace {
             .collect()
     }
 }
+
+pub(crate) fn open_ai_conversation(workspace:WeakEntity<Workspace>,id:String,cx:&mut App){if let Some(workspace)=workspace.upgrade(){let handle=workspace.read(cx).handle;let _=handle.update(cx,|_,w,cx|workspace.update(cx,|s,cx|s.select_ai_conversation(&id,w,cx)));}}
 
 #[cfg(test)]
 mod tests {

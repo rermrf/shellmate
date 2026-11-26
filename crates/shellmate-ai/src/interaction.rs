@@ -22,6 +22,7 @@ pub enum Phase {
     #[default]
     Idle,
     Generating,
+    Resource,
     Executing,
     Approval,
     Waiting(Vec<String>),
@@ -33,6 +34,7 @@ impl Phase {
         match self {
             Self::Idle => "空闲",
             Self::Generating => "正在回复",
+            Self::Resource => "等待共享资源",
             Self::Executing => "正在执行",
             Self::Approval => "等待批准",
             Self::Waiting(_) => "等待任务",

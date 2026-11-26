@@ -320,6 +320,9 @@ impl Conversation {
         if self.child.is_some() {
             offered.retain(|name| *name != "agent" && *name != "propose_command");
         }
+        if caps.sessions && !summarizing {
+            offered.extend(["list_sessions", "read_terminal", "compare_directories"]);
+        }
         if caps.web && !summarizing {
             offered.extend(["web_search", "web_fetch"]);
         }
@@ -455,6 +458,11 @@ impl Conversation {
             .messages(messages)
             .preamble(system);
         if !summarizing {
+            if caps.sessions {
+                for tool in crate::session_tools::tools() {
+                    request = request.tool(tool);
+                }
+            }
             if caps.web {
                 for tool in crate::web::tools() {
                     request = request.tool(tool);
@@ -463,7 +471,11 @@ impl Conversation {
             request = request.tool(tool);
             if caps.available() {
                 if memory.auto_memory {
-                    request = request.tool(crate::memory::tool());
+                    let mut tool = crate::memory::tool();
+                    if caps.sessions {
+                        tool.parameters["properties"]["session_id"] = serde_json::json!({"type":"string","description":"主机记忆所属终端引用；global 表示全局。省略使用默认终端。"});
+                    }
+                    request = request.tool(tool);
                 }
                 if self.child.is_none()
                     && caps.background

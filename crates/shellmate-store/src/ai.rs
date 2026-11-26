@@ -260,7 +260,7 @@ impl HostStore {
             return Ok(false);
         }
         let tx = self.conn.transaction()?;
-        tx.execute("INSERT INTO ai_conversations VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,session_label=excluded.session_label,provider=excluded.provider,model=excluded.model,updated_at=excluded.updated_at",params![c.id,c.host_id,c.label,c.title,c.provider,c.model,c.created_at,c.updated_at])?;
+        tx.execute("INSERT INTO ai_conversations VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET host_id=excluded.host_id,title=excluded.title,session_label=excluded.session_label,provider=excluded.provider,model=excluded.model,updated_at=excluded.updated_at",params![c.id,c.host_id,c.label,c.title,c.provider,c.model,c.created_at,c.updated_at])?;
         for (position, entry) in c.conversation.entries().iter().enumerate() {
             // A worker can finish between the drawer's clone and this save. Never replace
             // its terminal result with an older Running result from that clone.
@@ -273,6 +273,10 @@ impl HostStore {
             if let shellmate_ai::Entry::Step(step)=entry{tx.execute("DELETE FROM ai_external_steps WHERE conversation_id=?1 AND call_id=?2",params![c.id,step.call.id])?;}
         }
         if let Some(runtime)=runtime {
+            if let Some(targets)=runtime["targets"]["targets"].as_object(){
+                tx.execute("DELETE FROM ai_conversation_targets WHERE conversation_id=?1",[&c.id])?;
+                for(id,target)in targets{let role=if runtime["targets"]["default"].as_str()==Some(id){"default"}else{"participant"};tx.execute("INSERT INTO ai_conversation_targets VALUES(?1,?2,?3,?4,?5)",params![c.id,id,target["host_id"].as_str(),role,target.to_string()])?;}
+            }
             tx.execute("INSERT INTO ai_runtime VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET json=excluded.json",params![c.id,runtime.to_string()])?;
             if let Some(ids)=runtime["queue"]["delivered"].as_array(){for id in ids.iter().filter_map(|id|id.as_str()){tx.execute("DELETE FROM ai_task_events WHERE conversation_id=?1 AND id=?2",params![c.id,id])?;}}
         }
@@ -343,7 +347,7 @@ mod tests {
         conn.execute("INSERT INTO ai_messages VALUES('a','c1','assistant','回答','','[{\"command\":\"ls\",\"explanation\":\"列表\",\"risk\":\"low\"}]',2,1,0)", []).unwrap();
         drop(conn);
         let db = HostStore::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
         let c = db.ai_conversation("c1").unwrap().unwrap();
         assert!(
             matches!(&c.conversation.turns()[0].answer.as_ref().unwrap().items[..], [AnswerItem::Text(text),AnswerItem::Command(card)] if text=="回答" && card.command=="ls")
@@ -358,7 +362,7 @@ mod tests {
             .unwrap();
         assert_eq!(legacy, (String::new(), "[]".into(), 2));
         drop(db);
-        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 11);
+        assert_eq!(HostStore::open(path).unwrap().schema_version().unwrap(), 12);
     }
     #[test]
     fn ordered_steps_round_trip_preserves_content_and_caps_output() {
@@ -582,7 +586,7 @@ mod tests {
         db.save_ai_conversation(&loaded).unwrap();
         let nonzero: i64 = db.conn.query_row("SELECT count(*) FROM ai_messages WHERE redactions<>0", [], |r| r.get(0)).unwrap();
         assert_eq!(nonzero, 1, "v10 saves leave v9 rows untouched");
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
     #[test]
     fn crud_cascade_and_save_off() {
@@ -621,7 +625,7 @@ mod tests {
             .unwrap();
         drop(conn);
         let db = HostStore::open(path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
         assert_eq!(db.setting("fixture").unwrap().as_deref(), Some("kept"));
         assert!(db.ai_conversations().unwrap().is_empty());
     }

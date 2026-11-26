@@ -50,6 +50,7 @@ impl Target {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    pub sessions: bool,
     pub web: bool,
     pub terminal: bool,
     pub background: bool,
@@ -58,7 +59,7 @@ pub struct Capabilities {
 }
 impl Capabilities {
     pub fn available(&self) -> bool {
-        self.terminal || self.background
+        self.terminal || self.background || self.sessions
     }
     pub fn targets(&self) -> Vec<Target> {
         [Target::Terminal, Target::Background]
@@ -130,6 +131,9 @@ pub fn explicit_target(question: &str) -> Option<Target> {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub destination: Option<crate::session_tools::Destination>,
     pub id: String,
     pub command: String,
     pub purpose: String,
@@ -226,11 +230,21 @@ pub struct ReadOutput {
 }
 #[derive(Clone, Debug)]
 pub enum LocalTool {
+    Sessions(crate::session_tools::Request),
+    ScopedMemory {
+        session_id: String,
+        command: crate::memory::Command,
+    },
     Web(crate::web::Request),
     Memory(crate::memory::Command),
     ReadOutput(ReadOutput),
-    StopTask { id: String },
-    WaitTasks { ids: Vec<String>, all: bool },
+    StopTask {
+        id: String,
+    },
+    WaitTasks {
+        ids: Vec<String>,
+        all: bool,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct LocalResult {
@@ -294,6 +308,10 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    fn model_slots(&self) -> Option<Arc<tokio::sync::Semaphore>> { None }
+    fn sessions_enabled(&self) -> bool {
+        false
+    }
     fn web_enabled(&self) -> bool {
         false
     }
@@ -522,6 +540,11 @@ pub fn run<'a>(
     limits: Limits,
 ) -> Result<AgentStream<'a>, AiError> {
     capabilities.web = host.web_enabled();
+    capabilities.sessions = host.sessions_enabled();
+    if capabilities.sessions {
+        capabilities.background=true;
+        capabilities.terminal=conversation.child.is_none();
+    }
     let user = conversation
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
@@ -629,6 +652,7 @@ struct State<'a> {
     limits: Limits,
     turn: Option<Resume>,
     model: Option<CompletionStream>,
+    model_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     active: Option<(RigCall, ToolCall)>,
     first: bool,
     retry_wait: Option<Duration>,
@@ -673,6 +697,7 @@ impl State<'_> {
         let turn = self.turn.as_ref().unwrap();
         let mut capabilities = turn.capabilities.clone();
         capabilities.web = self.host.web_enabled();
+        capabilities.sessions = self.host.sessions_enabled();
         let mut request = self.conversation.request(
             &capabilities,
             &turn.native,
@@ -704,12 +729,14 @@ impl State<'_> {
     fn fail(&mut self, error: AiError) -> AgentEvent {
         self.done = true;
         self.model = None;
+        self.model_permit = None;
         self.turn = None;
         AgentEvent::Error(error)
     }
     fn pause(&mut self, reason: PauseReason) -> AgentEvent {
         self.done = true;
         self.model = None;
+        self.model_permit = None;
         let mut resume = self.turn.take().unwrap();
         resume.message_id = self.message_id;
         if reason == PauseReason::InvalidCalls {
@@ -723,6 +750,7 @@ impl State<'_> {
     }
     fn failure(&mut self, error: AiError, retry_after: Option<Duration>) -> AgentEvent {
         self.model = None;
+        self.model_permit = None;
         let transient = matches!(
             error,
             AiError::RateLimited | AiError::Unavailable | AiError::Network | AiError::Timeout
@@ -781,6 +809,7 @@ impl State<'_> {
             return false;
         }
         self.model = None;
+        self.model_permit = None;
         true
     }
 }
@@ -865,6 +894,7 @@ impl State<'_> {
             }
             crate::context::add_prompt(&mut request, prompt);
             let mut usage = Usage::default();
+            let _permit=if let Some(slots)=self.host.model_slots(){slots.acquire_owned().await.ok()}else{None};
             let summary = self.client.summarize(request, |u| usage.add(u)).await;
             if self.conversation.child.is_some() {
                 self.record(LogUpdate::RequestUsage(usage));
@@ -960,6 +990,7 @@ fn stream<'a>(
         limits,
         turn: Some(turn),
         model: None,
+        model_permit: None,
         active: None,
         first: true,
         retry_wait: None,
@@ -1070,7 +1101,13 @@ fn stream<'a>(
                     call: crate::LoggedCall {
                         id: raw.id.to_string(),
                         name: raw.function.name.to_string(),
-                        args_json: serde_json::Value::Object(raw.function.arguments),
+                        args_json: {
+                            let mut args = serde_json::Value::Object(raw.function.arguments);
+                            if let Some(d) = &call.destination {
+                                args["resolved_target"] = serde_json::to_value(d).unwrap();
+                            }
+                            args
+                        },
                     },
                     result: crate::LoggedResult {
                         subagent: None,
@@ -1084,8 +1121,9 @@ fn stream<'a>(
                     },
                     display: Some(display),
                 }));
-                if matches!(&outcome, ToolOutcome::Disconnected)
-                    || matches!(&outcome, ToolOutcome::Completed(out) if out.disconnected)
+                if !s.host.sessions_enabled()
+                    && (matches!(&outcome, ToolOutcome::Disconnected)
+                        || matches!(&outcome,ToolOutcome::Completed(out)if out.disconnected))
                 {
                     s.error = Some(AiError::Disconnected);
                 }
@@ -1195,7 +1233,7 @@ fn stream<'a>(
                         continue;
                     }
                     Pending::Local(raw, tool) => {
-                        if matches!(&tool, LocalTool::Web(_)) {
+                        if matches!(&tool, LocalTool::Web(_) | LocalTool::Sessions(_)) {
                             s.phase(crate::interaction::Phase::Executing);
                         }
                         let tool_id = raw.id.to_string();
@@ -1325,6 +1363,14 @@ fn stream<'a>(
                 s.received = false;
                 s.defer_text = false;
                 s.message_id = s.conversation.entries().len();
+                if let Some(slots)=s.host.model_slots() {
+                    s.phase(crate::interaction::Phase::Resource);
+                    s.model_permit=tokio::select! {
+                        biased;
+                        ()=interaction::urgent(s.host.control())=>{s.interrupt_stream();continue;},
+                        permit=slots.acquire_owned()=>permit.ok(),
+                    };
+                }
                 s.phase(crate::interaction::Phase::Generating);
                 match s.client.agent_open(request) {
                     Ok(model) => s.model = Some(model),
@@ -1418,6 +1464,7 @@ fn stream<'a>(
                         ()=interaction::urgent(s.host.control())=>{s.interrupt_stream();continue;},
                         result=tokio::time::timeout(timeouts.idle,model.finish())=>result,
                     };
+                    s.model_permit=None;
                     let mut response = match finished {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) => {
@@ -1489,6 +1536,7 @@ fn stream<'a>(
                     if truncated
                         && !s.turn.as_ref().unwrap().capabilities.available()
                         && !s.turn.as_ref().unwrap().capabilities.web
+                        && !s.host.sessions_enabled()
                     {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
@@ -1505,6 +1553,7 @@ fn stream<'a>(
                                     continue;
                                 }
                                 if !s.turn.as_ref().unwrap().capabilities.available()
+                                    && !s.host.sessions_enabled()
                                     && !matches!(
                                         raw.function.name.as_str(),
                                         "web_search" | "web_fetch"
@@ -1592,6 +1641,7 @@ fn stream<'a>(
                                         &raw,
                                         s.limits.auto_memory,
                                         s.host.web_enabled(),
+                                        s.host.sessions_enabled(),
                                     ) {
                                         Ok(Some(tool)) => Pending::Local(raw, tool),
                                         Err(error) => Pending::Invalid(raw, error),
@@ -1619,6 +1669,7 @@ fn stream<'a>(
                     // They never start another model call just to acknowledge a card.
                     if !s.turn.as_ref().unwrap().capabilities.available()
                         && !s.turn.as_ref().unwrap().capabilities.web
+                        && !s.host.sessions_enabled()
                     {
                         while let Some(pending) = pending.pop_front() {
                             if let Pending::Text(text) = pending {
@@ -1720,6 +1771,8 @@ fn parse_call(
     #[derive(Deserialize)]
     #[serde(crate = "rig_core::serde")]
     struct Arguments {
+        cwd: Option<String>,
+        session_id: Option<String>,
         command: Option<String>,
         purpose: Option<String>,
         target: Option<String>,
@@ -1769,11 +1822,16 @@ fn parse_call(
                     .join("、")
             )
         })?;
+    if let Some(cwd)=&a.cwd && (!capabilities.sessions || target!=Target::Background || !cwd.starts_with('/') || cwd.contains('\0') || cwd.len()>8192) {
+        return Err("cwd 仅用于多终端后台命令，必须为绝对目录".into());
+    }
     let timeout = a
         .timeout_secs
         .as_ref()
         .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()));
     Ok(ToolCall {
+        session_id: a.session_id,
+        cwd: a.cwd, destination: None,
         id: raw.id.to_string(),
         class: policy::classify(&command),
         command,
@@ -1790,8 +1848,29 @@ fn parse_call(
     })
 }
 
-fn parse_local(raw: &RigCall, auto_memory: bool, web: bool) -> Result<Option<LocalTool>, String> {
+fn parse_local(
+    raw: &RigCall,
+    auto_memory: bool,
+    web: bool,
+    sessions: bool,
+) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
+    if matches!(
+        name,
+        "list_sessions" | "read_terminal" | "compare_directories"
+    ) {
+        if !sessions {
+            return Err("终端目录不可用".into());
+        }
+        if raw.function.invalid_arguments.is_some() {
+            return Err("终端工具参数必须为完整 JSON".into());
+        }
+        return crate::session_tools::parse(
+            name,
+            serde_json::Value::Object(raw.function.arguments.clone()),
+        )
+        .map(|r| Some(LocalTool::Sessions(r)));
+    }
     if matches!(name, "web_search" | "web_fetch") {
         if !web {
             return Err("网页工具未启用，请在 AI 设置中开启".into());
@@ -1833,9 +1912,20 @@ fn parse_local(raw: &RigCall, auto_memory: bool, web: bool) -> Result<Option<Loc
         if !auto_memory {
             return Err("自动记忆已关闭，memory 工具不可用".into());
         }
+        let mut args = args;
+        let session_id = args
+            .as_object_mut()
+            .and_then(|o| o.remove("session_id"))
+            .and_then(|v| v.as_str().map(str::to_owned));
         let command: crate::memory::Command =
             serde_json::from_value(args).map_err(|e| format!("memory 参数无效：{e}"))?;
-        return Ok(Some(LocalTool::Memory(command)));
+        return Ok(Some(match session_id {
+            Some(session_id) => LocalTool::ScopedMemory {
+                session_id,
+                command,
+            },
+            None => LocalTool::Memory(command),
+        }));
     }
     if name == "read_output" {
         let a: ReadOutput = serde_json::from_value(args).map_err(|_| "read_output 参数无效")?;

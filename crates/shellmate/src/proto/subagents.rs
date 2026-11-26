@@ -32,6 +32,8 @@ pub fn approvals() -> Vec<(SubagentRef, ToolCall)> {
             kind: SubagentKind::General,
         };
         let call = ToolCall {
+            session_id: None,
+            cwd: None, destination: None,
             id: format!("{id}-call"),
             command: command.into(),
             purpose: description.into(),
@@ -93,6 +95,8 @@ pub fn view(id: &str, description: &str) -> crate::ai::subagent_view::View {
         timeouts: Default::default(),
     };
     let request = shellmate_ai::SubagentRequest {
+        session_ids: vec![],
+        default_session_id: None,
         description: description.into(),
         prompt: "fixture".into(),
         kind: SubagentKind::Explore,

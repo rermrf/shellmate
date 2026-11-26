@@ -64,6 +64,8 @@ fn call(class: Class) -> ToolCall {
         Class::RedLine => "systemctl reboot",
     };
     ToolCall {
+        session_id: None,
+        cwd: None, destination: None,
         id: "call-1".into(),
         command: command.into(),
         purpose: "测试".into(),
@@ -289,6 +291,9 @@ async fn memory_uses_local_executor_without_approval_or_task_registration() {
             compaction: Default::default(),
             mode: Arc::new(Mutex::new(mode)),
             executor: Box::new(crate::ai::exec::AppExecutor {
+                lease: None,
+            slots: None,
+                router: None,
                 subagents: None,
                 memory: Some((files.clone(), "local".into())),
                 tasks: tasks.clone(),

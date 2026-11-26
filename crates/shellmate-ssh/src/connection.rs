@@ -65,6 +65,8 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Whether two handles refer to the same authenticated transport generation.
+    pub fn same_transport(&self,other:&Self)->bool{Arc::ptr_eq(&self.inner,&other.inner)}
     /// Connects along `route`: every jump host and the target get the same
     /// host key check and authentication. Must run inside the tokio runtime
     /// (see [`SshRuntime::connect`](crate::SshRuntime::connect)).

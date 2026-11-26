@@ -68,7 +68,7 @@ pub fn authorized_config(
 pub fn needs_disclosure(destination: &str, accepted: &[String]) -> bool {
     !accepted.iter().any(|s| s == destination)
 }
-#[derive(Default)]
+#[derive(Clone,Default)]
 pub struct DrawerModel {
     pub conversation: Conversation,
     pub busy: bool,

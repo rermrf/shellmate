@@ -1,0 +1,958 @@
+use super::*;
+use shellmate_ai::Config;
+impl Drawer {
+    pub(super) fn session_result_content(
+        &self,
+        key: &str,
+        result: &str,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let value: serde_json::Value = serde_json::from_str(result).ok()?;
+        let p = cx.palette().clone();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .text_size(px(12.))
+            .whitespace_normal();
+        if let Some(rows) = value["sessions"].as_array() {
+            for row in rows {
+                body = body.child(div().py(px(4.)).border_b_1().border_color(p.line).child(
+                    format!(
+                        "{} · {} · {}\n{}",
+                        row["name"].as_str().unwrap_or("终端"),
+                        row["protocol"].as_str().unwrap_or_default(),
+                        if row["connected"] == true {
+                            "已连接"
+                        } else {
+                            "已断开"
+                        },
+                        row["cwd"].as_str().unwrap_or("目录未知")
+                    ),
+                ));
+            }
+            if rows.is_empty() {
+                body = body.child("没有匹配的终端");
+            }
+            if value["next_offset"].is_number() {
+                body = body.child("还有更多终端，可继续查询下一页");
+            }
+        } else {
+            let text = value["text"].as_str()?;
+            body = body
+                .child(format!(
+                    "{} · {}",
+                    value["target"]["label"].as_str().unwrap_or("终端"),
+                    value["target"]["cwd"].as_str().unwrap_or("目录未知")
+                ))
+                .child(super::subagent_ui::selectable(
+                    format!("{key}:terminal-snapshot"),
+                    text,
+                    w,
+                    cx,
+                ));
+        }
+        Some(body)
+    }
+    pub(super) fn message_context(
+        &mut self,
+        mut context: shellmate_ai::ContextSnapshot,
+    ) -> shellmate_ai::ContextSnapshot {
+        if !self.composer_targets.is_empty() {
+            context.text.push_str(&format!(
+                "\n本条消息明确选择的终端引用：{}。同名终端以这些引用为准。",
+                serde_json::to_string(&std::mem::take(&mut self.composer_targets)).unwrap()
+            ));
+        }
+        context
+    }
+    pub(super) fn composer_target_chips(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.composer_targets.is_empty() {
+            return None;
+        }
+        let catalog = self
+            .runtime
+            .as_ref()
+            .map(|r| r.router.catalog.clone())
+            .unwrap_or_else(|| crate::workspace::hub::Hub::ai_services(cx).0);
+        let mut row = div().flex().flex_wrap().gap(px(6.));
+        for id in &self.composer_targets {
+            let label = catalog
+                .resolve(id)
+                .map(|e| e.target.label)
+                .unwrap_or_else(|_| "终端已失效".into());
+            let id = id.clone();
+            row = row.child(
+                agent_ui::step_action(
+                    SharedString::from(format!("mention-{id}")),
+                    SharedString::from(format!("@{label} ×")),
+                    cx,
+                )
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    s.composer_targets.remove(&id);
+                    cx.notify();
+                })),
+            );
+        }
+        Some(row)
+    }
+    #[cfg(debug_assertions)]
+    pub(super) fn multi_fixture(&mut self, scene: &str, cx: &mut Context<Self>) {
+        use crate::ai::{exec::Binding, session_catalog::Catalog, target_router::Router};
+        use shellmate_ai::{Conversation, Entry, LoggedCall, LoggedResult, Step, UserTurn};
+        use std::sync::atomic::AtomicBool;
+        let Some(rt) = crate::runtime::get(cx) else {
+            return;
+        };
+        let handle = rt.handle();
+        let _entered = handle.enter();
+        let (tx, _) = async_channel::unbounded();
+        let catalog = Catalog::new(tx.clone());
+        catalog.update(
+            [
+                (1, "本地终端 1", "本机终端", "/Users/demo/project", true),
+                (2, "prod-web-01", "SSH", "/srv/app", false),
+                (3, "prod-db-01", "SSH", "/srv/db", false),
+            ]
+            .into_iter()
+            .map(|(session, label, protocol, cwd, local)| {
+                (
+                    Binding {
+                        session,
+                        local,
+                        connection: None,
+                        alive: Arc::new(AtomicBool::new(true)),
+                        capabilities: Capabilities {
+                            background: true,
+                            cwd: Some(cwd.into()),
+                            ..Default::default()
+                        },
+                    },
+                    label.into(),
+                    protocol.into(),
+                    (!local).then(|| label.into()),
+                    "窗口 1".into(),
+                )
+            })
+            .collect(),
+        );
+        let manager = crate::workspace::hub::Hub::ai_services(cx).1;
+        let mut current = None;
+        for (session, title, busy) in [
+            (1, "分析本地项目", true),
+            (2, "比较本地与远程目录", false),
+            (3, "检查数据库连接", true),
+        ] {
+            let router = Router::new(
+                catalog.clone(),
+                self.db.clone(),
+                self.data_root.clone(),
+                tx.clone(),
+            );
+            let target = catalog.session(session).unwrap().target;
+            router.add(&target.session_id, true).unwrap();
+            if session == 2 {
+                router
+                    .add(&catalog.session(1).unwrap().target.session_id, false)
+                    .unwrap();
+            }
+            let mut log = Conversation::default();
+            log.push_user(UserTurn::new(title, Default::default()));
+            log.push_text(if session == 2 {
+                "本地与远程目录清单已读取，正在整理差异。"
+            } else {
+                "任务正在处理，切换到其他对话不会停止本任务。"
+            });
+            if session == 2 && scene == "ai-multi-compare" {
+                log.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"compare".into(),name:"compare_directories".into(),args_json:serde_json::json!({"left":{"session_id":"local","path":"/Users/demo/project"},"right":{"session_id":"remote","path":"/srv/app"}})},result:LoggedResult{inline:serde_json::json!({"left":{"label":"本地终端 1"},"right":{"label":"prod-web-01"},"left_path":"/Users/demo/project","right_path":"/srv/app","scan_complete":true,"summary":{"内容不同":2,"仅左侧存在":1,"内容相同":126},"differences":[{"path":"config/app.toml","status":"内容不同"},{"path":"src/main.rs","status":"内容不同"},{"path":"README.local.md","status":"仅左侧存在"}]}).to_string(),output_id:None,subagent:None,cleared:false,is_error:false},display:None}));
+            }
+            let r = conversation_runtime::Runtime::new(
+                format!("multi-fixture-{session}"),
+                session as i64,
+                log,
+                Default::default(),
+                router,
+                self.db.clone(),
+                self.data_root.clone(),
+                Arc::new(shellmate_store::MemoryStore::default()),
+            );
+            {
+                let mut d = r.data.lock().unwrap();
+                d.model.busy = busy;
+                d.revision = 1;
+            }
+            let r = manager.insert(r);
+            if session == 2 {
+                current = Some(r);
+            }
+        }
+        self.multi_fixture = true;
+        self.attach_runtime(current.unwrap(), cx);
+        self.chooser = scene == "ai-multi-conversations";
+        self.target_picker = scene == "ai-multi-targets";
+        self.next_context = Some(SessionContext {
+            session: Some(1),
+            host: None,
+            label: "本地终端 1".into(),
+            protocol: "本机终端".into(),
+            binding: None,
+        });
+        if scene == "ai-multi-compare" {
+            self.state
+                .tool_expanded
+                .insert(self.tool_key("main", "compare", false));
+        }
+        cx.notify();
+    }
+    pub(crate) fn draft_title(&self, cx: &App) -> String {
+        self.state
+            .model
+            .conversation
+            .turns()
+            .first()
+            .map(|t| t.user.question.chars().take(28).collect())
+            .unwrap_or_else(|| {
+                let text = self.input.read(cx).value();
+                if text.trim().is_empty() {
+                    "新对话".into()
+                } else {
+                    text.chars().take(28).collect()
+                }
+            })
+    }
+    pub(crate) fn reuse_draft(&mut self) {
+        self.context_bound = false;
+        self.selected_targets.clear();
+        self.composer_targets.clear();
+        self.next_context = None;
+    }
+    pub(crate) fn empty_draft(&self, cx: &App) -> bool {
+        self.runtime.is_none()
+            && self.input.read(cx).value().trim().is_empty()
+            && self.state.model.conversation.turns().is_empty()
+            && !self.state.pending
+    }
+    pub(crate) fn runtime_retired(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|r| r.is_retired())
+    }
+    pub(crate) fn conversation_id(&self) -> &str {
+        &self.state.id
+    }
+    pub(crate) fn attach_runtime(
+        &mut self,
+        runtime: Arc<conversation_runtime::Runtime>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.id = runtime.id.clone();
+        self.state.created = runtime.created;
+        self.state.control = runtime.control.clone();
+        self.tasks = Some(runtime.tasks.clone());
+        self.runtime = Some(runtime);
+        self.runtime_revision = u64::MAX;
+        self.sync_runtime(cx);
+    }
+    pub(super) fn start_runtime(&mut self, config: Config, cx: &mut Context<Self>) -> bool {
+        let Some(runtime) = self.prepare_runtime(cx) else {
+            return false;
+        };
+        let settings = self.db.borrow().ai_settings().unwrap_or_default();
+        runtime.launch(config, settings.limits(), settings);
+        self.sync_runtime(cx);
+        true
+    }
+    pub(super) fn prepare_runtime(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<conversation_runtime::Runtime>> {
+        let runtime_handle = crate::runtime::get(cx)?;
+        let (catalog, manager) = crate::workspace::hub::Hub::ai_services(cx);
+        if self.runtime.is_none()
+            && let Some(existing) = manager.get(&self.state.id)
+        {
+            self.attach_runtime(existing, cx);
+        }
+        if self.runtime.is_none() {
+            let (tx, _) = async_channel::unbounded();
+            let router = crate::ai::target_router::Router::new(
+                catalog.clone(),
+                self.db.clone(),
+                self.data_root.clone(),
+                tx,
+            );
+            let restored = self
+                .db
+                .borrow()
+                .ai_runtime(&self.state.id)
+                .ok()
+                .flatten()
+                .and_then(|r| {
+                    serde_json::from_value::<crate::ai::target_router::Scope>(r["targets"].clone())
+                        .ok()
+                });
+            if let Some(scope) = restored {
+                *router.scope.lock().unwrap() = scope;
+            } else if self.state.readonly {
+                let id = format!("legacy-{}", self.state.id);
+                let target = shellmate_ai::session_tools::Destination {
+                    session_id: id.clone(),
+                    label: self
+                        .state
+                        .model
+                        .conversation
+                        .latest_user()
+                        .map_or("原终端", |u| u.context.label.as_str())
+                        .into(),
+                    protocol: self
+                        .state
+                        .model
+                        .conversation
+                        .latest_user()
+                        .map_or("", |u| u.context.protocol.as_str())
+                        .into(),
+                    host_id: self.state.history_memory_host.clone(),
+                    cwd: None,
+                };
+                let mut scope = router.scope.lock().unwrap();
+                scope.default = Some(id.clone());
+                scope.targets.insert(id, target);
+            } else if let Some(session) = self.session
+                && let Some(e) = catalog.session(session)
+            {
+                let _ = router.add(&e.target.session_id, true);
+            }
+            for id in &self.selected_targets {
+                let _ = router.add(id, router.resolve(None).is_err());
+            }
+            if !self.state.readonly
+                && let Some(text) = self
+                    .state
+                    .model
+                    .conversation
+                    .latest_user()
+                    .map(|u| u.question.as_str())
+            {
+                router.grant_named(text);
+            }
+            let id = self.state.id.clone();
+            let created = self.state.created;
+            let log = self.state.model.conversation.clone();
+            let control = self.state.control.clone();
+            let db = self.db.clone();
+            let root = self.data_root.clone();
+            let credentials = self.credentials.clone();
+            // Construct the independent worker's bridge on the application Tokio runtime.
+            let handle = runtime_handle.handle();
+            let _entered = handle.enter();
+            let runtime = conversation_runtime::Runtime::new(
+                id,
+                created,
+                log,
+                control,
+                router,
+                db,
+                root,
+                credentials,
+            );
+            {
+                let mut data = runtime.data.lock().unwrap();
+                data.timing = self.state.timing.clone();
+            }
+            self.attach_runtime(manager.insert(runtime), cx);
+        }
+        self.runtime.clone()
+    }
+    pub(super) fn sync_runtime(&mut self, _cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        if runtime.is_retired() {
+            self.runtime = None;
+            self.tasks = None;
+            self.state.reset_conversation();
+            return;
+        }
+        let requested = runtime.router.requested.lock().unwrap().clone();
+        if requested
+            .iter()
+            .any(|id| !self.target_requests_seen.contains(id))
+        {
+            self.target_requests_seen.extend(requested);
+            self.target_picker = true;
+            self.chooser = false;
+            self.state.follow_bottom = false;
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        }
+        let snapshot = runtime.snapshot();
+        if snapshot.revision == self.runtime_revision && !runtime.active() {
+            return;
+        }
+        self.subagent_service = runtime.service.lock().unwrap().clone();
+        self.runtime_revision = snapshot.revision;
+        self.state.model = snapshot.model;
+        self.state.timing = snapshot.timing;
+        if snapshot.config.is_some() {
+            self.state.readonly = false;
+        }
+        self.state.run_config = snapshot.config;
+        self.state.run_limits = Some(snapshot.limits);
+        self.state.run_subagent_settings = Some(snapshot.settings);
+        self.state.save_error = snapshot.error;
+        self.state.tool_ids = snapshot.tool_ids;
+        self.state.active_tools = snapshot.tools;
+        let keys: Vec<_> = self
+            .state
+            .active_steps
+            .iter()
+            .filter(|(key, _)| !snapshot.approvals.contains_key(*key))
+            .map(|(key, _)| key.to_owned())
+            .collect();
+        for key in keys {
+            self.state.active_steps.remove(&key);
+        }
+        for (key, a) in snapshot.approvals {
+            if a.reply.as_ref().is_some_and(|r| r.is_closed()) {
+                continue;
+            }
+            if self
+                .state
+                .active_steps
+                .get(&key)
+                .is_none_or(|s| s.started.is_none() != !a.started)
+            {
+                let mut step = agent_ui::ActiveStep::new(a.call);
+                step.source = a.source.clone();
+                step.redline = a.redline;
+                step.reply = a.reply;
+                step.automatic = a.automatic;
+                if a.started {
+                    step.started = Some(std::time::Instant::now());
+                }
+                self.state
+                    .active_steps
+                    .insert(key, a.source.map(|s| s.id), step);
+            }
+        }
+        for view in runtime.tasks.agent_views() {
+            if let Some(old) = self.state.subagents.get_mut(&view.id) {
+                old.refresh(view);
+            } else {
+                self.state.subagents.insert(view.id.clone(), view);
+            }
+        }
+        if let Ok(endpoint) = runtime.router.resolve(None) {
+            self.session = Some(endpoint.binding.session);
+            self.host = endpoint.target.host_id.clone();
+            self.label = endpoint.target.label.clone();
+            self.protocol = endpoint.target.protocol.clone();
+            *self.mode.lock().unwrap() = runtime.router.policy(&endpoint);
+            self.binding = Some(endpoint.binding.clone());
+            self.capabilities = endpoint.binding.capabilities;
+        } else {
+            let scope = runtime.router.scope.lock().unwrap();
+            let target = scope.default.as_ref().and_then(|id| scope.targets.get(id));
+            self.session = None;
+            self.binding = None;
+            self.host = target.and_then(|t| t.host_id.clone());
+            self.label = target.map_or("无默认终端", |t| t.label.as_str()).into();
+            self.protocol = target.map_or("", |t| t.protocol.as_str()).into();
+            self.capabilities.terminal = false;
+            self.capabilities.background = false;
+        }
+        self.capabilities.sessions = true;
+        self.capabilities.web = runtime.tasks.web_enabled();
+        let has_default = runtime.router.scope.lock().unwrap().default.is_some();
+        if has_default && runtime.router.resolve(None).is_err() && self.state.save_error.is_none() {
+            self.state.save_error = Some("默认终端不可用，请重新选择；已获得的结果仍保留".into());
+        }
+    }
+    pub(super) fn conversation_controls(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.fixture && !self.multi_fixture {
+            return None;
+        }
+        let all = crate::workspace::hub::Hub::ai_services(cx).1.list();
+        let pending = all
+            .iter()
+            .filter(|r| r.snapshot().approvals.values().any(|a| a.reply.is_some()))
+            .count();
+        let count = self
+            .runtime
+            .as_ref()
+            .map(|r| r.router.scope.lock().unwrap().targets.len())
+            .unwrap_or(
+                self.selected_targets
+                    .len()
+                    .max(usize::from(self.session.is_some())),
+            );
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .mt(px(6.))
+            .child(
+                agent_ui::step_action(
+                    "ai-conversations",
+                    if pending > 0 {
+                        "对话 · 待处理"
+                    } else {
+                        "切换对话"
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(|s, _, _, cx| {
+                    s.chooser = !s.chooser;
+                    s.target_picker = false;
+                    s.history = false;
+                    s.state.follow_bottom = false;
+                    s.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                    cx.notify();
+                })),
+            )
+            .child(
+                agent_ui::step_action(
+                    "ai-targets",
+                    SharedString::from(format!("终端 · {count}")),
+                    cx,
+                )
+                .on_click(cx.listener(|s, _, _, cx| {
+                    s.target_picker = !s.target_picker;
+                    s.chooser = false;
+                    s.history = false;
+                    s.state.follow_bottom = false;
+                    s.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                    cx.notify();
+                })),
+            );
+        if let Some(session) = self.session {
+            row = row.child(
+                agent_ui::step_action("locate-default", "定位", cx).on_click(cx.listener(
+                    move |s, _, w, cx| {
+                        let ws = s.workspace.clone();
+                        w.defer(cx, move |w, cx| {
+                            ws.update(cx, |s, cx| s.locate_ai_terminal(session, w, cx))
+                                .ok();
+                        });
+                    },
+                )),
+            );
+        }
+        if let Some(next) = &self.next_context
+            && next.session != self.session
+        {
+            row = row.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .text_size(px(11.))
+                            .text_color(cx.palette().tx3)
+                            .child(format!("当前标签：{}", next.label)),
+                    )
+                    .child(
+                        agent_ui::step_action("new-current-target", "为此新建", cx)
+                            .on_click(cx.listener(|s, _, w, cx| s.new_conversation(w, cx))),
+                    ),
+            );
+        }
+        Some(row)
+    }
+    pub(super) fn conversation_picker(&self, cx: &mut Context<Self>) -> Div {
+        let p = cx.palette();
+        let mut list = div()
+            .p(px(10.))
+            .rounded(px(12.))
+            .bg(p.card2)
+            .flex()
+            .flex_col()
+            .gap(px(8.));
+        let mut all = crate::workspace::hub::Hub::ai_services(cx).1.list();
+        all.sort_by_key(|r| {
+            let s = r.snapshot();
+            (
+                s.approvals.is_empty(),
+                !s.model.busy,
+                std::cmp::Reverse(r.created),
+            )
+        });
+        for runtime in all {
+            let snap = runtime.snapshot();
+            let title = snap
+                .model
+                .conversation
+                .turns()
+                .first()
+                .map(|t| t.user.question.chars().take(28).collect::<String>())
+                .unwrap_or_else(|| "新对话".into());
+            let scope = runtime.router.scope.lock().unwrap();
+            let target = scope
+                .default
+                .as_ref()
+                .and_then(|id| scope.targets.get(id))
+                .map(|t| t.label.as_str())
+                .unwrap_or("无默认终端");
+            let status = if snap.approvals.values().any(|a| a.reply.is_some()) {
+                "等待批准"
+            } else if snap.model.busy || runtime.tasks.has_running() {
+                "运行中"
+            } else if snap.paused {
+                "已暂停"
+            } else {
+                "已结束"
+            };
+            let unread = snap.revision > runtime.seen.load(std::sync::atomic::Ordering::Acquire);
+            let id = runtime.id.clone();
+            let close_id = id.clone();
+            let stop = runtime.clone();
+            let active = runtime.active();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("choose-{id}")))
+                    .p(px(6.))
+                    .rounded(px(8.))
+                    .hover(|s| s.bg(p.card3))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .whitespace_normal()
+                    .child(format!(
+                        "{}{title}\n{target} · {status} · {}s",
+                        if unread { "● " } else { "" },
+                        snap.timing
+                            .snapshot(timing::Moment::now())
+                            .last()
+                            .map_or(0, |t| t.duration_ms / 1000)
+                    ))
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        s.chooser = false;
+                        let ws = s.workspace.clone();
+                        let id = id.clone();
+                        w.defer(cx, move |w, cx| {
+                            ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
+                                .ok();
+                        });
+                    })),
+            );
+            list = list.child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .when(active, |d| {
+                        d.child(
+                            agent_ui::step_action(
+                                SharedString::from(format!("stop-{close_id}")),
+                                "停止回复",
+                                cx,
+                            )
+                            .on_click(move |_, _, _| stop.stop_reply()),
+                        )
+                    })
+                    .child(
+                        agent_ui::step_action(
+                            SharedString::from(format!("close-{close_id}")),
+                            if active {
+                                "停止并关闭"
+                            } else {
+                                "关闭此对话"
+                            },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            let ws = s.workspace.clone();
+                            let id = close_id.clone();
+                            w.defer(cx, move |w, cx| {
+                                ws.update(cx, |s, cx| s.close_ai_conversation(&id, w, cx))
+                                    .ok();
+                            });
+                        })),
+                    ),
+            );
+        }
+        if let Some(ws) = self.workspace.upgrade() {
+            for (id, title) in ws.read(cx).ai_drafts(cx) {
+                list = list.child(
+                    agent_ui::step_action(
+                        SharedString::from(format!("draft-{id}")),
+                        SharedString::from(format!("草稿 · {title}")),
+                        cx,
+                    )
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        let ws = s.workspace.clone();
+                        let id = id.clone();
+                        w.defer(cx, move |w, cx| {
+                            ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
+                                .ok();
+                        });
+                    })),
+                );
+            }
+        }
+        list.child(
+            agent_ui::step_action("all-history", "打开历史对话", cx).on_click(cx.listener(
+                |s, _, _, cx| {
+                    s.chooser = false;
+                    s.history(cx);
+                },
+            )),
+        )
+    }
+    pub(super) fn targets_panel(&self, cx: &mut Context<Self>) -> Div {
+        let p = cx.palette();
+        let mut list = div()
+            .p(px(10.))
+            .rounded(px(12.))
+            .bg(p.card2)
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().text_size(px(12.)).child("本次任务可操作的终端"));
+        let entries = self
+            .runtime
+            .as_ref()
+            .map(|r| r.router.catalog.list())
+            .unwrap_or_else(|| crate::workspace::hub::Hub::ai_services(cx).0.list());
+        if let Some(runtime) = &self.runtime {
+            let scope = runtime.router.scope.lock().unwrap().clone();
+            for (id, target) in &scope.targets {
+                if runtime.router.catalog.resolve(id).is_ok() {
+                    continue;
+                }
+                let old = id.clone();
+                let remove = id.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(12.))
+                                .text_ellipsis()
+                                .child(format!("{} · 已失效", target.label)),
+                        )
+                        .child(
+                            agent_ui::step_action(
+                                SharedString::from(format!("rebind-{id}")),
+                                "重新关联",
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |s, _, _, cx| {
+                                    s.rebind_target = Some(old.clone());
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            agent_ui::step_action(
+                                SharedString::from(format!("forget-{id}")),
+                                "移除",
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |s, _, _, cx| {
+                                    if let Some(r) = &s.runtime {
+                                        r.router.remove(&remove);
+                                        r.data.lock().unwrap().revision += 1;
+                                        r.save(&[], &[]);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                );
+            }
+        }
+        if self.rebind_target.is_some() {
+            list = list.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.palette().acc)
+                    .child("请选择下方终端作为原目标的新关联"),
+            );
+        }
+        for endpoint in entries {
+            let id = endpoint.target.session_id.clone();
+            let default_id = id.clone();
+            let default_endpoint = endpoint.clone();
+            let selected = self
+                .runtime
+                .as_ref()
+                .is_some_and(|r| r.router.scope.lock().unwrap().targets.contains_key(&id))
+                || self.selected_targets.contains(&id)
+                || self.session == Some(endpoint.binding.session);
+            let label = endpoint.target.label.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(100.))
+                            .text_size(px(12.))
+                            .whitespace_normal()
+                            .child(format!(
+                                "{}{} · {} · {} · {}{}\n{}",
+                                if self.runtime.as_ref().is_some_and(|r| r
+                                    .router
+                                    .requested
+                                    .lock()
+                                    .unwrap()
+                                    .contains(&id))
+                                {
+                                    "请求使用 · "
+                                } else {
+                                    ""
+                                },
+                                label,
+                                endpoint.target.protocol,
+                                endpoint.window,
+                                self.runtime
+                                    .as_ref()
+                                    .map(|r| r.router.policy(&endpoint))
+                                    .unwrap_or_else(|| self
+                                        .db
+                                        .borrow()
+                                        .ai_permission(if endpoint.binding.local {
+                                            "local"
+                                        } else {
+                                            endpoint
+                                                .target
+                                                .host_id
+                                                .as_deref()
+                                                .unwrap_or("temporary")
+                                        })
+                                        .unwrap_or_default())
+                                    .label(),
+                                if endpoint.binding.capabilities.terminal_busy {
+                                    " · 终端占用中"
+                                } else {
+                                    ""
+                                },
+                                if endpoint.connected {
+                                    endpoint.target.cwd.as_deref().unwrap_or("目录未知")
+                                } else {
+                                    "已断开"
+                                }
+                            )),
+                    )
+                    .child(
+                        agent_ui::step_action(
+                            SharedString::from(format!("default-{id}")),
+                            if self.runtime.as_ref().is_some_and(|r| {
+                                r.router.scope.lock().unwrap().default.as_ref() == Some(&id)
+                            }) {
+                                "默认 ✓"
+                            } else {
+                                "设为默认"
+                            },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if let Some(r) = &s.runtime {
+                                if r.active() {
+                                    s.state.save_error = Some(
+                                        "当前任务的默认终端已固定，请结束后更换；也可新建对话"
+                                            .into(),
+                                    );
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Err(e) = r.router.add(&default_id, true) {
+                                    s.state.save_error = Some(e);
+                                }
+                                r.data.lock().unwrap().revision += 1;
+                                r.save(&[], &[]);
+                            } else {
+                                s.session = Some(default_endpoint.binding.session);
+                                s.binding = Some(default_endpoint.binding.clone());
+                                s.label = default_endpoint.target.label.clone();
+                                s.protocol = default_endpoint.target.protocol.clone();
+                                s.host = default_endpoint.target.host_id.clone();
+                                s.selected_targets.insert(default_id.clone());
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        agent_ui::step_action(
+                            SharedString::from(format!("target-{id}")),
+                            if self.rebind_target.is_some() {
+                                "关联到此"
+                            } else if selected {
+                                "移除"
+                            } else {
+                                "加入"
+                            },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            let mention = s.input.read(cx).value().ends_with('@');
+                            if mention {
+                                s.composer_targets.insert(id.clone());
+                            }
+                            if let Some(r) = &s.runtime {
+                                if let Some(old) = s.rebind_target.take() {
+                                    if let Err(e) = r.router.rebind(&old, &id) {
+                                        s.state.save_error = Some(e);
+                                    }
+                                } else if selected && !mention {
+                                    r.router.remove(&id);
+                                } else if let Err(e) =
+                                    r.router.add(&id, r.router.resolve(None).is_err())
+                                {
+                                    s.state.save_error = Some(e);
+                                }
+                                r.data.lock().unwrap().revision += 1;
+                                r.save(&[], &[]);
+                            } else {
+                                if selected && !mention {
+                                    s.selected_targets.remove(&id);
+                                } else {
+                                    s.selected_targets.insert(id.clone());
+                                }
+                                if selected
+                                    && !mention
+                                    && s.session == Some(endpoint.binding.session)
+                                {
+                                    s.session = None;
+                                    s.binding = None;
+                                    s.host = None;
+                                    s.label = "无默认终端".into();
+                                }
+                                if !selected && s.session.is_none() {
+                                    s.session = Some(endpoint.binding.session);
+                                    s.host = endpoint.target.host_id.clone();
+                                    s.label = label.clone();
+                                    s.protocol = endpoint.target.protocol.clone();
+                                    s.binding = Some(endpoint.binding.clone());
+                                }
+                            }
+                            let draft = s.input.read(cx).value().to_string();
+                            if draft.ends_with('@') {
+                                s.set_composer_text(
+                                    format!("{}@{} ", draft.trim_end_matches('@'), label),
+                                    w,
+                                    cx,
+                                );
+                                s.target_picker = false;
+                            }
+                            cx.notify();
+                        })),
+                    ),
+            );
+        }
+        list
+    }
+}

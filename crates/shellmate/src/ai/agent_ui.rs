@@ -10,12 +10,12 @@ use shellmate_ai::{
     policy::{Class, classify},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+
 
 pub(super) struct ActiveStep {
     pub source: Option<shellmate_ai::SubagentRef>,
     pub call: ToolCall,
-    pub reply: Option<oneshot::Sender<Approval>>,
+    pub reply: Option<crate::ai::host::Reply>,
     pub redline: bool,
     pub started: Option<Instant>,
     pub automatic: bool,
@@ -119,6 +119,7 @@ impl Drawer {
         self.host.as_deref().unwrap_or("local")
     }
     pub(super) fn release_context(&mut self, cx: &mut Context<Self>) {
+        if self.runtime.is_some(){return;}
         if !self.state.model.busy
             && self.state.child_page.selected.is_none()
             && !self.state.pending
@@ -278,7 +279,7 @@ impl Drawer {
                                     let key=crate::ai::host::approval_key(source.as_ref(),&call.id);
                                     let mut step = ActiveStep::new(call);
                                     step.source=source.clone();
-                                    step.reply = Some(reply);
+                                    step.reply = Some(crate::ai::host::Reply::new(reply));
                                     step.redline = redline;
                                     s.state.active_steps.insert(key,source.map(|s|s.id),step);
                                     if s.state.child_page.selected.is_none(){s.state.follow_bottom = true;}
@@ -394,6 +395,7 @@ impl Drawer {
         let status=if step.started.is_some(){crate::ai::tool_model::Status::Running}else{crate::ai::tool_model::Status::Approval};
         let expanded=self.tool_open(&display_key,status);
         let detail=format!("{}执行{}{}",step.call.target.label(),if step.automatic{" · 自动批准"}else{""},step.source.as_ref().map(|s|format!(" · 子任务：{}",s.description)).unwrap_or_default());
+        let detail=if let Some(target)=&step.call.destination{format!("{} · {} · {} · {}",target.label,target.protocol,target.cwd.as_deref().unwrap_or("目录未知"),detail)}else{detail};
         let model=super::tool_ui::Card{key:display_key.clone(),title:"执行命令".into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
         let mut card=self.tool_shell(&model,cx);
         if red&&step.started.is_none(){card=card.child(div().text_size(px(12.)).text_color(p.err).font_weight(FontWeight::SEMIBOLD).child("高危命令，需要确认"));}
@@ -521,12 +523,13 @@ pub(super) fn step_actions() -> Div {
         .gap(px(12.))
 }
 
-pub(super) fn step_action(id: impl Into<ElementId>, label: &'static str, cx: &App) -> Button {
+pub(super) fn step_action(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Button {
+    let label = label.into();
     let p = cx.palette();
     Button::new(id)
         .text()
         .h(px(24.))
-        .accessibility_label(label)
+        .accessibility_label(label.clone())
         // Button's built-in label applies its own size and hover foreground.
         // Style the content directly to keep these controls at 12.5 px / tx2.
         .child(
@@ -657,6 +660,7 @@ impl Drawer {
             self.state.model.busy = false;
         } else {
             let step = ActiveStep::new(ToolCall {
+                session_id:None,cwd: None, destination: None,
                 id: "fixture-step-2".into(),
                 command: command.into(),
                 purpose: if redline {

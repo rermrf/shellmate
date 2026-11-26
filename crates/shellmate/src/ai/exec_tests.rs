@@ -22,6 +22,8 @@ impl Drop for Temp {
 }
 fn call(command: &str, target: Target, timeout: Duration) -> ToolCall {
     ToolCall {
+        session_id: None,
+        cwd: None, destination: None,
         id: HostId::generate().to_string(),
         command: command.into(),
         purpose: "测试".into(),
@@ -338,6 +340,9 @@ impl PtyHarness {
         });
         Self {
             executor: AppExecutor {
+                lease: None,
+            slots: None,
+                router: None,
                 subagents: None,
                 memory: None,
                 tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),
@@ -614,6 +619,9 @@ async fn terminal_cancel_before_start_reply_cleans_up_registration() {
     let (ui, rx) = async_channel::unbounded();
     let temp = Temp::new();
     let executor = AppExecutor {
+        lease: None,
+            slots: None,
+        router: None,
         subagents: None,
         memory: None,
         tasks: super::super::tasks::Tasks::new(temp.0.clone(), "pty".into()),

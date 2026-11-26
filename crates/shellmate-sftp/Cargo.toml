@@ -12,6 +12,7 @@ thiserror.workspace = true
 futures.workspace = true
 async-channel.workspace = true
 log.workspace = true
+sha2 = "0.11"
 
 [dev-dependencies]
 shellmate-core.workspace = true

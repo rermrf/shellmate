@@ -16,6 +16,7 @@ pub type ClientFactory =
     Arc<dyn Fn(&Config) -> Result<RigClient, shellmate_ai::AiError> + Send + Sync>;
 #[derive(Clone)]
 pub struct Service {
+    pub router: Option<super::target_router::Router>,
     // The registry owns live state; no extra strong task-registry references are stored here.
     pub tasks: Tasks,
     pub config: Config,
@@ -110,7 +111,7 @@ impl Service {
             if !resume {
                 return LocalResult::error("子任务已结束；明确继续时请设置 resume=true");
             }
-            let Some(record) =
+            let Some(mut record) =
                 load_record(&self.tasks.root(), self.tasks.conversation_id(), &view.id)
             else {
                 return LocalResult::error("子任务恢复信息已清理，无法继续原上下文");
@@ -119,6 +120,11 @@ impl Service {
                 || record.base_url != self.config.provider.base_url()
             {
                 return LocalResult::error("服务商已变化，请恢复原配置后继续子任务");
+            }
+            if let (Some(saved), Some(router)) = (&record.scope, &self.router) {
+                let targets=saved.targets.keys().map(|id|router.resumed_reference(id)).collect::<Result<Vec<_>,_>>();
+                record.request.session_ids=match targets {Ok(ids)=>ids,Err(e)=>return LocalResult::error(e)};
+                record.request.default_session_id=match saved.default.as_ref().map(|id|router.resumed_reference(id)).transpose(){Ok(id)=>id,Err(e)=>return LocalResult::error(e)};
             }
             let checkpoint = super::subagent_files::read_checkpoint(
                 &self.tasks.root(),
@@ -174,6 +180,9 @@ impl Service {
         })
     }
     pub fn supported(&self) -> bool {
+        if self.router.is_some() {
+            return true;
+        }
         supported(
             self.binding.capabilities.background,
             self.binding.local,
@@ -208,6 +217,15 @@ impl Service {
                 Ok(c) => c,
                 Err(_) => return LocalResult::error("无法读取子任务模型设置"),
             };
+            let router = match &self.router {
+                Some(router) => match router
+                    .subset(&request.session_ids, request.default_session_id.as_deref())
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => return LocalResult::error(e),
+                },
+                None => None,
+            };
             let ticket = match self.tasks.reserve_agent_family(
                 &call_id,
                 &request,
@@ -232,7 +250,11 @@ impl Service {
                 .unwrap_or_else(|| source.id.clone());
             let child_tasks = self.tasks.child_tasks();
             self.tasks.attach_child_outputs(&source.id, &child_tasks);
-            let mut binding = self.binding.clone();
+            let mut binding = router
+                .as_ref()
+                .and_then(|r| r.resolve(None).ok())
+                .map(|e| e.binding)
+                .unwrap_or_else(|| self.binding.clone());
             binding.capabilities.terminal = false;
             if let Some(context) = &restored {
                 binding.capabilities.cwd = context.cwd.clone();
@@ -242,6 +264,9 @@ impl Service {
                 mode: self.mode.clone(),
                 ui: self.ui.clone(),
                 executor: Box::new(AppExecutor {
+                    lease: None,
+            slots: None,
+                    router: router.clone(),
                     subagents: None,
                     memory: Some((self.memory.clone(), self.context.label.clone())),
                     binding: binding.clone(),
@@ -251,7 +276,35 @@ impl Service {
                 alive: binding.alive.clone(),
                 resolved: Mutex::new(None),
             };
-            let snapshot = self.memory_snapshot();
+            let snapshot = if let Some(router) = &router {
+                let scope = router.scope.lock().unwrap().clone();
+                let endpoint = router.resolve(None).ok();
+                let memory = shellmate_core::memory::Memory::new(
+                    &router.root,
+                    endpoint.as_ref().and_then(|e| {
+                        if e.binding.local {
+                            Some("local")
+                        } else {
+                            e.target.host_id.as_deref()
+                        }
+                    }),
+                );
+                let mut snapshot = shellmate_ai::memory::Snapshot::load(
+                    &memory,
+                    endpoint
+                        .as_ref()
+                        .map(|e| e.target.label.as_str())
+                        .unwrap_or("多终端任务"),
+                    self.limits.auto_memory,
+                );
+                snapshot.instructions.push_str(&format!(
+                    "\n子任务终端范围：{}。每次调用指定准确 session_id。",
+                    serde_json::to_string(&scope).unwrap()
+                ));
+                snapshot
+            } else {
+                self.memory_snapshot()
+            };
             let context = SubagentContext {
                 origin: Some(origin),
                 id: source.id.clone(),
@@ -262,6 +315,7 @@ impl Service {
                 cwd: binding.capabilities.cwd.clone(),
             };
             let record = AgentRecord {
+                scope: router.as_ref().map(|r| r.scope.lock().unwrap().clone()),
                 stable_id: stable,
                 request: request.clone(),
                 context: context.clone(),
@@ -314,7 +368,11 @@ impl Service {
             weak.configure(&checkpoint_log, &binding.capabilities.cwd);
             let ui = self.ui.clone();
             let source_id = source.id.clone();
-            let alive = binding.alive.clone();
+            let alive = if router.is_some() {
+                Arc::new(std::sync::atomic::AtomicBool::new(true))
+            } else {
+                binding.alive.clone()
+            };
             let foreground_token = token.clone();
             let db = self.db.clone();
             let conversation = self.tasks.conversation_id().to_owned();
@@ -415,6 +473,8 @@ impl Service {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(crate = "serde")]
 struct AgentRecord {
+    #[serde(default)]
+    scope: Option<super::target_router::Scope>,
     stable_id: String,
     request: SubagentRequest,
     context: SubagentContext,

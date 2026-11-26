@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicBool;
 
 fn request(kind: SubagentKind) -> SubagentRequest {
     SubagentRequest {
+        session_ids: vec![],
+        default_session_id: None,
         description: "检查入口服务".into(),
         prompt: "检查 nginx 状态，给出独立报告。即使写了终端也只用后台。".into(),
         kind,
@@ -509,6 +511,8 @@ async fn all_child_commands_reach_the_common_host_policy_in_every_mode() {
         snapshot(),
     );
     let call = ToolCall {
+        session_id: None,
+        cwd: None, destination: None,
         id: "fake".into(),
         command: "rm -rf /".into(),
         purpose: String::new(),
@@ -642,6 +646,8 @@ async fn memory_writes_are_inherited_while_outputs_and_execution_targets_remain_
     );
     child
         .run(ToolCall {
+            session_id: None,
+            cwd: None, destination: None,
             id: "cmd".into(),
             command: "pwd".into(),
             purpose: String::new(),

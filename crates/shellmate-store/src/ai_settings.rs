@@ -313,6 +313,8 @@ mod subagent_tests {
             timeouts: Default::default(),
         };
         let request = shellmate_ai::SubagentRequest {
+            session_ids: vec![],
+            default_session_id: None,
             description: "test".into(),
             prompt: "test".into(),
             kind: shellmate_ai::SubagentKind::Explore,

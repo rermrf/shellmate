@@ -32,6 +32,10 @@ pub struct SubagentRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct SubagentRequest {
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub default_session_id: Option<String>,
     pub description: String,
     pub prompt: String,
     pub kind: SubagentKind,
@@ -44,6 +48,9 @@ impl SubagentRequest {
         #[derive(Deserialize)]
         #[serde(crate = "rig_core::serde", deny_unknown_fields)]
         struct Args {
+            #[serde(default)]
+            session_ids: Vec<String>,
+            default_session_id: Option<String>,
             description: String,
             prompt: String,
             #[serde(rename = "type")]
@@ -91,6 +98,8 @@ impl SubagentRequest {
             })
             .transpose()?;
         Ok(Self {
+            session_ids: args.session_ids,
+            default_session_id: args.default_session_id,
             description,
             prompt: args.prompt,
             kind,
@@ -123,7 +132,7 @@ pub fn agent_tool(main: &Config) -> ToolDefinition {
             reasoning.join(", ")
         ),
         serde_json::json!({"type":"object","properties":{
-            "description":{"type":"string","description":"一句话标题，最多 30 字"},"prompt":{"type":"string","description":"完整、自包含的任务说明"},
+            "session_ids":{"type":"array","items":{"type":"string"},"maxItems":64},"default_session_id":{"type":"string"},"description":{"type":"string","description":"一句话标题，最多 30 字"},"prompt":{"type":"string","description":"完整、自包含的任务说明"},
             "run_in_background":{"type":"boolean","default":true,"description":"默认后台执行；需要结果时用 wait_tasks 等待，等待期间用户仍可补充指令"},
             "model":{"type":"string","description":"仅用户要求时指定同一服务商下的模型 ID","maxLength":256},
             "reasoning":{"type":"string","enum":reasoning}
@@ -255,6 +264,10 @@ impl<'a> ChildHost<'a> {
     }
 }
 impl ToolHost for ChildHost<'_> {
+    fn model_slots(&self) -> Option<std::sync::Arc<tokio::sync::Semaphore>> { self.inner.model_slots() }
+    fn sessions_enabled(&self) -> bool {
+        self.inner.sessions_enabled()
+    }
     fn web_enabled(&self) -> bool {
         self.inner.web_enabled()
     }
@@ -287,7 +300,8 @@ impl ToolHost for ChildHost<'_> {
         Box::pin(async move {
             let allowed = match &tool {
                 LocalTool::Web(_) => self.inner.web_enabled(),
-                LocalTool::Memory(_) => self.snapshot.auto_memory,
+                LocalTool::Sessions(_) => self.inner.sessions_enabled(),
+                LocalTool::Memory(_) | LocalTool::ScopedMemory { .. } => self.snapshot.auto_memory,
                 LocalTool::ReadOutput(args) => {
                     self.outputs.lock().unwrap().contains(&args.id)
                         || self.tasks.lock().unwrap().contains(&args.id)

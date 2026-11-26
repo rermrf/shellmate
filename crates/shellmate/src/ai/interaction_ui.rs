@@ -11,6 +11,7 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-multi-"){self.multi_fixture(scene,cx);return;}
         if scene.starts_with("ai-tools-") {
             self.unified_fixture(scene, cx);
             return;
@@ -58,6 +59,9 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn queue_message(&mut self, text: String, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.router.grant_named(&text);
+        }
         if let Some(id) = self.state.editing_message.clone() {
             if self.state.control.edit(&id, Some(text)).is_some() {
                 self.state.editing_message = None;
@@ -71,6 +75,7 @@ impl Drawer {
             .workspace
             .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
+        let context=self.message_context(context);
         let id = shellmate_core::HostId::generate().to_string();
         if self.state.control.enqueue(id, text, context) {
             self.input.update(cx, |i, cx| i.set_value("", w, cx));
@@ -109,7 +114,7 @@ impl Drawer {
                 self.child_error("请回到原主机会话后继续子任务".into(), cx);
                 return;
             }
-            if self.state.readonly {
+            if self.state.readonly && self.runtime.is_none() {
                 let local = self
                     .state
                     .model
@@ -205,12 +210,13 @@ impl Drawer {
                     s.local(slash_ui::LocalBody::Hint(result.inline),cx);return;
                 }
                 s.state.timing.start(s.state.model.conversation.turns().len().saturating_sub(1),s.state.model.conversation.entries().len(),timing_started);
+                if let Some(r)=&s.runtime{let mut d=r.data.lock().unwrap();let turn=d.model.conversation.turns().len().saturating_sub(1);let entry=d.model.conversation.entries().len();d.timing.start(turn,entry,timing_started);d.revision+=1;}
                 if result.subagent.is_some(){
                     let step=shellmate_ai::Step{
                         message_id:s.state.model.conversation.entries().len(),call:shellmate_ai::LoggedCall{id:saved_call,name:"send_agent_message".into(),args_json:serde_json::json!({"id":target,"message":label,"resume":true})},
                         result:shellmate_ai::LoggedResult{inline:result.inline,output_id:result.output_id,subagent:result.subagent,is_error:false,cleared:false},display:None,
                     };
-                    if s.state.model.busy {if let Some(tasks)=&s.tasks{tasks.external_step(step);}}
+                    if s.runtime.is_some()||s.state.model.busy {if let Some(tasks)=&s.tasks{tasks.external_step(step);}}
                     else{s.state.model.conversation.append(shellmate_ai::Entry::Step(step));}
                 }else{s.local(slash_ui::LocalBody::Hint("已向子任务追加消息".into()),cx);}
                 if let Some(tasks)=&s.tasks && let Some((view,_,_))=tasks.latest_agent(&target) {
@@ -231,6 +237,18 @@ impl Drawer {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.fixture {
+            let Some(runtime)=self.prepare_runtime(cx) else{return false;};
+            let binding=match runtime.router.resolve(None){Ok(e)=>e.binding,Err(e)=>{self.child_error(e,cx);return false;}};
+            let settings=self.db.borrow().ai_settings().unwrap_or_default();let limits=settings.limits();
+            let service=Arc::new(crate::ai::subagents::Service {
+                router:Some(runtime.router.clone()),tasks:runtime.tasks.clone(),config:config.clone(),settings:settings.clone(),limits,
+                db:self.db.clone(),snapshot:Default::default(),context:runtime.router.context(),binding,
+                memory:self.memory_files(),ui:runtime.ui.clone(),mode:self.mode.clone(),cancel:Default::default(),factory:runtime.factory.lock().unwrap().clone(),
+            });
+            *runtime.service.lock().unwrap()=Some(service.clone());self.subagent_service=Some(service);
+            runtime.watch(config,limits,settings);return true;
+        }
         let binding = self.binding.clone().or_else(|| {
             self.workspace
                 .update(cx, |s, cx| s.ai_binding(self.session, cx))
@@ -255,6 +273,7 @@ impl Drawer {
         let settings = self.db.borrow().ai_settings().unwrap_or_default();
         let limits = settings.limits();
         self.subagent_service = Some(Arc::new(crate::ai::subagents::Service {
+            router: None,
             tasks: self.tasks.as_ref().unwrap().clone(),
             config: config.clone(),
             settings,
@@ -317,6 +336,13 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn drive_interaction(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime {
+            let snap = runtime.snapshot();
+            if let Some(config) = snap.config {
+                runtime.launch(config, snap.limits, snap.settings);
+            }
+            return;
+        }
         if self.fixture
             || self.state.model.busy
             || self.state.pending
@@ -394,6 +420,11 @@ impl Drawer {
         }
     }
     fn stop_reply(&mut self, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.stop_reply();
+            cx.notify();
+            return;
+        }
         if self.state.pending {
             self.stop(cx);
             return;
@@ -408,6 +439,11 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn stop_all_tasks(&mut self, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.stop_all();
+            cx.notify();
+            return;
+        }
         self.state.control.hold();
         if let Some(tasks) = &self.tasks {
             tasks.stop_all();

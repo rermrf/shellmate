@@ -58,9 +58,6 @@ impl Workspace {
         self.tab_menu = None;
         self.picker = None;
         self.picker_subscription = None;
-        session
-            .ai_alive
-            .store(false, std::sync::atomic::Ordering::Release);
         session._subscription = None;
         if let Some(tab) = &mut session.files {
             tab._subscription = None;
@@ -98,10 +95,8 @@ impl Workspace {
             return;
         }
         let id = session.id;
-        session.ai_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        session
-            .terminal
-            .update(cx, |terminal, _| terminal.rebind_agent());
+        // Moving only changes the UI owner. The terminal backend and AI lease
+        // continue; commands and completion callbacks route through the Hub.
         session._subscription = Some(self.watch_terminal(id, &session.terminal, window, cx));
         // The session takes the font size of the window it lands in.
         let style = self.terminal_style(cx);

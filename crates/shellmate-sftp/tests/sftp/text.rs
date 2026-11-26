@@ -724,3 +724,19 @@ async fn with_an_expectation_a_dangling_link_is_just_not_found() {
     assert!(error.is_not_found(), "{error:?}");
     assert_eq!(fx.names("/ex"), ["link.txt"], "nothing was created");
 }
+
+#[tokio::test]
+async fn digest_streams_short_reads_and_enforces_size_and_listing_bounds() {
+    use sha2::{Digest,Sha256};
+    let fx=Fixture::start(SftpOptions{max_read:Some(4093),page:2,..Default::default()}).await;
+    let content=vec![b'x';200_003];
+    fx.file("/hash/file",&content,0o644);
+    let (digest,revision)=fx.session.file_digest("/hash/file",content.len() as u64).await.unwrap();
+    assert_eq!(&digest[..],&Sha256::digest(&content)[..]);
+    assert_eq!(revision.size,content.len() as u64);
+    assert!(matches!(fx.session.file_digest("/hash/file",100).await,Err(SftpError::TooLarge{..})));
+    for i in 0..4{fx.file(&format!("/many/{i}"),"data",0o644);}
+    assert!(fx.session.list_bounded("/many",2).await.is_err());
+    assert_eq!(fx.session.list_bounded("/many",4).await.unwrap().len(),4);
+    assert!(fx.logs.writes.lock().unwrap().is_empty());
+}

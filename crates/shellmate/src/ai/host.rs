@@ -11,7 +11,33 @@ pub enum Approval {
     Approve { command: String, target: Target },
     Deny { reason: Option<String> },
 }
+#[derive(Clone)]
+pub struct Reply(Arc<Mutex<Option<oneshot::Sender<Approval>>>>);
+impl Reply {
+    pub fn new(sender: oneshot::Sender<Approval>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+    pub fn send(&self, value: Approval) -> Result<(), Approval> {
+        match self.0.lock().unwrap().take() {
+            Some(sender) => sender.send(value),
+            None => Err(value),
+        }
+    }
+    pub fn is_closed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|s| s.is_closed())
+    }
+}
 pub enum Ui {
+    ReadSession {
+        session: usize,
+        lease: Arc<AtomicBool>,
+        lines: usize,
+        reply: oneshot::Sender<Result<shellmate_ai::ContextSnapshot, String>>,
+    },
     Context {
         reply: oneshot::Sender<Option<shellmate_ai::ContextSnapshot>>,
     },
@@ -44,6 +70,13 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn model_slots(&self) -> Option<Arc<tokio::sync::Semaphore>> { None }
+    fn sessions_enabled(&self) -> bool {
+        false
+    }
+    fn routed_host(&self, _call: &mut ToolCall) -> Result<Option<Host>, String> {
+        Ok(None)
+    }
     fn web_enabled(&self) -> bool {
         false
     }
@@ -143,6 +176,10 @@ impl Drop for RunningGuard {
     }
 }
 impl ToolHost for Host {
+    fn model_slots(&self) -> Option<Arc<tokio::sync::Semaphore>> { self.executor.model_slots() }
+    fn sessions_enabled(&self) -> bool {
+        self.executor.sessions_enabled()
+    }
     fn web_enabled(&self) -> bool {
         self.executor.web_enabled()
     }
@@ -233,6 +270,18 @@ impl ToolHost for Host {
         source: Option<shellmate_ai::SubagentRef>,
     ) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(async move {
+            match self.executor.routed_host(&mut call) {
+                Ok(Some(host)) => {
+                    *self.resolved.lock().unwrap() = Some((call.clone(), false));
+                    let result = host.run_from(call.clone(), source).await;
+                    if let Some(resolved) = host.resolved.lock().unwrap().clone() {
+                        *self.resolved.lock().unwrap() = Some(resolved);
+                    }
+                    return result;
+                }
+                Err(e) => return ToolOutcome::Failed(e),
+                Ok(None) => {}
+            }
             tokio::select! {
                 biased;
                 () = super::exec::disconnected(&self.alive) => ToolOutcome::Disconnected,

@@ -252,7 +252,7 @@ impl SftpSession {
     }
 
     /// The text of the symlink at `path`.
-    pub(crate) async fn read_link(&self, path: &str) -> Result<String, SftpError> {
+    pub async fn read_link(&self, path: &str) -> Result<String, SftpError> {
         let name = self.raw.read().await.readlink(path).await.map_err(|err| SftpError::from_raw(err, path))?;
         Ok(name.files.into_iter().next().map(|file| file.filename).unwrap_or_default())
     }
@@ -384,6 +384,11 @@ impl SftpSession {
     }
 
     async fn list_plain(&self, dir: &str) -> Result<Vec<Entry>, SftpError> {
+        self.list_bounded(dir, usize::MAX).await
+    }
+
+    /// Read metadata without following symlinks, with an explicit memory bound.
+    pub async fn list_bounded(&self, dir: &str, max: usize) -> Result<Vec<Entry>, SftpError> {
         let raw = self.raw.clone();
         let name = dir.to_owned();
         let open = self.runtime.spawn(async move {
@@ -412,6 +417,9 @@ impl SftpSession {
                     Err(RawError::Status(status)) if status.status_code == StatusCode::Eof => eof = true,
                     Err(err) => return Err(SftpError::from_raw(err, dir)),
                 }
+            }
+            if entries.len() > max {
+                return Err(SftpError::Failed { path: dir.into(), message: format!("目录条目超过读取上限 {max}，未完成扫描") });
             }
             if eof {
                 break;
@@ -684,6 +692,35 @@ impl SftpSession {
         let read = self.read_open_file(&handle, path, max).await;
         let _ = self.raw.read().await.close(handle).await;
         read
+    }
+    /// Bounded-memory SHA-256 read. The handle is closed even if the caller cancels.
+    pub async fn file_digest(&self, path: &str, max: u64) -> Result<([u8; 32], Revision), SftpError> {
+        use sha2::{Digest, Sha256};
+        let raw = self.raw.clone();
+        let name = path.to_owned();
+        let opened = self.runtime.spawn(async move {
+            let handle = raw.read().await.open(name, OpenFlags::READ, FileAttributes::empty()).await?.handle;
+            Ok::<_,RawError>(DirectoryHandle { handle, raw, runtime: tokio::runtime::Handle::current() })
+        }).await.map_err(|e|SftpError::Protocol(e.to_string()))?
+            .map_err(|e|SftpError::from_raw(e,path))?;
+        let handle = &opened.handle;
+        let raw = self.raw.read().await;
+        let before = raw.fstat(handle).await.map_err(|e|SftpError::from_raw(e,path))?.attrs;
+        let size = before.size.unwrap_or(0);
+        if size > max { return Err(SftpError::TooLarge { size }); }
+        let mut offset = 0;
+        let mut digest = Sha256::new();
+        while offset < size {
+            let bytes = raw.read(handle, offset, (size-offset).min(64*1024) as u32).await.map_err(|e|SftpError::from_raw(e,path))?.data;
+            if bytes.is_empty() { return Err(SftpError::Failed{path:path.into(),message:"读取期间文件缩短".into()}); }
+            offset += bytes.len() as u64;
+            digest.update(&bytes);
+        }
+        let after = raw.fstat(handle).await.map_err(|e|SftpError::from_raw(e,path))?.attrs;
+        if before.size != after.size || before.mtime != after.mtime {
+            return Err(SftpError::Failed{path:path.into(),message:"读取期间文件发生变化".into()});
+        }
+        Ok((digest.finalize().into(), Revision { size, mtime:before.mtime.map(i64::from) }))
     }
 
     async fn read_open_file(&self, handle: &str, path: &str, max: u64) -> Result<(Vec<u8>, Revision), SftpError> {

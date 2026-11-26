@@ -332,7 +332,7 @@ fn data_survives_reopening_the_file() {
         store.touch_connected_at(&web.id, 42).unwrap();
     }
     let store = HostStore::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
     assert_eq!(store.groups().unwrap(), [group]);
     web.last_connected_at = Some(42);
     assert_eq!(store.hosts().unwrap(), [web]);
@@ -492,9 +492,9 @@ fn a_newer_file_is_refused_with_a_clear_message() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hosts.db");
     drop(HostStore::open(&path).unwrap());
-    rusqlite::Connection::open(&path).unwrap().pragma_update(None, "user_version", 12).unwrap();
+    rusqlite::Connection::open(&path).unwrap().pragma_update(None, "user_version", 13).unwrap();
     let err = HostStore::open(&path).unwrap_err();
-    assert!(matches!(err, StoreError::TooNew { found: 12, .. }), "{err}");
+    assert!(matches!(err, StoreError::TooNew { found: 13, .. }), "{err}");
 }
 
 #[test]

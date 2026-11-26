@@ -50,6 +50,8 @@ fn config() -> Config {
 }
 fn request(background: bool) -> SubagentRequest {
     SubagentRequest {
+        session_ids: vec![],
+        default_session_id: None,
         description: "inspect".into(),
         prompt: "inspect".into(),
         kind: SubagentKind::General,
@@ -71,6 +73,7 @@ fn fixture(
     let http = SequencedHttpClient::new(responses);
     let factory_http = http.clone();
     let service = Service {
+        router: None,
         tasks: Tasks::new(root.path().into(), "conversation".into()),
         config: config(),
         settings: Settings::default(),
@@ -369,6 +372,8 @@ impl Executor for FakeExecutor {
 }
 fn call() -> ToolCall {
     ToolCall {
+        session_id: None,
+        cwd: None, destination: None,
         id: "same-id".into(),
         command: "uname -s".into(),
         purpose: "inspect".into(),
@@ -644,6 +649,9 @@ fn main_host(service: &Service) -> Host {
         mode: service.mode.clone(),
         ui: service.ui.clone(),
         executor: Box::new(AppExecutor {
+            lease: None,
+            slots: None,
+            router: None,
             subagents: Some(Arc::new(service.clone())),
             memory: Some((service.memory.clone(), "local".into())),
             binding: service.binding.clone(),

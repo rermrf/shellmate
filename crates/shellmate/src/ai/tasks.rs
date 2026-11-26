@@ -198,6 +198,7 @@ impl Tasks {
             .web
             .get_or_init(|| Arc::new(super::web::Service::new(db, credentials)));
     }
+    pub fn shared_web(&self, service: Arc<super::web::Service>) { let _ = self.0.web.set(service); }
     pub fn web_enabled(&self) -> bool {
         self.0.web.get().is_some_and(|w| w.enabled())
     }
@@ -384,6 +385,9 @@ impl Tasks {
             }
         }
     }
+    pub fn remember_output(&self, id: String, label: String) {
+        self.0.state.lock().unwrap().remembered.push((id, label));
+    }
     pub fn output_id_for(&self, call_id: &str) -> Option<String> {
         self.0
             .state
@@ -472,12 +476,14 @@ impl Tasks {
                 }
             }
             LocalTool::WaitTasks { ids, all } => self.wait_tasks(ids, all).await,
-            LocalTool::Memory(_) => LocalResult {
-                subagent: None,
-                inline: "记忆工具必须由会话主机处理".into(),
-                output_id: None,
-                is_error: true,
-            },
+            LocalTool::Memory(_) | LocalTool::ScopedMemory { .. } | LocalTool::Sessions(_) => {
+                LocalResult {
+                    subagent: None,
+                    inline: "记忆工具必须由会话主机处理".into(),
+                    output_id: None,
+                    is_error: true,
+                }
+            }
             LocalTool::StopTask { id } => {
                 let task = {
                     let state = self.0.state.lock().unwrap();

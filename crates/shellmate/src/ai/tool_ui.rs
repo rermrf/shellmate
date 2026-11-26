@@ -361,6 +361,17 @@ impl Drawer {
             summary,
             detail,
         };
+        let mut card = card;
+        if let Some(label) = call.args_json["resolved_target"]["label"].as_str() {
+            let target = &call.args_json["resolved_target"];
+            card.detail = format!(
+                "{} · {} · {} · {}",
+                label,
+                target["protocol"].as_str().unwrap_or_default(),
+                target["cwd"].as_str().unwrap_or("目录未知"),
+                card.detail
+            );
+        }
         let open = self.tool_open(&id, status);
         let mut surface = self.tool_shell(&card, cx);
         if open {
@@ -440,7 +451,18 @@ impl Drawer {
                     .child(self.web_content(&id, data, true, w, cx));
             } else if let Some(r) = result {
                 surface = surface.child(section("结果", &p));
-                if let Some(pane) = self.state.output_panes.get(&id) {
+                if call.name == "compare_directories"
+                    && let Some(content) = self.comparison_content(&id, &r.inline, w, cx)
+                {
+                    surface = surface.child(content);
+                    if let Some(pane)=self.state.output_panes.get(&id).cloned(){
+                        let key=id.clone();let expanded=self.comparison_full.contains(&id);
+                        surface=surface.child(agent_ui::step_action(SharedString::from(format!("{id}:full-comparison")),if expanded{"收起完整清单"}else{"展开完整清单"},cx).on_click(cx.listener(move|s,_,_,cx|{if !s.comparison_full.remove(&key){s.comparison_full.insert(key.clone());}cx.notify();})));
+                        if expanded{surface=surface.child(pane);}
+                    }
+                } else if matches!(call.name.as_str(),"list_sessions"|"read_terminal") && let Some(content)=self.session_result_content(&id,&r.inline,w,cx){
+                    surface=surface.child(content);
+                } else if let Some(pane) = self.state.output_panes.get(&id) {
                     surface = surface.child(pane.clone());
                 } else {
                     surface = surface.child(

@@ -247,6 +247,8 @@ mod tests {
 
     fn step() -> ActiveStep {
         ActiveStep::new(ToolCall {
+            session_id: None,
+            cwd: None, destination: None,
             id: "approval".into(),
             command: "pwd".into(),
             purpose: "查看目录".into(),

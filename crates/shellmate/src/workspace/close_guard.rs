@@ -88,18 +88,20 @@ impl Session {
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(crate) struct CloseImpact {
     sessions: Vec<(usize, String, Reason)>,
+    conversations: Vec<(String, String)>,
     pub(super) transfers: usize,
     pub(super) forwards: ForwardImpact,
 }
 
 impl CloseImpact {
     pub(super) fn needs_confirmation(&self) -> bool {
-        !self.sessions.is_empty() || self.transfers > 0 || self.forwards != ForwardImpact::default()
+        !self.conversations.is_empty() || !self.sessions.is_empty() || self.transfers > 0 || self.forwards != ForwardImpact::default()
     }
 
     /// Decreases are safe. A new task or newly affected resource needs fresh consent.
     pub(crate) fn covered_by(&self, previous: &Self) -> bool {
-        self.transfers <= previous.transfers
+        self.conversations.iter().all(|(id,_)|previous.conversations.iter().any(|(old,_)|id==old))
+            && self.transfers <= previous.transfers
             && self.forwards.rules <= previous.forwards.rules
             && self.forwards.connections <= previous.forwards.connections
             && self.sessions.iter().all(|(id, _, reason)| {
@@ -123,6 +125,9 @@ impl CloseImpact {
                 self.sessions.len() - 4
             ));
         }
+        if !self.conversations.is_empty() {
+            parts.push(format!("将影响 AI 对话：{}。此终端上的操作会中断，其他目标结果仍保留。",self.conversations.iter().take(4).map(|(_,title)|format!("「{title}」")).collect::<Vec<_>>().join("、")));
+        }
         if self.transfers > 0 {
             parts.push(format!("将中断 {} 个未完成的文件传输。", self.transfers));
         }
@@ -142,7 +147,7 @@ fn lost_groups(removed: BTreeSet<usize>, remaining: BTreeSet<usize>) -> BTreeSet
 
 impl Workspace {
     pub(super) fn close_impact(&self, ids: &[usize], cx: &App) -> CloseImpact {
-        let mut impact = CloseImpact::default();
+        let mut impact = CloseImpact { conversations:self.hub.conversations.affected(Some(ids)), ..Default::default() };
         let mut removed = BTreeSet::new();
         let mut remaining = BTreeSet::new();
         for session in &self.sessions {
@@ -191,7 +196,7 @@ impl Workspace {
     }
 
     pub(crate) fn quit_impact(&self, cx: &App) -> CloseImpact {
-        let mut impact = CloseImpact::default();
+        let mut impact = CloseImpact { conversations:self.hub.conversations.affected(None), ..Default::default() };
         let mut collect = |session: &Session| {
             if let Some(reason) = session.close_reason(cx) {
                 impact
@@ -313,6 +318,7 @@ mod tests {
         assert!(!with_task(1, task(11, "codex")).covered_by(&before));
         assert!(!with_task(2, task(10, "vim")).covered_by(&before));
         for impact in [
+            CloseImpact { conversations:vec![("a".into(),"检查目录".into())], ..Default::default() },
             CloseImpact {
                 transfers: 1,
                 ..Default::default()

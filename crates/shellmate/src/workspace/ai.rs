@@ -1,5 +1,164 @@
 use super::*;
+pub(super) fn refresh_catalog(cx: &App) {
+    let Some(hub) = cx.try_global::<Hub>() else {
+        return;
+    };
+    let mut entries = vec![];
+    for window in Hub::windows(cx) {
+        if let Some(ws) = window.workspace.upgrade() {
+            let ws = ws.read(cx);
+            for s in &ws.sessions {
+                if let Some(binding) = ws.ai_binding(Some(s.id), cx) {
+                    entries.push((
+                        binding,
+                        s.display_title(cx).to_string(),
+                        s.host().map_or("本机终端", |h| h.protocol.label()).into(),
+                        s.host().map(|h| h.id.to_string()),
+                        format!("窗口 {:?}", window.handle.window_id()),
+                    ));
+                }
+            }
+        }
+    }
+    hub.services.catalog.update(entries);
+}
+pub(super) fn session_catalog(cx: &mut App) -> crate::ai::session_catalog::Catalog {
+    let (tx, rx) = async_channel::unbounded();
+    let catalog = crate::ai::session_catalog::Catalog::new(tx);
+    cx.spawn(async move |cx| {
+        while let Ok(event) = rx.recv().await {
+            cx.update(|cx| match event {
+                crate::ai::host::Ui::ReadSession {
+                    session,
+                    lease,
+                    lines,
+                    reply,
+                } => {
+                    let result = hub::Route::Session(session)
+                        .target(cx)
+                        .and_then(|owner| {
+                            owner.update(cx, |ws, _, cx| {
+                                let binding = ws
+                                    .ai_binding(Some(session), cx)
+                                    .ok_or_else(|| "终端不存在".to_owned())?;
+                                if !Arc::ptr_eq(&lease, &binding.alive)
+                                    || !lease.load(std::sync::atomic::Ordering::Acquire)
+                                {
+                                    return Err("终端连接已变化".into());
+                                }
+                                let s = ws.sessions.iter().find(|s| s.id == session).unwrap();
+                                let raw=s.terminal.read(cx).recent_displayed_text(lines.saturating_add(1).min(501));
+                                let mut text=shellmate_ai::recent_context(&raw,lines.min(500));
+                                let truncated=raw.lines().count()>lines || text.len()>64*1024;
+                                if text.len()>64*1024 {let mut offset=text.len()-64*1024;while !text.is_char_boundary(offset){offset+=1;}text=text[offset..].into();}
+                                if truncated{text=format!("[较早输出已省略]\n{text}");}
+                                Ok(shellmate_ai::ContextSnapshot {
+                                    label: s.display_title(cx).to_string(),
+                                    protocol: s
+                                        .host()
+                                        .map_or("本机终端", |h| h.protocol.label())
+                                        .into(),
+                                    text,
+                                })
+                            })
+                        })
+                        .unwrap_or_else(|| Err("终端所在窗口已关闭".into()));
+                    let _ = reply.send(result);
+                }
+                crate::ai::host::Ui::TerminalStart {
+                    session,
+                    command,
+                    nonce,
+                    spool,
+                    lease,
+                    reply,
+                } => {
+                    let result = hub::Route::Session(session)
+                        .target(cx)
+                        .and_then(|owner| {
+                            owner.update(cx, |ws, _, cx| {
+                                ws.ai_terminal_start(session, &command, &nonce, &lease, spool, cx)
+                            })
+                        })
+                        .unwrap_or_else(|| Err(Box::new(shellmate_ai::ToolOutcome::Disconnected)));
+                    let _ = reply.send(result);
+                }
+                crate::ai::host::Ui::TerminalFinish { session, nonce, .. } => {
+                    if let Some(owner) = hub::Route::Session(session).target(cx) {
+                        owner.update(cx, |ws, _, cx| {
+                            ws.ai_terminal_finish(session, &nonce, true, cx)
+                        });
+                    }
+                }
+                _ => {}
+            });
+        }
+    })
+    .detach();
+    catalog
+}
 impl Workspace {
+    pub(crate) fn close_ai_conversation(&mut self,id:&str,w:&mut Window,cx:&mut Context<Self>) {
+        self.hub.conversations.remove(id);
+        self.ai_views.remove(id);
+        if self.ai_drawer.as_ref().is_some_and(|d|d.read(cx).conversation_id()==id){self.ai_drawer=None;self.open_ai(w,cx);}
+        cx.notify();
+    }
+    pub(crate) fn ai_drafts(&self,cx:&App)->Vec<(String,String)> {
+        self.ai_views.iter().filter(|(id,d)|self.hub.conversations.get(id).is_none()&&!d.read(cx).runtime_retired()).map(|(id,d)|(id.clone(),d.read(cx).draft_title(cx))).collect()
+    }
+    pub(crate) fn new_ai_conversation(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .ai_drawer
+            .as_ref()
+            .is_some_and(|d| d.read(cx).empty_draft(cx))
+        {
+            if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|s,_|s.reuse_draft());}
+            self.sync_ai_context(cx);
+            return;
+        }
+        if let Some(old) = self.ai_drawer.take() {
+            let id = old.read(cx).conversation_id().to_owned();
+            self.ai_views.insert(id, old);
+        }
+        self.open_ai(w, cx);
+    }
+    pub(crate) fn locate_ai_terminal(&mut self,id:usize,_w:&mut Window,cx:&mut Context<Self>){cx.defer(move|cx|{if let Some(owner)=hub::Route::Session(id).target(cx){owner.update(cx,|s,w,cx|{if let Some(ix)=s.sessions.iter().position(|s|s.id==id){s.activate(ix,w,cx);w.activate_window();}});}});}
+    pub(crate) fn select_ai_conversation(
+        &mut self,
+        id: &str,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .ai_drawer
+            .as_ref()
+            .is_some_and(|d| d.read(cx).conversation_id() == id)
+        {
+            return;
+        }
+        if let Some(old) = self.ai_drawer.take() {
+            let id = old.read(cx).conversation_id().to_owned();
+            self.ai_views.insert(id, old);
+        }
+        if let Some(view) = self.ai_views.remove(id) && !view.read(cx).runtime_retired() {
+            self.ai_drawer = Some(view);
+            self.ai_open = true;
+            cx.notify();
+            return;
+        }
+        self.open_ai(w, cx);
+        let runtime = self.hub.conversations.get(id);
+        if let Some(drawer) = &self.ai_drawer {
+            drawer.update(cx, |d, cx| {
+                if let Some(runtime) = runtime {
+                    d.attach_runtime(runtime, cx);
+                } else {
+                    d.load_saved(id, cx);
+                }
+            });
+        }
+    }
     #[cfg(debug_assertions)]
     pub(crate) fn debug_focus_ai_composer(&self, window: &mut Window, cx: &mut App) {
         if self.ai_open
@@ -58,6 +217,7 @@ impl Workspace {
             alive,
             capabilities: shellmate_ai::agent::Capabilities {
                 web: false,
+                sessions: false,
                 background,
                 terminal: can_terminal,
                 terminal_busy: terminal.agent_busy(),
@@ -136,6 +296,23 @@ impl Workspace {
         )
     }
     pub(crate) fn sync_ai_context(&mut self, cx: &mut Context<Self>) {
+        let window = format!("窗口 {:?}", self.handle.window_id());
+        let entries = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                self.ai_binding(Some(s.id), cx).map(|binding| {
+                    (
+                        binding,
+                        s.display_title(cx).to_string(),
+                        s.host().map_or("本机终端", |h| h.protocol.label()).into(),
+                        s.host().map(|h| h.id.to_string()),
+                        window.clone(),
+                    )
+                })
+            })
+            .collect();
+        self.hub.catalog.update_window(&window, entries);
         let Some(drawer) = self.ai_drawer.clone() else {
             return;
         };
@@ -171,6 +348,8 @@ impl Workspace {
         cx.notify();
     }
     pub(crate) fn clear_ai_memory(&mut self, cx: &mut Context<Self>) {
+        self.hub.conversations.clear();
+        self.ai_views.clear();
         if let Some(drawer) = &self.ai_drawer {
             drawer.update(cx, |d, cx| d.discard_and_clear(cx));
         }

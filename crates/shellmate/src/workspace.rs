@@ -30,7 +30,7 @@ use crate::ui::{SegmentItem, card_shadow, dot, item_shadow, segmented, toolbar_b
 
 mod attention;
 mod files;
-mod hub;
+pub(crate) mod hub;
 mod transfer;
 mod tab_drag;
 mod tab_menu;
@@ -238,6 +238,7 @@ pub struct Workspace {
     commands: Entity<crate::productivity::panel::Drawer>,
     commands_open: bool,
     ai_drawer: Option<Entity<crate::ai::panel::Drawer>>,
+    ai_views:HashMap<String,Entity<crate::ai::panel::Drawer>>,
     ai_open: bool,
     ai_drawer_width: f32,
     ai_drawer_drag: drawer_resize::Drag,
@@ -356,7 +357,7 @@ impl Workspace {
             connection_prompts: HashMap::new(),
             clash_dialogs: HashMap::new(),
             commands,
-            commands_open: false, ai_drawer:None,ai_open:false,
+            commands_open: false, ai_drawer:None,ai_open:false,ai_views:Default::default(),
             ai_drawer_width, ai_drawer_drag: Default::default(),
             drawer_motion: Default::default(),
             broadcast: Default::default(), broadcast_bar, split: Default::default(),session_menu:None,tab_menu:None,
@@ -1106,7 +1107,7 @@ impl Workspace {
                     .when(self.broadcast.enabled, |b| b.bg(p.warns).text_color(p.warn))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_broadcast(window, cx))),
             )
-            .child(toolbar_button("ai", AppIcon::Ai, Some("AI"), "AI 助手", true, cx).when(self.ai_open,|b|b.bg(p.accs).text_color(p.acc)).on_click(cx.listener(|this,_,w,cx|this.toggle_ai(w,cx))))
+            .child(toolbar_button("ai", AppIcon::Ai, Some(if self.hub.conversations.attention().0>0{"AI · 待处理"}else if self.hub.conversations.attention().1>0{"AI · ●"}else{"AI"}), "AI 助手", true, cx).when(self.ai_open,|b|b.bg(p.accs).text_color(p.acc)).on_click(cx.listener(|this,_,w,cx|this.toggle_ai(w,cx))))
             .child(
                 toolbar_button("snippets", AppIcon::Commands, Some("快捷命令"), "快捷命令", true, cx)
                     .when(self.commands_open, |b| b.bg(p.accs).text_color(p.acc))
