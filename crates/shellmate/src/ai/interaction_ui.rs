@@ -489,7 +489,10 @@ impl Drawer {
         let running = self.state.model.busy
             || self.state.pending
             || (self.state.timing.live() && !self.state.timing.paused());
-        if !running && snapshot.inputs.is_empty() && self.state.message_target.is_none() {
+        // The interaction bar is for an actual follow-up: queued input or an
+        // explicitly selected child. A running turn with no follow-up should
+        // keep the composer quiet instead of adding a second "正在回复" panel.
+        if snapshot.inputs.is_empty() && self.state.message_target.is_none() {
             return None;
         }
         let mut bar = div()
