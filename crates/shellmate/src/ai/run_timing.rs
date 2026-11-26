@@ -301,11 +301,7 @@ pub(super) fn label(
     } else {
         "运行"
     };
-    let followup = if record.followup { "续答 · " } else { "" };
-    format!(
-        "{followup}{time}{state} · {runtime} {}",
-        duration(record.duration_ms)
-    )
+    format!("{time}{state} · {runtime} {}", duration(record.duration_ms))
 }
 
 #[cfg(test)]
@@ -532,6 +528,14 @@ mod tests {
         runs.observe(&log, &tasks, &[]);
         runs.done(at(t, 11));
         assert_eq!(runs.snapshot(t)[1].status, Status::Completed);
+        assert_eq!(
+            label(
+                &runs.snapshot(t)[1],
+                t,
+                &shellmate_ai::interaction::Phase::Idle
+            ),
+            "结束 · 1 秒"
+        );
     }
     #[test]
     fn duration_labels_cover_short_long_and_unknown_end_without_fake_timestamp() {
