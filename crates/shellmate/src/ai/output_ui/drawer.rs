@@ -160,12 +160,27 @@ impl Drawer {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tasks = if self.fixture {
+            self.fixture_tasks.clone()
+        } else {
+            self.tasks.as_ref().map(|t| t.list()).unwrap_or_default()
+        };
+        let owner = tasks.iter().find(|t| t.output_id == id).and_then(|t| t.owner.clone());
+        let scope = if let Some(owner) = owner {
+            let owner = self.tasks.as_ref().and_then(|t| t.latest_agent(&owner))
+                .map(|(view, _, _)| view.id).unwrap_or(owner);
+            self.open_child(&owner, w, cx);
+            self.prepare_output_views(cx);
+            format!("child:{owner}")
+        } else {
+            "main".into()
+        };
         let key = self
             .state
             .output_panes
             .iter()
             .find(|(key, p)| {
-                key.starts_with(&format!("tool:{}:main:", self.state.id))
+                key.starts_with(&format!("tool:{}:{scope}:", self.state.id))
                     && p.read(cx).source.output.as_deref() == Some(id)
             })
             .map(|(key, _)| key.clone())

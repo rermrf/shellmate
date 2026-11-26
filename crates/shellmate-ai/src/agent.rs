@@ -76,6 +76,7 @@ impl Capabilities {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
+    pub service: Option<ServiceOptions>,
     pub cwd: Option<String>,
     pub session_id: Option<String>,
     pub destination: Option<crate::session_tools::Destination>,
@@ -88,6 +89,17 @@ pub struct ToolCall {
     pub exec_limits: ExecLimits,
     pub class: Class,
 }
+
+/// A process intended to outlive the agent turn. Readiness is evidence from output,
+/// not a claim that an HTTP endpoint has been verified.
+#[derive(Clone, Debug, PartialEq, Eq, rig_core::serde::Serialize, Deserialize)]
+#[serde(crate = "rig_core::serde", deny_unknown_fields)]
+pub struct ServiceOptions {
+    pub ready_pattern: Option<String>,
+    #[serde(default = "service_startup_timeout")]
+    pub startup_timeout_secs: u64,
+}
+fn service_startup_timeout() -> u64 { 10 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOutcome {
     Completed(ToolOutput),
@@ -1711,6 +1723,7 @@ fn parse_call(
     #[derive(Deserialize)]
     #[serde(crate = "rig_core::serde")]
     struct Arguments {
+        service: Option<ServiceOptions>,
         cwd: Option<String>,
         session_id: Option<String>,
         command: Option<String>,
@@ -1769,7 +1782,14 @@ fn parse_call(
         .timeout_secs
         .as_ref()
         .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()));
+    if let Some(service) = &a.service
+        && (!(1..=60).contains(&service.startup_timeout_secs)
+            || service.ready_pattern.as_ref().is_some_and(|p| p.trim().is_empty() || p.len() > 512)) {
+        return Err("service 就绪文本需为 1–512 字节，启动检查时间需为 1–60 秒".into());
+    }
     Ok(ToolCall {
+        run_in_background: a.run_in_background || a.service.is_some(),
+        service: a.service,
         session_id: a.session_id,
         cwd: a.cwd, destination: None,
         id: raw.id.to_string(),
@@ -1783,7 +1803,6 @@ fn parse_call(
         .into(),
         target,
         timeout: limits.timeout(timeout),
-        run_in_background: a.run_in_background,
         exec_limits: limits,
     })
 }

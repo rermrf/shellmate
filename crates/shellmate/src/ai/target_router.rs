@@ -374,6 +374,7 @@ mod tests {
         r.add(&id, true).unwrap();
         let tasks = Tasks::new(root.path().into(), "test".into());
         let mut call = ToolCall {
+            service: None,
             id: "c".into(),
             session_id: Some(id.clone()),
             cwd: None,
@@ -481,6 +482,7 @@ mod tests {
         );
         let tasks = Tasks::new(root.path().into(), "ssh-route".into());
         let mut call = ToolCall {
+            service: None,
             id: "remote-command".into(),
             session_id: Some(remote.clone()),
             cwd: None,

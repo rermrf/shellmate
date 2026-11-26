@@ -205,6 +205,7 @@ impl Timeline {
                     needed.push(id.clone());
                 }
             } else if step.call.name == "run_command"
+                && step.call.args_json.get("service").is_none_or(|v| v.is_null())
                 && step.call.args_json["run_in_background"].as_bool() != Some(true)
             {
                 needed.extend(
@@ -327,6 +328,7 @@ mod tests {
     }
     fn task(id: &str, call: &str) -> TaskInfo {
         TaskInfo {
+            service: None, destination: None, owner: None,
             kind: Kind::Command,
             call_id: call.into(),
             id: id.into(),
@@ -453,6 +455,19 @@ mod tests {
         runs.observe(&log, &[task("task-1", "server")], &[]);
         runs.done(at(t, 5));
         assert_eq!(runs.snapshot(t)[0].status, Status::Completed);
+    }
+    #[test]
+    fn service_without_explicit_async_flag_does_not_hold_round_open() {
+        let t = base();
+        let mut runs = Timeline::default();
+        let mut log = Conversation::default();
+        log.push_user(UserTurn::new("start server", Default::default()));
+        runs.start(0, log.entries().len(), t);
+        log.append(step("server", "run_command", serde_json::json!({"service":{}})));
+        runs.observe(&log, &[task("1", "server")], &[]);
+        runs.done(at(t, 5));
+        assert_eq!(runs.snapshot(t)[0].status, Status::Completed);
+        assert_eq!(runs.snapshot(at(t, 100))[0].duration_ms, 5000);
     }
     #[test]
     fn child_notification_remains_owned_until_accepted_and_is_not_registered_twice() {

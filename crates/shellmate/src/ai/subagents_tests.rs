@@ -372,6 +372,7 @@ impl Executor for FakeExecutor {
 }
 fn call() -> ToolCall {
     ToolCall {
+        service: None,
         session_id: None,
         cwd: None, destination: None,
         id: "same-id".into(),
@@ -514,7 +515,6 @@ fn event_mapping_has_steps_usage_report_and_tasks_share_existing_rows() {
     assert_eq!(tasks.running().len(), 1);
     assert_eq!(tasks.list()[0].kind, Kind::Agent);
     assert_eq!(tasks.list()[0].target_label(), "子任务");
-    assert_eq!(tasks.list()[0].bar_id(), "1");
     assert!(tasks.list()[0].status_text().contains("运行中"));
     tasks.stop_all();
     assert!(first.cancel.is_cancelled() && second.cancel.is_cancelled());
@@ -1384,4 +1384,75 @@ async fn reused_child_call_ids_keep_distinct_cards_during_stream_and_after_finis
     let ended = service.tasks.agent_views().remove(0);
     assert_eq!(ended.tool_ids.saved(&ids[0]), first_key);
     assert_eq!(ended.tool_ids.saved(&ids[1]), second_key);
+}
+
+#[tokio::test]
+async fn child_finishes_while_service_stays_managed_and_accepts_parent_stop() {
+    let (_root, service, ui, http) = fixture(vec![
+        tool_response(
+            "run_command",
+            json!({
+                "command":"printf SERVICE_READY; sleep 60",
+                "target":"background",
+                "service":{"ready_pattern":"SERVICE_READY","startup_timeout_secs":3}
+            }),
+        ),
+        response(false, "服务已出现就绪输出，持续运行。"),
+    ]);
+    *service.mode.lock().unwrap() = shellmate_ai::PermissionMode::Full;
+    let mut run = service.start(request(false), "start-service");
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            tokio::select! {
+                result = &mut run => break result,
+                event = ui.recv() => match event.unwrap() {
+                    Ui::Running { ready, source, call, .. } => {
+                        assert!(source.is_some());
+                        assert!(call.service.is_some());
+                        assert!(call.run_in_background);
+                        ready.send(()).unwrap();
+                    }
+                    Ui::Approval { .. } => panic!("ordinary command in full mode"),
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!result.is_error, "{}", result.inline);
+    assert_eq!(result.subagent.unwrap().status, SubagentStatus::Completed);
+    assert_eq!(http.requests().len(), 2);
+    let tasks = service.tasks.running();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].kind, Kind::Command);
+    assert_eq!(tasks[0].id, "agent-1/1");
+    assert_eq!(
+        tasks[0].service,
+        Some(crate::ai::tasks::ServiceState::Ready)
+    );
+    let view = service.tasks.agent_views().pop().unwrap();
+    assert_eq!(view.status, SubagentStatus::Completed);
+    assert_eq!(view.step_list.len(), 1);
+    assert!(
+        service
+            .tasks
+            .local_tool(read(&tasks[0].output_id), Default::default())
+            .await
+            .inline
+            .contains("SERVICE_READY")
+    );
+    assert!(
+        !service
+            .tasks
+            .local_tool(
+                LocalTool::StopTask {
+                    id: tasks[0].id.clone()
+                },
+                Default::default()
+            )
+            .await
+            .is_error
+    );
+    settled(&service.tasks).await;
 }

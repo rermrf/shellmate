@@ -138,6 +138,7 @@ fn executor(root: &Path, binding: Binding, ui: async_channel::Sender<Ui>) -> App
 }
 fn call(command: &str) -> ToolCall {
     ToolCall {
+        service: None,
         session_id: None,
         cwd: None, destination: None,
         id: shellmate_core::HostId::generate().to_string(),

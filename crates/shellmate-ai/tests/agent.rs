@@ -1256,6 +1256,7 @@ async fn approved_edit_and_target_reach_both_wires_events_and_history() {
         }
         fn resolved_call(&self, call: &ToolCall) -> ToolCall {
             ToolCall {
+                service: None,
                 session_id: None,
                 cwd: None, destination: None,
                 command: "pwd".into(),

@@ -22,6 +22,7 @@ impl Drop for Temp {
 }
 fn call(command: &str, target: Target, timeout: Duration) -> ToolCall {
     ToolCall {
+        service: None,
         session_id: None,
         cwd: None, destination: None,
         id: HostId::generate().to_string(),
@@ -1123,6 +1124,165 @@ async fn dropping_registry_stops_background_process_groups() {
 }
 
 #[tokio::test]
+async fn service_is_owned_by_conversation_survives_child_and_has_real_http_readiness() {
+    use crate::ai::tasks::{ServiceState, Tasks};
+    use shellmate_ai::agent::{LocalTool, ReadOutput, ServiceOptions};
+    let temp = Temp::new();
+    let parent = Tasks::new(temp.0.clone(), "services".into());
+    let child = parent.child_tasks();
+    parent.attach_child_outputs("agent-1", &child);
+    let script = "import http.server,os; s=http.server.HTTPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler); open('port','w').write(str(s.server_port)); open('pid','w').write(str(os.getpid())); print('SERVICE_READY',flush=True); s.serve_forever()";
+    let mut c = call(
+        &format!(
+            "/usr/bin/python3 -u -c '{script}'",
+            script = script.replace('\'', "'\\''")
+        ),
+        Target::Background,
+        Duration::from_secs(10),
+    );
+    c.service = Some(ServiceOptions {
+        ready_pattern: Some("SERVICE_READY".into()),
+        startup_timeout_secs: 5,
+    });
+    let out = completed(run_local(&child, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
+    assert!(out.message.as_ref().unwrap().contains("已匹配就绪输出"));
+    let id = format!("agent-1/{}", out.task_id.unwrap());
+    let pid = std::fs::read_to_string(temp.0.join("pid"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let port = std::fs::read_to_string(temp.0.join("port"))
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    child.finish_agent_commands();
+    drop(child);
+    let running = parent.running();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].id, id);
+    assert_eq!(running[0].service, Some(ServiceState::Ready));
+    assert!(parent.state().0.iter().any(|s| s.contains(&id)));
+    let body = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut connection = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        connection
+            .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut result = String::new();
+        connection.read_to_string(&mut result).unwrap();
+        result
+    })
+    .await
+    .unwrap();
+    assert!(body.starts_with("HTTP/1.0 200"), "{body}");
+    let read = parent
+        .local_tool(
+            LocalTool::ReadOutput(ReadOutput {
+                id: id.clone(),
+                offset_line: 0,
+                limit_lines: None,
+                grep: None,
+            }),
+            Default::default(),
+        )
+        .await;
+    assert!(read.inline.contains("SERVICE_READY"));
+    assert!(parent.wait_tasks(vec![id.clone()], true).await.is_error);
+    assert!(
+        !parent
+            .local_tool(LocalTool::StopTask { id }, Default::default())
+            .await
+            .is_error
+    );
+    assert_gone(&[pid]).await;
+    assert!(!parent.has_running());
+    assert!(parent.take_notices().iter().any(|s| s.contains("持续服务")));
+}
+
+#[tokio::test]
+async fn service_readiness_failure_timeout_and_parent_drop_do_not_leak_processes() {
+    use crate::ai::tasks::{ServiceState, Tasks};
+    use shellmate_ai::agent::ServiceOptions;
+    let temp = Temp::new();
+    let parent = Tasks::new(temp.0.clone(), "service-lifecycle".into());
+    for agent in ["agent-1", "agent-2"] {
+        let child = parent.child_tasks();
+        parent.attach_child_outputs(agent, &child);
+        let mut c = call(
+            "printf starting; sleep 60",
+            Target::Background,
+            Duration::from_secs(10),
+        );
+        c.service = Some(ServiceOptions {
+            ready_pattern: Some("READY".into()),
+            startup_timeout_secs: 1,
+        });
+        let out = completed(run_local(&child, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
+        assert!(out.message.unwrap().contains("尚未确认就绪"));
+        child.finish_agent_commands();
+    }
+    assert_eq!(
+        parent
+            .running()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>(),
+        ["agent-1/1", "agent-2/1"]
+    );
+    assert!(
+        parent
+            .running()
+            .iter()
+            .all(|t| t.service == Some(ServiceState::Unverified))
+    );
+    parent.stop("agent-1/1");
+    assert_eq!(
+        parent
+            .list()
+            .iter()
+            .find(|t| t.id == "agent-2/1")
+            .unwrap()
+            .status,
+        crate::ai::tasks::Status::Running
+    );
+    parent.stop_all();
+    let child = parent.child_tasks();
+    parent.attach_child_outputs("agent-3", &child);
+    let mut failed = call(
+        "printf failed >&2; exit 0",
+        Target::Background,
+        Duration::from_secs(5),
+    );
+    failed.service = Some(ServiceOptions {
+        ready_pattern: Some("READY".into()),
+        startup_timeout_secs: 2,
+    });
+    let out = completed(run_local(&child, failed, temp.0.clone(), "/bin/sh", Some(&temp.0)).await);
+    assert!(
+        !out.successful,
+        "exit 0 before readiness is not service success"
+    );
+    assert_eq!(child.list()[0].service, Some(ServiceState::Failed));
+    let mut running = call(
+        "echo $$ > pids; sleep 60 & echo $! >> pids; sleep 60 & echo $! >> pids; printf READY; wait",
+        Target::Background,
+        Duration::from_secs(5),
+    );
+    running.service = Some(ServiceOptions {
+        ready_pattern: Some("READY".into()),
+        startup_timeout_secs: 2,
+    });
+    run_local(&child, running, temp.0.clone(), "/bin/sh", Some(&temp.0)).await;
+    let ids = pids(&temp.0.join("pids")).await;
+    drop(child);
+    drop(parent);
+    assert_gone(&ids).await;
+}
+
+#[tokio::test]
 async fn terminal_directory_change_persists_after_timeout_or_background() {
     for run_in_background in [false, true] {
         let h = PtyHarness::new().await;
@@ -1210,4 +1370,105 @@ async fn live_interaction_promotes_a_real_command_without_restarting_or_killing_
             .unwrap();
     assert_eq!(text, "started\nfinished\n");
     assert_eq!(tasks.control().snapshot().completions.len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_service_keeps_selected_channel_and_releases_shell_when_stopped() {
+    let h = PtyHarness::new().await;
+    let mut c = call(
+        "printf '%s%s' SERVICE _READY; sleep 60",
+        Target::Terminal,
+        Duration::from_secs(3),
+    );
+    c.service = Some(shellmate_ai::agent::ServiceOptions {
+        ready_pattern: Some("SERVICE_READY".into()),
+        startup_timeout_secs: 3,
+    });
+    let out = completed(h.executor.execute(c).await);
+    assert!(out.message.unwrap().contains("已匹配就绪输出"));
+    let task = h.executor.tasks.running().pop().unwrap();
+    assert_eq!(task.target, Target::Terminal);
+    assert!(task.background);
+    assert!(h.scan.lock().unwrap().is_some());
+    assert_eq!(h.typed.lock().unwrap().len(), 1);
+    h.executor.tasks.finish_agent_commands();
+    assert!(h.executor.tasks.has_running());
+    assert!(h.executor.tasks.stop(&task.id));
+    h.settled().await;
+    let out = completed(
+        h.executor
+            .execute(call(
+                "printf shell_released",
+                Target::Terminal,
+                Duration::from_secs(3),
+            ))
+            .await,
+    );
+    assert_eq!(out.stdout().trim(), "shell_released");
+}
+
+#[tokio::test]
+async fn retired_conversation_rejects_late_child_service_without_starting_process() {
+    let temp = Temp::new();
+    let parent = crate::ai::tasks::Tasks::new(temp.0.clone(), "retired-service".into());
+    let child = parent.child_tasks();
+    parent.attach_child_outputs("agent-1", &child);
+    parent.retire();
+    let mut c = call(
+        "touch should-not-exist",
+        Target::Background,
+        Duration::from_secs(3),
+    );
+    c.service = Some(shellmate_ai::agent::ServiceOptions {
+        ready_pattern: None,
+        startup_timeout_secs: 1,
+    });
+    let out = run_local(&child, c, temp.0.clone(), "/bin/sh", Some(&temp.0)).await;
+    assert_eq!(out, ToolOutcome::Disconnected);
+    assert!(!temp.0.join("should-not-exist").exists());
+    assert!(parent.list().is_empty());
+}
+
+#[tokio::test]
+async fn service_startup_wait_yields_to_user_input_without_stopping_process() {
+    let temp = Temp::new();
+    let tasks = crate::ai::tasks::Tasks::new(temp.0.clone(), "service-input".into());
+    let mut c = call(
+        group_command(),
+        Target::Background,
+        Duration::from_secs(30),
+    );
+    c.service = Some(shellmate_ai::agent::ServiceOptions {
+        ready_pattern: Some("NEVER_READY".into()),
+        startup_timeout_secs: 30,
+    });
+    let mut run = Box::pin(run_local(
+        &tasks,
+        c,
+        temp.0.clone(),
+        "/bin/sh",
+        Some(&temp.0),
+    ));
+    let pid_path = temp.0.join("pids");
+    let ids = tokio::select! {
+        _ = &mut run => panic!("must still be checking startup"),
+        ids = pids(&pid_path) => ids,
+    };
+    let control = tasks.control();
+    assert!(control.enqueue(
+        "followup".into(),
+        "先看看其他项目".into(),
+        Default::default()
+    ));
+    control.request(shellmate_ai::interaction::Intent::SendNow);
+    let out = completed(
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .unwrap(),
+    );
+    assert!(out.message.unwrap().contains("尚未确认就绪"));
+    assert!(tasks.has_running());
+    assert_eq!(control.snapshot().inputs.len(), 1);
+    tasks.stop_all();
+    assert_gone(&ids).await;
 }

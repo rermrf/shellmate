@@ -13,6 +13,7 @@ pub const SCENES: &[&str] = &[
     "ai-child-long-prompt",
     "ai-live-queue",
     "ai-live-waiting",
+    "ai-service-child",
     "ai-live-approval",
     "ai-live-restored",
     "ai-live-target",
@@ -37,6 +38,7 @@ pub fn base(scene: &str) -> Option<&'static str> {
         | "ai-child-restored"
         | "ai-child-long-prompt" => "ai-subagent-done",
         "ai-live-queue" => "ai-agent-run",
+        "ai-service-child" => "ai-output-running",
         "ai-live-waiting" => "ai-subagent-running",
         "ai-live-approval" => "ai-subagent-approval",
         "ai-live-restored" | "ai-live-target" => "ai-subagent-done",

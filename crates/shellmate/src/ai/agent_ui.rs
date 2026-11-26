@@ -48,13 +48,16 @@ impl Drawer {
         };
         let running: Vec<_> = tasks
             .into_iter()
-            .filter(|t| t.status == crate::ai::tasks::Status::Running && t.background)
+            .filter(|t| t.kind == crate::ai::tasks::Kind::Command && t.status == crate::ai::tasks::Status::Running && t.background)
             .collect();
         if running.is_empty() {
             return None;
         }
         let p = cx.palette();
         let mut strip = div()
+            .id("running-command-list")
+            .max_h(px(144.))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(4.))
@@ -66,54 +69,32 @@ impl Drawer {
             let id = task.id.clone();
             let stop_id = id.clone();
             let output_id = task.output_id.clone();
+            let summary = format!("{}{}{}", task.command,
+                task.destination.as_ref().map(|d| format!(" · {}", d.label)).unwrap_or_default(),
+                task.service.map(|s| format!(" · {}", s.label())).unwrap_or_default());
             strip = strip.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .text_size(px(11.5))
-                    .text_color(p.tx2)
-                    .child(
-                        div()
-                            .flex_none()
-                            .px(px(5.))
-                            .py(px(2.))
-                            .rounded(px(5.))
-                            .bg(p.card3)
-                            .child(format!("#{} {}", task.bar_id(), task.target_label())),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(task.command),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(format!("{}s", task.started.elapsed().as_secs())),
-                    )
-                    .when(task.kind == crate::ai::tasks::Kind::Command, |d| d.child(
-                        step_action(SharedString::from(format!("task-output-{id}")), "查看输出", cx)
-                            .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx)))
-                    ))
-                    .child(
-                        Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止任务").h(px(24.)).text_size(px(11.5))
+                div().flex().flex_col().gap(px(3.)).min_w_0().text_size(px(11.5)).text_color(p.tx2)
+                    .child(div().flex().items_center().gap(px(6.)).min_w_0()
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(summary))
+                        .child(div().flex_none().text_color(p.tx3).child(format!("{}s", task.started.elapsed().as_secs()))))
+                    .child(div().flex().flex_wrap().items_center().gap(px(5.))
+                        .child(div().flex_none().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).child(task.target_label()))
+                        .child(step_action(SharedString::from(format!("task-output-{id}")), "查看输出", cx)
+                            .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx))))
+                        .child(Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止").h(px(24.)).text_size(px(11.5))
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 if s.fixture {
-                                    s.fixture_tasks.retain(|t| t.id != stop_id);
+                                    if let Some(task) = s.fixture_tasks.iter_mut().find(|t| t.id == stop_id) {
+                                        task.status = crate::ai::tasks::Status::Stopped;
+                                    }
                                 } else if let Some(tasks) = &s.tasks {
                                     tasks.stop(&stop_id);
                                 }
                                 cx.notify();
-                            })),
-                    ),
+                            })))),
             );
         }
-        Some(strip)
+        Some(div().child(strip))
     }
     pub(super) fn permission_key(&self) -> &str {
         self.host.as_deref().unwrap_or("local")
@@ -394,7 +375,7 @@ impl Drawer {
         let display_key=self.tool_key(&scope,&step.call.id,true);
         let status=if step.started.is_some(){crate::ai::tool_model::Status::Running}else{crate::ai::tool_model::Status::Approval};
         let expanded=self.tool_open(&display_key,status);
-        let detail=format!("{}执行{}{}",step.call.target.label(),if step.automatic{" · 自动批准"}else{""},step.source.as_ref().map(|s|format!(" · 子任务：{}",s.description)).unwrap_or_default());
+        let detail=format!("{}执行{}{}{}",step.call.target.label(),if step.call.service.is_some(){" · 持续服务"}else{""},if step.automatic{" · 自动批准"}else{""},step.source.as_ref().map(|s|format!(" · 子任务：{}",s.description)).unwrap_or_default());
         let detail=if let Some(target)=&step.call.destination{format!("{} · {} · {} · {}",target.label,target.protocol,target.cwd.as_deref().unwrap_or("目录未知"),detail)}else{detail};
         let model=super::tool_ui::Card{key:display_key.clone(),title:"执行命令".into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
         let mut card=self.tool_shell(&model,cx);
@@ -663,6 +644,7 @@ impl Drawer {
             self.state.model.busy = false;
         } else {
             let step = ActiveStep::new(ToolCall {
+                service: None,
                 session_id:None,cwd: None, destination: None,
                 id: "fixture-step-2".into(),
                 command: command.into(),

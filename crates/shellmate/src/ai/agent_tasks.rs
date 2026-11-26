@@ -354,6 +354,7 @@ impl Tasks {
         child
     }
     pub fn attach_child_outputs(&self, id: &str, tasks: &Self) {
+        let _ = tasks.0.service_parent.set((Arc::downgrade(&self.0), id.into()));
         if let Some(task) = self
             .0
             .state
@@ -455,6 +456,8 @@ impl Tasks {
     }
     pub fn retire(&self) {
         self.0.state.lock().unwrap().retired = true;
+        let children = self.0.state.lock().unwrap().services.values().cloned().collect::<Vec<_>>();
+        for child in children { child.retire(); }
         self.stop_all();
     }
     pub(super) async fn agent_tool(&self, tool: &LocalTool) -> Option<LocalResult> {
@@ -521,6 +524,7 @@ impl Tasks {
 }
 pub(super) fn info(view: &View, call_id: &str) -> TaskInfo {
     TaskInfo {
+        service: None, destination: None, owner: None,
         kind: Kind::Agent,
         call_id: call_id.into(),
         id: view.id.clone(),

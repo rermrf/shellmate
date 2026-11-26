@@ -64,6 +64,7 @@ fn call(class: Class) -> ToolCall {
         Class::RedLine => "systemctl reboot",
     };
     ToolCall {
+        service: None,
         session_id: None,
         cwd: None, destination: None,
         id: "call-1".into(),

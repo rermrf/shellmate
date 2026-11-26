@@ -1638,6 +1638,8 @@ impl Render for Drawer {
             }
             if self.state.model.compacting || self.state.pending
                 || (self.state.model.busy
+                    && !matches!(self.state.control.phase(), shellmate_ai::interaction::Phase::Waiting(_))
+                    && self.state.active_tools.is_empty()
                     && self.state.active_steps.is_empty()
                     && self
                         .state

@@ -247,6 +247,7 @@ mod tests {
 
     fn step() -> ActiveStep {
         ActiveStep::new(ToolCall {
+            service: None,
             session_id: None,
             cwd: None, destination: None,
             id: "approval".into(),

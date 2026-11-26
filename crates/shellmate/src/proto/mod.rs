@@ -76,6 +76,7 @@ pub const SCENES: &[&str] = &[
     "ai-subagent-approval", "ai-tasks-subagents",
     "ai-subagent-running", "ai-subagent-done", "ai-subagent-expanded", "ai-subagent-states", "ai-subagent-background",
     "ai-mode-popover",
+    "ai-service-child",
     "ai-live-queue", "ai-live-waiting", "ai-live-approval", "ai-live-restored", "ai-live-target", "ai-live-btw",
     "ai-timing-running", "ai-timing-waiting", "ai-timing-done", "ai-timing-paused", "ai-timing-interrupted",
     "ai-child-thread","ai-child-running","ai-child-approval","ai-child-restored","ai-child-long-prompt",
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 166 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 167 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

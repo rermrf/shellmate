@@ -28,6 +28,32 @@ impl Drawer {
             self.timing_fixture(scene, cx);
             return;
         }
+        if scene == "ai-service-child" {
+            let mut view = crate::proto::subagents::view("agent-1", "启动前端开发服务");
+            view.status = shellmate_ai::SubagentStatus::Completed;
+            view.prompt = "检查启动脚本，启动项目并核实地址，服务保持运行。".into();
+            view.transcript = Some(self.state.model.conversation.entries().to_vec());
+            view.report = "开发服务已启动：http://localhost:5173/".into();
+            view.steps = 1;
+            let mut log = shellmate_ai::Conversation::default();
+            log.push_user(UserTurn::new("让子代理帮我启动项目", Default::default()));
+            log.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
+                message_id: 1,
+                call: shellmate_ai::LoggedCall { id: view.call_id.clone(), name: "agent".into(), args_json:serde_json::json!({"prompt":view.prompt}) },
+                result: shellmate_ai::LoggedResult { inline:view.report.clone(), output_id:view.output_id.clone(), subagent:Some(Box::new(view.display())), cleared:false, is_error:false },
+                display: None,
+            }));
+            log.push_text("服务已交由当前会话管理，可以继续操作。");
+            self.state.model.conversation = log;
+            self.state.model.busy = false;
+            for task in &mut self.fixture_tasks {
+                task.owner = Some(view.id.clone());
+                task.id = format!("{}/{}", view.id, task.id);
+            }
+            self.state.subagents.insert(view.id.clone(), view);
+            cx.notify();
+            return;
+        }
         self.state.control.resume();
         self.state.model.busy = !matches!(scene, "ai-live-restored" | "ai-live-target");
         self.state.control.set_phase(match scene {
@@ -35,6 +61,15 @@ impl Drawer {
             "ai-live-approval" => Phase::Approval,
             _ => Phase::Executing,
         });
+        if scene == "ai-live-waiting" {
+            self.state.active_tools.push(shellmate_ai::LoggedCall {
+                id: "fixture-wait".into(), name: "wait_tasks".into(),
+                args_json: serde_json::json!({"ids":["agent-1"],"mode":"all"}),
+            });
+            self.state.tool_ids.start("fixture-wait");
+            self.fixture_tasks = crate::proto::subagents::tasks().into_iter()
+                .filter(|t| t.id == "agent-1").collect();
+        }
         if scene == "ai-live-target" {
             self.state.message_target = Some("agent-1".into());
             self.set_composer_text("继续检查测试和启动方式", w, cx);

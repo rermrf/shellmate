@@ -32,8 +32,28 @@ pub enum Kind {
     Command,
     Agent,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    Starting,
+    Ready,
+    Unverified,
+    Failed,
+}
+impl ServiceState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "检查启动",
+            Self::Ready => "已出现就绪信号",
+            Self::Unverified => "就绪待确认",
+            Self::Failed => "启动未完成",
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
+    pub service: Option<ServiceState>,
+    pub destination: Option<shellmate_ai::session_tools::Destination>,
+    pub owner: Option<String>,
     pub kind: Kind,
     pub call_id: String,
     pub id: String,
@@ -51,9 +71,6 @@ impl TaskInfo {
         } else {
             self.target.label()
         }
-    }
-    pub fn bar_id(&self) -> &str {
-        self.id.strip_prefix("agent-").unwrap_or(&self.id)
     }
     pub fn status_text(&self) -> String {
         let text = match self.status {
@@ -89,6 +106,7 @@ enum Stop {
     Timeout,
 }
 struct State {
+    services: BTreeMap<String, Tasks>,
     external_steps: Vec<shellmate_ai::Step>,
     next_agent: u64,
     agents: BTreeMap<u64, agents::AgentTask>,
@@ -99,6 +117,7 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    service_parent: std::sync::OnceLock<(Weak<Inner>, String)>,
     web: std::sync::OnceLock<Arc<super::web::Service>>,
     released_waits: Mutex<Vec<String>>,
     events: Mutex<events::Outbox>,
@@ -113,6 +132,9 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        for child in self.state.get_mut().unwrap().services.values() {
+            child.retire();
+        }
         for task in self.state.get_mut().unwrap().agents.values() {
             task.cancel.cancel();
         }
@@ -133,6 +155,110 @@ impl Retained {
     }
 }
 impl Tasks {
+    /// Only service processes are retained after their child agent finishes.
+    pub fn finish_agent_commands(&self) {
+        for task in self.0.state.lock().unwrap().tasks.values() {
+            if task.info.service.is_none() && task.info.status == Status::Running {
+                let _ = task.cancel.send(Some(Stop::User));
+            }
+        }
+    }
+    fn service_task(&self, id: &str) -> Option<(Tasks, String)> {
+        let children = self.0.state.lock().unwrap().services.clone();
+        for (agent, child) in children {
+            let local = id.strip_prefix(&format!("{agent}/"));
+            let found = child
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .tasks
+                .values()
+                .find(|t| {
+                    t.info.service.is_some()
+                        && (local == Some(t.info.id.as_str()) || t.info.output_id == id)
+                })
+                .map(|t| t.info.id.clone());
+            if let Some(id) = found {
+                return Some((child, id));
+            }
+        }
+        None
+    }
+    async fn check_service(
+        &self,
+        call: &ToolCall,
+        service: &shellmate_ai::agent::ServiceOptions,
+        number: u64,
+        oid: &str,
+        spool: &Spool,
+        result: &mut watch::Receiver<Option<ToolOutcome>>,
+    ) -> ToolOutcome {
+        let deadline = Instant::now() + Duration::from_secs(service.startup_timeout_secs);
+        let mut phase = ServiceState::Unverified;
+        loop {
+            if let Some(out) = result.borrow().clone() {
+                if let Some(task) = self.0.state.lock().unwrap().tasks.get_mut(&number) {
+                    task.info.service = Some(ServiceState::Failed);
+                }
+                return service_exited(out, oid);
+            }
+            let matched = service.ready_pattern.as_ref().is_some_and(|pattern| {
+                spool
+                    .window(65536)
+                    .is_ok_and(|w| String::from_utf8_lossy(&w.bytes).contains(pattern))
+            });
+            if matched {
+                phase = ServiceState::Ready;
+                break;
+            }
+            if service.ready_pattern.is_none() || Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = self.0.control.urgent() => break,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                changed = result.changed() => if changed.is_err() { return ToolOutcome::Disconnected; },
+            }
+        }
+        // Completion and readiness share the registry lock. An exit already observed
+        // by the worker must never be overwritten with a running/ready state.
+        let ended = {
+            let mut state = self.0.state.lock().unwrap();
+            let task = state.tasks.get_mut(&number).unwrap();
+            if task.info.status == Status::Running {
+                task.info.service = Some(phase);
+                false
+            } else {
+                task.info.service = Some(ServiceState::Failed);
+                true
+            }
+        };
+        if ended {
+            return service_exited(wait_result(result).await, oid);
+        }
+        let mut out = match background(call, oid, number, false) {
+            ToolOutcome::Completed(out) => out,
+            _ => unreachable!(),
+        };
+        let evidence = if phase == ServiceState::Ready {
+            format!(
+                "已匹配就绪输出 {:?}；这不是 HTTP 健康检查",
+                service.ready_pattern.as_deref().unwrap()
+            )
+        } else {
+            "尚未确认就绪，需读取输出或在服务所在目标检查端口/HTTP；不能宣称启动成功".into()
+        };
+        let preview = spool
+            .window(8192)
+            .map(|w| String::from_utf8_lossy(&w.bytes).into_owned())
+            .unwrap_or_default();
+        out.message = Some(format!(
+            "{}\n持续服务由会话管理，子代理或本轮回复结束不会停止。{evidence}。不要用 wait_tasks 等待服务退出。\n{preview}",
+            out.message.unwrap_or_default()
+        ));
+        ToolOutcome::Completed(out)
+    }
     pub fn retained(&self) -> Retained {
         Retained(Arc::downgrade(&self.0))
     }
@@ -148,6 +274,7 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            service_parent: Default::default(),
             web: Default::default(),
             released_waits: Default::default(),
             events: Default::default(),
@@ -159,6 +286,7 @@ impl Tasks {
             root,
             conversation,
             state: Mutex::new(State {
+                services: BTreeMap::new(),
                 external_steps: vec![],
                 next: 1,
                 next_agent: 1,
@@ -183,6 +311,16 @@ impl Tasks {
                     .map(|t| agents::info(&t.view, &t.call_id)),
             )
             .collect();
+        let children = state.services.clone();
+        drop(state);
+        for (agent, child) in children {
+            for mut task in child.list().into_iter().filter(|t| t.service.is_some()) {
+                task.id = format!("{agent}/{}", task.id);
+                task.call_id = format!("{agent}/{}", task.call_id);
+                task.owner = Some(agent.clone());
+                list.push(task);
+            }
+        }
         list.sort_by_key(|t| t.started);
         list
     }
@@ -198,7 +336,9 @@ impl Tasks {
             .web
             .get_or_init(|| Arc::new(super::web::Service::new(db, credentials)));
     }
-    pub fn shared_web(&self, service: Arc<super::web::Service>) { let _ = self.0.web.set(service); }
+    pub fn shared_web(&self, service: Arc<super::web::Service>) {
+        let _ = self.0.web.set(service);
+    }
     pub fn web_enabled(&self) -> bool {
         self.0.web.get().is_some_and(|w| w.enabled())
     }
@@ -250,6 +390,14 @@ impl Tasks {
                 .iter()
                 .filter(|t| t.status != Status::Running)
                 .count();
+            if selected
+                .iter()
+                .any(|t| t.service.is_some() && t.status == Status::Running)
+            {
+                return LocalResult::error(
+                    "持续服务不会自行结束；用 read_output 查看启动输出，在同一目标检查就绪后完成回复，不要等待服务退出",
+                );
+            }
             if (all && ended == selected.len()) || (!all && ended > 0) {
                 return LocalResult::text(
                     selected
@@ -288,6 +436,11 @@ impl Tasks {
         std::mem::take(&mut self.0.state.lock().unwrap().notices)
     }
     pub fn state(&self) -> (Vec<String>, Vec<String>) {
+        let services = self
+            .list()
+            .into_iter()
+            .filter(|t| t.owner.is_some())
+            .collect::<Vec<_>>();
         let state = self.0.state.lock().unwrap();
         let mut running: Vec<String> = state
             .tasks
@@ -307,6 +460,17 @@ impl Tasks {
                 .filter(|a| a.view.status == shellmate_ai::SubagentStatus::Running)
                 .map(|a| format!("{} · 子任务 · {}", a.view.id, a.view.description)),
         );
+        running.extend(
+            services
+                .iter()
+                .filter(|t| t.status == Status::Running)
+                .map(|t| {
+                    format!(
+                        "{} · 持续服务 · {} · 输出 id {}",
+                        t.id, t.command, t.output_id
+                    )
+                }),
+        );
         let mut outputs: Vec<_> = state
             .tasks
             .values()
@@ -315,6 +479,11 @@ impl Tasks {
             .take(20)
             .map(|t| (t.info.output_id.clone(), t.info.command.clone()))
             .collect();
+        outputs.extend(
+            services
+                .iter()
+                .map(|t| (t.output_id.clone(), t.command.clone())),
+        );
         for agent in state.agents.values().rev() {
             if outputs.len() >= 20 {
                 break;
@@ -400,6 +569,18 @@ impl Tasks {
             .map(|t| t.info.output_id.clone())
     }
     pub fn stop_all(&self) {
+        let services = self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for child in services {
+            child.stop_all();
+        }
         for task in self.0.state.lock().unwrap().agents.values() {
             if let Some(child) = task.child_outputs.upgrade() {
                 child.control.seal();
@@ -413,6 +594,9 @@ impl Tasks {
         }
     }
     pub fn stop(&self, id: &str) -> bool {
+        if let Some((child, local)) = self.service_task(id) {
+            return child.stop(&local);
+        }
         let state = self.0.state.lock().unwrap();
         if let Some(number) = id
             .strip_prefix("agent-")
@@ -436,6 +620,22 @@ impl Tasks {
         task.info.status == Status::Running && task.cancel.send(Some(Stop::User)).is_ok()
     }
     pub async fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> LocalResult {
+        let routed = match &tool {
+            LocalTool::ReadOutput(a) => self.service_task(&a.id),
+            LocalTool::StopTask { id } => self.service_task(id),
+            _ => None,
+        };
+        if let Some((child, id)) = routed {
+            let tool = match tool {
+                LocalTool::ReadOutput(mut a) => {
+                    a.id = id;
+                    LocalTool::ReadOutput(a)
+                }
+                LocalTool::StopTask { .. } => LocalTool::StopTask { id },
+                _ => unreachable!(),
+            };
+            return Box::pin(child.local_tool(tool, limits)).await;
+        }
         if let Some(result) = self.agent_tool(&tool).await {
             return result;
         }
@@ -589,29 +789,50 @@ impl Tasks {
     }
     pub async fn run<F>(
         &self,
-        call: ToolCall,
+        mut call: ToolCall,
         ready: Option<tokio::sync::oneshot::Receiver<()>>,
         work: F,
     ) -> ToolOutcome
     where
         F: FnOnce(Spool) -> BoxFuture<'static, ToolOutcome>,
     {
+        if call.service.is_some() {
+            call.run_in_background = true;
+            if let Some((parent, agent)) = self.0.service_parent.get() {
+                let Some(parent) = parent.upgrade() else {
+                    return ToolOutcome::Disconnected;
+                };
+                let mut state = parent.state.lock().unwrap();
+                if state.retired {
+                    return ToolOutcome::Disconnected;
+                }
+                state.services.insert(agent.clone(), self.clone());
+            }
+        }
         let oid = shellmate_core::HostId::generate().to_string();
-        let spool = match Spool::create(&self.0.root, &self.0.conversation, &oid) {
-            Ok(s) => s,
-            Err(e) => return ToolOutcome::Failed(format!("无法保存输出：{e}")),
-        };
+        let spool =
+            match self.while_retained(|| Spool::create(&self.0.root, &self.0.conversation, &oid)) {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => return ToolOutcome::Failed(format!("无法保存输出：{e}")),
+                None => return ToolOutcome::Disconnected,
+            };
         let (cancel, mut cancelled) = watch::channel(None);
         let (result_tx, mut result) = watch::channel(None);
         let started = Instant::now();
         let number = {
             let mut state = self.0.state.lock().unwrap();
+            if state.retired {
+                return ToolOutcome::Disconnected;
+            }
             let number = state.next;
             state.next += 1;
             state.tasks.insert(
                 number,
                 Task {
                     info: TaskInfo {
+                        service: call.service.as_ref().map(|_| ServiceState::Starting),
+                        destination: call.destination.clone(),
+                        owner: None,
                         kind: Kind::Command,
                         call_id: call.id.clone(),
                         id: number.to_string(),
@@ -637,6 +858,7 @@ impl Tasks {
         let future = work(spool.clone());
         let worker_call = call.clone();
         let worker_oid = oid.clone();
+        let service_spool = spool.clone();
         tokio::spawn(async move {
             let (raw, stopped) = tokio::select! {
                 biased;
@@ -714,6 +936,11 @@ impl Tasks {
                 return out;
             }
             guard.detached = true;
+            if let Some(service) = &call.service {
+                return self
+                    .check_service(&call, service, number, &oid, &service_spool, &mut result)
+                    .await;
+            }
             return background(&call, &oid, number, false);
         }
         tokio::select! {
@@ -752,6 +979,23 @@ impl Tasks {
         }
     }
 }
+fn service_exited(out: ToolOutcome, oid: &str) -> ToolOutcome {
+    match out {
+        ToolOutcome::Completed(mut out) => {
+            out.successful = false;
+            let detail = out
+                .message
+                .clone()
+                .unwrap_or_else(|| out.stdout().to_owned());
+            out.message = Some(format!(
+                "服务在启动检查期间已退出，尚未确认可用 · 输出 id {oid}\n{detail}"
+            ));
+            ToolOutcome::Completed(out)
+        }
+        other => other,
+    }
+}
+
 fn background(call: &ToolCall, oid: &str, number: u64, timeout: bool) -> ToolOutcome {
     let mut out = shape([], [], None, Duration::ZERO, false, false);
     out.output_id = Some(oid.into());
@@ -800,11 +1044,18 @@ fn notice(info: &TaskInfo) -> String {
 fn finish_task(weak: &Weak<Inner>, number: u64, status: Status, _: &ToolOutcome) {
     if let Some(inner) = weak.upgrade() {
         let mut state = inner.state.lock().unwrap();
+        let mut service_notice = None;
         if let Some(task) = state.tasks.get_mut(&number) {
             task.info.status = status;
+            if task.info.service == Some(ServiceState::Starting) {
+                task.info.service = Some(ServiceState::Failed);
+            }
             task.result = None;
             if task.info.background {
                 let text = notice(&task.info);
+                if task.info.service.is_some() {
+                    service_notice = Some((text.clone(), task.info.output_id.clone()));
+                }
                 inner.publish(
                     format!("output:{}", task.info.output_id),
                     task.info.id.clone(),
@@ -814,6 +1065,17 @@ fn finish_task(weak: &Weak<Inner>, number: u64, status: Status, _: &ToolOutcome)
             }
         }
         inner.changed.send_modify(|n| *n = n.wrapping_add(1));
+        drop(state);
+        if let Some((text, oid)) = service_notice
+            && let Some((parent, agent)) = inner.service_parent.get()
+            && let Some(parent) = parent.upgrade()
+        {
+            let id = format!("{agent}/{number}");
+            let text = format!("{agent} 创建的持续服务：{text}；任务引用 {id}");
+            parent.publish(format!("output:{oid}"), id, text.clone());
+            parent.state.lock().unwrap().notices.push(text);
+            parent.changed.send_modify(|n| *n = n.wrapping_add(1));
+        }
     }
 }
 struct Foreground {

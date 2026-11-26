@@ -323,6 +323,7 @@ pub fn execution_scene(scene: &str) -> Option<ExecutionScene> {
             ),
         ] {
             tasks.push(TaskInfo {
+                service: None, destination: None, owner: None,
                 kind: crate::ai::tasks::Kind::Command,
                 call_id: format!("fixture-{id}"),
                 id: id.into(),

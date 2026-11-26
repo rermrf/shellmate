@@ -134,3 +134,56 @@ async fn channels_are_chosen_per_call_independently_of_task_waiting_on_both_wire
         assert!(system.contains("序号对应对话中用户指向的那次列表"));
     }
 }
+
+#[tokio::test]
+async fn service_intent_is_async_preserves_channel_and_rejects_invalid_readiness_on_both_wires() {
+    for a in [false, true] {
+        let http = SequencedHttpClient::new([
+            response(
+                a,
+                &[
+                    (
+                        "service",
+                        "run_command",
+                        json!({"command":"npm run dev","target":"background","service":{"ready_pattern":"Local:"}}),
+                    ),
+                    (
+                        "visible",
+                        "run_command",
+                        json!({"command":"npm run dev","target":"terminal","service":{}}),
+                    ),
+                    (
+                        "invalid",
+                        "run_command",
+                        json!({"command":"npm run dev","target":"background","service":{"ready_pattern":"","startup_timeout_secs":1000}}),
+                    ),
+                ],
+                "",
+                false,
+            ),
+            response(a, &[], "服务已启动，继续检查访问地址", false),
+        ]);
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Host::new([completed("ready"), completed("pending")]);
+        let mut log = conversation();
+        let events = agent::run(&client, &mut log, capabilities(), &host, fast_limits())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(|e| !matches!(e, AgentEvent::Error(_))));
+        let calls = host.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.run_in_background && c.service.is_some())
+        );
+        assert_eq!(calls[0].target, Target::Background);
+        assert_eq!(calls[1].target, Target::Terminal);
+        assert_eq!(calls[0].service.as_ref().unwrap().startup_timeout_secs, 10);
+        assert!(tool_result(&bodies(&http)[1], a, "invalid").contains("service"));
+        let text = bodies(&http)[0].to_string();
+        assert!(text.contains("常驻服务退出"));
+        assert!(text.contains("ready_pattern"));
+    }
+}

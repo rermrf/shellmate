@@ -381,6 +381,7 @@ impl Workspace {
             | "ai-memory-chip" | "ai-mode-popover" | "ai-subagent-approval" | "ai-tasks-subagents"
             | "ai-subagent-running" | "ai-subagent-done" | "ai-subagent-expanded" | "ai-subagent-states" | "ai-subagent-background"
             | "ai-output-short" | "ai-output-expanded" | "ai-output-history" | "ai-output-missing" | "ai-output-retained" | "ai-output-running" | "ai-output-giant"
+            | "ai-service-child"
             | "ai-live-queue" | "ai-live-waiting" | "ai-live-approval" | "ai-live-restored" | "ai-live-target" | "ai-live-btw"
             | "ai-timing-running" | "ai-timing-waiting" | "ai-timing-done" | "ai-timing-paused" | "ai-timing-interrupted"
             | "ai-child-thread" | "ai-child-running" | "ai-child-approval" | "ai-child-restored" | "ai-child-long-prompt"

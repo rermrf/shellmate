@@ -25,7 +25,11 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
         return None;
     }
     let root = tempfile::tempdir().expect("output fixture root");
-    let mut text = if name == "ai-output-short" {
+    let running = name == "ai-output-running";
+    let command = if running { "npm run dev" } else { "cargo build --release" };
+    let mut text = if running {
+        "VITE v6.3.0 ready in 382 ms\nLocal: http://localhost:5173/\n".into()
+    } else if name == "ai-output-short" {
         "服务运行正常\n输出 id literal-user-uuid\n".into()
     } else {
         (0..3500)
@@ -43,7 +47,6 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
     }
     let spool = Spool::create(root.path(), conversation, "fixture-output").unwrap();
     spool.write(text.as_bytes(), false).unwrap();
-    let running = name == "ai-output-running";
     if !running {
         spool.finish().unwrap();
     }
@@ -67,13 +70,13 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
         Default::default(),
     );
     let mut log = ai::Conversation::default();
-    log.push_user(ai::UserTurn::new("检查部署输出", Default::default()));
+    log.push_user(ai::UserTurn::new(if running { "帮我启动前端项目" } else { "检查部署输出" }, Default::default()));
     log.append(Entry::Step(Step {
         message_id: 1,
         call: LoggedCall {
             id: "fixture-call".into(),
             name: "run_command".into(),
-            args_json: serde_json::json!({"command":"cargo build","target":"background"}),
+            args_json: serde_json::json!({"command":command,"target":"background","service":if running {serde_json::json!({"ready_pattern":"Local:"})} else {serde_json::Value::Null}}),
         },
         result: LoggedResult {
             inline: out.wire_text(),
@@ -83,16 +86,16 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
             subagent: None,
         },
         display: Some(StepDisplay {
-            command: "cargo build --release".into(),
+            command: command.into(),
             target: Target::Background,
-            purpose: "检查构建输出，确认完整日志可查看和复制".into(),
+            purpose: if running { "启动前端开发服务" } else { "检查构建输出，确认完整日志可查看和复制" }.into(),
             class: ai::policy::Class::ReadOnly,
             status: if running {
                 StepStatus::Background
             } else {
                 StepStatus::Completed
             },
-            exit_code: Some(0),
+            exit_code: if running { None } else { Some(0) },
             duration_ms: 4500,
             automatic: true,
             output: out.stored(),
@@ -100,10 +103,11 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
     }));
     let tasks = if running {
         vec![crate::ai::tasks::TaskInfo {
+            service: Some(crate::ai::tasks::ServiceState::Ready), destination: None, owner: None,
             kind: crate::ai::tasks::Kind::Command,
             call_id: "fixture-call".into(),
             id: "1".into(),
-            command: "cargo build --release".into(),
+            command: command.into(),
             target: Target::Background,
             started: std::time::Instant::now(),
             status: crate::ai::tasks::Status::Running,
@@ -113,6 +117,9 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
     } else {
         vec![]
     };
+    if running {
+        log.push_text("开发服务已启动： http://localhost:5173/ 。可以继续操作，日志和停止按钮保留在输入框上方。");
+    }
     if name == "ai-output-missing" {
         std::fs::remove_file(spool.path()).unwrap();
     }

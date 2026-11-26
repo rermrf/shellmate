@@ -514,6 +514,7 @@ async fn all_child_commands_reach_the_common_host_policy_in_every_mode() {
         snapshot(),
     );
     let call = ToolCall {
+        service: None,
         session_id: None,
         cwd: None, destination: None,
         id: "fake".into(),
@@ -649,6 +650,7 @@ async fn memory_writes_are_inherited_while_outputs_and_execution_targets_remain_
     );
     child
         .run(ToolCall {
+            service: None,
             session_id: None,
             cwd: None, destination: None,
             id: "cmd".into(),

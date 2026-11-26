@@ -32,6 +32,7 @@ pub fn approvals() -> Vec<(SubagentRef, ToolCall)> {
             kind: SubagentKind::General,
         };
         let call = ToolCall {
+            service: None,
             session_id: None,
             cwd: None, destination: None,
             id: format!("{id}-call"),
@@ -64,6 +65,7 @@ pub fn tasks() -> Vec<TaskInfo> {
     ]
     .into_iter()
     .map(|(id, description, kind, elapsed)| TaskInfo {
+        service: None, destination: None, owner: None,
         kind,
         call_id: format!("call-{id}"),
         id: id.into(),
@@ -284,6 +286,7 @@ pub fn cards(scene: &str) -> Option<Cards> {
     }
     let tasks = if scene == "ai-subagent-background" {
         vec![TaskInfo {
+            service: None, destination: None, owner: None,
             kind: Kind::Agent,
             call_id: views[0].call_id.clone(),
             id: views[0].id.clone(),
@@ -389,6 +392,5 @@ mod tests {
         assert!(rows.windows(2).all(|r| r[0].started < r[1].started));
         assert_eq!(rows[0].target_label(), "独立通道");
         assert_eq!(rows[1].target_label(), "子任务");
-        assert_eq!(rows[1].bar_id(), "1");
     }
 }

@@ -303,7 +303,7 @@ impl Executor for AppExecutor {
         self.tasks.agent_updates()
     }
     fn finish_subagent(&self) {
-        self.tasks.stop_all();
+        self.tasks.finish_agent_commands();
     }
 
     fn memory_snapshot(&self, auto_memory: bool) -> shellmate_ai::memory::Snapshot {
@@ -441,7 +441,7 @@ impl Executor for AppExecutor {
                     worker_call.command
                 );
             }
-            let (ready_tx, ready_rx) = if call.target == Target::Terminal && call.run_in_background
+            let (ready_tx, ready_rx) = if call.target == Target::Terminal && (call.run_in_background || call.service.is_some())
             {
                 let (tx, rx) = oneshot::channel();
                 (Some(tx), Some(rx))

@@ -414,7 +414,7 @@ impl Service {
                 if !alive.load(Ordering::Acquire) {
                     out.status = SubagentStatus::Failed(shellmate_ai::AiError::Disconnected);
                 }
-                child_tasks.stop_all();
+                child_tasks.finish_agent_commands();
                 let _ = ui.try_send(Ui::CancelSource(source_id));
                 let result = ticket.finish(out, limits.exec);
                 let logged = shellmate_ai::LoggedResult {

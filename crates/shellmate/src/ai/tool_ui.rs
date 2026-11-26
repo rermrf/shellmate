@@ -218,17 +218,23 @@ impl Drawer {
         call: &str,
         output: Option<&str>,
     ) -> Option<TaskInfo> {
-        let tasks = if self.fixture && scope == "main" {
-            self.fixture_tasks.clone()
+        let tasks = if self.fixture {
+            self.fixture_tasks.iter().filter(|t| scope == "main" || scope.strip_prefix("child:") == t.owner.as_deref()).cloned().collect()
         } else {
             self.tool_tasks(scope).map(|t| t.list()).unwrap_or_default()
         };
-        tasks.into_iter().rev().find(|t| {
+        let found = tasks.into_iter().rev().find(|t| {
             t.kind == Kind::Command
                 && match output {
                     Some(id) => t.output_id == id,
                     None => t.call_id == call,
                 }
+        });
+        // A resumed child transcript also includes calls from earlier runs.
+        // Their persistent services remain owned by the conversation registry.
+        found.or_else(|| {
+            let output = output?;
+            self.tasks.as_ref()?.list().into_iter().find(|t| t.service.is_some() && t.output_id == output)
         })
     }
     pub(super) fn tool_card(
@@ -367,6 +373,21 @@ impl Drawer {
             detail,
         };
         let mut card = card;
+        if call.name == "wait_tasks" {
+            let ids = call.args_json["ids"].as_array().map(|v| v.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()).unwrap_or_default();
+            let tasks = if self.fixture && scope == "main" { self.fixture_tasks.clone() } else { self.tool_tasks(scope).map(|t| t.list()).unwrap_or_default() };
+            let ended = tasks.iter().filter(|t| ids.contains(&t.id.as_str()) && t.status != TaskStatus::Running).count();
+            let agents = !ids.is_empty() && ids.iter().all(|id| id.starts_with("agent-") && !id.contains('/'));
+            card.title = if result.is_none() {
+                format!("等待 {} 个{} · {} 个已结束", ids.len(), if agents {"子代理"} else {"任务"}, ended)
+            } else if result.is_some_and(|r| r.is_error) { "等待未完成".into() } else { "已结束等待".into() };
+            card.summary.clear();
+            card.detail.clear();
+        }
+        if let Some(service) = task.as_ref().and_then(|t| t.service) {
+            card.detail.push_str(&format!(" · 持续服务 · {}", service.label()));
+            if service == crate::ai::tasks::ServiceState::Failed { card.status = model::Status::Failed; status = model::Status::Failed; }
+        }
         if let Some(label) = call.args_json["resolved_target"]["label"].as_str() {
             let target = &call.args_json["resolved_target"];
             card.detail = format!(
@@ -379,6 +400,9 @@ impl Drawer {
         }
         let open = self.tool_open(&id, status);
         let mut surface = self.tool_shell(&card, cx);
+        if call.name == "wait_tasks" {
+            surface = surface.bg(gpui::transparent_black()).py(px(3.)).px(px(2.));
+        }
         if open {
             surface = surface.child(section("输入", &p));
             if call.name == "run_command" {
@@ -540,9 +564,8 @@ impl Drawer {
             actions = actions.child(
                 agent_ui::step_action(SharedString::from(format!("{id}:stop")), "停止任务", cx)
                     .on_click(cx.listener(move |s, _, _, cx| {
-                        if let Some(tasks) = s.tool_tasks(&scope) {
-                            tasks.stop(&task.id);
-                        }
+                        let tasks = if task.owner.is_some() { s.tasks.clone() } else { s.tool_tasks(&scope) };
+                        if let Some(tasks) = tasks { tasks.stop(&task.id); }
                         cx.notify();
                     })),
             );
