@@ -1436,6 +1436,8 @@ impl Render for Drawer {
             let timing_records=self.state.timing.snapshot(timing_now);
             for (index, turn) in self.state.model.conversation.turns().iter().enumerate() {
                 body = body.children(self.local_cards_at(index, cx));
+                let message_id = format!("{}:main:user:{index}", self.state.id);
+                let copy = turn.user.question.clone();
                 body = body.child(
                     div()
                         .flex_none()
@@ -1444,7 +1446,9 @@ impl Render for Drawer {
                         .items_end()
                         .gap(px(5.))
                         .child(
-                            div()
+                            subagent_ui::selectable(
+                                message_id.clone(), &turn.user.question, window, cx,
+                            )
                                 .max_w_full()
                                 .px(px(12.))
                                 .py(px(9.))
@@ -1452,8 +1456,15 @@ impl Render for Drawer {
                                 .bg(p.accs)
                                 .text_size(px(13.))
                                 .line_height(px(20.8))
-                                .whitespace_normal()
-                                .child(turn.user.question.clone()),
+                                .whitespace_normal(),
+                        )
+                        .child(
+                            agent_ui::step_action(
+                                SharedString::from(format!("{message_id}:copy")), "复制", cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                            }),
                         ),
                 );
                 if let Some(answer) = &turn.answer {

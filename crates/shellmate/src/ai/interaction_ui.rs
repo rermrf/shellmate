@@ -483,8 +483,8 @@ impl Drawer {
         self.stop(cx);
         cx.notify();
     }
-    pub(super) fn interaction_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
-        let p = cx.palette();
+    pub(super) fn interaction_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let p = cx.palette().clone();
         let snapshot = self.state.control.snapshot();
         let running = self.state.model.busy
             || self.state.pending
@@ -533,7 +533,8 @@ impl Drawer {
         }) {
             let id = input.id.clone();
             let edit = id.clone();
-            let mut row = div()
+            let copy = input.text.clone();
+            let text = div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -547,16 +548,25 @@ impl Drawer {
                     "待处理"
                 }))
                 .child(
-                    div()
+                    super::subagent_ui::selectable(
+                        format!("{}:queued:{id}", self.state.id), &input.text, window, cx,
+                    )
                         .flex_1()
                         .min_w_0()
                         .text_ellipsis()
                         .overflow_hidden()
-                        .whitespace_nowrap()
-                        .child(input.text.clone()),
+                        .whitespace_nowrap(),
+                );
+            let mut actions = agent_ui::step_actions().child(
+                    agent_ui::step_action(
+                        SharedString::from(format!("input-copy-{id}")), "复制", cx,
+                    )
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                    }),
                 );
             if !input.claimed {
-                row = row.child(
+                actions = actions.child(
                     agent_ui::step_action(
                         SharedString::from(format!("input-edit-{id}")),
                         "编辑",
@@ -575,7 +585,7 @@ impl Drawer {
                         }
                     })),
                 );
-                row = row.child(
+                actions = actions.child(
                     agent_ui::step_action(
                         SharedString::from(format!("input-remove-{id}")),
                         "撤回",
@@ -591,7 +601,7 @@ impl Drawer {
                     })),
                 );
             }
-            bar = bar.child(row);
+            bar = bar.child(div().flex().flex_col().gap(px(2.)).child(text).child(actions));
         }
         if snapshot.inputs.len() > 4 {
             bar = bar.child(
