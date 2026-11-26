@@ -50,6 +50,7 @@ impl Target {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
+    pub web: bool,
     pub terminal: bool,
     pub background: bool,
     pub terminal_busy: bool,
@@ -225,6 +226,7 @@ pub struct ReadOutput {
 }
 #[derive(Clone, Debug)]
 pub enum LocalTool {
+    Web(crate::web::Request),
     Memory(crate::memory::Command),
     ReadOutput(ReadOutput),
     StopTask { id: String },
@@ -292,6 +294,9 @@ impl ExecLimits {
     }
 }
 pub trait ToolHost: Send + Sync {
+    fn web_enabled(&self) -> bool {
+        false
+    }
     fn take_external_steps(&self) -> Vec<crate::Step> {
         vec![]
     }
@@ -512,10 +517,11 @@ impl AgentStream<'_> {
 pub fn run<'a>(
     client: &'a RigClient,
     conversation: &'a mut Conversation,
-    capabilities: Capabilities,
+    mut capabilities: Capabilities,
     host: &'a dyn ToolHost,
     limits: Limits,
 ) -> Result<AgentStream<'a>, AiError> {
+    capabilities.web = host.web_enabled();
     let user = conversation
         .latest_user()
         .ok_or(AiError::InvalidConfig)?
@@ -665,8 +671,10 @@ impl State<'_> {
     }
     fn request(&self) -> Result<CompletionRequest, AiError> {
         let turn = self.turn.as_ref().unwrap();
+        let mut capabilities = turn.capabilities.clone();
+        capabilities.web = self.host.web_enabled();
         let mut request = self.conversation.request(
-            &turn.capabilities,
+            &capabilities,
             &turn.native,
             false,
             self.conversation.view_start(),
@@ -1187,6 +1195,9 @@ fn stream<'a>(
                         continue;
                     }
                     Pending::Local(raw, tool) => {
+                        if matches!(&tool, LocalTool::Web(_)) {
+                            s.phase(crate::interaction::Phase::Executing);
+                        }
                         let tool_id = raw.id.to_string();
                         let result = s.host.local_tool(tool, s.limits.exec).await;
                         s.entry(Entry::Step(crate::Step {
@@ -1475,7 +1486,10 @@ fn stream<'a>(
                         }
                     }
                     let truncated = !unfinished.is_empty();
-                    if truncated && !s.turn.as_ref().unwrap().capabilities.available() {
+                    if truncated
+                        && !s.turn.as_ref().unwrap().capabilities.available()
+                        && !s.turn.as_ref().unwrap().capabilities.web
+                    {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
                     if truncated && response.finish_reason() != Some(FinishReason::Length) {
@@ -1490,7 +1504,12 @@ fn stream<'a>(
                                 if unfinished.contains(&raw.id) {
                                     continue;
                                 }
-                                if !s.turn.as_ref().unwrap().capabilities.available() {
+                                if !s.turn.as_ref().unwrap().capabilities.available()
+                                    && !matches!(
+                                        raw.function.name.as_str(),
+                                        "web_search" | "web_fetch"
+                                    )
+                                {
                                     if raw.function.name.as_str() == "propose_command" {
                                         let card = serde_json::from_value::<CommandCard>(
                                             serde_json::Value::Object(
@@ -1568,18 +1587,24 @@ fn stream<'a>(
                                     });
                                     continue;
                                 }
-                                pending.push_back(match parse_local(&raw, s.limits.auto_memory) {
-                                    Ok(Some(tool)) => Pending::Local(raw, tool),
-                                    Err(error) => Pending::Invalid(raw, error),
-                                    Ok(None) => match parse_call(
+                                pending.push_back(
+                                    match parse_local(
                                         &raw,
-                                        &s.turn.as_ref().unwrap().capabilities,
-                                        s.limits.exec,
+                                        s.limits.auto_memory,
+                                        s.host.web_enabled(),
                                     ) {
-                                        Ok(call) => Pending::Call(raw, call),
+                                        Ok(Some(tool)) => Pending::Local(raw, tool),
                                         Err(error) => Pending::Invalid(raw, error),
+                                        Ok(None) => match parse_call(
+                                            &raw,
+                                            &s.turn.as_ref().unwrap().capabilities,
+                                            s.limits.exec,
+                                        ) {
+                                            Ok(call) => Pending::Call(raw, call),
+                                            Err(error) => Pending::Invalid(raw, error),
+                                        },
                                     },
-                                });
+                                );
                             }
                             AssistantContent::Text(text) if after_call => {
                                 pending.push_back(Pending::Text(text.text.clone()))
@@ -1592,7 +1617,9 @@ fn stream<'a>(
                     }
                     // Suggestion responses end after their cards and any following text.
                     // They never start another model call just to acknowledge a card.
-                    if !s.turn.as_ref().unwrap().capabilities.available() {
+                    if !s.turn.as_ref().unwrap().capabilities.available()
+                        && !s.turn.as_ref().unwrap().capabilities.web
+                    {
                         while let Some(pending) = pending.pop_front() {
                             if let Pending::Text(text) = pending {
                                 s.text(&text);
@@ -1763,8 +1790,21 @@ fn parse_call(
     })
 }
 
-fn parse_local(raw: &RigCall, auto_memory: bool) -> Result<Option<LocalTool>, String> {
+fn parse_local(raw: &RigCall, auto_memory: bool, web: bool) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
+    if matches!(name, "web_search" | "web_fetch") {
+        if !web {
+            return Err("网页工具未启用，请在 AI 设置中开启".into());
+        }
+        if raw.function.invalid_arguments.is_some() {
+            return Err("网页工具参数必须为完整 JSON".into());
+        }
+        return crate::web::Request::parse(
+            name,
+            serde_json::Value::Object(raw.function.arguments.clone()),
+        )
+        .map(|r| Some(LocalTool::Web(r)));
+    }
     if !matches!(name, "read_output" | "stop_task" | "memory" | "wait_tasks") {
         return Ok(None);
     }

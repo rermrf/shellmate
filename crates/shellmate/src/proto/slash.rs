@@ -24,7 +24,7 @@ pub struct SettingsScene {
 pub fn settings_scene(scene: &str) -> Option<SettingsScene> {
     if !matches!(
         scene,
-        "set-ai" | "set-ai-replace" | "set-ai-advanced" | "set-ai-memory"
+        "set-ai" | "set-ai-replace" | "set-ai-advanced" | "set-ai-memory" | "set-ai-web"
     ) {
         return None;
     }
@@ -41,7 +41,7 @@ pub fn settings_scene(scene: &str) -> Option<SettingsScene> {
             ..Default::default()
         },
         advanced,
-        scroll_to_bottom: advanced || scene == "set-ai-memory",
+        scroll_to_bottom: advanced || scene == "set-ai-memory" || scene == "set-ai-web",
     })
 }
 pub struct Fixture {

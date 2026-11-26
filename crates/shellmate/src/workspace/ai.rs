@@ -57,6 +57,7 @@ impl Workspace {
             local,
             alive,
             capabilities: shellmate_ai::agent::Capabilities {
+                web: false,
                 background,
                 terminal: can_terminal,
                 terminal_busy: terminal.agent_busy(),

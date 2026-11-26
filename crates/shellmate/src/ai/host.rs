@@ -44,6 +44,9 @@ pub enum Ui {
     },
 }
 pub trait Executor: Send + Sync {
+    fn web_enabled(&self) -> bool {
+        false
+    }
     fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
         vec![]
     }
@@ -140,6 +143,9 @@ impl Drop for RunningGuard {
     }
 }
 impl ToolHost for Host {
+    fn web_enabled(&self) -> bool {
+        self.executor.web_enabled()
+    }
     fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
         self.executor.take_external_steps()
     }

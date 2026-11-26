@@ -11,6 +11,10 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-web-") {
+            self.web_fixture(scene, cx);
+            return;
+        }
         if scene.starts_with("ai-child-") {
             self.child_fixture(scene, w, cx);
             return;

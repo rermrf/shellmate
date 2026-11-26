@@ -3,6 +3,8 @@ use super::*;
 use shellmate_ai::{LoggedCall, LoggedResult, StepDisplay};
 pub(super) fn label(call: &LoggedCall) -> String {
     match call.name.as_str() {
+        "web_search" => "搜索网页".into(),
+        "web_fetch" => "读取网页".into(),
         "run_command" => "执行命令".into(),
         "read_output" => "读取输出".into(),
         "wait_tasks" => "等待任务".into(),
@@ -102,6 +104,35 @@ impl Drawer {
                         cx.notify();
                     })),
             );
+        if matches!(call.name.as_str(), "web_search" | "web_fetch") {
+            if let Some(result) = result
+                && !result.is_error
+                && let Ok(data) =
+                    serde_json::from_str::<shellmate_ai::web::ResultData>(&result.inline)
+            {
+                return card
+                    .child(self.web_content(&key, &data, expanded, w, cx))
+                    .into_any_element();
+            }
+            if result.is_none() {
+                card = card.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.tx2)
+                        .whitespace_normal()
+                        .child(
+                            call.args_json[if call.name == "web_search" {
+                                "query"
+                            } else {
+                                "url"
+                            }]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        ),
+                );
+            }
+        }
         if call.name == "run_command" {
             let command = call.args_json["command"].as_str().unwrap_or_default();
             card = card.child(

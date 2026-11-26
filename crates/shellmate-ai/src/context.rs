@@ -320,6 +320,9 @@ impl Conversation {
         if self.child.is_some() {
             offered.retain(|name| *name != "agent" && *name != "propose_command");
         }
+        if caps.web && !summarizing {
+            offered.extend(["web_search", "web_fetch"]);
+        }
         let mut messages = Vec::new();
         let entries = &self.entries()[start..];
         let mut i = 0;
@@ -452,6 +455,11 @@ impl Conversation {
             .messages(messages)
             .preamble(system);
         if !summarizing {
+            if caps.web {
+                for tool in crate::web::tools() {
+                    request = request.tool(tool);
+                }
+            }
             request = request.tool(tool);
             if caps.available() {
                 if memory.auto_memory {

@@ -242,6 +242,9 @@ pub struct AppExecutor {
     pub ui: async_channel::Sender<Ui>,
 }
 impl Executor for AppExecutor {
+    fn web_enabled(&self) -> bool {
+        self.tasks.web_enabled()
+    }
     fn take_external_steps(&self) -> Vec<shellmate_ai::Step> {
         self.tasks.take_external_steps()
     }

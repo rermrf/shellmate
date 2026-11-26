@@ -23,14 +23,30 @@ impl Drawer {
             }
         }
         for (scope, step) in generic {
+            if step.call.name == "web_search" {
+                continue;
+            }
             let key = super::super::tool_ui::key(&scope, &step.call.id);
             if self.state.tool_expanded.contains(&key) || step.result.is_error {
                 initially_open.insert(key.clone());
             }
+            let preview = if step.call.name == "web_fetch" {
+                serde_json::from_str::<shellmate_ai::web::ResultData>(&step.result.inline)
+                    .ok()
+                    .and_then(|r| {
+                        if let shellmate_ai::web::ResultData::Page { content, .. } = r {
+                            Some(content)
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
             sources.push(source(
                 key,
                 step.result.output_id.clone(),
-                &step.result.inline,
+                preview.as_deref().unwrap_or(&step.result.inline),
                 false,
             ));
         }

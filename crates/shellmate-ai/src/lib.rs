@@ -84,6 +84,7 @@ pub use output::{ToolOutput, shape};
 pub use policy::PermissionMode;
 
 pub mod memory;
+pub mod web;
 
 pub mod subagent;
 pub use subagent::{SubagentRequest, SubagentKind, SubagentRef, SubagentDisplay, SubagentStatus, SubagentOutcome};

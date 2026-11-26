@@ -2,6 +2,8 @@
 mod memory;
 #[path = "settings_limits.rs"]
 mod limits;
+#[path="settings_web.rs"]
+mod web;
 use crate::{security::password::PasswordInput, theme::ActivePalette};
 use crate::ui::{Surface, field_input};
 use futures::StreamExt;
@@ -17,6 +19,7 @@ use shellmate_ai::{Event, Provider, ReasoningLevel, RigClient};
 use shellmate_store::{CredentialStore, SecretKey, SecretStore, SharedStore, ai::Settings};
 use std::sync::Arc;
 pub struct AiSettings {
+    web:web::Fields,
     limits: limits::Fields,
     _subscriptions: Vec<Subscription>,
     workspace: WeakEntity<crate::workspace::Workspace>,
@@ -54,6 +57,7 @@ impl AiSettings {
         })];
         for input in &limits.inputs { subscriptions.push(cx.subscribe(input, |_: &mut Self, _, _: &gpui::component::input::InputEvent, cx| cx.notify())); }
         Self {
+            web:web::Fields::new(w,cx),
             limits,
             _subscriptions: subscriptions,
             workspace,
@@ -83,6 +87,8 @@ impl AiSettings {
         self.limits.choices[0] = limits::Choice::Custom;
         cx.notify();
     }
+    #[cfg(debug_assertions)]
+    pub(crate) fn fixture_web(&mut self,cx:&mut Context<Self>){self.db.borrow_mut().set_setting(crate::ai::web::ENABLED,"1").unwrap();self.web.replace=true;cx.notify();}
     pub(crate) fn replace_key(&mut self, cx: &mut Context<Self>) {
         self.replace = true;
         cx.notify();
@@ -132,6 +138,7 @@ impl AiSettings {
         }, cx)
     }
     pub fn refresh_key(&mut self, cx: &mut Context<Self>) {
+        self.refresh_web_key(cx);
         if self.fixture {
             self.key_saved = true;
             cx.notify();
@@ -460,6 +467,7 @@ impl Render for AiSettings {
             .gap(px(12.))
             .child(form)
             .child(self.limit_fields(cx))
+            .child(self.web_card(cx))
             .child(
                 div()
                     .p(px(18.))

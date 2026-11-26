@@ -334,7 +334,11 @@ impl Tasks {
         }
     }
     pub fn child_tasks(&self) -> Self {
-        Self::new(self.0.root.clone(), self.0.conversation.clone())
+        let child = Self::new(self.0.root.clone(), self.0.conversation.clone());
+        if let Some(web) = self.0.web.get() {
+            let _ = child.0.web.set(web.clone());
+        }
+        child
     }
     pub fn attach_child_outputs(&self, id: &str, tasks: &Self) {
         if let Some(task) = self

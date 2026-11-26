@@ -255,6 +255,9 @@ impl<'a> ChildHost<'a> {
     }
 }
 impl ToolHost for ChildHost<'_> {
+    fn web_enabled(&self) -> bool {
+        self.inner.web_enabled()
+    }
     fn control(&self) -> Option<crate::interaction::Control> {
         self.inner.control()
     }
@@ -283,6 +286,7 @@ impl ToolHost for ChildHost<'_> {
     fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async move {
             let allowed = match &tool {
+                LocalTool::Web(_) => self.inner.web_enabled(),
                 LocalTool::Memory(_) => self.snapshot.auto_memory,
                 LocalTool::ReadOutput(args) => {
                     self.outputs.lock().unwrap().contains(&args.id)
@@ -298,7 +302,11 @@ impl ToolHost for ChildHost<'_> {
                     "子任务只能读取或停止自己的输出和任务；记忆工具遵循主对话的启用设置",
                 );
             }
-            self.inner.local_tool(tool, limits).await
+            let result = self.inner.local_tool(tool, limits).await;
+            if let Some(id) = &result.output_id {
+                self.outputs.lock().unwrap().insert(id.clone());
+            }
+            result
         })
     }
     fn memory_snapshot(&self, auto_memory: bool) -> crate::memory::Snapshot {

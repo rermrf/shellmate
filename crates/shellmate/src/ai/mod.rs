@@ -12,6 +12,7 @@ mod scroll;
 pub mod model;
 pub mod panel;
 pub mod settings;
+pub(crate) mod web;
 pub(crate) mod tasks;
 use crate::dialogs::{self, DialogBody, Tone};
 use gpui::{prelude::*, *};

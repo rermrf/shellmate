@@ -298,6 +298,119 @@ async fn non_command_tools_emit_started_then_result_without_changing_provider_pa
 }
 
 #[tokio::test]
+async fn web_tools_work_without_terminal_and_children_inherit_the_same_tools_on_both_wires() {
+    struct Web {
+        calls: AtomicUsize,
+    }
+    impl ToolHost for Web {
+        fn web_enabled(&self) -> bool {
+            true
+        }
+        fn run(&self, _: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+            Box::pin(async { panic!("no command") })
+        }
+        fn local_tool(
+            &self,
+            tool: agent::LocalTool,
+            _: agent::ExecLimits,
+        ) -> BoxFuture<'_, agent::LocalResult> {
+            Box::pin(async move {
+                assert!(matches!(tool, agent::LocalTool::Web(_)));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                agent::LocalResult::text(
+                    "{\"kind\":\"search\",\"results\":[{\"url\":\"https://nginx.org/\"}]}",
+                )
+            })
+        }
+    }
+    for a in [false, true] {
+        let responses = || {
+            [
+                response(
+                    a,
+                    &[("search", "web_search", json!({"query":"nginx docs"}))],
+                    "Searching",
+                    false,
+                ),
+                response(a, &[], "See https://nginx.org/", false),
+            ]
+        };
+        let http = SequencedHttpClient::new(responses());
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let host = Web {
+            calls: AtomicUsize::new(0),
+        };
+        let mut log = conversation();
+        let events = agent::run(
+            &client,
+            &mut log,
+            Capabilities::default(),
+            &host,
+            fast_limits(),
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        let body = bodies(&http);
+        assert!(body[0]["tools"].to_string().contains("web_search"));
+        assert!(body[0]["tools"].to_string().contains("web_fetch"));
+        assert!(!body[0]["tools"].to_string().contains("run_command"));
+        context_tests::assert_pairs(&body[1], a);
+        let http = SequencedHttpClient::new(responses());
+        let client = RigClient::with_http(&config(a), http.clone()).unwrap();
+        let out = shellmate_ai::subagent::run(
+            &client,
+            shellmate_ai::SubagentRequest {
+                description: "search".into(),
+                prompt: "research nginx".into(),
+                kind: shellmate_ai::SubagentKind::General,
+                background: true,
+                model: None,
+                reasoning: None,
+            },
+            shellmate_ai::subagent::SubagentContext {
+                id: "agent-1".into(),
+                snapshot: Default::default(),
+                cwd: None,
+                origin: None,
+            },
+            Default::default(),
+            &host,
+            fast_limits(),
+            |_| {},
+        )
+        .await;
+        assert_eq!(out.status, shellmate_ai::SubagentStatus::Completed);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+        assert!(bodies(&http)[0]["tools"].to_string().contains("web_fetch"));
+    }
+}
+
+#[tokio::test]
+async fn web_tools_disabled_are_not_offered_or_executed() {
+    let http = SequencedHttpClient::new([
+        response(
+            false,
+            &[("web", "web_search", json!({"query":"test"}))],
+            "",
+            false,
+        ),
+        response(false, &[], "unavailable", false),
+    ]);
+    let client = RigClient::with_http(&config(false), http.clone()).unwrap();
+    let host = Host::new([]);
+    let mut log = conversation();
+    agent::run(&client, &mut log, capabilities(), &host, fast_limits())
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(!bodies(&http)[0]["tools"].to_string().contains("web_search"));
+    assert!(log.entries().iter().any(|e|matches!(e,Entry::Step(s)if s.call.id=="web"&&s.result.is_error&&s.result.inline.contains("未启用"))));
+}
+
+#[tokio::test]
 async fn completion_delivery_and_new_input_share_one_request_without_duplicate_notifications() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([response(a, &[], "updated summary", false)]);

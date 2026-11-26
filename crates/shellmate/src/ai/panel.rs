@@ -12,6 +12,8 @@ mod subagent_ui;
 mod thread_ui;
 #[path = "tool_ui.rs"]
 mod tool_ui;
+#[path="web_ui.rs"]
+mod web_ui;
 #[path = "output_ui.rs"]
 mod output_ui;
 #[path = "mode_ui.rs"]
@@ -261,6 +263,7 @@ impl Drawer {
             .as_ref()
             .map(|b| b.capabilities.clone())
             .unwrap_or_default();
+        self.capabilities.web=self.db.borrow().setting(crate::ai::web::ENABLED).ok().flatten().as_deref()==Some("1");
         *self.mode.lock().unwrap() = self
             .db
             .borrow()
@@ -511,10 +514,11 @@ impl Drawer {
             let (ui,messages)=async_channel::unbounded();self.bridge(messages,self.state.id.clone(),w,cx);self.task_ui=Some(ui.clone());ui
         };
         let binding = self.binding.clone();
-        let capabilities = binding
+        let mut capabilities = binding
             .as_ref()
             .map(|b| b.capabilities.clone())
             .unwrap_or_default();
+        capabilities.web=self.tasks.as_ref().is_some_and(|t|t.web_enabled());
         self.capabilities = capabilities.clone();
         let alive = binding
             .as_ref()
@@ -645,6 +649,7 @@ impl Drawer {
             ));
         }
         self.tasks.as_ref().unwrap().set_store(self.db.clone());
+        self.tasks.as_ref().unwrap().set_web(self.db.clone(),self.credentials.clone());
         self.tasks
             .as_ref()
             .unwrap()

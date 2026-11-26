@@ -99,6 +99,7 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    web: std::sync::OnceLock<Arc<super::web::Service>>,
     released_waits: Mutex<Vec<String>>,
     events: Mutex<events::Outbox>,
     event_retrying: std::sync::atomic::AtomicBool,
@@ -147,6 +148,7 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            web: Default::default(),
             released_waits: Default::default(),
             events: Default::default(),
             event_retrying: Default::default(),
@@ -186,6 +188,22 @@ impl Tasks {
     }
     pub fn control(&self) -> shellmate_ai::interaction::Control {
         self.0.control.clone()
+    }
+    pub fn set_web(
+        &self,
+        db: shellmate_store::SharedStore,
+        credentials: Arc<dyn shellmate_store::SecretStore>,
+    ) {
+        self.0
+            .web
+            .get_or_init(|| Arc::new(super::web::Service::new(db, credentials)));
+    }
+    pub fn web_enabled(&self) -> bool {
+        self.0.web.get().is_some_and(|w| w.enabled())
+    }
+    #[cfg(test)]
+    pub fn test_web(&self, service: Arc<super::web::Service>) {
+        let _ = self.0.web.set(service);
     }
     pub fn external_step(&self, step: shellmate_ai::Step) {
         if let Some(db) = self.0.store.get()
@@ -418,6 +436,41 @@ impl Tasks {
             return result;
         }
         match tool {
+            LocalTool::Web(request) => {
+                let Some(web) = self.0.web.get() else {
+                    return LocalResult::error("网页工具不可用");
+                };
+                let result = tokio::select! {biased;()=self.0.control.urgent()=>Err("网页请求已取消，正在处理新指令".into()),result=web.execute(request)=>result};
+                match result {
+                    Ok(data) => {
+                        let mut result = LocalResult::text(serde_json::to_string(&data).unwrap());
+                        if let shellmate_ai::web::ResultData::Page { url, .. } = &data
+                            && let Some(text) = web.page_text(url)
+                        {
+                            let id = format!("web-{}", shellmate_core::HostId::generate());
+                            if matches!(
+                                self.while_retained(|| {
+                                    let spool =
+                                        Spool::create(&self.0.root, &self.0.conversation, &id)?;
+                                    spool.write(text.as_bytes(), false)?;
+                                    spool.finish()
+                                }),
+                                Some(Ok(()))
+                            ) {
+                                self.0
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .remembered
+                                    .push((id.clone(), url.clone()));
+                                result.output_id = Some(id);
+                            }
+                        }
+                        result
+                    }
+                    Err(e) => LocalResult::error(e),
+                }
+            }
             LocalTool::WaitTasks { ids, all } => self.wait_tasks(ids, all).await,
             LocalTool::Memory(_) => LocalResult {
                 subagent: None,

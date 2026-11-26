@@ -204,9 +204,13 @@ impl SettingsWindow {
         self.ai.update(cx, crate::ai::settings::AiSettings::fixture_advanced);
     }
     #[cfg(debug_assertions)]
+    pub fn fixture_ai_web(&self,cx:&mut Context<Self>){self.ai.update(cx,crate::ai::settings::AiSettings::fixture_web);}
+    #[cfg(debug_assertions)]
     pub fn fixture_scroll_bottom(&self, window: &mut Window) {
         crate::proto::scroll_after_layout(self.scroll.clone(), |handle| f32::from(handle.max_offset().y), window);
     }
+    #[cfg(debug_assertions)]
+    pub fn fixture_scroll_web(&self,window:&mut Window){crate::proto::scroll_after_layout(self.scroll.clone(),|handle|(f32::from(handle.max_offset().y)-300.).max(0.),window);}
     #[cfg(debug_assertions)]
     pub fn fixture_replace_key(&self, cx: &mut Context<Self>) {
         self.ai.update(cx, crate::ai::settings::AiSettings::replace_key);
