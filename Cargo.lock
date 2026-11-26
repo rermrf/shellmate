@@ -7580,7 +7580,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -7629,7 +7629,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-ai"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures",
  "rig-core",
@@ -7643,7 +7643,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -7653,7 +7653,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-forward"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -7672,7 +7672,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-monitor"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -7692,7 +7692,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-serial"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "serialport",
@@ -7702,7 +7702,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-sftp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -7721,7 +7721,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-ssh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "async-trait",
@@ -7742,7 +7742,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures",
  "keyring",
@@ -7763,7 +7763,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-telnet"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "shellmate-core",
  "tokio",
@@ -7772,7 +7772,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-term"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7789,7 +7789,7 @@ dependencies = [
 
 [[package]]
 name = "shellmate-vault"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2 0.5.3",
  "block2 0.6.2",

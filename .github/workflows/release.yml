@@ -139,7 +139,9 @@ jobs:
           {
             echo "## 更新内容"
             echo
-            if [ -n "$previous" ]; then
+            if [ -f "docs/releases/$VERSION.md" ]; then
+              cat "docs/releases/$VERSION.md"
+            elif [ -n "$previous" ]; then
               git log --no-merges --format='- %s' "$previous..$TAG" | grep -v '^- chore: 版本号' || true
             else
               echo "- 首个公开版本，功能介绍见 README。"
