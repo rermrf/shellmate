@@ -1452,6 +1452,8 @@ async fn child_can_choose_both_channels_with_async_task_on_both_providers() {
         let requests = bodies(&http);
         assert!(requests[0].to_string().contains("普通检查、日期计算、ping、sleep 等辅助命令优先 background"));
         assert!(requests[0].to_string().contains("在第1个终端执行 ls 让我切过去看"));
+        assert!(!requests[0]["tools"].to_string().contains("compare_directories"));
+        assert!(requests[0]["tools"].to_string().contains("list_sessions"));
         assert_eq!(schema(tool(&requests[0], a, "run_command").unwrap(), a)["properties"]["target"]["enum"], json!(["terminal", "background"]));
         let steps = out.transcript.entries().iter().filter_map(|entry| if let Entry::Step(s)=entry {Some(s)}else{None}).filter(|s| s.call.name == "run_command").collect::<Vec<_>>();
         assert_eq!(steps[0].display.as_ref().unwrap().target, Target::Terminal);
@@ -1467,7 +1469,7 @@ async fn responses_child_inherits_protocol_and_replays_its_own_tools() {
         wire::reply(vec![wire::message("child-final","子任务完成","final_answer")]),
     ]);
     let client=RigClient::with_http(&responses_config(),http.clone()).unwrap();
-    let inner=Inner::new([]);
+    let mut inner=Inner::new([]);inner.sessions=true;
     let out=subagent::run(&client,request(SubagentKind::General),context(),snapshot(),&inner,fast_limits(),|_|{}).await;
     assert_eq!(out.status,SubagentStatus::Completed);
     assert_eq!(inner.seen.lock().unwrap().len(),1);
@@ -1475,6 +1477,8 @@ async fn responses_child_inherits_protocol_and_replays_its_own_tools() {
     assert!(http.requests().iter().all(|r|r.uri.ends_with("/responses")));
     assert!(requests.iter().all(|r|r["store"]==false));
     assert!(requests[1].to_string().contains("CIPHER_child"));
+    assert!(!requests[0]["tools"].to_string().contains("compare_directories"));
+    assert!(requests[0]["tools"].to_string().contains("list_sessions"));
     assert!(requests[1].to_string().contains("function_call_output"));
     assert!(serde_json::to_string(out.transcript.entries()).unwrap().contains("PRIVATE_REASONING"));
 }

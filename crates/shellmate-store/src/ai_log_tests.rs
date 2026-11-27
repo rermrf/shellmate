@@ -430,3 +430,47 @@ fn thinking_fragments_survive_sqlite_reopen_without_becoming_answer_text() {
     assert_eq!(answer.text(),"端口被占用。");assert!(matches!(&answer.items[0],shellmate_ai::AnswerItem::Thinking(b)if b.text=="先检查配置。再验证端口。" && b.complete && b.kind==ThinkingKind::Summary));
     assert!(!serde_json::to_string(&loaded.conversation.prepare(&Default::default()).unwrap().chat_history).unwrap().contains("先检查配置"));
 }
+
+#[test]
+fn retired_comparison_results_and_output_references_survive_history_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("history.db");
+    let mut db = HostStore::open(&path).unwrap();
+    let mut log = Conversation::default();
+    log.push_user(UserTurn::new("比较目录", Default::default()));
+    let step=shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:"legacy-compare".into(),name:"compare_directories".into(),args_json:serde_json::json!({"left":{"session_id":"local","path":"/left"},"right":{"session_id":"remote","path":"/right"}})},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:serde_json::json!({"scan_complete":false,"differences":[{"path":"config.toml","status":"内容不同"}],"cursor":"legacy-cursor"}).to_string(),output_id:Some("legacy-output".into()),cleared:false,is_error:false},display:None};
+    log.append(Entry::Step(step.clone()));
+    let saved = SavedConversation {
+        id: "retired-tool".into(),
+        host_id: None,
+        label: "local".into(),
+        title: "比较目录".into(),
+        provider: "openai".into(),
+        model: "fixture".into(),
+        created_at: 1,
+        updated_at: 2,
+        conversation: log,
+    };
+    db.save_ai_conversation(&saved).unwrap();
+    drop(db);
+    let db = HostStore::open(&path).unwrap();
+    let loaded = db.ai_conversation(&saved.id).unwrap().unwrap();
+    assert_eq!(loaded.conversation.entries(), saved.conversation.entries());
+    assert_eq!(loaded.conversation.displayed_step(0, 0), Some(&step));
+    let caps = shellmate_ai::Capabilities {
+        sessions: true,
+        background: true,
+        ..Default::default()
+    };
+    let request = loaded.conversation.prepare(&caps).unwrap();
+    assert!(
+        !serde_json::to_string(&request.tools)
+            .unwrap()
+            .contains("compare_directories")
+    );
+    assert!(
+        serde_json::to_string(&request.chat_history)
+            .unwrap()
+            .contains("config.toml")
+    );
+}

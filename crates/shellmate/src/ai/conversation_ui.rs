@@ -167,6 +167,7 @@ impl Drawer {
             } else {
                 "任务正在处理，切换到其他对话不会停止本任务。"
             });
+            // Historical fixture: rendering this retired tool must never read live files.
             if session == 2 && scene == "ai-multi-compare" {
                 log.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"compare".into(),name:"compare_directories".into(),args_json:serde_json::json!({"left":{"session_id":"local","path":"/Users/demo/project"},"right":{"session_id":"remote","path":"/srv/app"}})},result:LoggedResult{attachments: Vec::new(), inline:serde_json::json!({"left":{"label":"本地终端 1"},"right":{"label":"prod-web-01"},"left_path":"/Users/demo/project","right_path":"/srv/app","scan_complete":true,"summary":{"内容不同":2,"仅左侧存在":1,"内容相同":126},"differences":[{"path":"config/app.toml","status":"内容不同"},{"path":"src/main.rs","status":"内容不同"},{"path":"README.local.md","status":"仅左侧存在"}]}).to_string(),output_id:None,subagent:None,cleared:false,is_error:false},display:None}));
             }

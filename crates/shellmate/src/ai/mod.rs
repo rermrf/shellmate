@@ -17,7 +17,6 @@ pub(crate) mod tasks;
 pub(crate) mod session_catalog;
 pub(crate) mod target_router;
 pub(crate) mod conversation_manager;
-pub(crate) mod directory_compare;
 pub(crate) mod tool_model;
 use crate::dialogs::{self, DialogBody, Tone};
 use gpui::{prelude::*, *};

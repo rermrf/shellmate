@@ -16,8 +16,6 @@ mod timing_ui;
 pub(crate) mod conversation_runtime;
 #[path="conversation_ui.rs"]
 mod conversation_ui;
-#[path="directory_compare_ui.rs"]
-mod directory_compare_ui;
 #[path = "subagent_ui.rs"]
 mod subagent_ui;
 #[path = "thread_ui.rs"]
@@ -91,9 +89,6 @@ pub struct Drawer {
     target_picker:bool,
     rebind_target:Option<String>,
     multi_fixture:bool,
-    comparison_full:std::collections::BTreeSet<String>,
-    comparison_previews:std::collections::BTreeMap<String,String>,
-    comparison_only_changes:std::collections::BTreeSet<String>,
     context_bound:bool,
     composer_targets:std::collections::BTreeSet<String>,
     state: state::ConversationState,
@@ -216,7 +211,7 @@ impl Drawer {
         })
         .detach();
         Self {
-            runtime:None,runtime_revision:0,chooser:false,target_picker:false,rebind_target:None,multi_fixture:false,comparison_full:Default::default(),comparison_previews:Default::default(),comparison_only_changes:Default::default(),context_bound:false,composer_targets:Default::default(),
+            runtime:None,runtime_revision:0,chooser:false,target_picker:false,rebind_target:None,multi_fixture:false,context_bound:false,composer_targets:Default::default(),
             popup: Default::default(),
             context_focus: cx.focus_handle(),
             compact_queue: Default::default(),

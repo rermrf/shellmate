@@ -219,9 +219,8 @@ impl Router {
         child.scope = Arc::new(Mutex::new(scope));
         Ok(child)
     }
-    pub async fn local(&self, request: Request, tasks: &Tasks) -> LocalResult {
+    pub async fn local(&self, request: Request) -> LocalResult {
         match request {
-            Request::Compare(args) => super::directory_compare::compare(self, args, tasks).await,
             Request::List(args) => {
                 let scope = self.scope.lock().unwrap().clone();
                 let entries = self.catalog.list();

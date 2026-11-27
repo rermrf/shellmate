@@ -556,9 +556,6 @@ impl Tasks {
             }
         }
     }
-    pub fn remember_output(&self, id: String, label: String) {
-        self.0.state.lock().unwrap().remembered.push((id, label));
-    }
     pub fn output_id_for(&self, call_id: &str) -> Option<String> {
         self.0
             .state
@@ -1172,6 +1169,66 @@ mod tests {
                 .unwrap()
                 .bytes
                 .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn retired_tool_full_output_is_readable_without_its_executor() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = Spool::create(root.path(), "history", "legacy-comparison").unwrap();
+        spool
+            .write(
+                "config.toml\t内容不同\nREADME.md\t仅左侧存在\n".as_bytes(),
+                false,
+            )
+            .unwrap();
+        spool.finish().unwrap();
+        let mut log = shellmate_ai::Conversation::default();
+        log.push_user(shellmate_ai::UserTurn::new(
+            "旧目录比较",
+            Default::default(),
+        ));
+        log.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
+            message_id: 1,
+            call: shellmate_ai::LoggedCall {
+                id: "old".into(),
+                name: "compare_directories".into(),
+                args_json: serde_json::json!({}),
+            },
+            result: shellmate_ai::LoggedResult {
+                attachments: vec![],
+                subagent: None,
+                inline: "旧结果摘要".into(),
+                output_id: Some("legacy-comparison".into()),
+                cleared: false,
+                is_error: false,
+            },
+            display: None,
+        }));
+        let tasks = Tasks::new(root.path().into(), "history".into());
+        tasks.remember_outputs(&log);
+        assert!(
+            tasks
+                .state()
+                .1
+                .iter()
+                .any(|s| s.contains("legacy-comparison"))
+        );
+        let result = tasks
+            .local_tool(
+                LocalTool::ReadOutput(shellmate_ai::agent::ReadOutput {
+                    id: "legacy-comparison".into(),
+                    offset_line: 0,
+                    limit_lines: None,
+                    grep: None,
+                }),
+                ExecLimits::default(),
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.inline.contains("config.toml") && result.inline.contains("README.md"));
+        assert!(
+            tasks.list().is_empty(),
+            "reading saved output starts no terminal task"
         );
     }
     #[tokio::test]

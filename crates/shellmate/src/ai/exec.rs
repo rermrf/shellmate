@@ -339,12 +339,12 @@ impl Executor for AppExecutor {
                 return Box::pin(async move {
                     match &self.router {
                         Some(r) => {
-                            if matches!(&request,shellmate_ai::session_tools::Request::Compare(_)) {
-                                let result=r.local(request,&self.tasks).await;
-                                if let Some(id)=&result.output_id{self.tasks.remember_output(id.clone(),"目录比较".into());}
-                                return result;
+                            let control = self.tasks.control();
+                            tokio::select! {
+                                biased;
+                                ()=control.urgent()=>shellmate_ai::agent::LocalResult::error("终端读取已取消"),
+                                result=r.local(request)=>result,
                             }
-                            tokio::select! {biased;()=async{self.tasks.control().urgent().await}=>shellmate_ai::agent::LocalResult::error("终端读取已取消"),result=r.local(request,&self.tasks)=>{if let Some(id)=&result.output_id{self.tasks.remember_output(id.clone(),"目录比较".into());}result}}
                         }
                         None => shellmate_ai::agent::LocalResult::error("终端目录不可用"),
                     }

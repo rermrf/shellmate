@@ -87,11 +87,11 @@ async fn both_provider_wires_keep_targets_and_continue_after_one_terminal_discon
         for name in [
             "list_sessions",
             "read_terminal",
-            "compare_directories",
             "session_id",
         ] {
             assert!(schema.contains(name), "{schema}");
         }
+        assert!(!schema.contains("compare_directories"));
         assert!(tool_result(&bodies[2], a, "right").contains("remote-result"));
         assert_eq!(slots.available_permits(), 1);
     }
@@ -188,5 +188,125 @@ async fn service_intent_is_async_preserves_channel_and_rejects_invalid_readiness
         let text = bodies(&http)[0].to_string();
         assert!(text.contains("常驻服务退出"));
         assert!(text.contains("ready_pattern"));
+    }
+}
+
+#[tokio::test]
+async fn retired_comparison_is_history_only_and_generic_commands_still_reach_both_targets() {
+    use super::responses_tests::{responses_config, wire};
+    for protocol in 0..3 {
+        let a = protocol == 1;
+        let cfg = if protocol == 2 {
+            responses_config()
+        } else {
+            config(a)
+        };
+        let reply = |calls: &[(&str, &str, Value)], text: &str| {
+            if protocol == 2 {
+                let mut items = calls
+                    .iter()
+                    .map(|(id, name, args)| wire::call(id, name, args.clone()))
+                    .collect::<Vec<_>>();
+                if !text.is_empty() {
+                    items.push(wire::message("answer", text, "final_answer"));
+                }
+                wire::reply(items)
+            } else {
+                response(a, calls, text, false)
+            }
+        };
+        let args = json!({"left":{"session_id":"local-ref","path":"/project"},"right":{"session_id":"remote-ref","path":"/srv/app"}});
+        let http = SequencedHttpClient::new([
+            reply(&[("discover", "list_sessions", json!({}))], ""),
+            reply(&[("retired", "compare_directories", args.clone())], ""),
+            reply(
+                &[
+                    (
+                        "left",
+                        "run_command",
+                        json!({"session_id":"local-ref","command":"ls -a","target":"background","cwd":"/project"}),
+                    ),
+                    (
+                        "right",
+                        "run_command",
+                        json!({"session_id":"remote-ref","command":"ls -a","target":"background","cwd":"/srv/app"}),
+                    ),
+                ],
+                "",
+            ),
+            reply(&[], "两侧清单已读取，需要进一步核实内容差异。"),
+        ]);
+        let client = RigClient::with_http(&cfg, http.clone()).unwrap();
+        let host = Sessions {
+            inner: Host::new([completed("LOCAL_FILE"), completed("REMOTE_FILE")]),
+            requests: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let mut log = conversation();
+        log.append(Entry::Step(Step {
+            message_id: 1,
+            call: LoggedCall {
+                id: "old-compare".into(),
+                name: "compare_directories".into(),
+                args_json: args,
+            },
+            result: LoggedResult {
+                attachments: vec![],
+                subagent: None,
+                inline: "HISTORICAL_RESULT: config differs".into(),
+                output_id: Some("saved-comparison".into()),
+                cleared: false,
+                is_error: false,
+            },
+            display: None,
+        }));
+        log.push_user(UserTurn::new(
+            "检查第1和第2个终端的项目目录",
+            Default::default(),
+        ));
+        let events = agent::run(
+            &client,
+            &mut log,
+            Capabilities::default(),
+            &host,
+            fast_limits(),
+        )
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        let calls = host.inner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.session_id.as_deref(), c.target, c.cwd.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("local-ref"), Target::Background, Some("/project")),
+                (Some("remote-ref"), Target::Background, Some("/srv/app"))
+            ]
+        );
+        assert_eq!(
+            host.requests.lock().unwrap().len(),
+            1,
+            "retired tool never reaches the host"
+        );
+        let requests = bodies(&http);
+        assert_eq!(requests.len(), 4);
+        for request in &requests {
+            let tools = request["tools"].to_string();
+            assert!(!tools.contains("compare_directories"));
+            for name in ["list_sessions", "read_terminal", "run_command"] {
+                assert!(tools.contains(name));
+            }
+        }
+        assert!(requests[0].to_string().contains("HISTORICAL_RESULT"));
+        assert!(
+            requests[3].to_string().contains("LOCAL_FILE")
+                && requests[3].to_string().contains("REMOTE_FILE")
+        );
+        assert!(log.entries().iter().any(|e|matches!(e,Entry::Step(s)if s.call.id=="retired" && s.result.is_error && s.result.inline.contains("未知工具"))));
+        assert!(log.entries().iter().any(|e|matches!(e,Entry::Step(s)if s.call.id=="old-compare" && s.result.inline.contains("HISTORICAL_RESULT") && s.result.output_id.as_deref()==Some("saved-comparison"))));
     }
 }

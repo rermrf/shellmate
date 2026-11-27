@@ -61,6 +61,7 @@ pub fn label(call: &LoggedCall) -> String {
         "run_command" => "执行命令",
         "list_sessions" => "查看终端列表",
         "read_terminal" => "读取终端",
+        // Display-only compatibility for saved calls; this tool is no longer offered.
         "compare_directories" => "比较目录",
         "web_search" => "搜索网页",
         "web_fetch" => "读取网页",

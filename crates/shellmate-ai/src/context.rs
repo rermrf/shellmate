@@ -328,7 +328,7 @@ impl Conversation {
             offered.retain(|name| *name != "agent" && *name != "propose_command");
         }
         if caps.sessions && !summarizing {
-            offered.extend(["list_sessions", "read_terminal", "compare_directories"]);
+            offered.extend(["list_sessions", "read_terminal"]);
         }
         if caps.web && !summarizing {
             offered.extend(["web_search", "web_fetch"]);

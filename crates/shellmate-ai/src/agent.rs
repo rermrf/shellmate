@@ -1876,7 +1876,7 @@ fn parse_local(
     }
     if matches!(
         name,
-        "list_sessions" | "read_terminal" | "compare_directories"
+        "list_sessions" | "read_terminal"
     ) {
         if !sessions {
             return Err("终端目录不可用".into());
