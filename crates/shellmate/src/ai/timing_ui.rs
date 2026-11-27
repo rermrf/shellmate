@@ -101,6 +101,7 @@ pub(super) fn footer(
     now: Moment,
     phase: &shellmate_ai::interaction::Phase,
     reply_group: &SharedString,
+    copy: Option<AnyElement>,
     cx: &App,
 ) -> Stateful<Div> {
     let started = timing::timestamp(record.started_at_ms, now.wall_ms, true);
@@ -131,12 +132,15 @@ pub(super) fn footer(
         .items_center()
         .gap_x(px(8.))
         .child(timing::label(record, phase))
-        .children(record.ended_at_ms.map(|at| {
-            div()
-                .opacity(0.)
-                .group_hover(reply_group.clone(), |time| time.opacity(1.))
-                .child(timing::timestamp(at, now.wall_ms, false))
-        }))
+        .when(record.ended_at_ms.is_some() || copy.is_some(), |footer| {
+            footer.child(div().flex().flex_none().items_center().gap(px(4.))
+                .children(record.ended_at_ms.map(|at| {
+                    div().opacity(0.)
+                        .group_hover(reply_group.clone(), |time| time.opacity(1.))
+                        .child(timing::timestamp(at, now.wall_ms, false))
+                }))
+                .children(copy))
+        })
         .tooltip(move |window, cx| {
             gpui::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
         })

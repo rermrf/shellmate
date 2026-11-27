@@ -1607,8 +1607,18 @@ impl Render for Drawer {
                     }
                     reply_surface = reply_surface.child(reply);
                 }
-                for record in timing_records.iter().filter(|r| r.turn==index) {
-                    reply_surface=reply_surface.child(timing_ui::footer(record,timing_now,&self.state.control.phase(),&reply_group,cx));
+                let reply_text = turn.answer.as_ref().map(|a| a.text()).unwrap_or_default();
+                let records = timing_records.iter().filter(|r| r.turn == index).collect::<Vec<_>>();
+                for (position, record) in records.iter().enumerate() {
+                    let copy = (position + 1 == records.len() && !reply_text.is_empty()).then(|| {
+                        message_ui::reply_copy(&reply_group, &reply_text, &reply_group, self.selection_scroll.clone(), window, cx).into_any_element()
+                    });
+                    reply_surface=reply_surface.child(timing_ui::footer(record,timing_now,&self.state.control.phase(),&reply_group,copy,cx));
+                }
+                if records.is_empty() && !reply_text.is_empty() {
+                    reply_surface = reply_surface.child(message_ui::reply_copy(
+                        &reply_group, &reply_text, &reply_group, self.selection_scroll.clone(), window, cx,
+                    ));
                 }
                 if turn.answer.is_some() || timing_records.iter().any(|r| r.turn == index) {
                     body = body.child(reply_surface);
