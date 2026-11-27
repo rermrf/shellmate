@@ -11,6 +11,12 @@ pub enum Status {
     Running,
     Waiting,
     Completed,
+    Read,
+    Sent,
+    ConditionMet,
+    TimedOut,
+    ScreenChanged,
+    TakenOver,
     Failed,
     Cancelled,
     Stopped,
@@ -29,6 +35,12 @@ impl Status {
             Self::Running => "运行中",
             Self::Waiting => "等待结果",
             Self::Completed => "已完成",
+            Self::Read => "已读取",
+            Self::Sent => "已发送",
+            Self::ConditionMet => "条件已满足",
+            Self::TimedOut => "等待超时",
+            Self::ScreenChanged => "画面已变化",
+            Self::TakenOver => "已接管",
             Self::Failed => "失败",
             Self::Cancelled => "已取消",
             Self::Stopped => "已停止",
@@ -39,18 +51,18 @@ impl Status {
     }
     pub fn color(self, p: &crate::theme::Palette) -> gpui::Hsla {
         match self {
-            Self::Approval | Self::Question | Self::Paused => p.warn,
+            Self::Approval | Self::Question | Self::Paused | Self::TimedOut | Self::ScreenChanged => p.warn,
             Self::Running | Self::Waiting => p.acc,
-            Self::Completed | Self::Answered => p.ok,
+            Self::Completed | Self::Answered | Self::ConditionMet => p.ok,
             Self::Failed => p.err,
             _ => p.tx3,
         }
     }
     pub fn badge_colors(self, p: &crate::theme::Palette) -> (gpui::Hsla, gpui::Hsla) {
         let bg = match self {
-            Self::Approval | Self::Question | Self::Paused => p.warns,
+            Self::Approval | Self::Question | Self::Paused | Self::TimedOut | Self::ScreenChanged => p.warns,
             Self::Running | Self::Waiting => p.accs,
-            Self::Completed | Self::Answered => p.oks,
+            Self::Completed | Self::Answered | Self::ConditionMet => p.oks,
             Self::Failed => p.errs,
             _ => p.card3,
         };
@@ -63,7 +75,7 @@ impl Status {
         )
     }
     pub fn attention(self) -> bool {
-        matches!(self, Self::Question | Self::Approval | Self::Failed | Self::Denied)
+        matches!(self, Self::Question | Self::Approval | Self::Failed | Self::Denied | Self::TimedOut | Self::ScreenChanged | Self::TakenOver)
     }
 }
 pub fn elapsed(ms: u64) -> String {
@@ -201,6 +213,24 @@ pub fn command_status(display: Option<&StepDisplay>, result: Option<&LoggedResul
         Status::Running
     }
 }
+/// Execution transport success is distinct from observing the requested result.
+pub fn terminal_status(call:&LoggedCall,result:Option<&LoggedResult>)->Option<(Status,String)>{
+    if !matches!(call.name.as_str(),"read_terminal"|"terminal_input"|"wait_terminal"){return None;}
+    let result = result?;
+    let v=serde_json::from_str::<serde_json::Value>(&result.inline).unwrap_or_default();
+    if result.is_error{
+        let status=match v["code"].as_str(){Some("screen_changed")=>Status::ScreenChanged,Some("user_takeover")=>Status::TakenOver,Some("stopped")=>Status::Stopped,_=>Status::Failed};
+        let detail=v["message"].as_str().or(v["error"].as_str()).unwrap_or(&result.inline);
+        return Some((status,compact(detail,160)));
+    }
+    let status=match call.name.as_str(){"read_terminal"=>Status::Read,"terminal_input"=>if call.args_json["release"]==true{Status::Completed}else{Status::Sent},_=>if v["timed_out"]==true{Status::TimedOut}else if v["matched"]==true{Status::ConditionMet}else if v["screen"]["ended"]==true{Status::Stopped}else{Status::Unknown}};
+    let detail=match call.name.as_str(){
+        "terminal_input" if call.args_json["release"]==true=>"已交还控制，程序继续运行".into(),
+        "terminal_input"=>format!("{} 个动作已发送 · {}",v["actions_sent"].as_u64().unwrap_or(0),match v["observation_status"].as_str(){Some("condition_met")=>"观察条件已满足",Some("changed")=>"已观察到画面变化",Some("no_change")=>"尚未观察到变化",Some("ended")=>"程序已结束",Some("state_changed")=>"终端状态已变化，请重新观察",_=>"等待确认实际效果"}),
+        "wait_terminal"=>match status{Status::TimedOut=>"到时未满足条件，已返回当前画面",Status::ConditionMet=>if call.args_json["stable_ms"].is_number()&&call.args_json["text"].is_null()&&call.args_json["screen_id"].is_null()&&call.args_json["fingerprint"].is_null(){"观察区域已稳定；不代表操作成功"}else{"指定观察条件已满足"},Status::Stopped=>"程序已结束，已返回最后画面",_=>"已返回观察结果"}.into(),
+        _=>if v["screen"]["ended"]==true{"程序已结束，显示最后画面".into()}else if let(Some(c),Some(r))=(v["screen"]["columns"].as_u64(),v["screen"]["rows"].as_u64()){format!("{c} × {r} · 当前画面")}else{String::new()},
+    };Some((status,detail))
+}
 fn successful(d: &StepDisplay) -> bool {
     shellmate_ai::output::successful(&d.command, d.exit_code)
 }
@@ -323,5 +353,19 @@ mod tests {
         };
         assert_eq!(command(&call, Some(&d)), "grep pattern /tmp/file");
         assert_eq!(command(&call, None), "old command");
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests{
+    use super::*;
+    #[test]
+    fn old_and_new_terminal_results_distinguish_sending_from_matching(){
+        let mut call=LoggedCall{id:"call".into(),name:"wait_terminal".into(),args_json:serde_json::json!({"session_id":"s"})};
+        let mut result=LoggedResult{inline:r#"{"matched":false,"timed_out":true}"#.into(),is_error:false,cleared:false,output_id:None,attachments:vec![],subagent:None};
+        assert_eq!(terminal_status(&call,Some(&result)).unwrap().0,Status::TimedOut);
+        result.inline=r#"{"matched":true,"timed_out":false}"#.into();assert_eq!(terminal_status(&call,Some(&result)).unwrap().0,Status::ConditionMet);
+        call.name="terminal_input".into();result.inline=r#"{"actions_sent":1,"observation_status":"no_change"}"#.into();let(s,d)=terminal_status(&call,Some(&result)).unwrap();assert_eq!(s,Status::Sent);assert!(d.contains("尚未观察"));
+        result.is_error=true;result.inline=r#"{"code":"screen_changed","message":"未发送"}"#.into();assert_eq!(terminal_status(&call,Some(&result)).unwrap().0,Status::ScreenChanged);
     }
 }

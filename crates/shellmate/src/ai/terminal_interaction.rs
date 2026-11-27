@@ -10,7 +10,9 @@ use shellmate_ai::{
     policy::{Class, PermissionMode},
     session_tools::{Input, Request, Wait},
 };
-use shellmate_core::terminal_interaction::{Action, Controller, InputResult, Region, Screen};
+use shellmate_core::terminal_interaction::{
+    Action, Controller, ErrorCode, Guard, InputResult, InteractionError, Observe, Region, Screen,
+};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -23,24 +25,66 @@ pub enum Operation {
     },
     Check {
         screen_id: String,
+        guards: Vec<Guard>,
     },
     Input {
         screen_id: String,
+        guards: Vec<Guard>,
         actions: Vec<Action>,
+    },
+    Observe {
+        screen_id: Option<String>,
+        fingerprint: Option<String>,
+        region: Option<Region>,
     },
     Release,
 }
 pub enum Reply {
     Screen { screen: Screen, owned: bool },
     Input(InputResult),
+    Observation(shellmate_term::ObservationWatch),
     Released,
 }
-pub fn apply(t:&mut shellmate_term::Terminal,op:Operation,owner:Arc<Controller>,cx:&mut gpui::Context<shellmate_term::Terminal>)->Result<Reply,String>{
+pub fn apply(
+    t: &mut shellmate_term::Terminal,
+    op: Operation,
+    owner: Arc<Controller>,
+    cx: &mut gpui::Context<shellmate_term::Terminal>,
+) -> Result<Reply, InteractionError> {
     match op {
-        Operation::Read{region}=>{let owned=t.interaction_owned(&owner);t.interaction_snapshot(region.as_ref()).map(|screen|Reply::Screen{screen,owned})},
-        Operation::Check{screen_id}=>{let owned=t.interaction_owned(&owner);t.interaction_check(&screen_id,&owner).map(|screen|Reply::Screen{screen,owned})},
-        Operation::Input{screen_id,actions}=>t.interaction_input(&screen_id,&actions,owner,cx).map(Reply::Input),
-        Operation::Release=>t.interaction_release(&owner,cx).map(|_|Reply::Released),
+        Operation::Read { region } => {
+            let owned = t.interaction_owned(&owner);
+            t.interaction_snapshot(region.as_ref())
+                .map(|screen| Reply::Screen { screen, owned })
+                .map_err(Into::into)
+        }
+        Operation::Check { screen_id, guards } => {
+            let owned = t.interaction_owned(&owner);
+            t.interaction_check_guarded(&screen_id, &owner, &guards)
+                .map(|screen| Reply::Screen { screen, owned })
+        }
+        Operation::Input {
+            screen_id,
+            actions,
+            guards,
+        } => t
+            .interaction_input_guarded(&screen_id, &actions, owner, &guards, cx)
+            .map(Reply::Input),
+        Operation::Observe {
+            screen_id,
+            fingerprint,
+            region,
+        } => t
+            .interaction_observe(
+                screen_id.as_deref(),
+                fingerprint.as_deref(),
+                region.as_ref(),
+            )
+            .map(Reply::Observation),
+        Operation::Release => t
+            .interaction_release(&owner, cx)
+            .map(|_| Reply::Released)
+            .map_err(Into::into),
     }
 }
 pub fn handles(request: &Request) -> bool {
@@ -52,7 +96,13 @@ pub fn handles(request: &Request) -> bool {
     )
 }
 fn endpoint(router: &Router, id: &str) -> Result<Endpoint, String> {
-    let e = if let Ok(e)=router.catalog.lookup(id) && e.independent {e}else{router.resolve(Some(id))?};
+    let e = if let Ok(e) = router.catalog.lookup(id)
+        && e.independent
+    {
+        e
+    } else {
+        router.resolve(Some(id))?
+    };
     if !e.binding.capabilities.terminal || (!e.binding.local && e.binding.connection.is_none()) {
         return Err("当前只支持已连接的本机和 SSH 交互终端".into());
     }
@@ -63,10 +113,19 @@ async fn request(
     e: &Endpoint,
     owner: Arc<Controller>,
     operation: Operation,
-) -> Result<Reply, String> {
+) -> Result<Reply, InteractionError> {
     let current = endpoint(router, &e.target.session_id)?;
-    if !Arc::ptr_eq(&current.binding.alive, &e.binding.alive) || !owner.active() {
-        return Err("终端连接或任务状态已变化".into());
+    if !owner.active() {
+        return Err(InteractionError::new(
+            ErrorCode::Stopped,
+            "任务已停止，输入未发送",
+        ));
+    }
+    if !Arc::ptr_eq(&current.binding.alive, &e.binding.alive) {
+        return Err(InteractionError::new(
+            ErrorCode::ConnectionChanged,
+            "终端连接已变化",
+        ));
     }
     let (reply, rx) = oneshot::channel();
     router
@@ -81,7 +140,8 @@ async fn request(
         })
         .await
         .map_err(|_| "终端桥接已关闭")?;
-    rx.await.map_err(|_| "终端交互已取消".to_owned())?
+    rx.await
+        .map_err(|_| InteractionError::new(ErrorCode::Stopped, "终端交互已取消"))?
 }
 fn encode_screen(e: &Endpoint, screen: Screen) -> LocalResult {
     LocalResult::text(serde_json::json!({"target":e.target,"screen":screen}).to_string())
@@ -104,7 +164,7 @@ pub async fn execute(
     };
     let e = match endpoint(router, id) {
         Ok(e) => e,
-        Err(e) => return LocalResult::error(e),
+        Err(e) => return failure(e),
     };
     let owner = executor.tasks.interaction_owner(
         source
@@ -119,7 +179,7 @@ pub async fn execute(
                 match request(router, &e, owner, Operation::Read { region: a.region }).await {
                     Ok(Reply::Screen { screen, .. }) => encode_screen(&e, screen),
                     Ok(_) => LocalResult::error("读屏响应无效"),
-                    Err(e) => LocalResult::error(e),
+                    Err(e) => failure(e),
                 }
             }
             Request::Input(input) => {
@@ -135,7 +195,7 @@ pub async fn execute(
             _ => LocalResult::error("交互请求无效"),
         }
     };
-    tokio::select! {biased;()=control.urgent()=>{executor.tasks.release_interaction();LocalResult::error("用户已更新指令，停止本次终端交互；程序仍在原终端运行")},()=super::exec::disconnected(&e.lease)=>LocalResult::error("终端已断开"),out=work=>out}
+    tokio::select! {biased;()=control.urgent()=>{executor.tasks.release_interaction();LocalResult::error(serde_json::json!({"code":"stopped","message":"用户已更新指令，停止本次终端交互；已发送的输入不会撤销，不要自动重发。程序仍在原终端运行","actions_sent":null}).to_string())},()=super::exec::disconnected(&e.lease)=>LocalResult::error("终端已断开"),out=work=>out}
 }
 struct ApprovalGuard {
     ui: async_channel::Sender<Ui>,
@@ -160,7 +220,7 @@ async fn input_action(
     if input.release {
         return match request(router, e, owner, Operation::Release).await {
             Ok(_) => LocalResult::text("已交还此终端控制权，程序继续运行"),
-            Err(e) => LocalResult::error(e),
+            Err(e) => failure(e),
         };
     }
     let (screen, owned) = match request(
@@ -169,12 +229,13 @@ async fn input_action(
         owner.clone(),
         Operation::Check {
             screen_id: input.screen_id.clone(),
+            guards: input.guards.clone(),
         },
     )
     .await
     {
         Ok(Reply::Screen { screen, owned }) => (screen, owned),
-        Err(e) => return LocalResult::error(e),
+        Err(e) => return failure(e),
         _ => return LocalResult::error("校验响应无效"),
     };
     let policy = router.policy(e);
@@ -250,56 +311,248 @@ async fn input_action(
     control.set_phase(shellmate_ai::interaction::Phase::Executing);
     let current = match endpoint(router, &input.session_id) {
         Ok(e) => e,
-        Err(e) => return LocalResult::error(e),
+        Err(e) => return failure(e),
     };
     if router.policy(&current) != policy {
         return LocalResult::error("目标权限已改变，请重新发起交互");
     }
-    match request(router,e,owner,Operation::Input{screen_id:input.screen_id,actions:input.actions}).await {
-        Ok(Reply::Input(result))=>LocalResult{attachments:vec![],subagent:None,is_error:result.error.is_some(),output_id:None,inline:serde_json::json!({"target":e.target,"actions_sent":result.actions_sent,"error":result.error,"screen":result.screen,"note":"输入已写入，不代表程序完成预期操作；等待并观察实际画面。"}).to_string()},
-        Err(e)=>LocalResult::error(e),_=>LocalResult::error("输入响应无效"),
+    // Pin the observation baseline and register for output before sending anything.
+    let watching = match request(
+        router,
+        e,
+        owner.clone(),
+        Operation::Observe {
+            screen_id: Some(input.screen_id.clone()),
+            fingerprint: None,
+            region: input.observe.region.clone(),
+        },
+    )
+    .await
+    {
+        Ok(Reply::Observation(w)) => w,
+        Err(e) => return failure(e),
+        _ => return LocalResult::error("观察响应无效"),
+    };
+    let result = match request(
+        router,
+        e,
+        owner.clone(),
+        Operation::Input {
+            screen_id: input.screen_id,
+            actions: input.actions,
+            guards: input.guards,
+        },
+    )
+    .await
+    {
+        Ok(Reply::Input(result)) => result,
+        Err(e) => return failure(e),
+        _ => return LocalResult::error("输入响应无效"),
+    };
+    let sent = result.actions_sent;
+    if result.error.is_some() {
+        return LocalResult{attachments:vec![],subagent:None,is_error:true,output_id:None,inline:serde_json::json!({"target":e.target,"actions_sent":sent,"error":result.error,"code":"write_failed","screen":result.screen}).to_string()};
+    }
+    control.set_phase(shellmate_ai::interaction::Phase::Waiting(vec![format!(
+        "terminal:{}",
+        e.target.session_id
+    )]));
+    match observe_after(router,e,owner,&input.observe,watching).await{
+        Ok(out)=>LocalResult::text(serde_json::json!({"target":e.target,"actions_sent":sent,"changed":out.changed,"condition_matched":out.matched,"observation_status":out.status,"screen":out.screen,"note":"输入只发送一次；画面变化/条件满足不等于业务成功。无进展时检查布局或程序内帮助，勿自动重发。"}).to_string()),
+        Err(mut e)=>{e.actions_sent=sent;failure(e)},
     }
 }
-async fn wait(router: &Router, e: &Endpoint, owner: Arc<Controller>, args: Wait) -> LocalResult {
-    let start = Instant::now();
-    let mut stable = Instant::now();
-    let mut previous = String::new();
-    loop {
-        let screen = match request(
-            router,
-            e,
-            owner.clone(),
-            Operation::Read {
-                region: args.region.clone(),
-            },
-        )
-        .await
-        {
-            Ok(Reply::Screen { screen, owned }) => {
-                if owned && screen.paused {
-                    return LocalResult::error("用户已接管，停止等待");
-                }
-                screen
+fn failure(error: impl Into<InteractionError>) -> LocalResult {
+    let e = error.into();
+    LocalResult::error(serde_json::to_string(&e).unwrap())
+}
+struct Observed {
+    screen: Screen,
+    changed: bool,
+    matched: Option<bool>,
+    status: &'static str,
+}
+async fn next_screen(
+    router: &Router,
+    e: &Endpoint,
+    owner: Arc<Controller>,
+    region: Region,
+) -> Result<Screen, InteractionError> {
+    match request(
+        router,
+        e,
+        owner,
+        Operation::Read {
+            region: Some(region),
+        },
+    )
+    .await?
+    {
+        Reply::Screen { screen, .. } => {
+            if screen.paused {
+                let mut error = InteractionError::new(
+                    ErrorCode::UserTakeover,
+                    "用户已接管，停止自动观察与输入",
+                );
+                error.screen = Some(Box::new(screen));
+                return Err(error);
             }
-            Err(e) => return LocalResult::error(e),
-            _ => return LocalResult::error("读屏响应无效"),
-        };
+            Ok(screen)
+        }
+        _ => Err(InteractionError::new(
+            ErrorCode::InvalidReference,
+            "读屏响应无效",
+        )),
+    }
+}
+async fn wait_event(updates: &async_channel::Receiver<()>, until: tokio::time::Instant) {
+    tokio::select! {event = updates.recv()=>{if event.is_err(){tokio::time::sleep_until(until).await;}},_ = tokio::time::sleep_until(until)=>{}}
+}
+async fn observe_after(
+    router: &Router,
+    e: &Endpoint,
+    owner: Arc<Controller>,
+    args: &Observe,
+    watch: shellmate_term::ObservationWatch,
+) -> Result<Observed, InteractionError> {
+    let base = watch.screen;
+    let region = base.region.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(args.timeout_ms);
+    let mut previous = base.fingerprint.clone();
+    let mut stable = Instant::now();
+    let explicit = args.text.is_some() || args.absent_text.is_some() || args.stable_ms.is_some();
+    loop {
+        let screen = next_screen(router, e, owner.clone(), region.clone()).await?;
+        if screen.rows != base.rows
+            || screen.columns != base.columns
+            || screen.alternate_screen != base.alternate_screen
+        {
+            return Ok(Observed {
+                screen,
+                changed: true,
+                matched: None,
+                status: "state_changed",
+            });
+        }
+        let changed = screen.fingerprint != base.fingerprint;
         if screen.fingerprint != previous {
             previous = screen.fingerprint.clone();
             stable = Instant::now();
         }
         let matched = args.text.as_ref().is_none_or(|t| screen.text.contains(t))
             && args
-                .fingerprint
+                .absent_text
                 .as_ref()
-                .is_none_or(|f| f != &screen.fingerprint)
+                .is_none_or(|t| !screen.text.contains(t))
             && args
                 .stable_ms
                 .is_none_or(|ms| stable.elapsed() >= Duration::from_millis(ms));
-        if screen.ended || matched || start.elapsed() >= Duration::from_millis(args.timeout_ms) {
-            return LocalResult::text(serde_json::json!({"target":e.target,"matched":matched,"timed_out":!matched&&!screen.ended,"screen":screen}).to_string());
+        let done = if explicit {
+            matched
+        } else {
+            changed && stable.elapsed() >= Duration::from_millis(60)
+        };
+        if screen.ended || done || tokio::time::Instant::now() >= deadline {
+            return Ok(Observed {
+                status: if screen.ended {
+                    "ended"
+                } else if explicit && matched {
+                    "condition_met"
+                } else if changed {
+                    "changed"
+                } else {
+                    "no_change"
+                },
+                screen,
+                changed,
+                matched: explicit.then_some(matched),
+            });
         }
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let quiet = Duration::from_millis(args.stable_ms.unwrap_or(60));
+        let needs_quiet = args.stable_ms.is_some() || (!explicit && changed);
+        let until = if needs_quiet && stable.elapsed() < quiet {
+            deadline.min(tokio::time::Instant::now() + quiet.saturating_sub(stable.elapsed()))
+        } else {
+            deadline
+        };
+        wait_event(&watch.updates, until).await;
+    }
+}
+async fn wait(router: &Router, e: &Endpoint, owner: Arc<Controller>, args: Wait) -> LocalResult {
+    let watch = match request(
+        router,
+        e,
+        owner.clone(),
+        Operation::Observe {
+            screen_id: args.screen_id,
+            fingerprint: args.fingerprint,
+            region: args.region,
+        },
+    )
+    .await
+    {
+        Ok(Reply::Observation(w)) => w,
+        Err(e) => return failure(e),
+        _ => return LocalResult::error("观察响应无效"),
+    };
+    // Own this baseline for the whole wait; later reads cannot evict it.
+    let base = watch.baseline;
+    let region = watch.screen.region.clone();
+    let mut screen = watch.screen;
+    let mut stable = Instant::now();
+    let mut previous = screen.fingerprint.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(args.timeout_ms);
+    loop {
+        if screen.paused {
+            let mut e = InteractionError::new(ErrorCode::UserTakeover, "用户已接管，停止等待");
+            e.screen = Some(Box::new(screen));
+            return failure(e);
+        }
+        if base.as_ref().is_some_and(|b| {
+            b.rows != screen.rows
+                || b.columns != screen.columns
+                || b.alternate_screen != screen.alternate_screen
+        }) {
+            let mut e =
+                InteractionError::new(ErrorCode::ScreenChanged, "终端尺寸或模式已变化，请重新读屏");
+            e.screen = Some(Box::new(screen));
+            return failure(e);
+        }
+        if screen.fingerprint != previous {
+            previous = screen.fingerprint.clone();
+            stable = Instant::now();
+        }
+        let changed = base
+            .as_ref()
+            .is_some_and(|b| b.fingerprint != screen.fingerprint);
+        let matched = args.text.as_ref().is_none_or(|t| screen.text.contains(t))
+            && args
+                .absent_text
+                .as_ref()
+                .is_none_or(|t| !screen.text.contains(t))
+            && (base.is_none() || changed)
+            && args
+                .stable_ms
+                .is_none_or(|ms| stable.elapsed() >= Duration::from_millis(ms))
+            && (!args.exited || screen.ended);
+        if screen.ended || matched || tokio::time::Instant::now() >= deadline {
+            return LocalResult::text(serde_json::json!({"target":e.target,"matched":matched,"changed":changed,"timed_out":!matched&&!screen.ended,"observation_status":if matched{"condition_met"}else if screen.ended{"ended"}else{"timed_out"},"screen":screen}).to_string());
+        }
+        let until = if let Some(ms) = args.stable_ms
+            && stable.elapsed() < Duration::from_millis(ms)
+        {
+            deadline.min(
+                tokio::time::Instant::now()
+                    + Duration::from_millis(ms).saturating_sub(stable.elapsed()),
+            )
+        } else {
+            deadline
+        };
+        wait_event(&watch.updates, until).await;
+        screen = match next_screen(router, e, owner.clone(), region.clone()).await {
+            Ok(s) => s,
+            Err(e) => return failure(e),
+        };
     }
 }
 
@@ -311,6 +564,14 @@ pub(super) mod tests {
         Mutex,
         atomic::{AtomicBool, Ordering},
     };
+    fn observed_reply(screen: Screen, base: bool) -> Reply {
+        let (_tx, updates) = async_channel::bounded(1);
+        Reply::Observation(shellmate_term::ObservationWatch {
+            baseline: base.then(|| screen.clone()),
+            screen,
+            updates,
+        })
+    }
     fn screen() -> Screen {
         Screen {
             ended: false,
@@ -392,6 +653,11 @@ pub(super) mod tests {
     }
     fn input(id: &str, key: &str) -> Request {
         Request::Input(Input {
+            guards: vec![],
+            observe: Observe {
+                timeout_ms: 0,
+                ..Default::default()
+            },
             session_id: id.into(),
             screen_id: "observed".into(),
             actions: vec![Action::Key {
@@ -420,6 +686,9 @@ pub(super) mod tests {
                         reply,
                         ..
                     } => match operation {
+                        Operation::Observe { screen_id, .. } => {
+                            let _ = reply.send(Ok(observed_reply(screen(), screen_id.is_some())));
+                        }
                         Operation::Check { .. } | Operation::Read { .. } => {
                             let _ = reply.send(Ok(Reply::Screen {
                                 screen: screen(),
@@ -470,6 +739,11 @@ pub(super) mod tests {
         assert_eq!(*approvals.lock().unwrap(), 2);
         assert_eq!(sent.lock().unwrap().len(), 3);
         let release = Request::Input(Input {
+            guards: vec![],
+            observe: Observe {
+                timeout_ms: 0,
+                ..Default::default()
+            },
             session_id: id,
             screen_id: String::new(),
             actions: vec![],
@@ -533,19 +807,31 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn bounded_wait_matches_text_or_returns_timeout_with_screen() {
-        for (matched,ended) in [(false,false),(true,false),(false,true)] {
+        for (matched, ended) in [(false, false), (true, false), (false, true)] {
             let (_dir, executor, rx, id) = fixture();
             let bridge = tokio::spawn(async move {
-                while let Ok(Ui::TerminalInteraction { reply, .. }) = rx.recv().await {
-                    let _ = reply.send(Ok(Reply::Screen {
-                        screen: Screen{ended,..screen()},
-                        owned: false,
-                    }));
+                while let Ok(Ui::TerminalInteraction {
+                    operation, reply, ..
+                }) = rx.recv().await
+                {
+                    let s = Screen { ended, ..screen() };
+                    let result = if matches!(operation, Operation::Observe { .. }) {
+                        observed_reply(s, false)
+                    } else {
+                        Reply::Screen {
+                            screen: s,
+                            owned: false,
+                        }
+                    };
+                    let _ = reply.send(Ok(result));
                 }
             });
             let out = execute(
                 &executor,
                 Request::Wait(Wait {
+                    screen_id: None,
+                    absent_text: None,
+                    exited: false,
                     session_id: id,
                     region: None,
                     text: Some(if matched { "menu" } else { "unseen" }.into()),
@@ -561,8 +847,8 @@ pub(super) mod tests {
             assert!(!out.is_error);
             let result: serde_json::Value = serde_json::from_str(&out.inline).unwrap();
             assert_eq!(result["matched"], matched);
-            assert_eq!(result["timed_out"], !matched&&!ended);
-            assert_eq!(result["screen"]["ended"],ended);
+            assert_eq!(result["timed_out"], !matched && !ended);
+            assert_eq!(result["screen"]["ended"], ended);
             assert_eq!(result["screen"]["text"], "menu");
             bridge.abort();
         }
@@ -587,6 +873,16 @@ pub(super) mod tests {
                         Ui::TerminalInteraction {
                             operation, reply, ..
                         } => match operation {
+                            Operation::Observe { screen_id, .. } => {
+                                let _ =
+                                    reply.send(Ok(observed_reply(screen(), screen_id.is_some())));
+                            }
+                            Operation::Read { .. } => {
+                                let _ = reply.send(Ok(Reply::Screen {
+                                    screen: screen(),
+                                    owned: true,
+                                }));
+                            }
                             Operation::Check { .. } => {
                                 let _ = reply.send(Ok(Reply::Screen {
                                     screen: screen(),
@@ -613,6 +909,11 @@ pub(super) mod tests {
                 }
             });
             let req = Request::Input(Input {
+                guards: vec![],
+                observe: Observe {
+                    timeout_ms: 0,
+                    ..Default::default()
+                },
                 session_id: id,
                 screen_id: "observed".into(),
                 actions: vec![Action::Text {
@@ -637,16 +938,27 @@ pub(super) mod tests {
                 operation, reply, ..
             }) = rx.recv().await
             {
-                assert!(matches!(operation, Operation::Read { .. }));
-                let _ = reply.send(Ok(Reply::Screen {
-                    screen: screen(),
-                    owned: true,
-                }));
+                assert!(matches!(
+                    operation,
+                    Operation::Observe { .. } | Operation::Read { .. }
+                ));
+                let result = if matches!(operation, Operation::Observe { .. }) {
+                    observed_reply(screen(), false)
+                } else {
+                    Reply::Screen {
+                        screen: screen(),
+                        owned: true,
+                    }
+                };
+                let _ = reply.send(Ok(result));
             }
         });
         let work = execute(
             &executor,
             Request::Wait(Wait {
+                screen_id: None,
+                absent_text: None,
+                exited: false,
                 session_id: id,
                 region: None,
                 text: Some("never".into()),
@@ -665,5 +977,96 @@ pub(super) mod tests {
         assert!(out.is_error);
         assert!(!owner.active());
         bridge.abort();
+    }
+    #[tokio::test]
+    async fn short_observation_waits_for_output_and_never_repeats_input() {
+        for (change, expected) in [
+            (false, None),
+            (true, None),
+            (true, Some("not there")),
+            (true, Some("selected")),
+        ] {
+            let (_dir, executor, rx, id) = fixture();
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let n = writes.clone();
+            let content = Arc::new(Mutex::new(screen()));
+            let shared = content.clone();
+            let (tx, updates) = async_channel::bounded(1);
+            let bridge = tokio::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    match event {
+                        Ui::TuiApproval { call, reply, .. } => {
+                            let _ = reply.send(Approval::Approve {
+                                command: call.command,
+                                target: Target::Terminal,
+                            });
+                        }
+                        Ui::TerminalInteraction {
+                            operation, reply, ..
+                        } => {
+                            let response = match operation {
+                                Operation::Check { .. } | Operation::Read { .. } => Reply::Screen {
+                                    screen: shared.lock().unwrap().clone(),
+                                    owned: true,
+                                },
+                                Operation::Observe { .. } => {
+                                    Reply::Observation(shellmate_term::ObservationWatch {
+                                        screen: shared.lock().unwrap().clone(),
+                                        baseline: Some(screen()),
+                                        updates: updates.clone(),
+                                    })
+                                }
+                                Operation::Input { .. } => {
+                                    n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if change {
+                                        let shared = shared.clone();
+                                        let tx = tx.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(Duration::from_millis(30)).await;
+                                            let mut s = shared.lock().unwrap();
+                                            s.text = "selected".into();
+                                            s.fingerprint = "after".into();
+                                            drop(s);
+                                            let _ = tx.try_send(());
+                                        });
+                                    }
+                                    Reply::Input(InputResult {
+                                        screen: screen(),
+                                        actions_sent: 1,
+                                        error: None,
+                                    })
+                                }
+                                Operation::Release => panic!("unexpected release"),
+                            };
+                            let _ = reply.send(Ok(response));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let mut request = input(&id, "down");
+            if let Request::Input(a) = &mut request {
+                a.observe = Observe {
+                    timeout_ms: 160,
+                    text: expected.map(str::to_owned),
+                    ..Default::default()
+                };
+            }
+            let result = execute(&executor, request, ExecLimits::default(), None, "input").await;
+            assert!(!result.is_error, "{}", result.inline);
+            let v: serde_json::Value = serde_json::from_str(&result.inline).unwrap();
+            assert_eq!(v["changed"], change);
+            assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if let Some(expected) = expected {
+                assert_eq!(v["condition_matched"], expected == "selected");
+            } else {
+                assert!(v["condition_matched"].is_null());
+            }
+            assert_eq!(
+                v["screen"]["text"],
+                if change { "selected" } else { "menu" }
+            );
+            bridge.abort();
+        }
     }
 }

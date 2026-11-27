@@ -29,6 +29,8 @@ impl Drawer {
                 .child(div().id(SharedString::from(format!("{key}:screen-scroll"))).max_h(px(260.)).overflow_scroll().bg(p.card2).rounded(px(10.)).p(px(8.)).child(super::subagent_ui::selectable(format!("{key}:screen"),&rows,w,cx).font_family(MONO_FONT).whitespace_nowrap().text_size(px(11.5))));
             if screen.ended {body=body.child(div().text_color(p.tx3).child("程序已结束，以上为最后画面"));}
             if value["timed_out"]==true {body=body.child(div().text_color(p.tx3).child("等待已到时，以上为当前画面"));}
+            if let Some(message)=value["message"].as_str(){body=body.child(div().text_color(p.warn).child(message.to_owned()));}
+            if let Some(rows)=value["changed_rows"].as_array().filter(|r|!r.is_empty()){body=body.child(div().text_color(p.tx3).child(format!("变化行：{}",rows.iter().filter_map(|v|v.as_u64()).map(|n|n.to_string()).collect::<Vec<_>>().join("、"))));}
             if let Some(error)=value["error"].as_str(){body=body.child(div().text_color(p.err).child(error.to_owned()));}
             return Some(body);
         }
@@ -76,8 +78,13 @@ impl Drawer {
     #[cfg(debug_assertions)]
     pub(crate) fn terminal_interaction_fixture(&mut self,screen:shellmate_core::terminal_interaction::Screen,cx:&mut Context<Self>){
         let mut log=shellmate_ai::Conversation::default();log.push_user(UserTurn::new("帮我在这个终端菜单中选择配置检查",Default::default()).sent_now());
-        log.append(shellmate_ai::Entry::Step(shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:"tui".into(),name:"terminal_input".into(),args_json:serde_json::json!({"session_id":"fixture","purpose":"选择配置检查","actions":[{"type":"key","key":"down"}]})},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:serde_json::json!({"target":{"label":"当前终端"},"actions_sent":1,"screen":screen}).to_string(),output_id:None,cleared:false,is_error:false},display:None}));
-        log.push_text("已发送方向键。你可以随时点击终端或输入接管，程序会继续运行。");self.state.model.conversation=log;self.state.model.busy=false;self.state.follow_bottom=false;self.scroll.set_offset(point(px(0.),px(0.)));self.state.tool_expanded.insert(self.tool_key("main","tui",false));cx.notify();
+        let step=|id:&str,name:&str,args:serde_json::Value,value:serde_json::Value|shellmate_ai::Entry::Step(shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:id.into(),name:name.into(),args_json:args},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:value.to_string(),output_id:None,cleared:false,is_error:false},display:None});
+        log.append(step("read","read_terminal",serde_json::json!({"session_id":"fixture","screen":true}),serde_json::json!({"target":{"label":"当前终端"},"screen":screen})));
+        log.append(shellmate_ai::Entry::Thinking{message_id:1,block:shellmate_ai::ThinkingBlock{id:"fixture-think".into(),kind:shellmate_ai::ThinkingKind::Summary,text:"根据菜单位置选择下一项，然后核对选中状态。".into(),complete:true}});
+        log.append(step("tui","terminal_input",serde_json::json!({"session_id":"fixture","purpose":"选择配置检查","actions":[{"type":"key","key":"down"}]}),serde_json::json!({"target":{"label":"当前终端"},"actions_sent":1,"changed":true,"condition_matched":null,"observation_status":"changed","screen":screen})));
+        log.append(step("wait","wait_terminal",serde_json::json!({"session_id":"fixture","text":"Inspect configuration"}),serde_json::json!({"target":{"label":"当前终端"},"matched":true,"timed_out":false,"screen":screen})));
+        log.append(step("timeout","wait_terminal",serde_json::json!({"session_id":"fixture","text":"Ready"}),serde_json::json!({"target":{"label":"当前终端"},"matched":false,"timed_out":true,"screen":screen})));
+        log.push_text("已选中配置检查；等待就绪文字已超时，当前画面仍保留。你可以随时接管。");self.state.model.conversation=log;self.state.model.busy=false;self.state.follow_bottom=false;self.scroll.set_offset(point(px(0.),px(0.)));cx.notify();
     }
     #[cfg(debug_assertions)]
     pub(crate) fn independent_terminal_fixture(&mut self,cx:&mut Context<Self>){

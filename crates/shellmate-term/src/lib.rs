@@ -34,3 +34,5 @@ mod behavior;
 
 pub mod agent;
 mod interaction;
+
+pub use interaction::ObservationWatch;

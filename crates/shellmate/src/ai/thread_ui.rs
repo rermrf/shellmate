@@ -575,22 +575,28 @@ impl Drawer {
             .as_ref()
             .filter(|entries| !entries.is_empty())
         {
-            for item in grouped(entries) {
+            let items=grouped(entries);
+            let pieces=items.iter().map(|i|match i{Item::Step(s)=>terminal_flow_ui::Piece::Step(s),Item::Thinking(b)=>terminal_flow_ui::Piece::Thinking(b),_=>terminal_flow_ui::Piece::Break}).collect::<Vec<_>>();
+            let flow_ranges=terminal_flow_ui::ranges(&pieces);let mut flow_until=0;
+            for (n,item) in items.iter().enumerate() {
+                if n<flow_until{continue;}
+                if let Some(end)=flow_ranges.get(&n){body=body.child(self.terminal_flow(&scope,&pieces[n..*end],w,cx));flow_until = *end;continue;}
+
                 match item {
                     Item::Thinking(block) => {
                         let live=running && !block.complete && entries.iter().rev().find(|e|!matches!(e,Entry::Assistant{text,..}if text.is_empty())).is_some_and(|e|matches!(e,Entry::Thinking{block:last,..}if last.id==block.id));
-                        body=body.child(self.thinking_block(&scope,&block,live,w,cx));
+                        body=body.child(self.thinking_block(&scope,block,live,w,cx));
                     }
                     Item::User {
                         index,
                         text,
                         origin, sent_at_ms, attachments,
-                    } => body = body.child(self.child_message(&id, index, &text, origin, sent_at_ms, &attachments, w, cx)),
+                    } => body = body.child(self.child_message(&id, *index, text, *origin, *sent_at_ms, attachments, w, cx)),
                     Item::Text { index, text } => {
                         body = body.child(markdown::drawer_view(
                             SharedString::from(format!("{}:{scope}:text:{index}", self.state.id))
                                 .into(),
-                            text.into(),
+                            text.clone().into(),
                             self.selection_scroll.clone(),
                             self.fixture_copy,
                             w,
@@ -613,7 +619,7 @@ impl Drawer {
                                 .text_size(px(11.5))
                                 .text_color(p.tx3)
                                 .whitespace_normal()
-                                .child(text),
+                                .child(text.clone()),
                         )
                     }
                 }

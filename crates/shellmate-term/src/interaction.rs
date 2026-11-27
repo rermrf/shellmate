@@ -6,6 +6,7 @@ use alacritty_terminal::{
     vte::ansi::Color,
 };
 use shellmate_core::terminal_interaction::{Action, Controller, Cursor, Region, Row, Screen, Span};
+use shellmate_core::terminal_interaction::{ErrorCode, Guard, InteractionError, contains};
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
@@ -16,12 +17,71 @@ use std::{
 pub(crate) struct Observation {
     pub id: String,
     pub epoch: u64,
-    pub alternate: bool,
-    pub rows: u16,
-    pub columns: u16,
-    pub fingerprint: String,
     pub region: Region,
+    pub frame: Arc<Frame>,
     pub at: Instant,
+}
+/// A saved physical grid. A crop never reduces the input's default full-screen guard.
+#[derive(Clone)]
+pub(crate) struct Frame {
+    rows: u16,
+    columns: u16,
+    mode: TermMode,
+    cursor: Cursor,
+    cells: Vec<alacritty_terminal::term::cell::Cell>,
+}
+impl Frame {
+    pub fn capture<T>(term: &Term<T>) -> Result<Self, String> {
+        let rows = term.screen_lines().min(u16::MAX as usize) as u16;
+        let columns = term.columns().min(u16::MAX as usize) as u16;
+        if usize::from(rows) * usize::from(columns) > 160_000 {
+            return Err("终端过大，请先缩小尺寸（完整基准最多 160000 单元格）".into());
+        }
+        let point = term.grid().cursor.point;
+        Ok(Self {
+            rows,
+            columns,
+            mode: *term.mode(),
+            cursor: Cursor {
+                row: point.line.0.max(0) as u16,
+                column: point.column.0 as u16,
+                visible: term.mode().contains(TermMode::SHOW_CURSOR),
+            },
+            cells: (0..rows)
+                .flat_map(|r| {
+                    (0..columns).map(move |c| {
+                        term.grid()[Line(i32::from(r))][Column(usize::from(c))].clone()
+                    })
+                })
+                .collect(),
+        })
+    }
+    pub fn screen(&self, region: Option<&Region>) -> Result<Screen, String> {
+        render(self, region)
+    }
+    fn modes_match(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.columns == other.columns
+            && (self.mode & !TermMode::SHOW_CURSOR) == (other.mode & !TermMode::SHOW_CURSOR)
+    }
+    fn changed_rows(&self, other: &Self) -> Vec<u16> {
+        if !self.modes_match(other) {
+            return (0..other.rows).take(100).collect();
+        }
+        (0..self.rows)
+            .filter(|r| {
+                let start = usize::from(*r) * usize::from(self.columns);
+                self.cells[start..start + usize::from(self.columns)]
+                    != other.cells[start..start + usize::from(self.columns)]
+            })
+            .take(100)
+            .collect()
+    }
+}
+pub struct ObservationWatch {
+    pub screen: Screen,
+    pub baseline: Option<Screen>,
+    pub updates: async_channel::Receiver<()>,
 }
 #[derive(Default)]
 pub(crate) struct State {
@@ -29,14 +89,28 @@ pub(crate) struct State {
     pub paused: bool,
     pub epoch: u64,
     pub observations: VecDeque<Observation>,
+    watchers: Vec<async_channel::Sender<()>>,
 }
 impl State {
     pub fn owner(&self) -> Option<&Arc<Controller>> {
         self.owner.as_ref().filter(|o| o.active())
     }
+    pub fn signal(&mut self) {
+        self.watchers.retain(|tx| !tx.is_closed());
+        for tx in &self.watchers {
+            let _ = tx.try_send(());
+        }
+    }
+    pub fn watch(&mut self) -> async_channel::Receiver<()> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.watchers.retain(|t| !t.is_closed());
+        self.watchers.push(tx);
+        rx
+    }
     pub fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.observations.clear();
+        self.signal();
     }
     pub fn takeover(&mut self) {
         if self.owner().is_some() {
@@ -48,50 +122,130 @@ impl State {
         self.paused = false;
         self.invalidate();
     }
-    pub fn record(&mut self, screen: &mut Screen) {
+    pub fn record(&mut self, screen: &mut Screen, frame: Arc<Frame>) {
         screen.screen_id = shellmate_core::HostId::generate().to_string();
         self.observations.push_back(Observation {
             id: screen.screen_id.clone(),
             epoch: self.epoch,
-            alternate: screen.alternate_screen,
-            rows: screen.rows,
-            columns: screen.columns,
-            fingerprint: screen.fingerprint.clone(),
             region: screen.region.clone(),
+            frame,
             at: Instant::now(),
         });
         while self.observations.len() > 32 {
             self.observations.pop_front();
         }
     }
-    pub fn validate(&self, id: &str, owner: &Controller, screen: &Screen) -> Result<(), String> {
+    pub fn observation(&self, id: &str) -> Result<&Observation, InteractionError> {
+        self.observations
+            .iter()
+            .find(|o| {
+                o.id == id && o.epoch == self.epoch && o.at.elapsed() <= Duration::from_secs(120)
+            })
+            .ok_or_else(|| {
+                InteractionError::new(ErrorCode::InvalidReference, "画面引用已失效，请重新读取")
+            })
+    }
+    pub fn legacy(
+        &self,
+        fingerprint: &str,
+        region: Option<&Region>,
+    ) -> Result<&Observation, InteractionError> {
+        self.observations
+            .iter()
+            .rev()
+            .find(|o| {
+                o.epoch == self.epoch
+                    && o.at.elapsed() <= Duration::from_secs(120)
+                    && region.is_none_or(|r| *r == o.region)
+                    && o.frame
+                        .screen(Some(&o.region))
+                        .is_ok_and(|s| s.fingerprint == fingerprint)
+            })
+            .ok_or_else(|| {
+                InteractionError::new(
+                    ErrorCode::InvalidReference,
+                    "指纹没有同区域的有效基准，请使用 screen_id",
+                )
+            })
+    }
+    pub fn validate(
+        &self,
+        id: &str,
+        owner: &Controller,
+        current: &Frame,
+        guards: &[Guard],
+    ) -> Result<(), InteractionError> {
         if !owner.active() {
-            return Err("任务已停止，终端输入未发送".into());
+            return Err(InteractionError::new(
+                ErrorCode::Stopped,
+                "任务已停止，输入未发送",
+            ));
         }
         if self.owner().is_some_and(|o| o.id == owner.id) && self.paused {
-            return Err("用户已接管，请等待用户在终端上允许继续".into());
+            return Err(InteractionError::new(
+                ErrorCode::UserTakeover,
+                "用户已接管，请等待用户允许继续",
+            ));
         }
         if self.owner().is_some_and(|o| o.id != owner.id) {
-            return Err("另一个 Agent 正在操作此终端，请等待它交还控制".into());
+            return Err(InteractionError::new(
+                ErrorCode::ControllerBusy,
+                "另一个 Agent 正在操作此终端",
+            ));
         }
-        let o = self
-            .observations
-            .iter()
-            .find(|o| o.id == id)
-            .ok_or("画面引用已失效，请重新读取当前画面")?;
-        if o.at.elapsed() > Duration::from_secs(120)
-            || o.epoch != self.epoch
-            || o.alternate != screen.alternate_screen
-            || o.rows != screen.rows
-            || o.columns != screen.columns
-        {
-            return Err("终端状态或尺寸已变化，请重新读取画面".into());
-        }
-        if o.fingerprint != screen.fingerprint {
-            return Err(
-                "观察区域已变化，本次未发送输入；重新读屏，持续刷新时可选不含动态内容的 region"
-                    .into(),
+        let o = self.observation(id)?;
+        let changed = || {
+            let mut e = InteractionError::new(
+                ErrorCode::ScreenChanged,
+                "画面或前置条件已变化，本次未发送。根据当前画面调整操作；动态程序可显式指定与动作相关的 guards，不能仅用标题或空白规避校验。",
             );
+            e.changed_rows = o.frame.changed_rows(current);
+            e
+        };
+        if !o.frame.modes_match(current) {
+            return Err(changed());
+        }
+        if guards.is_empty() {
+            if o.frame.cells != current.cells || o.frame.cursor != current.cursor {
+                return Err(changed());
+            }
+        } else {
+            if guards.len() > 4 {
+                return Err(InteractionError::new(
+                    ErrorCode::InvalidArguments,
+                    "最多指定 4 个前置条件",
+                ));
+            }
+            for guard in guards {
+                guard
+                    .validate()
+                    .map_err(|e| InteractionError::new(ErrorCode::InvalidArguments, e))?;
+                let r = &guard.region;
+                if !contains(&o.region, r.row, r.column)
+                    || u32::from(r.row) + u32::from(r.rows)
+                        > u32::from(o.region.row) + u32::from(o.region.rows)
+                    || u32::from(r.column) + u32::from(r.columns)
+                        > u32::from(o.region.column) + u32::from(o.region.columns)
+                {
+                    return Err(InteractionError::new(
+                        ErrorCode::InvalidArguments,
+                        "前置条件必须位于已读取的区域内",
+                    ));
+                }
+                let before = o
+                    .frame
+                    .screen(Some(r))
+                    .map_err(|e| InteractionError::new(ErrorCode::InvalidArguments, e))?;
+                let now = current
+                    .screen(Some(r))
+                    .map_err(|e| InteractionError::new(ErrorCode::InvalidArguments, e))?;
+                if !guard.matches(&before)
+                    || !guard.matches(&now)
+                    || (guard.exact() && before.fingerprint != now.fingerprint)
+                {
+                    return Err(changed());
+                }
+            }
         }
         Ok(())
     }
@@ -103,9 +257,13 @@ fn color(c: Color) -> String {
         Color::Spec(c) => format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
     }
 }
+#[cfg(test)]
 pub(crate) fn snapshot<T>(term: &Term<T>, region: Option<&Region>) -> Result<Screen, String> {
-    let rows = term.screen_lines().min(u16::MAX as usize) as u16;
-    let columns = term.columns().min(u16::MAX as usize) as u16;
+    Frame::capture(term)?.screen(region)
+}
+fn render(frame: &Frame, region: Option<&Region>) -> Result<Screen, String> {
+    let rows = frame.rows;
+    let columns = frame.columns;
     let region = region.cloned().unwrap_or(Region {
         row: 0,
         column: 0,
@@ -124,13 +282,22 @@ pub(crate) fn snapshot<T>(term: &Term<T>, region: Option<&Region>) -> Result<Scr
     }
     let mut lines = vec![];
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    let mode = *term.mode();
-    (rows, columns, mode.bits()).hash(&mut hash);
+    let mode = frame.mode;
+    (
+        rows,
+        columns,
+        (mode & !TermMode::SHOW_CURSOR).bits(),
+        region.row,
+        region.column,
+        region.rows,
+        region.columns,
+    )
+        .hash(&mut hash);
     for r in region.row..region.row + region.rows {
         let mut text = String::new();
         let mut styles: Vec<Span> = vec![];
         for c in region.column..region.column + region.columns {
-            let cell = &term.grid()[Line(i32::from(r))][Column(usize::from(c))];
+            let cell = &frame.cells[usize::from(r) * usize::from(columns) + usize::from(c)];
             cell.c.hash(&mut hash);
             cell.flags.bits().hash(&mut hash);
             format!("{:?}{:?}{:?}", cell.fg, cell.bg, cell.zerowidth()).hash(&mut hash);
@@ -182,12 +349,7 @@ pub(crate) fn snapshot<T>(term: &Term<T>, region: Option<&Region>) -> Result<Scr
             styles,
         });
     }
-    let point = term.grid().cursor.point;
-    let cursor = Cursor {
-        row: point.line.0.max(0) as u16,
-        column: point.column.0 as u16,
-        visible: mode.contains(TermMode::SHOW_CURSOR),
-    };
+    let cursor = frame.cursor.clone();
     // Cursor can blink/move during continuous refresh; include it only inside the observed region.
     if cursor.row >= region.row
         && cursor.row < region.row + region.rows
@@ -283,6 +445,9 @@ pub(crate) fn encode(action: &Action, mode: &TermMode) -> Result<Vec<u8>, String
             Ok(crate::keys::paste_payload(text, mode).into_bytes())
         }
         Action::Key { key, repeat } => {
+            if shellmate_core::terminal_interaction::printable_key(key) {
+                return Ok(key.as_bytes().repeat(usize::from(*repeat)));
+            }
             if key == "space" {
                 return Ok(vec![b' '; usize::from(*repeat)]);
             }
@@ -433,58 +598,168 @@ mod tests {
         assert!(snapshot(&term, None).unwrap().text.contains("current"));
     }
     #[test]
-    fn observed_region_ignores_changing_metrics_but_rejects_stale_input_takeover_and_resize() {
+    fn cropped_reads_keep_full_guard_and_explicit_conditions_tolerate_animation() {
         let (mut term, mut p) = grid();
-        p.advance(&mut term, b"\x1b[HMenu\x1b[3;1HClock 1\x1b[6;1H");
+        p.advance(&mut term, b"Music[2;1HSearch > Song[4;1HClock 1[6;1H");
+        let title = Region {
+            row: 0,
+            column: 0,
+            rows: 1,
+            columns: 20,
+        };
+        let mut state = State::default();
+        let owner = Arc::new(Controller::new("Agent".into()));
+        let base = Arc::new(Frame::capture(&term).unwrap());
+        let mut screen = base.screen(Some(&title)).unwrap();
+        state.record(&mut screen, base.clone());
+        p.advance(&mut term, b"[4;1HClock 2[6;1H");
+        let current = Frame::capture(&term).unwrap();
+        assert_eq!(
+            state
+                .validate(&screen.screen_id, &owner, &current, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::ScreenChanged
+        );
+        let mut full = base.screen(None).unwrap();
+        state.record(&mut full, base);
+        let guard = Guard {
+            region: Region {
+                row: 1,
+                column: 0,
+                rows: 1,
+                columns: 20,
+            },
+            text: Some("Search > Song".into()),
+            absent_text: None,
+            cursor: None,
+        };
+        assert!(
+            state
+                .validate(
+                    &full.screen_id,
+                    &owner,
+                    &current,
+                    std::slice::from_ref(&guard)
+                )
+                .is_ok()
+        );
+        p.advance(&mut term, b"\x1b[?25l");
+        let hidden_cursor = Frame::capture(&term).unwrap();
+        assert!(
+            state
+                .validate(
+                    &full.screen_id,
+                    &owner,
+                    &hidden_cursor,
+                    std::slice::from_ref(&guard)
+                )
+                .is_ok()
+        );
+        p.advance(&mut term, b"[2;1HDelete file?[K[6;1H");
+        let changed = Frame::capture(&term).unwrap();
+        assert_eq!(
+            state
+                .validate(
+                    &full.screen_id,
+                    &owner,
+                    &changed,
+                    std::slice::from_ref(&guard)
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ScreenChanged
+        );
+        state.owner = Some(owner.clone());
+        state.takeover();
+        let frame = Arc::new(Frame::capture(&term).unwrap());
+        let mut fresh = frame.screen(None).unwrap();
+        state.record(&mut fresh, frame.clone());
+        assert_eq!(
+            state
+                .validate(&fresh.screen_id, &owner, &frame, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::UserTakeover
+        );
+        state.resume();
+        state.record(&mut fresh, frame.clone());
+        assert!(
+            state
+                .validate(&fresh.screen_id, &owner, &frame, &[])
+                .is_ok()
+        );
+        let other = Controller::new("Other".into());
+        assert_eq!(
+            state
+                .validate(&fresh.screen_id, &other, &frame, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::ControllerBusy
+        );
+        let mut resized = (*frame).clone();
+        resized.columns += 1;
+        assert_eq!(
+            state
+                .validate(&fresh.screen_id, &owner, &resized, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::ScreenChanged
+        );
+        state.observations.back_mut().unwrap().at = Instant::now() - Duration::from_secs(121);
+        assert_eq!(
+            state
+                .validate(&fresh.screen_id, &owner, &frame, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidReference
+        );
+    }
+    #[test]
+    fn cropped_fingerprints_are_scoped_and_baseline_survives_cache_eviction() {
+        let (term, _) = grid();
+        let frame = Arc::new(Frame::capture(&term).unwrap());
+        let mut full = frame.screen(None).unwrap();
+        let mut state = State::default();
+        state.record(&mut full, frame.clone());
         let region = Region {
             row: 0,
             column: 0,
             rows: 1,
             columns: 20,
         };
-        let mut screen = snapshot(&term, Some(&region)).unwrap();
-        let mut state = State::default();
-        state.record(&mut screen);
-        let owner = Arc::new(Controller::new("Agent".into()));
-        p.advance(&mut term, b"\x1b[3;1HClock 2\x1b[6;1H");
-        assert!(
-            state
-                .validate(
-                    &screen.screen_id,
-                    &owner,
-                    &snapshot(&term, Some(&region)).unwrap()
-                )
-                .is_ok()
+        assert!(state.legacy(&full.fingerprint, Some(&region)).is_err());
+        let pinned = state.observation(&full.screen_id).unwrap().clone();
+        let expected = pinned.frame.screen(Some(&region)).unwrap();
+        for _ in 0..40 {
+            let mut s = frame.screen(None).unwrap();
+            state.record(&mut s, frame.clone());
+        }
+        assert!(state.observation(&full.screen_id).is_err());
+        assert_eq!(expected, pinned.frame.screen(Some(&region)).unwrap());
+        assert_ne!(expected.fingerprint, full.fingerprint);
+        assert_eq!(
+            encode(
+                &Action::Key {
+                    key: "6".into(),
+                    repeat: 1
+                },
+                &TermMode::empty()
+            )
+            .unwrap(),
+            b"6"
         );
-        state.owner = Some(owner.clone());
-        let other = Controller::new("Child".into());
-        assert!(state.validate(&screen.screen_id, &other, &screen).is_err());
-        state.takeover();
-        assert!(state.validate(&screen.screen_id, &owner, &screen).is_err());
-        let mut fresh = snapshot(&term, Some(&region)).unwrap();
-        state.record(&mut fresh);
-        assert!(state.validate(&fresh.screen_id, &owner, &fresh).is_err());
-        state.resume();
-        state.record(&mut fresh);
-        assert!(state.validate(&fresh.screen_id, &owner, &fresh).is_ok());
-        state.observations.back_mut().unwrap().at = Instant::now() - Duration::from_secs(121);
-        assert!(state.validate(&fresh.screen_id, &owner, &fresh).is_err());
-        state.record(&mut fresh);
-        let mut resized = fresh.clone();
-        resized.columns += 1;
-        assert!(state.validate(&fresh.screen_id, &owner, &resized).is_err());
-        p.advance(&mut term, b"\x1b[HExit\x1b[6;1H");
-        assert!(
-            state
-                .validate(
-                    &fresh.screen_id,
-                    &owner,
-                    &snapshot(&term, Some(&region)).unwrap()
-                )
-                .is_err()
+        assert_eq!(
+            encode(
+                &Action::Key {
+                    key: "?".into(),
+                    repeat: 1
+                },
+                &TermMode::empty()
+            )
+            .unwrap(),
+            b"?"
         );
-        owner.release();
-        assert!(state.validate(&fresh.screen_id, &owner, &fresh).is_err());
     }
     #[test]
     fn terminal_keys_and_paste_follow_application_modes() {

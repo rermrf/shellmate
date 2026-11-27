@@ -348,7 +348,17 @@ async fn agent_interaction(cx:&mut AsyncApp,harness:Harness) {
     assert!(terminal.update(cx,|t,cx|t.interaction_input(&snapshot.screen_id,&[Action::Key{key:"enter".into(),repeat:1}],owner.clone(),cx)).is_err());assert_eq!(calls.lock().unwrap().writes,before);
     terminal.update(cx,|t,cx|t.resume_interaction(cx));let screen=terminal.update(cx,|t,_|t.interaction_snapshot(Some(&Region{row:0,column:0,rows:1,columns:20})).unwrap());
     sink.output(b"\x1b[4;1Hclock changes\x1b[6;1H");harness.settle(cx).await;
-    terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Paste{text:"hello\nworld".into()}],owner.clone(),cx).unwrap());
+    let before=calls.lock().unwrap().writes.clone();
+    let failure=terminal.update(cx,|t,cx|t.interaction_input_guarded(&screen.screen_id,&[Action::Paste{text:"hello\nworld".into()}],owner.clone(),&[],cx).unwrap_err());
+    assert_eq!(failure.code,shellmate_core::terminal_interaction::ErrorCode::ScreenChanged);assert!(failure.screen.as_ref().unwrap().text.contains("clock changes"));assert_eq!(calls.lock().unwrap().writes,before);
+    let guard=shellmate_core::terminal_interaction::Guard{region:Region{row:0,column:0,rows:1,columns:20},text:Some("Menu".into()),absent_text:None,cursor:None};
+    terminal.update(cx,|t,cx|t.interaction_input_guarded(&screen.screen_id,&[Action::Paste{text:"hello\nworld".into()}],owner.clone(),&[guard],cx).unwrap());
+    let base=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());
+    let watch=terminal.update(cx,|t,_|t.interaction_observe(Some(&base.screen_id),None,Some(&Region{row:3,column:0,rows:1,columns:20})).unwrap());
+    for _ in 0..40{terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());}
+    sink.output(b"\x1b[4;1Hclock 2\x1b[K");harness.settle(cx).await;assert!(watch.updates.try_recv().is_ok());
+    let now=terminal.update(cx,|t,_|t.interaction_snapshot(Some(&watch.screen.region)).unwrap());assert_ne!(watch.baseline.unwrap().fingerprint,now.fingerprint);
+
     let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,_|t.set_size(TerminalSize{cols:81,rows:24,..Default::default()}));assert!(terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"x".into()}],owner.clone(),cx)).is_err());
     let before=calls.lock().unwrap().writes.clone();terminal.update(cx,|t,cx|t.interaction_release(&owner,cx).unwrap());assert_eq!(calls.lock().unwrap().writes,before);assert!(!calls.lock().unwrap().closed);
     let old=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());attach(terminal,cx);assert!(terminal.update(cx,|t,cx|t.interaction_input(&old.screen_id,&[Action::Text{text:"x".into()}],owner,cx)).is_err());

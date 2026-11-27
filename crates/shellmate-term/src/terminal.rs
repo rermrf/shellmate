@@ -514,6 +514,7 @@ impl Terminal {
     }
 
     fn close_backend(&mut self) {
+        self.interaction.signal();
         self.alive.lock().store(false, Ordering::Release);
         if let Some(mut backend) = self.backend.take() {
             backend.close();
@@ -590,6 +591,7 @@ impl Terminal {
             match msg {
                 Msg::Output => {
                     self.output_pending.store(false, Ordering::Release);
+                    self.interaction.signal();
                     output = true;
                 }
                 Msg::Alac { generation, event } if generation == self.current_generation() => self.handle_alac_event(event, cx),
@@ -808,10 +810,25 @@ impl Terminal {
     pub fn resume_interaction(&mut self,cx:&mut Context<Self>){self.interaction.resume();cx.notify();}
     pub fn user_write_raw(&mut self,bytes:&[u8]){self.interaction.takeover();self.write_raw(bytes);}
     pub fn interaction_snapshot(&mut self,region:Option<&shellmate_core::terminal_interaction::Region>)->Result<shellmate_core::terminal_interaction::Screen,String>{
-        if !self.agent_connected() && self.ended.is_none(){return Err("终端未连接".into());}
-        let mut screen=crate::interaction::snapshot(&*self.term.lock(),region)?;
-        screen.ended = !self.agent_connected();
-        screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();self.interaction.record(&mut screen);Ok(screen)
+        if !self.agent_connected()&&self.ended.is_none(){return Err("终端未连接".into());}
+        let frame=Arc::new(crate::interaction::Frame::capture(&*self.term.lock())?);
+        let mut screen=frame.screen(region)?;
+        screen.ended = !self.agent_connected();screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();
+        self.interaction.record(&mut screen,frame);Ok(screen)
+    }
+    pub fn interaction_observe(&mut self,id:Option<&str>,legacy:Option<&str>,region:Option<&shellmate_core::terminal_interaction::Region>)->Result<crate::interaction::ObservationWatch,shellmate_core::terminal_interaction::InteractionError>{self.interaction_observe_inner(id,legacy,region).map_err(|e|self.interaction_failure(e))}
+    fn interaction_observe_inner(&mut self,id:Option<&str>,legacy:Option<&str>,region:Option<&shellmate_core::terminal_interaction::Region>)->Result<crate::interaction::ObservationWatch,shellmate_core::terminal_interaction::InteractionError>{
+        use shellmate_core::terminal_interaction::{InteractionError,ErrorCode};
+        let baseline=match(id,legacy){(Some(id),_)=>Some(self.interaction.observation(id)?.clone()),(_,Some(fp))=>Some(self.interaction.legacy(fp,region)?.clone()),_=>None};
+        let selected=region.cloned().or_else(||baseline.as_ref().map(|b|b.region.clone()));
+        let base=baseline.map(|b|b.frame.screen(selected.as_ref())).transpose().map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+        let updates=self.interaction.watch();
+        let screen=self.interaction_snapshot(selected.as_ref()).map_err(|e|InteractionError::new(ErrorCode::ConnectionChanged,e))?;
+        if base.as_ref().is_some_and(|b|b.rows!=screen.rows||b.columns!=screen.columns||b.alternate_screen!=screen.alternate_screen){return Err(InteractionError::new(ErrorCode::ScreenChanged,"终端尺寸或模式已变化，请重新读屏"));}
+        Ok(crate::interaction::ObservationWatch{screen,baseline:base,updates})
+    }
+    fn interaction_failure(&mut self,mut error:shellmate_core::terminal_interaction::InteractionError)->shellmate_core::terminal_interaction::InteractionError{
+        if error.screen.is_none(){error.screen=self.interaction_snapshot(None).ok().map(Box::new);}error
     }
     pub fn interaction_owned(&self,owner:&shellmate_core::terminal_interaction::Controller)->bool{self.interaction.owner().is_some_and(|o|o.id==owner.id)}
     pub fn claim_interaction(&mut self,owner:Arc<shellmate_core::terminal_interaction::Controller>,cx:&mut Context<Self>)->Result<(),String>{
@@ -829,36 +846,46 @@ impl Terminal {
     }
     pub fn set_managed_program(&mut self){self.managed_program=true;}
     pub fn stop_interactive_program(&mut self,cx:&mut Context<Self>){self.close_backend();self.interaction=Default::default();self.ended=Some(SessionEnd::Exited(None));cx.emit(TerminalEvent::Exited(None));cx.notify();}
-    pub fn interaction_check(&self,id:&str,owner:&shellmate_core::terminal_interaction::Controller)->Result<shellmate_core::terminal_interaction::Screen,String>{
-        if !self.agent_connected(){return Err("终端未连接".into());}
-        let region=self.interaction.observations.iter().find(|o|o.id==id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
-        let mut screen=crate::interaction::snapshot(&*self.term.lock(),Some(&region))?;
-        self.interaction.validate(id,owner,&screen)?;screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();Ok(screen)
+    pub fn interaction_check(&mut self,id:&str,owner:&shellmate_core::terminal_interaction::Controller)->Result<shellmate_core::terminal_interaction::Screen,String>{self.interaction_check_guarded(id,owner,&[]).map_err(|e|e.to_string())}
+    pub fn interaction_check_guarded(&mut self,id:&str,owner:&shellmate_core::terminal_interaction::Controller,guards:&[shellmate_core::terminal_interaction::Guard])->Result<shellmate_core::terminal_interaction::Screen,shellmate_core::terminal_interaction::InteractionError>{
+        use shellmate_core::terminal_interaction::{InteractionError,ErrorCode};
+        let result=(||{
+            if !self.agent_connected(){return Err(InteractionError::new(ErrorCode::ConnectionChanged,"终端未连接"));}
+            let current=crate::interaction::Frame::capture(&*self.term.lock()).map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            self.interaction.validate(id,owner,&current,guards)?;
+            let region=&self.interaction.observation(id)?.region;
+            let mut screen=current.screen(Some(region)).map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused;Ok(screen)
+        })();result.map_err(|e|self.interaction_failure(e))
     }
     pub fn interaction_release(&mut self,owner:&shellmate_core::terminal_interaction::Controller,cx:&mut Context<Self>)->Result<(),String>{
         if self.interaction.owner().is_some_and(|o|o.id!=owner.id){return Err("不能释放其他 Agent 的控制权".into());}
         self.interaction.owner=None;self.interaction.paused=false;self.interaction.invalidate();cx.notify();Ok(())
     }
-    pub fn interaction_input(&mut self,screen_id:&str,actions:&[shellmate_core::terminal_interaction::Action],owner:Arc<shellmate_core::terminal_interaction::Controller>,cx:&mut Context<Self>)->Result<shellmate_core::terminal_interaction::InputResult,String>{
-        use shellmate_core::terminal_interaction::{validate_actions,InputResult};
-        validate_actions(actions)?;
-        if !self.agent_connected(){return Err("终端未连接".into());}
-        if self.agent.lock().active.as_ref().is_some_and(|(_,s)|s.running()){return Err("此终端正在执行已捕获的命令，请先等待命令结束或使用另一个终端".into());}
-        let region=self.interaction.observations.iter().find(|o|o.id==screen_id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
-        let term=self.term.lock();let screen=crate::interaction::snapshot(&*term,Some(&region))?;self.interaction.validate(screen_id,&owner,&screen)?;
-        crate::interaction::validate_pointer(actions,&region)?;
-        let mode=*term.mode();let frames=actions.iter().map(|a|crate::interaction::encode(a,&mode)).collect::<Result<Vec<_>,_>>()?;
-        self.interaction.owner=Some(owner);self.interaction.paused=false;
-        let mut sent=0;let mut error=None;
-        for (action,frame) in actions.iter().zip(frames) {
-            if let Err(e)=self.backend.as_mut().ok_or("终端未连接")?.write(&frame){
-                // A failed write may have delivered the press but not the release.
-                if let Some(release)=crate::interaction::release_pointer(action,&mode){let _=self.backend.as_mut().unwrap().write(&release);}
-                error=Some(format!("输入写入失败：{e}；请重新观察，勿自动重发"));break;
+    pub fn interaction_input(&mut self,id:&str,actions:&[shellmate_core::terminal_interaction::Action],owner:Arc<shellmate_core::terminal_interaction::Controller>,cx:&mut Context<Self>)->Result<shellmate_core::terminal_interaction::InputResult,String>{self.interaction_input_guarded(id,actions,owner,&[],cx).map_err(|e|e.to_string())}
+    pub fn interaction_input_guarded(&mut self,id:&str,actions:&[shellmate_core::terminal_interaction::Action],owner:Arc<shellmate_core::terminal_interaction::Controller>,guards:&[shellmate_core::terminal_interaction::Guard],cx:&mut Context<Self>)->Result<shellmate_core::terminal_interaction::InputResult,shellmate_core::terminal_interaction::InteractionError>{
+        use shellmate_core::terminal_interaction::{validate_actions,InputResult,InteractionError,ErrorCode};
+        let result=(||{
+            validate_actions(actions).map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            if !self.agent_connected(){return Err(InteractionError::new(ErrorCode::ConnectionChanged,"终端未连接"));}
+            if self.agent.lock().active.as_ref().is_some_and(|(_,s)|s.running()){return Err(InteractionError::new(ErrorCode::ControllerBusy,"此终端正在执行已捕获的命令，请等待结束或使用另一个终端"));}
+            let region=self.interaction.observation(id)?.region.clone();
+            let term=self.term.lock();let current=crate::interaction::Frame::capture(&*term).map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            self.interaction.validate(id,&owner,&current,guards)?;
+            crate::interaction::validate_pointer(actions,&region).map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            let mode=*term.mode();let frames=actions.iter().map(|a|crate::interaction::encode(a,&mode)).collect::<Result<Vec<_>,_>>().map_err(|e|InteractionError::new(ErrorCode::InvalidArguments,e))?;
+            self.interaction.owner=Some(owner);self.interaction.paused=false;
+            let mut sent=0;let mut error=None;
+            for(action,frame)in actions.iter().zip(frames){
+                if let Err(e)=self.backend.as_mut().unwrap().write(&frame){
+                    if let Some(release)=crate::interaction::release_pointer(action,&mode){let _=self.backend.as_mut().unwrap().write(&release);}
+                    error=Some(format!("输入写入失败：{e}；请重新观察，勿自动重发"));break;
+                }self.capture.lock().input(&*term,&frame);sent+=1;
             }
-            self.capture.lock().input(&*term,&frame);sent+=1;
-        }
-        drop(term);self.watch_interaction(cx);self.interaction.invalidate();let screen=self.interaction_snapshot(Some(&region))?;cx.notify();Ok(InputResult{screen,actions_sent:sent,error})
+            drop(term);self.watch_interaction(cx);self.interaction.invalidate();
+            let screen=self.interaction_snapshot(Some(&region)).map_err(|e|{let mut error=InteractionError::new(ErrorCode::ConnectionChanged,e);error.actions_sent=sent;error})?;
+            cx.notify();Ok(InputResult{screen,actions_sent:sent,error})
+        })();result.map_err(|e|self.interaction_failure(e))
     }
     pub fn paste(&mut self, text: &str) {
         let mode = self.paste_mode();
@@ -972,6 +999,7 @@ impl Terminal {
     pub(crate) fn resize_pending(&self) -> bool { self.resize_throttle.pending() }
 
     pub fn set_size(&mut self, size: TerminalSize) {
+        if self.size()!=size{self.interaction.signal();}
         let grid_changed = (size.cols, size.rows) != (self.size.cols, self.size.rows);
         self.size = size;
         if grid_changed {

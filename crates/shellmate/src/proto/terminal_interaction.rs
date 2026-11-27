@@ -49,7 +49,7 @@ pub fn install(terminal: &Entity<Terminal>, cx: &mut App) -> Screen {
     terminal.update(cx, |t, cx| {
         t.attach(
             |sink, _| {
-                let menu = Menu { sink, selected: 0 };
+                let menu = Menu { sink, selected: 1 };
                 menu.render();
                 Ok(Box::new(menu))
             },

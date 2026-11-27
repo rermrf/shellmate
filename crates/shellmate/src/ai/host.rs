@@ -38,7 +38,7 @@ pub enum Ui {
     TuiApproval {source:Option<shellmate_ai::SubagentRef>,call:ToolCall,reply:oneshot::Sender<Approval>},
     TerminalInteraction {
         session:usize,lease:Arc<AtomicBool>,owner:Arc<shellmate_core::terminal_interaction::Controller>,operation:super::terminal_interaction::Operation,
-        reply:oneshot::Sender<Result<super::terminal_interaction::Reply,String>>,
+        reply:oneshot::Sender<Result<super::terminal_interaction::Reply,shellmate_core::terminal_interaction::InteractionError>>,
     },
     ReadSession {
         session: usize,

@@ -159,6 +159,9 @@ pub fn validate_actions(actions: &[Action]) -> Result<(), String> {
     Ok(())
 }
 fn valid_key(key: &str) -> bool {
+    if printable_key(key) {
+        return true;
+    }
     let mut parts = key.split('-').collect::<Vec<_>>();
     let Some(key) = parts.pop() else {
         return false;
@@ -200,6 +203,156 @@ fn valid_key(key: &str) -> bool {
         .is_some_and(|n| (1..=12).contains(&n))
         || (!parts.is_empty() && key.len() == 1 && key.bytes().all(|c| c.is_ascii_alphanumeric()))
 }
+/// A literal single character is also a valid key (including case and punctuation).
+pub fn printable_key(key: &str) -> bool {
+    key.chars().count() == 1 && key.chars().all(|c| !c.is_control())
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Position {
+    pub row: u16,
+    pub column: u16,
+}
+/// Explicit preconditions. With no text/cursor predicate the region must be unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guard {
+    pub region: Region,
+    pub text: Option<String>,
+    pub absent_text: Option<String>,
+    pub cursor: Option<Position>,
+}
+impl Guard {
+    pub fn matches(&self, screen: &Screen) -> bool {
+        self.text.as_ref().is_none_or(|t| screen.text.contains(t))
+            && self
+                .absent_text
+                .as_ref()
+                .is_none_or(|t| !screen.text.contains(t))
+            && self
+                .cursor
+                .as_ref()
+                .is_none_or(|p| p.row == screen.cursor.row && p.column == screen.cursor.column)
+    }
+    pub fn exact(&self) -> bool {
+        self.text.is_none() && self.absent_text.is_none() && self.cursor.is_none()
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.region.rows == 0
+            || self.region.columns == 0
+            || [&self.text, &self.absent_text]
+                .into_iter()
+                .flatten()
+                .any(|s| s.trim().is_empty() || s.len() > 2000)
+        {
+            return Err("校验区域和文字不能为空，文字最多 2000 字节".into());
+        }
+        if self
+            .cursor
+            .as_ref()
+            .is_some_and(|p| !contains(&self.region, p.row, p.column))
+        {
+            return Err("光标条件必须位于校验区域内".into());
+        }
+        Ok(())
+    }
+}
+pub fn contains(region: &Region, row: u16, column: u16) -> bool {
+    row >= region.row
+        && column >= region.column
+        && u32::from(row) < u32::from(region.row) + u32::from(region.rows)
+        && u32::from(column) < u32::from(region.column) + u32::from(region.columns)
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observe {
+    pub region: Option<Region>,
+    pub text: Option<String>,
+    pub absent_text: Option<String>,
+    pub stable_ms: Option<u64>,
+    #[serde(default = "observe_timeout")]
+    pub timeout_ms: u64,
+}
+fn observe_timeout() -> u64 {
+    600
+}
+impl Default for Observe {
+    fn default() -> Self {
+        Self {
+            region: None,
+            text: None,
+            absent_text: None,
+            stable_ms: None,
+            timeout_ms: observe_timeout(),
+        }
+    }
+}
+impl Observe {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout_ms > 2000
+            || self.stable_ms.is_some_and(|n| !(40..=1000).contains(&n))
+            || [&self.text, &self.absent_text]
+                .into_iter()
+                .flatten()
+                .any(|s| s.is_empty() || s.len() > 2000)
+        {
+            return Err(
+                "输入后观察最多 2000 毫秒；稳定时间为 40–1000 毫秒，文字最多 2000 字节".into(),
+            );
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    ScreenChanged,
+    UserTakeover,
+    InvalidReference,
+    InvalidArguments,
+    ConnectionChanged,
+    ControllerBusy,
+    Stopped,
+    WriteFailed,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InteractionError {
+    pub code: ErrorCode,
+    pub message: String,
+    #[serde(default)]
+    pub actions_sent: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Box<Screen>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_rows: Vec<u16>,
+}
+impl InteractionError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            actions_sent: 0,
+            screen: None,
+            changed_rows: vec![],
+        }
+    }
+}
+impl From<String> for InteractionError {
+    fn from(message: String) -> Self {
+        Self::new(ErrorCode::ConnectionChanged, message)
+    }
+}
+impl From<&str> for InteractionError {
+    fn from(message: &str) -> Self {
+        Self::new(ErrorCode::ConnectionChanged, message)
+    }
+}
+impl std::fmt::Display for InteractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for InteractionError {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     pub column: u16,

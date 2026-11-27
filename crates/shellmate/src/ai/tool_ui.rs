@@ -129,8 +129,10 @@ impl Drawer {
             || (status.attention() && !self.state.tool_collapsed.contains(key))
     }
     pub(super) fn tool_shell(&self, card: &Card, cx: &mut Context<Self>) -> Stateful<Div> {
+        self.tool_shell_open(card,self.tool_open(&card.key,card.status),cx)
+    }
+    pub(super) fn tool_shell_open(&self,card:&Card,open:bool,cx:&mut Context<Self>)->Stateful<Div>{
         let p = cx.palette().clone();
-        let open = self.tool_open(&card.key, card.status);
         let toggle = card.key.clone();
         let attention = card.status == model::Status::Approval;
         let status = if let Some(ms) = card.duration {
@@ -385,11 +387,12 @@ impl Drawer {
                     "wait_tasks" => "等待已返回，展开查看任务结果",
                     "stop_task" => "停止请求已处理",
                     "send_agent_message" => "消息已送达",
-                    _ => "已返回结果，展开查看",
+                    _ => "",
                 }
             }
             .into();
         }
+        if let Some((s,d))=model::terminal_status(call,result){status=s;detail=d;}
         let card = Card {
             key: id.clone(),
             title: model::label(call),

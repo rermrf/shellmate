@@ -22,6 +22,8 @@ mod conversation_ui;
 mod subagent_ui;
 #[path = "thread_ui.rs"]
 mod thread_ui;
+#[path="terminal_flow_ui.rs"]
+mod terminal_flow_ui;
 #[path = "tool_ui.rs"]
 mod tool_ui;
 #[path="web_ui.rs"]
@@ -1678,7 +1680,15 @@ impl Render for Drawer {
                         .flex()
                         .flex_col()
                         .gap(px(8.));
+                    let flow_pieces=answer.items.iter().enumerate().map(|(n,item)|match item{
+                        shellmate_ai::AnswerItem::Thinking(b)=>terminal_flow_ui::Piece::Thinking(b),
+                        _=>self.state.model.conversation.displayed_step(index,n).map(terminal_flow_ui::Piece::Step).unwrap_or(terminal_flow_ui::Piece::Break),
+                    }).collect::<Vec<_>>();
+                    let flow_ranges=terminal_flow_ui::ranges(&flow_pieces);let mut flow_until=0;
                     for (n, item) in answer.items.iter().enumerate() {
+                        if n<flow_until{continue;}
+                        if let Some(end)=flow_ranges.get(&n){reply=reply.child(self.terminal_flow("main",&flow_pieces[n..*end],window,cx));flow_until = *end;continue;}
+
                         let card = match item {
                             shellmate_ai::AnswerItem::Thinking(block) => {
                                 let live=self.state.model.busy && index+1==self.state.model.conversation.turns().len() && self.state.model.thinking && !block.complete && matches!(answer.items.last(),Some(shellmate_ai::AnswerItem::Thinking(last))if last.id==block.id);

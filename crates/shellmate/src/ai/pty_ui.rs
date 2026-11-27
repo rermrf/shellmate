@@ -93,7 +93,7 @@ pub fn interaction(
     owner: Arc<shellmate_core::terminal_interaction::Controller>,
     op: Operation,
     cx: &mut App,
-) -> Result<Reply, String> {
+) -> Result<Reply, shellmate_core::terminal_interaction::InteractionError> {
     let r = registry(cx).ok_or("终端管理器不可用")?;
     let r = r.read(cx);
     let e = r.entries.get(&session).ok_or("终端已关闭")?;

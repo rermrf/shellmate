@@ -46,6 +46,10 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde", deny_unknown_fields)]
 pub struct Input {
+    #[serde(default)]
+    pub guards:Vec<shellmate_core::terminal_interaction::Guard>,
+    #[serde(default)]
+    pub observe:shellmate_core::terminal_interaction::Observe,
     pub session_id: String,
     #[serde(default)]
     pub screen_id: String,
@@ -58,6 +62,10 @@ pub struct Input {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(crate = "rig_core::serde", deny_unknown_fields)]
 pub struct Wait {
+    pub screen_id:Option<String>,
+    pub absent_text:Option<String>,
+    #[serde(default)]
+    pub exited:bool,
     pub session_id: String,
     pub region: Option<shellmate_core::terminal_interaction::Region>,
     pub text: Option<String>,
@@ -109,6 +117,9 @@ pub fn parse(name: &str, value: serde_json::Value) -> Result<Request, String> {
         {
             return Err("需要指定终端和操作目的".into());
         }
+        input.observe.validate()?;
+        if input.guards.len()>4{return Err("最多指定 4 个前置条件".into());}
+        for guard in &input.guards{guard.validate()?;}
         if input.release {
             if !input.actions.is_empty() {
                 return Err("释放控制不能同时发送按键".into());
@@ -123,6 +134,7 @@ pub fn parse(name: &str, value: serde_json::Value) -> Result<Request, String> {
     }
     if name == "wait_terminal" {
         let wait: Wait = serde_json::from_value(value).map_err(|_| "等待终端参数无效")?;
+        if wait.screen_id.as_ref().is_some_and(|s|s.is_empty()||s.len()>160)||wait.fingerprint.as_ref().is_some_and(|s|s.is_empty()||s.len()>80)||wait.screen_id.is_some()&&wait.fingerprint.is_some()||wait.absent_text.as_ref().is_some_and(|s|s.is_empty()||s.len()>2000){return Err("等待基准/文字无效；screen_id 和旧 fingerprint 只能提供一个".into());}
         if wait.session_id.is_empty()
             || wait.timeout_ms == 0
             || wait.timeout_ms > 10000
@@ -134,8 +146,8 @@ pub fn parse(name: &str, value: serde_json::Value) -> Result<Request, String> {
         {
             return Err("等待超出范围，timeout_ms 为 1–10000，stable_ms 为 100–3000".into());
         }
-        if wait.text.is_none() && wait.fingerprint.is_none() && wait.stable_ms.is_none() {
-            return Err("请指定 text、fingerprint 或 stable_ms 中的一种等待条件".into());
+        if wait.text.is_none() && wait.absent_text.is_none() && wait.screen_id.is_none() && wait.fingerprint.is_none() && wait.stable_ms.is_none() && !wait.exited {
+            return Err("请指定 text、absent_text、screen_id、stable_ms 或 exited 等待条件".into());
         }
         return Ok(Request::Wait(wait));
     }
@@ -178,24 +190,41 @@ pub fn tools() -> Vec<ToolDefinition> {
 fn region_schema() -> serde_json::Value {
     serde_json::json!({"type":"object","description":"可选观察区域，物理单元格，行列从 0 开始；持续刷新的 TUI 可避开时钟/指标，只观察菜单或状态栏。","properties":{"row":{"type":"integer","minimum":0},"column":{"type":"integer","minimum":0},"rows":{"type":"integer","minimum":1},"columns":{"type":"integer","minimum":1}},"required":["row","column","rows","columns"],"additionalProperties":false})
 }
+fn guard_schema()->serde_json::Value{
+    serde_json::json!({"type":"object","description":"显式前置条件：无谓词时区域必须不变；提供 text/absent_text/cursor 时它们须在基准和当前画面中同时成立，允许其他动画变化。必须对应实际操作目标，不用标题或空白代替。","properties":{"region":region_schema(),"text":{"type":"string"},"absent_text":{"type":"string"},"cursor":{"type":"object","properties":{"row":{"type":"integer","minimum":0},"column":{"type":"integer","minimum":0}},"required":["row","column"],"additionalProperties":false}},"required":["region"],"additionalProperties":false})
+}
+fn observe_schema()->serde_json::Value{
+    serde_json::json!({"type":"object","description":"输入后短暂观察；默认最多 600ms。无目标文字时等首次变化后短暂稳定。返回已发送/变化/条件满足分别标识；无变化不重发。较长等待使用 wait_terminal。","properties":{"region":region_schema(),"text":{"type":"string"},"absent_text":{"type":"string"},"stable_ms":{"type":"integer","minimum":40,"maximum":1000},"timeout_ms":{"type":"integer","minimum":0,"maximum":2000,"default":600}},"additionalProperties":false})
+}
 fn input_tool() -> ToolDefinition {
     ToolDefinition::new(
         ToolName::new("terminal_input").unwrap(),
         "操作已有终端中的交互程序。先读当前 screen，以 screen_id 校验观察区域，按目的发送短动作，再等待并核对画面。输入到真实终端，不是执行一条 shell 命令。release=true 交还控制且不停止程序。",
-        serde_json::json!({"type":"object","properties":{"session_id":{"type":"string"},"screen_id":{"type":"string"},"purpose":{"type":"string"},"release":{"type":"boolean","default":false},"actions":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"type":{"type":"string","enum":["text","paste","key","click","scroll","drag"]},"text":{"type":"string","maxLength":4096,"description":"text 模拟输入文字（如 vim 的 i、:wq）；paste 使用程序支持的括号粘贴。text 不含换行，回车用单独 key 动作。"},"key":{"type":"string","description":"enter、escape、up/down/left/right、tab、shift-tab、pageup/pagedown、home/end、F1–F12（小写 f1）或 ctrl/alt/shift 组合。不支持系统 cmd 快捷键。"},"row":{"type":"integer","minimum":0},"column":{"type":"integer","minimum":0},"to_row":{"type":"integer","minimum":0},"to_column":{"type":"integer","minimum":0},"button":{"type":"string","enum":["left","middle","right"]},"lines":{"type":"integer","minimum":-20,"maximum":20,"description":"滚轮行数，正数向下，负数向上，不能为 0"},"repeat":{"type":"integer","minimum":1,"maximum":20}},"required":["type"],"additionalProperties":false}}},"required":["session_id","purpose"],"additionalProperties":false}),
+        serde_json::json!({"type":"object","properties":{"session_id":{"type":"string"},"screen_id":{"type":"string"},"purpose":{"type":"string"},"release":{"type":"boolean","default":false},"guards":{"type":"array","maxItems":4,"items":guard_schema()},"observe":observe_schema(),"actions":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"type":{"type":"string","enum":["text","paste","key","click","scroll","drag"]},"text":{"type":"string","maxLength":4096,"description":"text 模拟输入文字（如 vim 的 i、:wq）；paste 使用程序支持的括号粘贴。text 不含换行；需要确认输入框已更新再提交时，把文字与 enter 分成两次调用。"},"key":{"type":"string","description":"enter、escape、up/down/left/right、tab、shift-tab、pageup/pagedown、home/end、F1–F12（小写 f1）或 ctrl/alt/shift 组合。也支持单个可打印字符如 6、?、k（区分大小写）。不支持系统 cmd 快捷键。"},"row":{"type":"integer","minimum":0},"column":{"type":"integer","minimum":0},"to_row":{"type":"integer","minimum":0},"to_column":{"type":"integer","minimum":0},"button":{"type":"string","enum":["left","middle","right"]},"lines":{"type":"integer","minimum":-20,"maximum":20,"description":"滚轮行数，正数向下，负数向上，不能为 0"},"repeat":{"type":"integer","minimum":1,"maximum":20}},"required":["type"],"additionalProperties":false}}},"required":["session_id","purpose"],"additionalProperties":false}),
     )
 }
 fn wait_tool() -> ToolDefinition {
     ToolDefinition::new(
         ToolName::new("wait_terminal").unwrap(),
-        "等待终端画面包含文字、相对 fingerprint 变化或观察区域稳定。只等待，不发送输入；超时仍返回当前 screen 以及 matched=false，不表示操作成功。多个条件同时提供时全部满足才返回。",
-        serde_json::json!({"type":"object","properties":{"session_id":{"type":"string"},"region":region_schema(),"text":{"type":"string"},"fingerprint":{"type":"string","description":"此前 screen 的 fingerprint，等待观察区域发生变化"},"stable_ms":{"type":"integer","minimum":100,"maximum":3000},"timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":3000}},"required":["session_id"],"additionalProperties":false}),
+        "等待终端画面出现/消失文字、相对 screen_id 变化、稳定或程序退出。稳定只表示画面未变化，不代表业务成功。只等待，不发送输入；超时仍返回当前 screen 以及 matched=false，不表示操作成功。多个条件同时提供时全部满足才返回。",
+        serde_json::json!({"type":"object","properties":{"session_id":{"type":"string"},"region":region_schema(),"text":{"type":"string"},"screen_id":{"type":"string","description":"引用先前读屏，等待相同区域相对该画面变化；后端从完整基准提取 region，不传裸指纹"},"absent_text":{"type":"string","description":"等待指定文字消失"},"exited":{"type":"boolean","default":false,"description":"等待程序结束"},"stable_ms":{"type":"integer","minimum":100,"maximum":3000},"timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":3000}},"required":["session_id"],"additionalProperties":false}),
     )
 }
-pub const INTERACTION_RULES: &str = "\n终端交互程序使用 read_terminal(screen=true) → terminal_input → wait_terminal → 再观察。只能向用户任务指定的终端输入，主/子代理能力一致；不需要切换页面焦点。每次引用最新 screen_id，画面变化或尺寸改变时重新读屏；持续刷新的程序用 region 观察有意义的菜单/状态，不能盲发长串按键。text 表示键入字符，paste 表示粘贴（编辑器模式语义不同），文字和 enter 分开发送；程序启动也可通过终端输入完成，run_command 仍只用于空闲 shell 的命令捕获。TUI 不等于备用屏幕，按当前画面判断。等待的 matched=false 不是成功。修改文件、结束进程、提交操作等不能因表现为按键就当成只读，输入需遵循目标审批；用户接管后停止自动输入，只有用户允许继续才能恢复。release=true 只交还控制，不退出程序；任务结束应用也交还控制。需要独立交互环境时使用 create_terminal，返回的新 session_id 与已有终端一样操作；默认后台运行，用户查看不重启程序，停止回复不停止程序。完成后不再需要的终端用 manage_terminal 关闭，仍需使用的交还控制。鼠标 click/scroll/drag 使用从 0 开始的物理行列坐标，整个动作必须在已观察区域内；程序不支持鼠标时改用键盘，不操控系统指针。需要用户选择时使用 ask_user。\n";
+pub const INTERACTION_RULES: &str = "\n终端交互程序使用 read_terminal(screen=true) → terminal_input → wait_terminal → 再观察。只能向用户任务指定的终端输入，主/子代理能力一致；不需要切换页面焦点。每次引用最新 screen_id。region 只裁剪读屏结果，不缩小输入前默认完整画面校验。动态程序可显式提供 guards：相关区域保持不变，或区域内目标文字/光标条件仍成立；条件必须对应实际菜单、选中项或输入框，不能只读标题/空白规避变化。模式、尺寸、人工接管仍严格校验。画面变化的错误附带当前画面和 changed_rows，可直接根据新画面调整操作，不能盲发长串按键。text 表示键入字符，paste 表示粘贴（编辑器模式语义不同），文字和 enter 是不同动作；TUI 文本输入后先观察已出现输入，再独立发送 enter 提交，避免同批文字被程序当成粘贴而吞掉回车；程序启动也可通过终端输入完成，run_command 仍只用于空闲 shell 的命令捕获。TUI 不等于备用屏幕，按当前画面判断。terminal_input 默认短暂观察，返回 actions_sent、changed、condition_matched、observation_status；已发送不等于目标实现，尚未观察到变化不能自动重发。wait_terminal 用 screen_id 绑定基准，等待相关文字/区域；稳定不等于操作成功，matched=false 不是成功。动作后先检查新画面，再决定是否查帮助。同一动作连续无进展时重新判断布局或查看程序内帮助，不重复相同按键；外部查询后重新读屏再输入。最终回复前确认最新实际状态。修改文件、结束进程、提交操作等不能因表现为按键就当成只读，输入需遵循目标审批；用户接管后停止自动输入，只有用户允许继续才能恢复。release=true 只交还控制，不退出程序；任务结束应用也交还控制。需要独立交互环境时使用 create_terminal，返回的新 session_id 与已有终端一样操作；默认后台运行，用户查看不重启程序，停止回复不停止程序。完成后不再需要的终端用 manage_terminal 关闭，仍需使用的交还控制。鼠标 click/scroll/drag 使用从 0 开始的物理行列坐标，整个动作必须在已观察区域内；程序不支持鼠标时改用键盘，不操控系统指针。需要用户选择时使用 ask_user。\n";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_schema_and_validation_cover_current_and_legacy_calls(){
+        use super::*;
+        assert!(parse("terminal_input",serde_json::json!({"session_id":"s","screen_id":"x","purpose":"搜索","actions":[{"type":"key","key":"6"}],"guards":[{"region":{"row":1,"column":0,"rows":1,"columns":20},"text":"搜索"}],"observe":{"text":"按单曲"}})).is_ok());
+        assert!(parse("terminal_input",serde_json::json!({"session_id":"s","screen_id":"x","purpose":"搜索","actions":[{"type":"key","key":"6"}],"guards":[{"region":{"row":1,"column":0,"rows":1,"columns":20},"text":" "}]})).is_err());
+        assert!(parse("wait_terminal",serde_json::json!({"session_id":"s","screen_id":"x","region":{"row":2,"column":0,"rows":1,"columns":20}})).is_ok());
+        assert!(parse("wait_terminal",serde_json::json!({"session_id":"s","exited":true})).is_ok());
+        assert!(parse("wait_terminal",serde_json::json!({"session_id":"s","fingerprint":"old","stable_ms":200})).is_ok());
+        assert!(parse("wait_terminal",serde_json::json!({"session_id":"s","fingerprint":"old","screen_id":"x"})).is_err());
+        assert!(!wait_tool().parameters.to_string().contains("fingerprint"));
+    }
     #[test]
     fn independent_and_pointer_requests_validate_semantics(){
         use super::*;
