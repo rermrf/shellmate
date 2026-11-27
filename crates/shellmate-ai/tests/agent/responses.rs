@@ -54,7 +54,8 @@ async fn tools_replay_ciphertext_and_phase_across_execution_and_durable_reopen()
     assert_eq!(call["id"], "fc_call_1");
     assert!(result["output"].as_str().unwrap().contains("/project"));
     let saved = serde_json::to_string(log.entries()).unwrap();
-    assert!(!saved.contains("PRIVATE_REASONING"));
+    assert!(saved.contains("PRIVATE_REASONING"));
+    assert!(log.turns()[0].answer.as_ref().unwrap().items.iter().any(|i|matches!(i,AnswerItem::Thinking(b)if b.kind==shellmate_ai::ThinkingKind::Summary)));
     assert!(saved.contains("CIPHER_r1"));
     assert!(
         !log.turns()[0]
@@ -296,4 +297,17 @@ async fn manual_compaction_uses_responses_and_replaces_old_replay_state() {
     assert!(requests[3].to_string().contains("项目目录已检查"));
     assert!(!requests[3].to_string().contains("CIPHER_before-compact"));
     assert_eq!(host.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn exposed_thinking_and_tools_keep_transcript_order_and_do_not_inflate_answer() {
+    let http=SequencedHttpClient::new([
+        wire::reply(vec![wire::reasoning("before"),wire::call("inspect","run_command",args("pwd")),wire::reasoning("after"),wire::message("m","核对中","commentary")]),done(),
+    ]);
+    let cfg=responses_config();let client=RigClient::with_http(&cfg,http).unwrap();let host=Host::new([completed("/project")]);let mut log=conversation();
+    let events=agent::run(&client,&mut log,capabilities(),&host,fast_limits()).unwrap().collect::<Vec<_>>().await;
+    assert!(matches!(events.last(),Some(AgentEvent::Done(_))));
+    let kinds=log.turns()[0].answer.as_ref().unwrap().items.iter().map(|i|match i{AnswerItem::Thinking(_)=>"thinking",AnswerItem::Step{..}=>"step",AnswerItem::Text(_)=>"text",_=>"other"}).collect::<Vec<_>>();
+    assert_eq!(kinds,["thinking","step","thinking","text"]);
+    assert_eq!(log.turns()[0].answer.as_ref().unwrap().text(),"核对中完成");
 }

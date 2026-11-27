@@ -55,6 +55,7 @@ impl State<'_> {
                 }
                 Pending::AgentMessage(raw, ..) => self.close_unexecuted(*raw, None),
                 Pending::Text(text) => self.text(&text),
+                Pending::Reasoning(block) => { self.reasoning(block); },
                 Pending::Truncated(_) => {}
             }
         }

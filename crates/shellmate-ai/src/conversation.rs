@@ -77,6 +77,7 @@ pub enum StepStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub enum AnswerItem {
+    Thinking(crate::ThinkingBlock),
     Subagent {
         display: Box<crate::SubagentDisplay>,
         report: String,
@@ -102,6 +103,7 @@ pub enum AnswerItem {
 impl AnswerItem {
     pub fn wire_text(&self) -> String {
         match self {
+            Self::Thinking(_) => String::new(),
             Self::Subagent { report, .. } => report.clone(),
             Self::Text(text) | Self::Notice(text) => text.clone(),
             Self::Compaction(c) => c.summary.clone().unwrap_or_default(),
@@ -164,6 +166,9 @@ pub struct Answer {
     pub items: Vec<AnswerItem>,
 }
 impl Answer {
+    pub fn push_thinking(&mut self, fragment: &crate::ThinkingBlock) {
+        if let Some(AnswerItem::Thinking(block))=self.items.iter_mut().find(|item|matches!(item,AnswerItem::Thinking(b) if b.id==fragment.id)) {block.merge(fragment);} else if !fragment.text.is_empty() {self.items.push(AnswerItem::Thinking(fragment.clone()));}
+    }
     pub fn push_text(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
@@ -198,6 +203,7 @@ impl Answer {
     pub fn wire_text(&self) -> String {
         self.items
             .iter()
+            .filter(|i| !matches!(i,AnswerItem::Thinking(_)))
             .map(AnswerItem::wire_text)
             .collect::<Vec<_>>()
             .join("\n")

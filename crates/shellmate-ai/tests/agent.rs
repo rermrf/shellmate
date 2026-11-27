@@ -411,7 +411,8 @@ async fn anthropic_signed_thinking_replays_only_in_current_turn() {
     assert!(blocks.iter().any(|v| v["type"] == "thinking"
         && v["thinking"] == "PRIVATE-THINKING"
         && v["signature"] == "signature-fixture"));
-    assert!(!format!("{:?}", c.turns()[0].answer).contains("PRIVATE"));
+    assert!(!c.turns()[0].answer.as_ref().unwrap().text().contains("PRIVATE"));
+    assert!(c.turns()[0].answer.as_ref().unwrap().items.iter().any(|i|matches!(i,AnswerItem::Thinking(b)if b.text=="PRIVATE-THINKING")));
     c.push_turn(Turn {
         user: UserTurn::new("继续说明", ContextSnapshot::default()),
         answer: None,
@@ -1123,10 +1124,8 @@ async fn text_without_tool_calls_finishes_on_both_wires() {
                 .collect::<Vec<_>>()
                 .await;
             assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
-            assert_eq!(
-                c.turns()[0].answer.as_ref().unwrap().items,
-                [AnswerItem::Text("无需执行命令。".into())]
-            );
+            assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(),"无需执行命令。");
+            assert!(c.turns()[0].answer.as_ref().unwrap().items.iter().all(|i|matches!(i,AnswerItem::Text(_)|AnswerItem::Thinking(_))));
             assert!(host.calls.lock().unwrap().is_empty());
             assert_eq!(http.requests().len(), 1);
         }

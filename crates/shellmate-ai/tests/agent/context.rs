@@ -173,7 +173,8 @@ async fn cross_question_replay_is_paired_on_both_wires_and_unoffered_tools_are_t
             assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
             assert_pairs(&bodies(&http)[1], a);
             let json = serde_json::to_string(log.entries()).unwrap();
-            assert!(!json.contains("PRIVATE-THINKING") && !json.contains("signature-fixture"));
+            assert_eq!(json.contains("PRIVATE-THINKING"),a);
+            assert!(!json.contains("signature-fixture"));
             log.push_user(UserTurn::new("follow-up", ContextSnapshot::default()));
             log.push_user(UserTurn::new("also this", ContextSnapshot::default()));
             let events = agent::run(

@@ -1,6 +1,6 @@
 //! Durable semantic log. A Step atomically owns its call and result: no persisted
 //! or replayed half-pairs. Turn/Answer are read-only projections for the drawer.
-//! Plaintext reasoning is never persisted. Responses replay metadata is opaque.
+//! Public reasoning text is presentation-only. Responses replay metadata stays opaque.
 use crate::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, PermissionMode, StepStatus, Turn, Usage,
     UserTurn, agent::Target, policy::Class,
@@ -194,6 +194,7 @@ pub struct Compaction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde", tag = "entry", rename_all = "snake_case")]
 pub enum Entry {
+    Thinking { message_id: usize, block: crate::ThinkingBlock },
     User {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
@@ -225,8 +226,13 @@ pub enum Entry {
 #[serde(crate = "rig_core::serde", rename_all = "snake_case")]
 pub enum MessageOrigin { Delegation, Parent, User }
 impl Entry {
+    /// Callers may batch streaming fragments; completed blocks are durable boundaries.
+    pub fn is_streaming_fragment(&self) -> bool {
+        matches!(self, Self::Assistant { .. } | Self::Thinking { block: crate::ThinkingBlock { complete: false, .. }, .. })
+    }
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Thinking { .. } => "thinking",
             Self::User { .. } => "user",
             Self::Assistant { .. } => "assistant",
             Self::Step(_) => "step",
@@ -237,7 +243,7 @@ impl Entry {
     }
     pub(crate) fn message_id(&self) -> Option<usize> {
         match self {
-            Self::Assistant { message_id, .. } | Self::CommandCard { message_id, .. } => {
+            Self::Thinking { message_id, .. } | Self::Assistant { message_id, .. } | Self::CommandCard { message_id, .. } => {
                 Some(*message_id)
             }
             Self::Step(s) => Some(s.message_id),
@@ -361,6 +367,7 @@ impl Conversation {
     pub fn push_item(&mut self, item: AnswerItem) {
         let message_id = self.entries.len();
         let entry = match item {
+            AnswerItem::Thinking(block) => Entry::Thinking {message_id,block},
             AnswerItem::Text(text) => Entry::Assistant { text, message_id, replay: None },
             AnswerItem::Command(card) => Entry::CommandCard { card, message_id },
             AnswerItem::Compaction(c) => Entry::Compaction(c),
@@ -496,6 +503,7 @@ impl Conversation {
                 if let Some(turn) = self.turns.last_mut() {
                     let answer = turn.answer.get_or_insert_with(Answer::default);
                     match &entry {
+                        Entry::Thinking { block, .. } => answer.push_thinking(block),
                         Entry::Assistant { text, .. } => answer.push_text(text),
                         Entry::CommandCard { card, .. } => {
                             answer.items.push(AnswerItem::Command(card.clone()))

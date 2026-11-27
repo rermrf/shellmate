@@ -11,6 +11,7 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-thinking") {self.thinking_fixture(scene,w,cx);return;}
         if scene=="ai-images" {
             let a=shellmate_ai::media::import(&self.data_root,&self.state.id,"界面截图.png",include_bytes!("../../assets/app-icon/dock-light.png")).unwrap();
             self.state.model.conversation=shellmate_ai::Conversation::default();

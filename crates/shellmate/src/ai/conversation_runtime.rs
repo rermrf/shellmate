@@ -607,7 +607,7 @@ impl Runtime {
                     let mut checkpoint = std::time::Instant::now();
                     while let Some(event) = stream.next().await {
                         let updates = stream.take_updates();
-                        let durable=updates.iter().any(|u|!matches!(u,shellmate_ai::LogUpdate::Append(e)if matches!(&**e,Entry::Assistant{..})))||matches!(&event,AgentEvent::Done(_)|AgentEvent::Error(_)|AgentEvent::Paused{..}|AgentEvent::Released(_));
+                        let durable=updates.iter().any(|u|!matches!(u,shellmate_ai::LogUpdate::Append(e)if e.is_streaming_fragment()))||matches!(&event,AgentEvent::Done(_)|AgentEvent::Error(_)|AgentEvent::Paused{..}|AgentEvent::Released(_));
                         let accepted = if let AgentEvent::InputsAccepted(ids) = &event {
                             ids.clone()
                         } else {
@@ -718,6 +718,7 @@ impl Runtime {
                                     );
                                     self.control.hold();
                                 }
+                                AgentEvent::Reasoning {block,..} => d.model.thinking = !block.complete,
                                 AgentEvent::Thinking => d.model.thinking = true,
                                 AgentEvent::Retrying { error, .. } => {
                                     d.model.retrying = Some(error.to_string())

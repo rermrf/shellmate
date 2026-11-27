@@ -4,6 +4,8 @@ pub mod interaction;
 mod client;
 mod config;
 mod responses;
+mod thinking;
+pub use thinking::{ThinkingBlock, ThinkingKind};
 pub use responses::ResponseReplay;
 mod conversation;
 mod log;

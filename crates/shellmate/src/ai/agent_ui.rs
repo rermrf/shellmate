@@ -146,6 +146,7 @@ impl Drawer {
             }
             AgentEvent::Compacting { tier } => self.state.model.event(Event::Compacting { tier }),
             AgentEvent::Compacted { before, after, summary } => self.state.model.event(Event::Compacted { before, after, summary }),
+            AgentEvent::Reasoning {block,..} => self.state.model.thinking = !block.complete,
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
             AgentEvent::TextDelta(_) | AgentEvent::Command(_) => self.state.model.thinking = false,
             AgentEvent::Done(u) => {

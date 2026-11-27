@@ -521,7 +521,7 @@ pub async fn run_from_history(
                     on_event(SubagentEvent::Updates(&updates));
                     let durable = status.is_some()
                         || updates.iter().any(|u| match u {
-                            LogUpdate::Append(e) => !matches!(&**e, Entry::Assistant { .. }),
+                            LogUpdate::Append(e) => !e.is_streaming_fragment(),
                             LogUpdate::ClearResults(_) | LogUpdate::ResponseReplay { .. } => true,
                             _ => false,
                         });

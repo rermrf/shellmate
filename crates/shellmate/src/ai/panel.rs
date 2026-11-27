@@ -1,3 +1,5 @@
+#[path = "thinking_ui.rs"]
+mod thinking_ui;
 #[path = "media_ui.rs"]
 mod media_ui;
 #[path = "interaction_ui.rs"]
@@ -658,7 +660,7 @@ impl Drawer {
                             }
                             Worker::Event(event, updates, ready) => {
                                 let event = *event;
-                                let durable = matches!(&event, AgentEvent::Context { .. }) || updates.iter().any(|u| !matches!(u, shellmate_ai::LogUpdate::Append(e) if matches!(&**e, shellmate_ai::Entry::Assistant { .. })));
+                                let durable = matches!(&event, AgentEvent::Context { .. }) || updates.iter().any(|u| !matches!(u, shellmate_ai::LogUpdate::Append(e) if e.is_streaming_fragment()));
                                 for update in updates {
                                     let raw=match &update{shellmate_ai::LogUpdate::Append(e)=>if let shellmate_ai::Entry::Step(step)=&**e{Some(step.call.id.clone())}else{None},_=>None};
                                     s.state.model.conversation.apply(update);
@@ -1480,6 +1482,10 @@ impl Render for Drawer {
                         .gap(px(8.));
                     for (n, item) in answer.items.iter().enumerate() {
                         let card = match item {
+                            shellmate_ai::AnswerItem::Thinking(block) => {
+                                let live=self.state.model.busy && index+1==self.state.model.conversation.turns().len() && self.state.model.thinking && !block.complete && matches!(answer.items.last(),Some(shellmate_ai::AnswerItem::Thinking(last))if last.id==block.id);
+                                reply=reply.child(self.thinking_block("main",block,live,window,cx));continue;
+                            }
                             shellmate_ai::AnswerItem::Subagent { .. } => {
                                 if let Some(view) = agent_items.get(&(index,n)).and_then(|id|self.state.subagents.get(id)) {
                                     reply = reply.child(self.subagent_card(view, window, cx));
@@ -1664,7 +1670,7 @@ impl Render for Drawer {
                         .turns()
                         .last()
                         .and_then(|t| t.answer.as_ref())
-                        .is_none_or(|a| a.text().is_empty())
+                        .is_none_or(|a| a.text().is_empty() && !a.items.iter().any(|i|matches!(i,shellmate_ai::AnswerItem::Thinking(_))))
                         || self.state.model.busy && self.state.model.retrying.is_some())
             {
                 body = body.child(div().text_size(px(12.5)).text_color(p.tx2).child(

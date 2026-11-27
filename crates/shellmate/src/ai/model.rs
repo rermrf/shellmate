@@ -142,6 +142,7 @@ impl DrawerModel {
             Event::Context { used, window, trigger } => self.meter = Some(ContextMeter { used, window, trigger }),
             Event::Compacting { .. } => { self.compacting = true; self.busy = true; self.thinking = false; }
             Event::Compacted { .. } => self.compacting = false,
+            Event::Reasoning {message_id,block} => {self.thinking = !block.complete;self.conversation.append(shellmate_ai::Entry::Thinking{message_id,block});},
             Event::Thinking => self.thinking = self.conversation.turns().last().and_then(|t| t.answer.as_ref()).is_none_or(|a| a.text().is_empty()),
             Event::TextDelta(text) => { if !text.is_empty() { self.thinking = false; } self.conversation.push_text(&text); }
             Event::Command(card) => self.conversation.push_item(shellmate_ai::AnswerItem::Command(card)),

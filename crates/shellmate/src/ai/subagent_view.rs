@@ -187,6 +187,8 @@ impl View {
                 }
                 self.steps += 1;
             }
+            SubagentEvent::Agent(AgentEvent::Reasoning {block,..}) => {self.latest_activity=if block.complete {block.kind.label().into()}else{"正在思考…".into()};}
+            SubagentEvent::Agent(AgentEvent::Thinking) => self.latest_activity="正在思考…".into(),
             SubagentEvent::Agent(AgentEvent::TextDelta(text)) => {
                 self.report.push_str(text);
                 self.latest_activity = text.chars().take(160).collect();

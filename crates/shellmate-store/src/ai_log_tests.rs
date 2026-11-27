@@ -183,7 +183,7 @@ fn signed_response(tool: bool) -> rig_core::test_utils::MockHttpResponse {
     )
 }
 #[tokio::test]
-async fn native_signed_reasoning_replays_in_run_but_never_reaches_sqlite_or_next_run() {
+async fn public_thinking_is_saved_but_native_signatures_stay_in_run() {
     use futures::StreamExt;
     use shellmate_ai::{agent, *};
     struct Host;
@@ -254,7 +254,7 @@ async fn native_signed_reasoning_replays_in_run_but_never_reaches_sqlite_or_next
         .unwrap();
     assert!(
         !json.contains("SIGNED-BYTES-ONLY")
-            && !json.contains("MEMORY-ONLY-THINKING")
+            && json.contains("MEMORY-ONLY-THINKING")
             && !json.contains("native")
     );
     let mut restored = db.ai_conversation("signed").unwrap().unwrap().conversation;
@@ -414,4 +414,19 @@ fn multiple_target_metadata_is_atomic_and_deleted_with_conversation() {
         })
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn thinking_fragments_survive_sqlite_reopen_without_becoming_answer_text() {
+    use shellmate_ai::{ThinkingBlock,ThinkingKind};
+    let dir=tempfile::tempdir().unwrap();let path=dir.path().join("history.db");let mut db=HostStore::open(&path).unwrap();
+    let mut log=Conversation::default();log.push_user(UserTurn::new("检查配置",Default::default()));
+    let mut c=SavedConversation{id:"thinking-history".into(),host_id:None,label:"local".into(),title:"检查".into(),provider:"openai".into(),model:"fixture".into(),created_at:1,updated_at:2,conversation:log};
+    for (text,complete) in [("先检查配置。",false),("再验证端口。",true)] {
+        c.conversation.append(Entry::Thinking{message_id:1,block:ThinkingBlock{id:"1:0".into(),kind:ThinkingKind::Summary,text:text.into(),complete}});
+    }
+    c.conversation.push_text("端口被占用。");db.save_ai_conversation(&c).unwrap();drop(db);
+    let db=HostStore::open(&path).unwrap();let loaded=db.ai_conversation(&c.id).unwrap().unwrap();let answer=loaded.conversation.turns()[0].answer.as_ref().unwrap();
+    assert_eq!(answer.text(),"端口被占用。");assert!(matches!(&answer.items[0],shellmate_ai::AnswerItem::Thinking(b)if b.text=="先检查配置。再验证端口。" && b.complete && b.kind==ThinkingKind::Summary));
+    assert!(!serde_json::to_string(&loaded.conversation.prepare(&Default::default()).unwrap().chat_history).unwrap().contains("先检查配置"));
 }

@@ -52,7 +52,7 @@ async fn answer(
     let mut deltas = 0;
     while let Some(event) = stream.next().await {
         match event {
-            Event::Thinking
+            Event::Reasoning { .. } | Event::Thinking
             | Event::Context { .. }
             | Event::Compacting { .. }
             | Event::Compacted { .. } => {}

@@ -152,6 +152,11 @@ pub(super) fn reply_copy(
     w: &mut Window,
     cx: &mut App,
 ) -> Div {
+    content_copy(id,text,"复制回复",group,selection,w,cx)
+}
+pub(super) fn content_copy(
+    id:&str,text:&str,label:&'static str,group:&SharedString,selection:Entity<crate::ai::selection_scroll::SelectionScroll>,w:&mut Window,cx:&mut App,
+)->Div {
     let state = w.use_keyed_state(
         SharedString::from(format!("{id}:copy-feedback")),
         cx,
@@ -164,7 +169,7 @@ pub(super) fn reply_copy(
         .when(!focused, |d| {
             d.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.))
         })
-        .child(copy_button(id, text, "复制回复", state, selection, cx))
+        .child(copy_button(id, text, label, state, selection, cx))
 }
 
 #[cfg(test)]

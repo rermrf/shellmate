@@ -1476,5 +1476,5 @@ async fn responses_child_inherits_protocol_and_replays_its_own_tools() {
     assert!(requests.iter().all(|r|r["store"]==false));
     assert!(requests[1].to_string().contains("CIPHER_child"));
     assert!(requests[1].to_string().contains("function_call_output"));
-    assert!(!serde_json::to_string(out.transcript.entries()).unwrap().contains("PRIVATE_REASONING"));
+    assert!(serde_json::to_string(out.transcript.entries()).unwrap().contains("PRIVATE_REASONING"));
 }

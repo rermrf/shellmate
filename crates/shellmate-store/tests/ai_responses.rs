@@ -92,7 +92,7 @@ async fn sqlite_reopen_keeps_ciphertext_and_phase_out_of_visible_transcript() {
             .contains("CIPHER")
     );
     let raw = serde_json::to_string(restored.entries()).unwrap();
-    assert!(!raw.contains("PRIVATE_REASONING"));
+    assert!(raw.contains("PRIVATE_REASONING"));
     restored.push_user(UserTurn::new("继续", Default::default()));
     let events = agent::run(&client, &mut restored, caps, &Host, Limits::default())
         .unwrap()

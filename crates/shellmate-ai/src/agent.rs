@@ -421,6 +421,7 @@ pub enum AgentEvent {
         summary: Option<String>,
     },
     Thinking,
+    Reasoning {message_id: usize, block: crate::ThinkingBlock},
     TextDelta(String),
     Command(CommandCard),
     StepProposed(ToolCall),
@@ -456,6 +457,7 @@ enum Pending {
     Call(Box<RigCall>, ToolCall),
     Invalid(Box<RigCall>, String),
     Text(String),
+    Reasoning(crate::ThinkingBlock),
     Truncated(u32),
 }
 /// Opaque, memory-only continuation. Deliberately neither Debug nor serializable:
@@ -616,6 +618,7 @@ struct State<'a> {
     received: bool,
     defer_text: bool,
     thinking: bool,
+    reasoning: crate::thinking::Tracker,
     retry_notice: bool,
     steps: usize,
     done: bool,
@@ -640,6 +643,10 @@ impl State<'_> {
             control.tool_finished();
         }
         self.record(LogUpdate::Append(Box::new(entry)));
+    }
+    fn reasoning(&mut self, block: crate::ThinkingBlock) -> AgentEvent {
+        self.entry(Entry::Thinking {message_id:self.message_id,block:block.clone()});
+        AgentEvent::Reasoning {message_id:self.message_id,block}
     }
     fn text(&mut self, text: &str) {
         if !text.is_empty() {
@@ -968,6 +975,7 @@ fn stream<'a>(
         received: false,
         defer_text: false,
         thinking: false,
+        reasoning: Default::default(),
         retry_notice: false,
         steps: 0,
         done: false,
@@ -1275,6 +1283,7 @@ fn stream<'a>(
                         }
                         continue;
                     }
+                    Pending::Reasoning(block) => {let event=s.reasoning(block);return Some((event,s));}
                     Pending::Text(text) => {
                         s.text(&text);
                         return Some((AgentEvent::TextDelta(text), s));
@@ -1336,6 +1345,8 @@ fn stream<'a>(
                 s.first = true;
                 s.received = false;
                 s.defer_text = false;
+                s.thinking = false;
+                s.reasoning = Default::default();
                 s.message_id = s.conversation.entries().len();
                 if let Some(slots)=s.host.model_slots() {
                     s.phase(crate::interaction::Phase::Resource);
@@ -1397,7 +1408,7 @@ fn stream<'a>(
                                 return Some((AgentEvent::Thinking, s));
                             }
                         }
-                        // Never expose reasoning text. finish() retains native signatures.
+                        // Display only provider-exposed text; finish() retains native signatures separately.
                         Item::Event(
                             event @ (StreamEvent::Reasoning { .. }
                             | StreamEvent::Start {
@@ -1410,6 +1421,12 @@ fn stream<'a>(
                             }),
                         ) => {
                             s.received |= !matches!(event, StreamEvent::Start { .. });
+                            if !s.defer_text && let Some(block)=s.reasoning.event(&event,s.message_id,matches!(s.client.config.provider,crate::Provider::OpenAiResponses{..})) {
+                                s.retry_notice=false;
+                                s.thinking = !block.complete;
+                                let event=s.reasoning(block);
+                                return Some((event,s));
+                            }
                             if (!s.thinking || s.retry_notice) && (s.turn.as_ref().unwrap().capabilities.available() || !s.conversation.entries()[s.message_id..].iter().any(|e| matches!(e, Entry::Assistant { text, .. } if !text.is_empty()))) {
                                 s.retry_notice = false;
                                 s.thinking = true;
@@ -1521,8 +1538,11 @@ fn stream<'a>(
                     }
                     let mut pending = VecDeque::new();
                     let mut after_call = false;
-                    for content in &response.choice {
+                    for (part, content) in response.choice.iter().enumerate() {
                         match content {
+                            AssistantContent::Reasoning(r) if after_call && !r.redacted && !r.text.is_empty() => {
+                                pending.push_back(Pending::Reasoning(crate::ThinkingBlock{id:format!("{}:deferred:{part}",s.message_id),kind:crate::thinking::kind(r,matches!(s.client.config.provider,crate::Provider::OpenAiResponses{..})),text:r.text.clone(),complete:true}));
+                            }
                             AssistantContent::ToolCall(raw) => {
                                 after_call = true;
                                 if unfinished.contains(&raw.id) {
@@ -1651,9 +1671,10 @@ fn stream<'a>(
                         && s.conversation.attachments().is_empty()
                     {
                         while let Some(pending) = pending.pop_front() {
-                            if let Pending::Text(text) = pending {
-                                s.text(&text);
-                                s.queue.push_back(AgentEvent::TextDelta(text));
+                            match pending {
+                                Pending::Text(text) => {s.text(&text);s.queue.push_back(AgentEvent::TextDelta(text));},
+                                Pending::Reasoning(block) => {let event=s.reasoning(block);s.queue.push_back(event);},
+                                _=>{}
                             }
                         }
                     }
@@ -1670,7 +1691,7 @@ fn stream<'a>(
                     // Anchor reasoning-only or tool-only batches even before their result.
                     if !s.conversation.entries()[s.message_id..]
                         .iter()
-                        .any(|e| e.message_id() == Some(s.message_id))
+                        .any(|e| matches!(e,Entry::Assistant{message_id,..} if *message_id==s.message_id))
                     {
                         s.entry(Entry::Assistant {
                             replay: None,

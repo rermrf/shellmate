@@ -126,7 +126,7 @@ async fn both_wires_stream_tools_and_use_exact_request_shape() {
         while let Some(e) = stream.next().await {
             match e {
                 Event::Context { .. } | Event::Compacting { .. } | Event::Compacted { .. } => {}
-                Event::Thinking => panic!("unexpected reasoning"),
+                Event::Reasoning { .. } | Event::Thinking => panic!("unexpected reasoning"),
                 Event::TextDelta(d) => text.push_str(&d),
                 Event::Command(c) => cards.push(c),
                 Event::Done(u) => {
@@ -636,7 +636,7 @@ fn reasoning_sse(a: bool) -> String {
 }
 
 #[tokio::test]
-async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_history() {
+async fn reasoning_streams_separately_and_is_saved_without_replaying_as_text() {
     for a in [false, true] {
         let http = SequencedHttpClient::new([
             MockHttpResponse::success_typed(reasoning_sse(a), "text/event-stream"),
@@ -655,14 +655,21 @@ async fn reasoning_emits_one_progress_event_without_leaking_into_answer_or_histo
         );
         assert!(matches!(events.last(), Some(Event::Done(_))));
         let mut answer = Answer::default();
+        let mut thinking=String::new();
         for event in events {
             match event {
+                Event::Reasoning {block,..} => {thinking.push_str(&block.text);assert_eq!(block.kind,ThinkingKind::Process);},
                 Event::TextDelta(text) => answer.push_text(&text),
                 Event::Command(card) => answer.items.push(AnswerItem::Command(card)),
                 Event::Error(e) => panic!("safe error: {e}"),
                 _ => {}
             }
         }
+        assert_eq!(thinking,"PRIVATE_REASONING_MORE");
+        let saved=serde_json::to_string(c.entries()).unwrap();
+        assert!(!saved.contains("PRIVATE_SIGNATURE"));
+        let restored=Conversation::from_entries(serde_json::from_str(&saved).unwrap());
+        assert!(matches!(&restored.turns()[0].answer.as_ref().unwrap().items[0],AnswerItem::Thinking(b)if b.text==thinking && b.complete));
         assert_eq!(answer.text(), "公开回答");
         assert!(answer.commands().next().is_none());
         assert_eq!(c.turns()[0].answer.as_ref().unwrap().text(), answer.text());
@@ -697,11 +704,14 @@ async fn reasoning_activity_resets_idle_timeout() {
     let mut log = conversation();
     let mut stream = client.start(&mut log).unwrap();
     assert!(matches!(stream.next().await, Some(Event::Thinking)));
-    assert!(matches!(stream.next().await, Some(Event::TextDelta(text)) if text == "answer"));
-    assert!(matches!(
-        stream.next().await,
-        Some(Event::Error(AiError::Timeout))
-    ));
+    let mut thinking=String::new();
+    loop {match stream.next().await {
+        Some(Event::Reasoning{block,..})=>thinking.push_str(&block.text),
+        Some(Event::TextDelta(text))=>{assert_eq!(text,"answer");break;},
+        _=>panic!("reasoning activity must keep the stream alive"),
+    }}
+    assert_eq!(thinking,"private".repeat(8));
+    assert!(matches!(stream.next().await,Some(Event::Error(AiError::Timeout))));
 }
 
 #[tokio::test]
@@ -1041,3 +1051,6 @@ mod responses_tests;
 
 #[path = "providers/images.rs"]
 mod image_tests;
+
+#[path = "providers/thinking.rs"]
+mod thinking_tests;

@@ -507,6 +507,10 @@ impl Drawer {
         {
             for item in grouped(entries) {
                 match item {
+                    Item::Thinking(block) => {
+                        let live=running && !block.complete && entries.iter().rev().find(|e|!matches!(e,Entry::Assistant{text,..}if text.is_empty())).is_some_and(|e|matches!(e,Entry::Thinking{block:last,..}if last.id==block.id));
+                        body=body.child(self.thinking_block(&scope,&block,live,w,cx));
+                    }
                     Item::User {
                         index,
                         text,
@@ -812,6 +816,7 @@ impl Drawer {
     }
 }
 pub(super) enum Item {
+    Thinking(shellmate_ai::ThinkingBlock),
     User {
         attachments: Vec<shellmate_ai::Attachment>,
         index: usize,
@@ -831,6 +836,9 @@ pub(super) fn grouped(entries: &[Entry]) -> Vec<Item> {
     let mut last_message = None;
     for (index, e) in entries.iter().enumerate() {
         match e {
+            Entry::Thinking {block,..} => {
+                if let Some(Item::Thinking(previous))=out.iter_mut().find(|i|matches!(i,Item::Thinking(b)if b.id==block.id)) {previous.merge(block);}else if !block.text.is_empty(){out.push(Item::Thinking(block.clone()));last_message=None;}
+            }
             Entry::User { text, origin, sent_at_ms, attachments, .. } => {
                 out.push(Item::User {
                     attachments:attachments.clone(),

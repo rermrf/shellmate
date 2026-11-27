@@ -52,6 +52,7 @@ pub enum Event {
         summary: Option<String>,
     },
     Thinking,
+    Reasoning {message_id: usize, block: crate::ThinkingBlock},
     TextDelta(String),
     Command(CommandCard),
     Done(Option<Usage>),
@@ -77,6 +78,7 @@ pub struct RigClient {
 struct ClientOptions {
     output_tokens: AtomicU32,
     cache: AtomicBool,
+    summary: AtomicBool,
 }
 impl RigClient {
     pub fn new(config: &Config) -> Result<Self, AiError> {
@@ -130,6 +132,7 @@ impl RigClient {
             options: Arc::new(ClientOptions {
                 output_tokens: AtomicU32::new(max_tokens),
                 cache: AtomicBool::new(matches!(config.provider, Provider::Anthropic { .. })),
+                summary: AtomicBool::new(matches!(config.provider,Provider::OpenAiResponses{..}) && config.reasoning!=ReasoningLevel::Off && crate::catalog_spec(&config.provider,&config.model).is_none_or(|s|s.reasoning.supported())),
             }),
         })
     }
@@ -159,7 +162,9 @@ impl RigClient {
     }
     fn protocol_options(&self, request: CompletionRequest) -> CompletionRequest {
         if matches!(self.config.provider, Provider::OpenAiResponses { .. }) {
-            request.provider_option(rig_core::providers::openai::extension::OpenAiOptions::default().store(false))
+            let mut options=rig_core::providers::openai::extension::OpenAiOptions::default().store(false);
+            if self.options.summary.load(Ordering::Relaxed) {options=options.reasoning_summary(rig_core::providers::openai::extension::ReasoningSummary::Auto);}
+            request.provider_option(options)
         } else { request }
     }
     pub(crate) fn map_error(&self, error: rig_core::ProviderError) -> AiError {
@@ -180,6 +185,7 @@ impl RigClient {
     }
     /// Before content, try specific option fixes before a one-shot cache-free 400 retry.
     pub(crate) fn option_fallback(&self, error: &rig_core::ProviderError) -> bool {
+        if option_refusal(error,&["reasoning.summary","reasoning_summary","summary"]) && self.options.summary.swap(false,Ordering::Relaxed) {return true;}
         if cache_refusal(error) && self.options.cache.swap(false, Ordering::Relaxed) {
             return true;
         }
@@ -421,6 +427,7 @@ impl ProviderClient for RigClient {
                     crate::AgentEvent::InputsAccepted(_)
                     | crate::AgentEvent::CompletionsAccepted(_) => Event::TextDelta(String::new()),
                     crate::AgentEvent::Thinking => Event::Thinking,
+                    crate::AgentEvent::Reasoning {message_id,block} => Event::Reasoning {message_id,block},
                     crate::AgentEvent::TextDelta(t) => Event::TextDelta(t),
                     crate::AgentEvent::Command(c) => Event::Command(c),
                     crate::AgentEvent::Done(u) => Event::Done(u),
@@ -483,6 +490,7 @@ struct Reading {
     cards: usize,
     first: bool,
     thinking: bool,
+    reasoning: crate::thinking::Tracker,
     fallback: Option<(RigClient, CompletionRequest)>,
     received: bool,
     timeouts: Timeouts,
@@ -520,6 +528,7 @@ impl ResponseStream<'static> {
             cards: 0,
             first: true,
             thinking: false,
+            reasoning: Default::default(),
             fallback,
             received: false,
             timeouts,
@@ -551,7 +560,7 @@ impl ResponseStream<'static> {
                         return Some((Event::Error(error), s));
                     }
                     Ok(Some(Ok(Item::Event(
-                        StreamEvent::Reasoning { .. }
+                        event @ (StreamEvent::Reasoning { .. }
                         | StreamEvent::Start {
                             kind: PartKind::Reasoning,
                             ..
@@ -559,11 +568,14 @@ impl ResponseStream<'static> {
                         | StreamEvent::End {
                             content: AssistantContent::Reasoning(_),
                             ..
-                        },
+                        }),
                     )))) => {
                         s.first = false;
                         s.received = true;
-                        // Discard all reasoning payloads; only expose progress before answer text.
+                        if let Some(block)=s.reasoning.event(&event,0,s.fallback.as_ref().is_some_and(|(c,_)|matches!(c.config.provider,Provider::OpenAiResponses{..}))) {
+                            return Some((Event::Reasoning {message_id:0,block},s));
+                        }
+                        // Empty or opaque blocks only signal activity.
                         if !s.thinking && s.text.is_empty() {
                             s.thinking = true;
                             return Some((Event::Thinking, s));
