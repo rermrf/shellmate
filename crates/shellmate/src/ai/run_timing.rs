@@ -269,7 +269,6 @@ pub(super) fn timestamp(ms: i64, now_ms: i64, full: bool) -> String {
 }
 pub(super) fn label(
     record: &Record,
-    now: Moment,
     phase: &shellmate_ai::interaction::Phase,
 ) -> String {
     use shellmate_ai::interaction::Phase;
@@ -287,21 +286,17 @@ pub(super) fn label(
         }
         Status::Waiting => "等待任务",
         Status::Paused => "已暂停",
-        Status::Completed => "结束",
+        Status::Completed => "",
         Status::Stopped => "已停止",
         Status::Failed => "失败",
         Status::Interrupted => "已中断",
     };
-    let time = record
-        .ended_at_ms
-        .map(|at| format!("{} ", timestamp(at, now.wall_ms, false)))
-        .unwrap_or_default();
-    let runtime = if record.status == Status::Interrupted {
-        "已记录"
+    let elapsed = format!("用时 {}", duration(record.duration_ms));
+    if state.is_empty() {
+        elapsed
     } else {
-        "运行"
-    };
-    format!("{time}{state} · {runtime} {}", duration(record.duration_ms))
+        format!("{elapsed} {state}")
+    }
 }
 
 #[cfg(test)]
@@ -531,10 +526,9 @@ mod tests {
         assert_eq!(
             label(
                 &runs.snapshot(t)[1],
-                t,
                 &shellmate_ai::interaction::Phase::Idle
             ),
-            format!("{} 结束 · 运行 1 秒", timestamp(at(t, 11).wall_ms, t.wall_ms, false))
+            "用时 1 秒"
         );
     }
     #[test]
@@ -548,8 +542,8 @@ mod tests {
         runs.finish(Status::Interrupted, at(t, 3));
         let r = &runs.snapshot(t)[0];
         assert_eq!(
-            label(r, t, &shellmate_ai::interaction::Phase::Idle),
-            "已中断 · 已记录 3 秒"
+            label(r, &shellmate_ai::interaction::Phase::Idle),
+            "用时 3 秒 已中断"
         );
     }
 }

@@ -1447,6 +1447,9 @@ impl Render for Drawer {
                     message_id, &turn.user.question, turn.user.sent_at_ms,
                     bubble, self.selection_scroll.clone(), window, cx,
                 ));
+                let reply_group = SharedString::from(format!("{}:reply:{index}", self.state.id));
+                let mut reply_surface = div().id(reply_group.clone()).group(reply_group.clone())
+                    .flex_none().min_w_0().w_full().flex().flex_col().gap(px(12.));
                 if let Some(answer) = &turn.answer {
                     let commands: Vec<String> = answer
                         .items
@@ -1602,10 +1605,13 @@ impl Render for Drawer {
                                 ),
                         );
                     }
-                    body = body.child(reply);
+                    reply_surface = reply_surface.child(reply);
                 }
                 for record in timing_records.iter().filter(|r| r.turn==index) {
-                    body=body.child(timing_ui::footer(record,timing_now,&self.state.control.phase(),cx));
+                    reply_surface=reply_surface.child(timing_ui::footer(record,timing_now,&self.state.control.phase(),&reply_group,cx));
+                }
+                if turn.answer.is_some() || timing_records.iter().any(|r| r.turn == index) {
+                    body = body.child(reply_surface);
                 }
             }
             // The awaited foreground call has not produced its Step yet. Keep its

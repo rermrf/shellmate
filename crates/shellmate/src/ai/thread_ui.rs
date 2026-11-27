@@ -610,9 +610,9 @@ impl Drawer {
         }
         if !running {
             body = body.child(div().text_size(px(11.5)).text_color(p.tx3).child(format!(
-                "{} · 运行 {}",
-                crate::ai::subagent_view::status_label(&view.status),
-                timing::duration(view.duration_ms)
+                "用时 {} {}",
+                timing::duration(view.duration_ms),
+                crate::ai::subagent_view::status_label(&view.status)
             )));
         }
         let queued = self

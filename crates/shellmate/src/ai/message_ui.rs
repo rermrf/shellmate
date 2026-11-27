@@ -65,6 +65,7 @@ pub(super) fn message(
                 .text_size(px(10.5))
                 .line_height(px(16.))
                 .text_color(p.tx3)
+                .when(!visible, |time| time.opacity(0.))
                 .child(time_label(sent_at, now))
                 .tooltip(move |w, cx| {
                     gpui::component::tooltip::Tooltip::new(tip.clone()).build(w, cx)

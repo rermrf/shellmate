@@ -100,6 +100,7 @@ pub(super) fn footer(
     record: &Record,
     now: Moment,
     phase: &shellmate_ai::interaction::Phase,
+    reply_group: &SharedString,
     cx: &App,
 ) -> Stateful<Div> {
     let started = timing::timestamp(record.started_at_ms, now.wall_ms, true);
@@ -114,7 +115,7 @@ pub(super) fn footer(
             }
         });
     let tip = format!(
-        "开始：{started}\n结束：{ended}\n运行：{}\n按本地时区显示；不含排队及手动暂停时间",
+        "开始时间：{started}\n回复时间：{ended}\n用时：{}\n按本地时区显示；不含排队及手动暂停时间",
         timing::duration(record.duration_ms)
     );
     div()
@@ -125,7 +126,17 @@ pub(super) fn footer(
         .line_height(px(17.))
         .text_color(cx.palette().tx3)
         .whitespace_normal()
-        .child(timing::label(record, now, phase))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(8.))
+        .child(timing::label(record, phase))
+        .children(record.ended_at_ms.map(|at| {
+            div()
+                .opacity(0.)
+                .group_hover(reply_group.clone(), |time| time.opacity(1.))
+                .child(timing::timestamp(at, now.wall_ms, false))
+        }))
         .tooltip(move |window, cx| {
             gpui::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
         })
