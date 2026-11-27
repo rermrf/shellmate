@@ -64,6 +64,7 @@ pub const PAGE_SCROLL_SCENES: &[(&str, (u32, u32))] = &[
 ];
 
 pub const SCENES: &[&str] = &[
+    "ai-question","ai-question-async","ai-question-child","ai-question-restored",
     "ai-images","ai-thinking","ai-thinking-live","ai-thinking-child",
     "quit-confirm", "shortcuts", "tab-attention", "tab-attention-menu", "tab-list-scroll", "settings-window", "close-window-dialog", "tabmenu-move", "tabmenu-single",
     "update-available", "update-downloading", "update-ready", "update-uptodate",
@@ -320,7 +321,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 172 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 176 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

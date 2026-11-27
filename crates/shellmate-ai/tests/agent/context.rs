@@ -379,16 +379,17 @@ async fn manual_focus_summary_state_fresh_snapshot_and_second_compaction_fold() 
 }
 #[tokio::test]
 async fn mid_run_compaction_then_pause_and_manual_compaction_then_resume() {
+    // Leave room for the expanded tool schema after each checkpoint.
     for a in [false, true] {
         let http = SequencedHttpClient::new([
-            with_usage(a, &[("one", "run_command", args("pwd"))], "step one", 4500),
+            with_usage(a, &[("one", "run_command", args("pwd"))], "step one", 6500),
             response(a, &[], "<summary>checkpoint one</summary>", false),
             response(a, &[("two", "run_command", args("ls"))], "step two", a),
             response(a, &[], "<summary>manual while paused</summary>", false),
             response(a, &[], "finished", false),
         ]);
         let mut cfg = config(a);
-        cfg.context_window = ContextWindow::Tokens(6000);
+        cfg.context_window = ContextWindow::Tokens(8000);
         let client = RigClient::with_http(&cfg, http.clone()).unwrap();
         let host = ContextHost {
             host: Host::new([completed("/srv"), completed("files")]),

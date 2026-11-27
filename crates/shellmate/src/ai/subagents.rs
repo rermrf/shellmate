@@ -141,17 +141,9 @@ impl Service {
                 self.tasks.conversation_id(),
                 &view.id,
             );
-            let pending = checkpoint
-                .as_ref()
-                .map(|c| {
-                    c.inbox
-                        .inputs
-                        .iter()
-                        .filter(|i| !i.claimed)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let restored_control=shellmate_ai::interaction::Control::default();
+            if let Some(saved)=&checkpoint {restored_control.restore(saved.inbox.clone());}
+            let pending=checkpoint.as_ref().map(|c|c.inbox.inputs.iter().filter(|i|!i.claimed || i.question_id.is_some()).cloned().collect::<Vec<_>>()).unwrap_or_default();
             let Some(transcript) = view
                 .transcript
                 .clone()
@@ -169,11 +161,10 @@ impl Service {
                 return LocalResult::error("执行记录已清理，无法继续原上下文");
             };
             let mut transcript = shellmate_ai::Conversation::from_entries(transcript);
+            restored_control.restore_questions(transcript.entries());
             for input in pending {
-                transcript.push_user_from(
-                    input.user_turn(),
-                    input.origin,
-                );
+                if input.question_id.as_ref().is_some_and(|id|transcript.entries().iter().any(|e|matches!(e,shellmate_ai::Entry::QuestionAnswer{request_id,..}if request_id==id))){continue;}
+                transcript.append(restored_control.input_entry(&input));
             }
             let mut request = record.request;
             request.prompt = text;
@@ -186,6 +177,80 @@ impl Service {
                 &call_id,
                 Some((transcript, record.context, stable)),
                 origin,
+            )
+            .await
+        })
+    }
+    pub fn answer_question(
+        &self,
+        id: &str,
+        question: &str,
+        response: shellmate_ai::questions::Response,
+    ) -> BoxFuture<'_, LocalResult> {
+        let id = id.to_owned();
+        let question = question.to_owned();
+        Box::pin(async move {
+            let Some((view, _, children)) = self.tasks.latest_agent(&id) else {
+                return LocalResult::error("子任务不可用");
+            };
+            let control =
+                if let Some(children) = children.filter(|_| view.status == SubagentStatus::Running) {
+                    children.control()
+                } else {
+                    let Some(saved) = super::subagent_files::read_checkpoint(
+                        &self.tasks.root(),
+                        self.tasks.conversation_id(),
+                        &view.id,
+                    ) else {
+                        return LocalResult::error("子任务恢复记录不可用");
+                    };
+                    let c = shellmate_ai::interaction::Control::default();
+                    c.restore(saved.inbox);
+                    c.restore_questions(&saved.entries);
+                    c
+                };
+            if let Some(entries) = &view.transcript {
+                control.restore_questions(entries);
+            }
+            let retry_saved = view.status != SubagentStatus::Running
+                && control
+                    .question(&question)
+                    .is_some_and(|q| q.response.as_ref() == Some(&response))
+                && control
+                    .snapshot()
+                    .inputs
+                    .iter()
+                    .any(|i| i.question_id.as_deref() == Some(&question));
+            if !retry_saved {
+                let saved = self.tasks.while_retained(|| {
+                    control.answer_question(&question, response, |snapshot| {
+                        super::subagent_files::save_question_answers(
+                            &self.tasks.root(),
+                            self.tasks.conversation_id(),
+                            &view.id,
+                            snapshot,
+                        )
+                        .map_err(|_| "答案未能保存，请重试".into())
+                    })
+                });
+                match saved {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return LocalResult::error(e),
+                    None => return LocalResult::error("对话已删除"),
+                }
+            }
+            if view.status == SubagentStatus::Running {
+                control.resume();
+                return LocalResult::text("答案已送达子任务");
+            }
+            self.message_images(
+                &id,
+                "请根据用户刚提交的问题反馈继续原任务。",
+                false,
+                true,
+                &format!("answer-{question}"),
+                vec![],
+                shellmate_ai::MessageOrigin::User,
             )
             .await
         })
@@ -360,6 +425,7 @@ impl Service {
                 context.sent_at_ms,
                 context.attachments.clone(),
             );
+            child_tasks.control().restore_questions(checkpoint_log.entries());
             let saved = self.tasks.while_retained(|| {
                 super::subagent_files::checkpoint(
                     &self.tasks.root(),

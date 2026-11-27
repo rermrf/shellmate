@@ -50,7 +50,7 @@ impl State<'_> {
         for item in pending {
             match item {
                 Pending::Call(raw, call) => self.close_unexecuted(*raw, Some(call)),
-                Pending::Subagent(raw, _) | Pending::Local(raw, _) | Pending::Invalid(raw, _) => {
+                Pending::Subagent(raw, _) | Pending::Local(raw, _) | Pending::Invalid(raw, _) | Pending::Question(raw,_) => {
                     self.close_unexecuted(*raw, None)
                 }
                 Pending::AgentMessage(raw, ..) => self.close_unexecuted(*raw, None),
@@ -94,15 +94,8 @@ impl State<'_> {
             return None;
         }
         let ids = inputs.iter().map(|i| i.id.clone()).collect();
-        for input in inputs {
-            self.entry(Entry::User {
-                attachments: input.attachments,
-                sent_at_ms: input.sent_at_ms,
-                origin: input.origin,
-                text: input.text,
-                context: input.context,
-            });
-        }
+        if inputs.iter().any(|i|i.question_id.is_none()) {for entry in control.supersede_questions(){self.entry(entry);}}
+        for input in inputs {self.entry(control.input_entry(&input));}
         let turn = self.turn.as_mut().unwrap();
         turn.turn = self.conversation.latest_user().unwrap().clone();
         turn.turns = self.conversation.turns().len();

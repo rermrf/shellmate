@@ -1,6 +1,7 @@
 //! AI model and agent boundary; command execution is delegated to the host.
 pub mod agent;
 pub mod interaction;
+pub mod questions;
 mod client;
 mod config;
 mod responses;

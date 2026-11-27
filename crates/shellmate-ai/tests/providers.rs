@@ -259,7 +259,7 @@ async fn errors_are_chinese_and_never_echo_payloads() {
         }
     }
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_and_cancellation_without_sockets() {
     for a in [false, true] {
         let mut cfg = config(a);

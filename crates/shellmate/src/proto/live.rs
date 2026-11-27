@@ -1,4 +1,5 @@
 pub const SCENES: &[&str] = &[
+    "ai-question","ai-question-async","ai-question-child","ai-question-restored",
     "ai-images","ai-thinking","ai-thinking-live","ai-thinking-child",
     "ai-multi-conversations","ai-multi-targets","ai-multi-compare",
     "ai-tools-unified",
@@ -30,6 +31,7 @@ pub fn base(scene: &str) -> Option<&'static str> {
         return None;
     }
     Some(match scene {
+        "ai-question"|"ai-question-async"|"ai-question-child"|"ai-question-restored"=>"ai-chat",
         "ai-images"|"ai-thinking"|"ai-thinking-live"|"ai-thinking-child"=>"ai-chat",
         "ai-multi-conversations"|"ai-multi-targets"|"ai-multi-compare"=>"ai-chat",
         "ai-tools-unified" | "ai-tools-expanded" => "ai-chat",

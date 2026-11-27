@@ -25,6 +25,7 @@ pub enum Phase {
     Resource,
     Executing,
     Approval,
+    UserInput,
     Waiting(Vec<String>),
     Compacting,
     Retrying,
@@ -37,6 +38,7 @@ impl Phase {
             Self::Resource => "等待共享资源",
             Self::Executing => "正在执行",
             Self::Approval => "等待批准",
+            Self::UserInput => "等待回答",
             Self::Waiting(_) => "等待任务",
             Self::Compacting => "正在压缩上下文",
             Self::Retrying => "等待重试",
@@ -46,6 +48,8 @@ impl Phase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct Input {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub question_id:Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +71,8 @@ impl Input {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct Snapshot {
+    #[serde(default)]
+    pub questions:Vec<crate::questions::Pending>,
     pub inputs: VecDeque<Input>,
     pub held: bool,
     pub auto_continue: bool,
@@ -86,15 +92,15 @@ pub struct Completion {
     pub claimed: bool,
 }
 #[derive(Default)]
-struct State {
-    saved: Snapshot,
+pub(crate) struct State {
+    pub(crate) saved: Snapshot,
     intent: Intent,
     phase: Phase,
     sealed: bool,
 }
 #[derive(Clone)]
 pub struct Control {
-    state: Arc<Mutex<State>>,
+    pub(crate) state: Arc<Mutex<State>>,
     changed: watch::Sender<u64>,
 }
 impl Default for Control {
@@ -106,7 +112,7 @@ impl Default for Control {
     }
 }
 impl Control {
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -172,6 +178,7 @@ impl Control {
             return Ok(false);
         }
         let input = Input {
+            question_id:None,
             attachments: user.attachments,
             sent_at_ms: user.sent_at_ms,
             origin,
@@ -193,7 +200,7 @@ impl Control {
             .saved
             .inputs
             .iter()
-            .position(|i| i.id == id && !i.claimed)?;
+            .position(|i| i.id == id && !i.claimed && i.question_id.is_none())?;
         let input = state.saved.inputs.remove(index);
         drop(state);
         self.notify();
@@ -206,7 +213,7 @@ impl Control {
             .saved
             .inputs
             .iter_mut()
-            .find(|i| i.id == id && !i.claimed)?;
+            .find(|i| i.id == id && !i.claimed && i.question_id.is_none())?;
         if let Some(text) = text {
             if text.trim().is_empty() && attachments.as_ref().unwrap_or(&i.attachments).is_empty() {
                 return None;
@@ -283,7 +290,7 @@ impl Control {
     }
     pub fn finish_if_empty(&self) -> bool {
         let mut s = self.state.lock().unwrap();
-        if s.saved.inputs.iter().any(|i| !i.claimed) {
+        if s.saved.inputs.iter().any(|i| !i.claimed) || s.saved.questions.iter().any(|q|q.response.is_none()) {
             false
         } else {
             s.sealed = true;
@@ -403,6 +410,17 @@ impl Control {
         state.phase = phase;
         drop(state);
         self.notify();
+    }
+    pub(crate) async fn question_activity(&self, all: bool) {
+        let mut changes = self.changed.subscribe();
+        loop {
+            if !self.has_questions(all) || self.pending() || self.intent() != Intent::None {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
     }
     pub async fn urgent(&self) {
         let mut changes = self.changed.subscribe();

@@ -13,6 +13,14 @@ pub struct Reading {
     pub docker_cpu: &'static [(&'static str, f64)],
 }
 pub const READINGS: &[Reading] = &[
+Reading {scene:"ai-question",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-async",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-async",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-child",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-child",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-restored",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
+Reading {scene:"ai-question-restored",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-thinking",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-thinking",dark:false,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},
 Reading {scene:"ai-thinking-live",dark:true,reconnect:2,cpu:19.,memory_gib:9.6,net:[0.4,2.4],cores:[34.,22.,48.,17.],processes:&[],transfer:18.316,transfer_speed:6.4,docker_cpu:&[]},

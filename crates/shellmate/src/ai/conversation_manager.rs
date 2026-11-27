@@ -30,9 +30,10 @@ impl Manager {
         let mut pending = 0;
         let mut unread = 0;
         for r in self.list() {
+            let question=r.needs_answer();
             let d = r.data.lock().unwrap();
             pending += usize::from(
-                d.approvals
+                question || d.approvals
                     .values()
                     .any(|a| a.reply.as_ref().is_some_and(|reply| !reply.is_closed())),
             );

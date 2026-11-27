@@ -11,6 +11,7 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene.starts_with("ai-question") {self.questions_fixture(scene,w,cx);return;}
         if scene.starts_with("ai-thinking") {self.thinking_fixture(scene,w,cx);return;}
         if scene=="ai-images" {
             let a=shellmate_ai::media::import(&self.data_root,&self.state.id,"界面截图.png",include_bytes!("../../assets/app-icon/dock-light.png")).unwrap();
@@ -280,7 +281,7 @@ impl Drawer {
         }).detach();
         cx.notify();
     }
-    fn install_subagent_service(
+    pub(super) fn install_subagent_service(
         &mut self,
         config: shellmate_ai::Config,
         w: &mut Window,
@@ -503,7 +504,8 @@ impl Drawer {
     }
     pub(super) fn interaction_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let p = cx.palette().clone();
-        let snapshot = self.state.control.snapshot();
+        let mut snapshot = self.state.control.snapshot();
+        snapshot.inputs.retain(|i|i.question_id.is_none());
         let running = self.state.model.busy
             || self.state.pending
             || (self.state.timing.live() && !self.state.timing.paused());
@@ -547,7 +549,7 @@ impl Drawer {
                     ),
             );
         }
-        for input in snapshot.inputs.iter().take(if self.state.queue_expanded {
+        for input in snapshot.inputs.iter().filter(|i|i.question_id.is_none()).take(if self.state.queue_expanded {
             usize::MAX
         } else {
             4

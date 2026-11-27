@@ -382,6 +382,7 @@ impl Drawer {
                 .into_any_element();
         };
         let running = view.status == shellmate_ai::SubagentStatus::Running;
+        let waiting_answer=self.scope_questions(&format!("child:{}",view.id)).iter().any(|q|q.response.is_none() && q.request.mode==shellmate_ai::questions::Mode::Wait);
         let page = self.state.child_page.pages.entry(id.clone()).or_default();
         let unseen = !self.state.follow_bottom && page.seen != view.revision;
         if self.state.follow_bottom {
@@ -396,7 +397,7 @@ impl Drawer {
         } else {
             view.duration_ms / 1000
         };
-        let child_status = crate::ai::tool_model::child_status(&view.status);
+        let child_status = if waiting_answer {crate::ai::tool_model::Status::Question}else{crate::ai::tool_model::child_status(&view.status)};
         let (badge_bg, badge_fg) = child_status.badge_colors(&p);
         let status = format!(
             "{} 步 · {}",
@@ -697,7 +698,7 @@ impl Drawer {
             .and_then(|(_, _, t)| t)
             .map(|t| t.control().snapshot().inputs)
             .unwrap_or_else(|| view.pending_inputs.clone().into());
-        for (n, input) in queued.iter().filter(|i| !i.claimed).enumerate() {
+        for (n, input) in queued.iter().filter(|i| !i.claimed && i.question_id.is_none()).enumerate() {
             body = body
                 .child(
                     div()
@@ -967,6 +968,7 @@ pub(super) fn grouped(entries: &[Entry]) -> Vec<Item> {
     let mut last_message = None;
     for (index, e) in entries.iter().enumerate() {
         match e {
+            Entry::QuestionAnswer {..} => {},
             Entry::Thinking {block,..} => {
                 if let Some(Item::Thinking(previous))=out.iter_mut().find(|i|matches!(i,Item::Thinking(b)if b.id==block.id)) {previous.merge(block);}else if !block.text.is_empty(){out.push(Item::Thinking(block.clone()));last_message=None;}
             }

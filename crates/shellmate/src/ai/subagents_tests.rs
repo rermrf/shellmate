@@ -1095,7 +1095,7 @@ async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint(
     checkpoint
         .inbox
         .inputs
-        .push_back(shellmate_ai::interaction::Input { attachments: Vec::new(),
+        .push_back(shellmate_ai::interaction::Input { question_id:None, attachments: Vec::new(),
             sent_at_ms: None,
             origin: None,
             id: "pending".into(),
@@ -1479,4 +1479,109 @@ async fn delegated_and_direct_followup_images_reach_child_wire_and_checkpoints()
     shellmate_core::ai_output::delete_conversation(root.path(),"conversation").unwrap();
     assert!(service.tasks.retained().while_retained(||panic!("discarded owner must not import again")).is_none());
     assert!(!a.path(root.path(),false).unwrap().exists());
+}
+
+fn user_question_response() -> MockHttpResponse {
+    // Build a regular streamed tool call, with the same wire used by child commands.
+    let chunk = |delta: Value, finish: Value| json!({"id":"q","object":"chat.completion.chunk","created":1,"model":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+    let args = json!({"questions":[{"id":"target","question":"请选择环境","options":[{"id":"dev","label":"开发环境"},{"id":"prod","label":"生产环境"}]}]});
+    let events = [
+        chunk(
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"question","type":"function","function":{"name":"ask_user","arguments":args.to_string()}}]}),
+            Value::Null,
+        ),
+        chunk(json!({}), json!("tool_calls")),
+    ];
+    MockHttpResponse::success_typed(
+        events
+            .into_iter()
+            .map(|v| format!("data: {v}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n",
+        "text/event-stream",
+    )
+}
+#[tokio::test]
+async fn child_questions_wait_answer_and_restore_from_checkpoint_without_reasking() {
+    for restart in [false, true] {
+        let (root, service, _, http) = fixture(vec![
+            user_question_response(),
+            response(false, "已根据用户选择继续"),
+        ]);
+        service.start(request(true), "initial-question").await;
+        let id = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some((_, _, Some(child))) = service.tasks.latest_agent("agent-1")
+                    && child.control().phase() == shellmate_ai::interaction::Phase::UserInput
+                {
+                    break child.control().snapshot().questions[0].id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(http.requests().len(), 1);
+        if restart {
+            service.tasks.stop("agent-1");
+            settled(&service.tasks).await;
+        }
+        let answer = shellmate_ai::questions::Response {
+            status: shellmate_ai::questions::Status::Answered,
+            answers: std::collections::BTreeMap::from([(
+                "target".into(),
+                shellmate_ai::questions::Answer {
+                    selected: vec!["dev".into()],
+                    text: "先检查".into(),
+                },
+            )]),
+        };
+        if restart {
+            let mut changed = service.clone();
+            changed.config.provider = shellmate_ai::Provider::Anthropic {
+                base_url: "https://other.invalid".into(),
+            };
+            let result = changed
+                .answer_question("agent-1", &id, answer.clone())
+                .await;
+            assert!(result.is_error);
+            assert_eq!(http.requests().len(), 1);
+        }
+        let result = service
+            .answer_question("agent-1", &id, answer.clone())
+            .await;
+        assert!(!result.is_error, "{}", result.inline);
+        settled(&service.tasks).await;
+        let (view, _, _) = service.tasks.latest_agent("agent-1").unwrap();
+        assert_eq!(view.status, SubagentStatus::Completed);
+        let entries = view.transcript.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| matches!(e,Entry::QuestionAnswer{request_id,..}if request_id==&id))
+                .count(),
+            1
+        );
+        assert_eq!(http.requests().len(), 2);
+        assert!(
+            String::from_utf8(http.requests()[1].body.to_vec())
+                .unwrap()
+                .contains("先检查")
+        );
+        assert!(
+            service
+                .answer_question("agent-1", &id, answer)
+                .await
+                .is_error
+        );
+        let saved =
+            super::super::subagent_files::read_checkpoint(root.path(), "conversation", &view.id)
+                .unwrap();
+        assert!(
+            saved
+                .entries
+                .iter()
+                .any(|e| matches!(e,Entry::QuestionAnswer{request_id,..}if request_id==&id))
+        );
+    }
 }

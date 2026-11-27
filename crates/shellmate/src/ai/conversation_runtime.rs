@@ -90,6 +90,7 @@ impl Runtime {
         let tasks = Tasks::with_control(root.clone(), id.clone(), control.clone());
         tasks.set_store(db.clone());
         tasks.shared_web(router.catalog.web(db.clone(), credentials));
+        control.restore_questions(log.entries());
         tasks.remember_outputs(&log);
         let runtime = Arc::new(Self {
             id,
@@ -213,6 +214,7 @@ impl Runtime {
     pub fn snapshot(&self) -> Snapshot {
         self.data.lock().unwrap().clone()
     }
+    pub fn needs_answer(&self)->bool {self.control.has_questions(true)||self.tasks.agent_views().iter().any(|v|v.questions.iter().any(|q|q.response.is_none()))}
     pub fn active(&self) -> bool {
         let d = self.data.lock().unwrap();
         d.model.busy || d.paused || self.tasks.has_running() || !d.approvals.is_empty()
@@ -355,6 +357,63 @@ impl Runtime {
                 false
             }
         }
+    }
+    pub fn answer_question(
+        &self,
+        id: &str,
+        response: shellmate_ai::questions::Response,
+    ) -> Result<(), String> {
+        let _save = self.persistence.lock().unwrap();
+        if self.is_retired() {
+            return Err("对话已关闭".into());
+        }
+        let d = self.snapshot();
+        self.control
+            .restore_questions(d.model.conversation.entries());
+        let first = d
+            .model
+            .conversation
+            .turns()
+            .first()
+            .ok_or("对话记录不可用")?;
+        let scope = self.router.scope.lock().unwrap().clone();
+        let target = scope.default.as_ref().and_then(|id| scope.targets.get(id));
+        let previous = self
+            .db
+            .borrow()
+            .ai_conversation(&self.id)
+            .map_err(|_| "无法读取对话记录")?;
+        let saved = SavedConversation {
+            id: self.id.clone(),
+            host_id: target.and_then(|t| t.host_id.clone()),
+            label: target
+                .map(|t| t.label.clone())
+                .unwrap_or_else(|| first.user.context.label.clone()),
+            title: first.user.title(48),
+            provider: d
+                .config
+                .as_ref()
+                .map(|c| c.provider.id().to_owned())
+                .or_else(|| previous.as_ref().map(|c| c.provider.clone()))
+                .unwrap_or_else(|| "openai".into()),
+            model: d
+                .config
+                .as_ref()
+                .map(|c| c.model.clone())
+                .or_else(|| previous.as_ref().map(|c| c.model.clone()))
+                .unwrap_or_default(),
+            created_at: self.created,
+            updated_at: crate::ai::now(),
+            conversation: d.model.conversation.clone(),
+        };
+        self.control.answer_question(id,response,|queue| {
+            let runtime=serde_json::json!({"version":2,"targets":scope,"queue":queue,"timing":d.timing.snapshot(timing::Moment::now())});
+            self.db.borrow_mut().save_ai_conversation_with_runtime(&saved,Some(&runtime)).map(|_|()).map_err(|_|"答案未能保存，请检查存储后重试".into())
+        })?;
+        self.control.resume();
+        self.data.lock().unwrap().revision += 1;
+        self.wake.notify_one();
+        Ok(())
     }
     pub fn launch(self: &Arc<Self>, config: Config, limits: agent::Limits, settings: Settings) {
         {

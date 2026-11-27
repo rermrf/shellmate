@@ -451,6 +451,7 @@ pub enum ReleaseReason {
 }
 #[derive(Clone)]
 enum Pending {
+    Question(Box<RigCall>, crate::questions::Request),
     AgentMessage(Box<RigCall>, String, String, bool, bool),
     Subagent(Box<RigCall>, crate::SubagentRequest),
     Local(Box<RigCall>, LocalTool),
@@ -513,6 +514,7 @@ pub fn run<'a>(
         .ok_or(AiError::InvalidConfig)?
         .clone();
     let base_capabilities = capabilities.clone();
+    if let Some(control)=host.control(){control.restore_questions(conversation.entries());}
     conversation.prepare(&capabilities)?;
     let state = Resume {
         native: NativeMessages::new(),
@@ -998,6 +1000,10 @@ fn stream<'a>(
     let inner = futures::stream::unfold(state, |mut s| async move {
         loop {
             if let Some(event) = s.queue.pop_front() {
+                if matches!(event,AgentEvent::Done(_)) && let Some(c)=s.host.control() && c.has_questions(true) && c.intent()==crate::interaction::Intent::None && !c.pending() {
+                    s.phase(crate::interaction::Phase::UserInput);
+                    c.question_activity(true).await;s.queue.push_front(event);continue;
+                }
                 if matches!(event, AgentEvent::Done(_)) {
                     if let Some(input) = s.receive_input() {
                         return Some((input, s));
@@ -1024,6 +1030,9 @@ fn stream<'a>(
             }
             if s.host.cancelled() {
                 return Some((s.fail(AiError::Cancelled), s));
+            }
+            if s.model.is_none() && let Some(c)=s.host.control() && c.has_questions(false) && c.intent()==crate::interaction::Intent::None && !c.pending() {
+                s.phase(crate::interaction::Phase::UserInput);c.question_activity(false).await;continue;
             }
             if let Some(delay) = s.retry_wait.take() {
                 // Owned by this stream: dropping it cancels the backoff future.
@@ -1119,7 +1128,7 @@ fn stream<'a>(
                 return Some((s.pause(PauseReason::StepLimit), s));
             }
             if let Some(pending) = s.turn.as_mut().unwrap().pending.pop_front() {
-                if let Pending::Local(raw, _) | Pending::AgentMessage(raw, ..) = &pending {
+                if let Pending::Local(raw, _) | Pending::AgentMessage(raw, ..) | Pending::Question(raw,_) = &pending {
                     let id = raw.id.to_string();
                     if s.started_tool.as_deref() != Some(&id) {
                         let call = crate::LoggedCall {
@@ -1134,6 +1143,14 @@ fn stream<'a>(
                     s.started_tool = None;
                 }
                 match pending {
+                    Pending::Question(raw,request) => {
+                        let call=crate::LoggedCall{id:raw.id.to_string(),name:"ask_user".into(),args_json:serde_json::Value::Object(raw.function.arguments)};
+                        let q=crate::questions::Pending::new(shellmate_core::HostId::generate().to_string(),call.clone(),request,s.conversation.latest_user().unwrap().context.clone());
+                        let (inline,is_error)=match s.host.control().ok_or_else(||"当前环境不支持用户提问".to_owned()).and_then(|c|c.register_question(q.clone())) {Ok(())=>(q.receipt(),false),Err(e)=>(e,true)};
+                        let id=call.id.clone();s.entry(Entry::Step(crate::Step{message_id:s.message_id,call,result:crate::LoggedResult{attachments:vec![],subagent:None,inline,output_id:None,cleared:false,is_error},display:None}));
+                        s.steps+=1;s.turn.as_mut().unwrap().steps+=1;
+                        return Some((AgentEvent::ToolFinished(id),s));
+                    }
                     Pending::AgentMessage(raw, id, text, immediate, resume) => {
                         let tool_id = raw.id.to_string();
                         let result = s
@@ -1552,7 +1569,7 @@ fn stream<'a>(
                                     && !s.host.sessions_enabled()
                                     && !matches!(
                                         raw.function.name.as_str(),
-                                        "web_search" | "web_fetch" | "view_image"
+                                        "web_search" | "web_fetch" | "view_image" | "ask_user"
                                     )
                                 {
                                     if raw.function.name.as_str() == "propose_command" {
@@ -1587,6 +1604,10 @@ fn stream<'a>(
                                     continue;
                                 }
                                 let raw = Box::new(raw.clone());
+                                if raw.function.name.as_str()=="ask_user" {
+                                    let parsed=if raw.function.invalid_arguments.is_some(){Err("提问参数必须为完整 JSON".into())}else{crate::questions::Request::parse(serde_json::Value::Object(raw.function.arguments.clone()))};
+                                    pending.push_back(match parsed {Ok(request)=>Pending::Question(raw,request),Err(e)=>Pending::Invalid(raw,e)});continue;
+                                }
                                 if raw.function.name.as_str() == "send_agent_message" {
                                     let args =
                                         serde_json::Value::Object(raw.function.arguments.clone());
@@ -1669,6 +1690,7 @@ fn stream<'a>(
                         && !s.turn.as_ref().unwrap().capabilities.web
                         && !s.host.sessions_enabled()
                         && s.conversation.attachments().is_empty()
+                        && !pending.iter().any(|p|matches!(p,Pending::Question(..)))
                     {
                         while let Some(pending) = pending.pop_front() {
                             match pending {

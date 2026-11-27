@@ -647,6 +647,8 @@ impl Drawer {
                 .unwrap_or("无默认终端");
             let (status, badge_fg, badge_bg, has_dot) = if snap.approvals.values().any(|a| a.reply.is_some()) {
                 ("等待批准", p.warn, p.warns, true)
+            } else if runtime.needs_answer() {
+                ("待回答",p.warn,p.warns,true)
             } else if snap.model.busy || runtime.tasks.has_running() {
                 ("运行中", p.acc, p.accs, true)
             } else if snap.paused {

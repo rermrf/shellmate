@@ -96,6 +96,7 @@ impl Drawer {
     ) {
         let composer_focused = self.input.focus_handle(cx).contains_focused(w, cx);
         if self.state.child_page.selected.is_some()
+            && !self.question_input_focused(w,cx)
             && (action as &dyn Action).as_any().is::<input::Escape>()
             && !self.input_composing(w, cx)
         {

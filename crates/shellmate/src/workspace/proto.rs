@@ -386,7 +386,7 @@ impl Workspace {
             | "ai-timing-running" | "ai-timing-waiting" | "ai-timing-done" | "ai-timing-paused" | "ai-timing-interrupted"
             | "ai-child-thread" | "ai-child-running" | "ai-child-approval" | "ai-child-restored" | "ai-child-long-prompt"
             | "ai-web-search" | "ai-web-fetch" | "ai-web-fallback" | "ai-web-error"
-            | "ai-tools-unified" | "ai-tools-expanded" | "ai-images" | "ai-thinking" | "ai-thinking-live" | "ai-thinking-child"
+            | "ai-tools-unified" | "ai-tools-expanded" | "ai-question" | "ai-question-async" | "ai-question-child" | "ai-question-restored" | "ai-images" | "ai-thinking" | "ai-thinking-live" | "ai-thinking-child"
             | "ai-multi-conversations" | "ai-multi-targets" | "ai-multi-compare"
             | "ai-unconfigured" | "ai-slash" | "ai-slash-filter" | "ai-slash-context" | "ai-slash-tasks" => {
                 if scene=="ai-memory-chip" {crate::proto::memory::seed(&self.memory_root(),"h1");}

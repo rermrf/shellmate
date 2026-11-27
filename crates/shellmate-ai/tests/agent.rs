@@ -2149,3 +2149,6 @@ mod session_tests;
 
 #[path = "agent/responses.rs"]
 mod responses_tests;
+
+#[path="agent/questions.rs"]
+mod question_tests;

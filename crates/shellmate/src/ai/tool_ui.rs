@@ -270,6 +270,7 @@ impl Drawer {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if call.name=="ask_user" && let Some(card)=self.question_card(scope,call,result,w,cx){return card;}
         let p = cx.palette().clone();
         let id = self.tool_key(scope, &call.id, result.is_none());
         let task = self.tool_task(scope, &call.id, result.and_then(|r| r.output_id.as_deref()));

@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Approval,
+    Question,
+    Answered,
+    Skipped,
+    Updated,
     Running,
     Waiting,
     Completed,
@@ -18,6 +22,10 @@ impl Status {
     pub fn label(self) -> &'static str {
         match self {
             Self::Approval => "等待批准",
+            Self::Question => "待回答",
+            Self::Answered => "已回答",
+            Self::Skipped => "已跳过",
+            Self::Updated => "已更新要求",
             Self::Running => "运行中",
             Self::Waiting => "等待结果",
             Self::Completed => "已完成",
@@ -31,18 +39,18 @@ impl Status {
     }
     pub fn color(self, p: &crate::theme::Palette) -> gpui::Hsla {
         match self {
-            Self::Approval | Self::Paused => p.warn,
+            Self::Approval | Self::Question | Self::Paused => p.warn,
             Self::Running | Self::Waiting => p.acc,
-            Self::Completed => p.ok,
+            Self::Completed | Self::Answered => p.ok,
             Self::Failed => p.err,
             _ => p.tx3,
         }
     }
     pub fn badge_colors(self, p: &crate::theme::Palette) -> (gpui::Hsla, gpui::Hsla) {
         let bg = match self {
-            Self::Approval | Self::Paused => p.warns,
+            Self::Approval | Self::Question | Self::Paused => p.warns,
             Self::Running | Self::Waiting => p.accs,
-            Self::Completed => p.oks,
+            Self::Completed | Self::Answered => p.oks,
             Self::Failed => p.errs,
             _ => p.card3,
         };
@@ -51,11 +59,11 @@ impl Status {
     pub fn has_dot(self) -> bool {
         matches!(
             self,
-            Self::Approval | Self::Running | Self::Waiting | Self::Completed | Self::Failed
+            Self::Approval | Self::Running | Self::Waiting | Self::Completed | Self::Answered | Self::Failed
         )
     }
     pub fn attention(self) -> bool {
-        matches!(self, Self::Approval | Self::Failed | Self::Denied)
+        matches!(self, Self::Question | Self::Approval | Self::Failed | Self::Denied)
     }
 }
 pub fn elapsed(ms: u64) -> String {
@@ -74,6 +82,7 @@ pub fn elapsed(ms: u64) -> String {
 }
 pub fn label(call: &LoggedCall) -> String {
     match call.name.as_str() {
+        "ask_user" => "向你提问",
         "run_command" => "执行命令",
         "list_sessions" => "查看终端列表",
         "read_terminal" => "读取终端",

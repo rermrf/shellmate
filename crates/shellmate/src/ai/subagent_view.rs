@@ -19,6 +19,7 @@ pub struct StepView {
 pub struct View {
     pub tool_ids: super::tool_model::Identities,
     finishing_tool: Option<String>,
+    pub questions: Vec<shellmate_ai::questions::Pending>,
     pub pending_inputs: Vec<shellmate_ai::interaction::Input>,
     pub prompt: String,
     pub cwd: Option<String>,
@@ -54,6 +55,7 @@ impl View {
         Self {
             tool_ids: Default::default(),
             finishing_tool: None,
+            questions: vec![],
             pending_inputs: vec![],
             prompt: request.prompt.clone(),
             cwd: None,
@@ -281,6 +283,7 @@ impl View {
         Self {
             tool_ids: Default::default(),
             finishing_tool: None,
+            questions: vec![],
             pending_inputs: vec![],
             prompt: String::new(),
             cwd: None,
@@ -334,6 +337,7 @@ impl View {
         }
         self.transcript_loaded = true;
         self.cwd = super::subagents::saved_cwd(root, conversation, &self.id);
+        self.questions = super::subagent_files::read_checkpoint(root, conversation, &self.id).map(|c|c.inbox.questions).unwrap_or_default();
         self.pending_inputs = super::subagent_files::read_checkpoint(root, conversation, &self.id)
             .map(|c| c.inbox.inputs.into_iter().filter(|i| !i.claimed).collect())
             .unwrap_or_default();
@@ -378,6 +382,7 @@ impl View {
             }
             if self.transcript_loaded {
                 next.pending_inputs = self.pending_inputs.clone();
+                next.questions = self.questions.clone();
                 next.transcript = self.transcript.take();
                 next.step_list = std::mem::take(&mut self.step_list);
                 next.transcript_loaded = true;

@@ -194,6 +194,7 @@ pub struct Compaction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde", tag = "entry", rename_all = "snake_case")]
 pub enum Entry {
+    QuestionAnswer {request_id:String,response:crate::questions::Response,text:String,sent_at_ms:Option<i64>},
     Thinking { message_id: usize, block: crate::ThinkingBlock },
     User {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -232,6 +233,7 @@ impl Entry {
     }
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::QuestionAnswer { .. } => "question_answer",
             Self::Thinking { .. } => "thinking",
             Self::User { .. } => "user",
             Self::Assistant { .. } => "assistant",
@@ -503,6 +505,7 @@ impl Conversation {
                 if let Some(turn) = self.turns.last_mut() {
                     let answer = turn.answer.get_or_insert_with(Answer::default);
                     match &entry {
+                        Entry::QuestionAnswer {..} => {},
                         Entry::Thinking { block, .. } => answer.push_thinking(block),
                         Entry::Assistant { text, .. } => answer.push_text(text),
                         Entry::CommandCard { card, .. } => {

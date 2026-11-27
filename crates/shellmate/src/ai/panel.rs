@@ -1,3 +1,5 @@
+#[path = "questions_ui.rs"]
+mod questions_ui;
 #[path = "thinking_ui.rs"]
 mod thinking_ui;
 #[path = "media_ui.rs"]
@@ -865,7 +867,7 @@ impl Drawer {
                     if let Ok(records)=serde_json::from_value::<Vec<timing::Record>>(runtime["timing"].clone()) { self.state.timing.restore(records); }
                     if let Ok(mut queue)=serde_json::from_value::<shellmate_ai::interaction::Snapshot>(runtime["queue"].clone()) {
                         if self.state.model.conversation.turns().is_empty() && let Some(text)=runtime["preparing"]["text"].as_str() {
-                            queue.inputs.push_front(shellmate_ai::interaction::Input{attachments:serde_json::from_value(runtime["preparing"]["attachments"].clone()).unwrap_or_default(),sent_at_ms:runtime["preparing"]["sent_at_ms"].as_i64(),origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
+                            queue.inputs.push_front(shellmate_ai::interaction::Input{question_id:None,attachments:serde_json::from_value(runtime["preparing"]["attachments"].clone()).unwrap_or_default(),sent_at_ms:runtime["preparing"]["sent_at_ms"].as_i64(),origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
                         }
                         self.state.control.restore(queue);
                     }
@@ -1872,6 +1874,7 @@ impl Render for Drawer {
             for view in self.state.subagents.values().filter(|v| !v.history && !agent_items.values().any(|id|id==&v.id)) {
                 body = body.child(self.subagent_card(view,window,cx));
             }
+            body=body.children(self.child_question_notices(cx));
             for call in &self.state.active_tools{body=body.child(self.tool_card("main",call,None,None,window,cx));}
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
             if let Some(runtime)=&self.runtime&&runtime.snapshot().paused {body=body.child(agent_ui::pill_action("runtime-resume","继续执行",agent_ui::ActionTone::Accent,cx).on_click(cx.listener(|s,_,_,cx|{if let Some(runtime)=&s.runtime{let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}}cx.notify();})));}
@@ -1888,7 +1891,7 @@ impl Render for Drawer {
             }
             if self.state.model.compacting || self.state.pending
                 || (self.state.model.busy
-                    && !matches!(self.state.control.phase(), shellmate_ai::interaction::Phase::Waiting(_))
+                    && !matches!(self.state.control.phase(), shellmate_ai::interaction::Phase::Waiting(_) | shellmate_ai::interaction::Phase::UserInput)
                     && self.state.active_tools.is_empty()
                     && self.state.active_steps.is_empty()
                     && self

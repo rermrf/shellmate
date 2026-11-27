@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 // Resume is opaque. Keeping its ownership generic lets tests use a drop-tracked marker.
 pub(super) struct ConversationState<R = Box<agent::Resume>> {
+    pub(super) question_drafts: std::cell::RefCell<std::collections::BTreeMap<String,(gpui::Entity<super::questions_ui::Draft>,gpui::Subscription)>>,
     pub(super) media: super::media_ui::Drafts,
     pub(super) model: DrawerModel,
     pub(super) context_popover: crate::ai::context_view::Popover,
@@ -54,6 +55,7 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
 impl<R> Default for ConversationState<R> {
     fn default() -> Self {
         Self {
+            question_drafts: Default::default(),
             media: Default::default(),
             model: Default::default(),
             context_popover: Default::default(),

@@ -195,7 +195,7 @@ async fn suggestion_sessions_offer_no_output_tools_and_replay_them_as_text() {
         )
         .await;
         let body = bodies(&http)[0].clone();
-        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
         assert!(body["tools"].to_string().contains("propose_command"));
         super::context_tests::assert_pairs(&body, a);
         assert!(host.calls.lock().unwrap().is_empty() && host.locals.lock().unwrap().is_empty());

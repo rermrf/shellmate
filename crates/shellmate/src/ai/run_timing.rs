@@ -277,6 +277,7 @@ pub(super) fn label(
             Phase::Waiting(ids) if ids.iter().all(|id| id.starts_with("agent-")) => "等待子代理",
             Phase::Waiting(_) => "等待任务",
             Phase::Approval => "等待批准",
+            Phase::UserInput => "等待回答",
             Phase::Retrying => "等待重试",
             Phase::Compacting => "正在压缩上下文",
             _ => "正在运行",

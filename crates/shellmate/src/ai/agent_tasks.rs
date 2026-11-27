@@ -129,6 +129,7 @@ impl Ticket {
         if let Some(registry) = self.registry.upgrade() {
             let mut state = registry.state.lock().unwrap();
             if let Some(task) = state.agents.get_mut(&self.id) {
+                task.view.questions=task.child_outputs.upgrade().map(|c|c.control.snapshot().questions).unwrap_or_default();
                 task.view.pending_inputs = task
                     .child_outputs
                     .upgrade()
@@ -316,7 +317,7 @@ impl Tasks {
                 if state.agents.contains_key(&n) {
                     continue;
                 }
-                let view = View::reopened(
+                let mut view = View::reopened(
                     id.clone(),
                     display,
                     step.call.args_json["run_in_background"]
@@ -324,6 +325,7 @@ impl Tasks {
                         .unwrap_or(false),
                     step.result.inline.clone(),
                 );
+                view.questions=super::super::subagent_files::read_checkpoint(&self.0.root,&self.0.conversation,&view.id).map(|c|c.inbox.questions).unwrap_or_default();
                 let (sender, result) = watch::channel(None);
                 drop(sender);
                 state.agents.insert(
@@ -385,6 +387,8 @@ impl Tasks {
             .into_iter()
             .map(|(mut view, children)| {
                 if let Some(children) = children {
+                    view.questions=children.control.snapshot().questions;
+                    if children.control.phase()==shellmate_ai::interaction::Phase::UserInput {view.latest_activity="等待回答".into();}
                     let state = children.state.lock().unwrap();
                     for step in &mut view.step_list {
                         if let Some(task) = state.tasks.values().find(|t| t.info.call_id == step.id)
