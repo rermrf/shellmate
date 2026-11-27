@@ -443,6 +443,7 @@ impl Tasks {
         for task in state.agents.values() {
             if task.view.status == SubagentStatus::Running && !task.view.background {
                 if let Some(child) = task.child_outputs.upgrade() {
+                    if let Some(owner)=child.interaction.lock().unwrap().take(){owner.release();}
                     child.control.seal();
                 }
                 task.cancel.cancel();

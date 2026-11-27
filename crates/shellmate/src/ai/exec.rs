@@ -329,6 +329,12 @@ impl Executor for AppExecutor {
     fn output_id(&self, call: &ToolCall) -> Option<String> {
         self.tasks.output_id_for(&call.id)
     }
+    fn local_tool_from(&self,tool:shellmate_ai::agent::LocalTool,limits:shellmate_ai::agent::ExecLimits,source:Option<shellmate_ai::SubagentRef>,call_id:&str)->futures::future::BoxFuture<'_,shellmate_ai::agent::LocalResult>{
+        if let shellmate_ai::agent::LocalTool::Sessions(request)=&tool && super::terminal_interaction::handles(request) {
+            let request=request.clone();let call_id=call_id.to_owned();return Box::pin(async move{super::terminal_interaction::execute(self,request,limits,source,&call_id).await});
+        }
+        self.local_tool(tool,limits)
+    }
     fn local_tool(
         &self,
         tool: shellmate_ai::agent::LocalTool,

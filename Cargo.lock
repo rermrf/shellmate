@@ -7648,6 +7648,7 @@ name = "shellmate-core"
 version = "0.4.0"
 dependencies = [
  "libc",
+ "serde",
  "tempfile",
  "uuid",
  "zeroize",

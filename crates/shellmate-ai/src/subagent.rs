@@ -306,7 +306,9 @@ impl ToolHost for ChildHost<'_> {
             out
         })
     }
-    fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
+    fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> BoxFuture<'_, LocalResult> {self.local_tool_from(tool,limits,None,"")}
+    fn local_tool_from(&self,tool:LocalTool,limits:ExecLimits,_source:Option<SubagentRef>,call_id:&str)->BoxFuture<'_,LocalResult>{
+        let call_id=call_id.to_owned();
         Box::pin(async move {
             let allowed = match &tool {
                 LocalTool::ViewImage { .. } => true,
@@ -327,7 +329,7 @@ impl ToolHost for ChildHost<'_> {
                     "子任务只能读取或停止自己的输出和任务；记忆工具遵循主对话的启用设置",
                 );
             }
-            let result = self.inner.local_tool(tool, limits).await;
+            let result = self.inner.local_tool_from(tool,limits,Some(self.source.clone()),&call_id).await;
             if let Some(id) = &result.output_id {
                 self.outputs.lock().unwrap().insert(id.clone());
             }

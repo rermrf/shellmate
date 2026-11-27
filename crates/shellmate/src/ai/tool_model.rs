@@ -85,6 +85,8 @@ pub fn label(call: &LoggedCall) -> String {
         "ask_user" => "向你提问",
         "run_command" => "执行命令",
         "list_sessions" => "查看终端列表",
+        "terminal_input" => "终端交互",
+        "wait_terminal" => "等待终端画面",
         "read_terminal" => "读取终端",
         // Display-only compatibility for saved calls; this tool is no longer offered.
         "compare_directories" => "比较目录",
@@ -105,6 +107,9 @@ pub fn summary(call: &LoggedCall) -> String {
     match call.name.as_str() {
         "view_image" => return "读取会话中的图片".into(),
         "list_sessions" => return "查看已打开的终端与连接状态".into(),
+        "terminal_input" => return call.args_json["purpose"].as_str().unwrap_or("操作终端交互程序").into(),
+        "wait_terminal" => return call.args_json["text"].as_str().map(|s|format!("等待画面出现：{s}")).unwrap_or_else(||"等待终端画面变化".into()),
+        "read_terminal" if call.args_json["screen"]==true => return "读取程序当前画面".into(),
         "read_terminal" => {
             return format!(
                 "读取最近 {} 行输出",

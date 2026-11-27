@@ -335,6 +335,45 @@ async fn focus_and_notifications(cx: &mut AsyncApp, harness: Harness) {
     assert!(!harness.shows(cx, "hello") && !harness.shows(cx, "Body"));
 }
 
+
+async fn agent_interaction(cx:&mut AsyncApp,harness:Harness) {
+    use shellmate_core::terminal_interaction::{Action,Controller,Region};
+    let terminal=&harness.terminal;let (calls,sink)=attach(terminal,cx);
+    sink.output(b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[HMenu\r\n\x1b[7mFirst\x1b[0m\r\nSecond");harness.settle(cx).await;
+    let owner=Arc::new(Controller::new("Test Agent".into()));
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());assert!(screen.alternate_screen);assert!(terminal.read_with(cx,|t,_|t.agent_busy()));
+    let result=terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Key{key:"down".into(),repeat:1}],owner.clone(),cx).unwrap());assert_eq!(result.actions_sent,1);assert!(calls.lock().unwrap().writes.ends_with(b"\x1bOB"));
+    let other=Arc::new(Controller::new("Other".into()));assert!(terminal.update(cx,|t,cx|t.interaction_input(&result.screen.screen_id,&[Action::Text{text:"x".into()}],other,cx)).is_err());
+    terminal.update(cx,|t,_|t.input(b"user"));let before=calls.lock().unwrap().writes.clone();let snapshot=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());assert!(snapshot.paused);
+    assert!(terminal.update(cx,|t,cx|t.interaction_input(&snapshot.screen_id,&[Action::Key{key:"enter".into(),repeat:1}],owner.clone(),cx)).is_err());assert_eq!(calls.lock().unwrap().writes,before);
+    terminal.update(cx,|t,cx|t.resume_interaction(cx));let screen=terminal.update(cx,|t,_|t.interaction_snapshot(Some(&Region{row:0,column:0,rows:1,columns:20})).unwrap());
+    sink.output(b"\x1b[4;1Hclock changes\x1b[6;1H");harness.settle(cx).await;
+    terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Paste{text:"hello\nworld".into()}],owner.clone(),cx).unwrap());
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,_|t.set_size(TerminalSize{cols:81,rows:24,..Default::default()}));assert!(terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"x".into()}],owner.clone(),cx)).is_err());
+    let before=calls.lock().unwrap().writes.clone();terminal.update(cx,|t,cx|t.interaction_release(&owner,cx).unwrap());assert_eq!(calls.lock().unwrap().writes,before);assert!(!calls.lock().unwrap().closed);
+    let old=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());attach(terminal,cx);assert!(terminal.update(cx,|t,cx|t.interaction_input(&old.screen_id,&[Action::Text{text:"x".into()}],owner,cx)).is_err());
+}
+async fn real_tui(cx:&mut AsyncApp,harness:Harness) {
+    use shellmate_core::{Program,Secret,terminal_interaction::{Action,Controller}};
+    let dir=tempfile::tempdir().unwrap();let file=dir.path().join("editable.txt");std::fs::write(&file,"original\n").unwrap();
+    let program=Program{executable:"/usr/bin/vim".into(),args:vec!["-Nu".into(),"NONE".into(),"-n".into(),file.to_string_lossy().into()],cwd:Some(dir.path().into()),env:[("HOME".into(),Secret::new(dir.path().to_str().unwrap())),("TERM".into(),Secret::new("xterm-256color"))].into()};
+    let terminal=&harness.terminal;terminal.update(cx,|t,cx|{assert!(t.attach(move|sink,size|{let exit=sink.clone();Ok(Box::new(shellmate_term::LocalPty::spawn_program(&program,size,move|b|sink.output(b),move|code|exit.exited(code))?))},cx));});
+    harness.wait_for_text(cx,"original").await;harness.settle(cx).await;
+    let owner=Arc::new(Controller::new("Editor test".into()));
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());
+    terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"i".into()}],owner.clone(),cx).unwrap());harness.settle(cx).await;
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"edited ".into()},Action::Key{key:"escape".into(),repeat:1}],owner.clone(),cx).unwrap());harness.wait_for_text(cx,"edited original").await;harness.settle(cx).await;
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:":wq".into()},Action::Key{key:"enter".into(),repeat:1}],owner,cx).unwrap());
+    let deadline=Instant::now()+Duration::from_secs(5);while std::fs::read_to_string(&file).unwrap()!="edited original\n" {assert!(Instant::now()<deadline);cx.background_executor().timer(Duration::from_millis(10)).await;}
+    harness.settle(cx).await;
+    // Pager uses the same generic input path; search and exit leave its file intact.
+    let lines=(0..100).map(|n|format!("line {n:03}\n")).collect::<String>();std::fs::write(&file,&lines).unwrap();
+    let program=Program{executable:"/usr/bin/less".into(),args:vec!["-N".into(),file.to_string_lossy().into()],cwd:Some(dir.path().into()),env:[("HOME".into(),Secret::new(dir.path().to_str().unwrap())),("TERM".into(),Secret::new("xterm-256color"))].into()};
+    terminal.update(cx,|t,cx|{assert!(t.attach(move|sink,size|{let exit=sink.clone();Ok(Box::new(shellmate_term::LocalPty::spawn_program(&program,size,move|b|sink.output(b),move|code|exit.exited(code))?))},cx));});harness.wait_for_text(cx,"line 000").await;harness.settle(cx).await;
+    let owner=Arc::new(Controller::new("Pager test".into()));let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());
+    terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"/line 080".into()},Action::Key{key:"enter".into(),repeat:1}],owner.clone(),cx).unwrap());harness.wait_for_text(cx,"line 080").await;harness.settle(cx).await;
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"q".into()}],owner,cx).unwrap());harness.settle(cx).await;assert_eq!(std::fs::read_to_string(&file).unwrap(),lines);
+}
 fn main() {
     if std::env::var_os("SHELLMATE_GUI_TESTS").is_none() {
         println!("terminal_session: skipped (set SHELLMATE_GUI_TESTS=1 to run; needs a macOS login session)");
@@ -356,12 +395,15 @@ fn main() {
         let title = Harness::new(cx);
         let closing = Harness::new(cx);
         let focusing = Harness::new(cx);
+        let interacting=Harness::new(cx);let real=Harness::new(cx);
         cx.spawn(async move |cx| {
             run(cx, lifecycle).await;
             connecting(cx, progress).await;
             titles(cx, title).await;
             close_activity(cx, closing).await;
             focus_and_notifications(cx, focusing).await;
+            agent_interaction(cx,interacting).await;
+            real_tui(cx,real).await;
             println!("terminal_session: ok");
             cx.update(|cx| cx.quit());
         })

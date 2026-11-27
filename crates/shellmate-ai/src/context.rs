@@ -285,7 +285,8 @@ impl Conversation {
                 ""
             }
             + &memory.text()
-            + crate::questions::RULES;
+            + crate::questions::RULES
+            + if caps.sessions {crate::session_tools::INTERACTION_RULES}else{""};
         let pending=crate::questions::from_entries(self.entries()).into_iter().filter(|q|q.response.is_none()).map(|q|format!("{}：{}",q.id,q.request.questions.iter().map(|q|q.question.as_str()).collect::<Vec<_>>().join("；"))).collect::<Vec<_>>();
         let system=if pending.is_empty(){system}else{format!("{system}\n已发出、尚待用户反馈的问题（不能视为同意，不重复提问）：\n{}",pending.join("\n"))};
         let images=self.attachments();
@@ -334,7 +335,7 @@ impl Conversation {
         }
         if !summarizing {offered.push("ask_user");}
         if caps.sessions && !summarizing {
-            offered.extend(["list_sessions", "read_terminal"]);
+            offered.extend(["list_sessions", "read_terminal", "terminal_input", "wait_terminal"]);
         }
         if caps.web && !summarizing {
             offered.extend(["web_search", "web_fetch"]);

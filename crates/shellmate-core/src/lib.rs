@@ -5,6 +5,7 @@ pub mod filter;
 pub mod host;
 pub mod import;
 pub mod io;
+pub mod terminal_interaction;
 pub mod program;
 pub use program::Program;
 #[cfg(any(test, feature = "test-support"))]

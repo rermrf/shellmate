@@ -28,6 +28,21 @@ pub(super) fn session_catalog(cx: &mut App) -> crate::ai::session_catalog::Catal
     cx.spawn(async move |cx| {
         while let Ok(event) = rx.recv().await {
             cx.update(|cx| match event {
+                crate::ai::host::Ui::TerminalInteraction{session,lease,owner:controller,operation,reply}=>{
+                    if reply.is_closed(){return;}
+                    let result=hub::Route::Session(session).target(cx).and_then(|owner|owner.update(cx,|ws,_,cx|{
+                        let Some(s)=ws.sessions.iter().find(|s|s.id==session)else{return Err("终端不存在".into());};
+                        if !Arc::ptr_eq(&lease,&s.terminal.read(cx).agent_liveness())||!lease.load(std::sync::atomic::Ordering::Acquire)||!controller.active(){return Err("终端连接或任务状态已变化".into());}
+                        s.terminal.update(cx,|t,cx|{use crate::ai::terminal_interaction::{Operation,Reply};
+                            match operation {
+                                Operation::Read{region}=>{let owned=t.interaction_owned(&controller);t.interaction_snapshot(region.as_ref()).map(|screen|Reply::Screen{screen,owned})},
+                                Operation::Check{screen_id}=>{let owned=t.interaction_owned(&controller);t.interaction_check(&screen_id,&controller).map(|screen|Reply::Screen{screen,owned})},
+                                Operation::Input{screen_id,actions}=>t.interaction_input(&screen_id,&actions,controller,cx).map(Reply::Input),
+                                Operation::Release=>t.interaction_release(&controller,cx).map(|_|Reply::Released),
+                            }
+                        })
+                    })).unwrap_or_else(||Err("终端所在窗口已关闭".into()));let _=reply.send(result);
+                }
                 crate::ai::host::Ui::ReadSession {
                     session,
                     lease,

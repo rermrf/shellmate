@@ -273,6 +273,8 @@ impl OutputHandler for GridSink {
 /// A terminal session: the alacritty grid plus the backend feeding it. Create
 /// one with [`Terminal::local`] or [`Terminal::new`] + [`Terminal::attach`].
 pub struct Terminal {
+    interaction:crate::interaction::State,
+    interaction_watch:Option<Task<()>>,
     term: Arc<FairMutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
     capture: Arc<Mutex<Capture>>,
@@ -348,6 +350,8 @@ impl Terminal {
         });
 
         Self {
+            interaction:Default::default(),
+            interaction_watch:None,
             term: Arc::new(FairMutex::new(term)),
             parser: Arc::new(Mutex::new(Processor::new())),
             capture: Arc::new(Mutex::new(Capture::default())),
@@ -413,6 +417,7 @@ impl Terminal {
         cx: &mut Context<Self>,
     ) -> bool {
         self.close_backend();
+        self.interaction=Default::default();
         self.prompt_idle = None;
         self.prompt_highlighter.reset();
         let generation = {
@@ -688,7 +693,7 @@ impl Terminal {
     }
     pub fn agent_liveness(&self) -> Arc<AtomicBool> { self.alive.lock().clone() }
     pub fn agent_connected(&self) -> bool { self.alive.lock().load(Ordering::Acquire) && self.backend.is_some() && !self.replay }
-    pub fn agent_busy(&self) -> bool { self.agent.lock().busy(self.mode().contains(TermMode::ALT_SCREEN)) || self.capture.lock().running() }
+    pub fn agent_busy(&self) -> bool { self.agent.lock().busy(self.mode().contains(TermMode::ALT_SCREEN)) || self.capture.lock().running() || self.interaction.owner().is_some() }
     pub fn agent_start(
         &mut self,
         command: &str,
@@ -713,7 +718,7 @@ impl Terminal {
         if !self.agent_connected() {
             return Err("disconnected");
         }
-        if self.capture.lock().running() {
+        if self.capture.lock().running() || self.interaction.owner().is_some() {
             return Err("busy");
         }
         let (scanner, handle) = match spool {
@@ -733,7 +738,7 @@ impl Terminal {
     }
     pub fn agent_interrupt(&mut self, nonce: &str) {
         let running = self.agent.lock().active.as_ref().is_some_and(|(id, scanner)| id == nonce && scanner.running());
-        if running { self.input(b"\x03"); }
+        if running { self.try_input(b"\x03").ok(); }
     }
     pub fn agent_finish(&mut self, nonce: &str, interrupt: bool) {
         if interrupt { self.agent_interrupt(nonce); }
@@ -773,6 +778,7 @@ impl Terminal {
     /// Sends user input to the process, snapping the view back to the prompt.
     pub fn input(&mut self, bytes: &[u8]) {
         if self.replay{return;}
+        self.interaction.takeover();
         if self.try_input(bytes).is_err() {
             log::warn!("terminal input write failed");
         }
@@ -795,6 +801,49 @@ impl Terminal {
         self.backend.as_mut().ok_or(std::io::ErrorKind::NotConnected)?.write(bytes)
     }
 
+    pub fn interaction_status(&self)->Option<(String,bool)> {self.interaction.owner().map(|o|(o.label.clone(),self.interaction.paused))}
+    pub fn take_over_interaction(&mut self,cx:&mut Context<Self>){self.interaction.takeover();cx.notify();}
+    pub fn resume_interaction(&mut self,cx:&mut Context<Self>){self.interaction.resume();cx.notify();}
+    pub fn user_write_raw(&mut self,bytes:&[u8]){self.interaction.takeover();self.write_raw(bytes);}
+    pub fn interaction_snapshot(&mut self,region:Option<&shellmate_core::terminal_interaction::Region>)->Result<shellmate_core::terminal_interaction::Screen,String>{
+        if !self.agent_connected(){return Err("终端未连接".into());}
+        let mut screen=crate::interaction::snapshot(&*self.term.lock(),region)?;
+        screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();self.interaction.record(&mut screen);Ok(screen)
+    }
+    pub fn interaction_owned(&self,owner:&shellmate_core::terminal_interaction::Controller)->bool{self.interaction.owner().is_some_and(|o|o.id==owner.id)}
+    pub fn interaction_check(&self,id:&str,owner:&shellmate_core::terminal_interaction::Controller)->Result<shellmate_core::terminal_interaction::Screen,String>{
+        if !self.agent_connected(){return Err("终端未连接".into());}
+        let region=self.interaction.observations.iter().find(|o|o.id==id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
+        let mut screen=crate::interaction::snapshot(&*self.term.lock(),Some(&region))?;
+        self.interaction.validate(id,owner,&screen)?;screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();Ok(screen)
+    }
+    pub fn interaction_release(&mut self,owner:&shellmate_core::terminal_interaction::Controller,cx:&mut Context<Self>)->Result<(),String>{
+        if self.interaction.owner().is_some_and(|o|o.id!=owner.id){return Err("不能释放其他 Agent 的控制权".into());}
+        self.interaction.owner=None;self.interaction.paused=false;self.interaction.invalidate();cx.notify();Ok(())
+    }
+    pub fn interaction_input(&mut self,screen_id:&str,actions:&[shellmate_core::terminal_interaction::Action],owner:Arc<shellmate_core::terminal_interaction::Controller>,cx:&mut Context<Self>)->Result<shellmate_core::terminal_interaction::InputResult,String>{
+        use shellmate_core::terminal_interaction::{validate_actions,InputResult};
+        validate_actions(actions)?;
+        if !self.agent_connected(){return Err("终端未连接".into());}
+        if self.agent.lock().active.as_ref().is_some_and(|(_,s)|s.running()){return Err("此终端正在执行已捕获的命令，请先等待命令结束或使用另一个终端".into());}
+        let region=self.interaction.observations.iter().find(|o|o.id==screen_id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
+        let term=self.term.lock();let screen=crate::interaction::snapshot(&*term,Some(&region))?;self.interaction.validate(screen_id,&owner,&screen)?;
+        let mode=*term.mode();let frames=actions.iter().map(|a|crate::interaction::encode(a,&mode)).collect::<Result<Vec<_>,_>>()?;
+        self.interaction.owner=Some(owner);self.interaction.paused=false;
+        self.interaction_watch=Some(cx.spawn(async move|this,cx|loop {
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            if !this.update(cx,|t,cx|{
+                let keep=t.agent_connected() && t.interaction.owner().is_some();
+                if !keep{t.interaction.owner=None;t.interaction.invalidate();cx.notify();}keep
+            }).unwrap_or(false){break;}
+        }));
+        let mut sent=0;let mut error=None;
+        for frame in frames {
+            if let Err(e)=self.backend.as_mut().ok_or("终端未连接")?.write(&frame){error=Some(format!("输入写入失败：{e}；请重新观察，勿自动重发"));break;}
+            self.capture.lock().input(&*term,&frame);sent+=1;
+        }
+        drop(term);self.interaction.invalidate();let screen=self.interaction_snapshot(Some(&region))?;cx.notify();Ok(InputResult{screen,actions_sent:sent,error})
+    }
     pub fn paste(&mut self, text: &str) {
         let mode = self.paste_mode();
         self.input(paste_payload(text, &mode).as_bytes());
@@ -808,6 +857,7 @@ impl Terminal {
 
     /// Sends a reviewed command as a paste followed by a separate carriage return.
     pub fn send_command(&mut self, command: &str) -> Result<(), &'static str> {
+        self.interaction.takeover();
         self.validate_command(command)?;
         crate::send::send(command, &self.paste_mode(), |bytes| self.try_input(bytes))
     }

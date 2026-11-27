@@ -17,6 +17,16 @@ impl Drawer {
             .gap(px(8.))
             .text_size(px(12.))
             .whitespace_normal();
+        if let Ok(screen)=serde_json::from_value::<shellmate_core::terminal_interaction::Screen>(value["screen"].clone()) {
+            let target=value["target"]["label"].as_str().unwrap_or("终端");
+            let rows=screen.lines.iter().map(|r|format!("{:>3} │ {}",r.row,r.text)).collect::<Vec<_>>().join("\n");
+            let metadata=format!("{target} · {} × {} · 光标 {}, {}{}",screen.columns,screen.rows,screen.cursor.row,screen.cursor.column,if screen.alternate_screen{" · 备用屏幕"}else{""});
+            body=body.child(div().text_color(p.tx3).child(metadata))
+                .child(div().id(SharedString::from(format!("{key}:screen-scroll"))).max_h(px(260.)).overflow_scroll().bg(p.card2).rounded(px(10.)).p(px(8.)).child(super::subagent_ui::selectable(format!("{key}:screen"),&rows,w,cx).font_family(MONO_FONT).whitespace_nowrap().text_size(px(11.5))));
+            if value["timed_out"]==true {body=body.child(div().text_color(p.tx3).child("等待已到时，以上为当前画面"));}
+            if let Some(error)=value["error"].as_str(){body=body.child(div().text_color(p.err).child(error.to_owned()));}
+            return Some(body);
+        }
         if let Some(rows) = value["sessions"].as_array() {
             for (index, row) in rows.iter().enumerate() {
                 body = body.child(div().py(px(4.)).border_b_1().border_color(p.line).child(
@@ -57,6 +67,12 @@ impl Drawer {
                 ));
         }
         Some(body)
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn terminal_interaction_fixture(&mut self,screen:shellmate_core::terminal_interaction::Screen,cx:&mut Context<Self>){
+        let mut log=shellmate_ai::Conversation::default();log.push_user(UserTurn::new("帮我在这个终端菜单中选择配置检查",Default::default()).sent_now());
+        log.append(shellmate_ai::Entry::Step(shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:"tui".into(),name:"terminal_input".into(),args_json:serde_json::json!({"session_id":"fixture","purpose":"选择配置检查","actions":[{"type":"key","key":"down"}]})},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:serde_json::json!({"target":{"label":"当前终端"},"actions_sent":1,"screen":screen}).to_string(),output_id:None,cleared:false,is_error:false},display:None}));
+        log.push_text("已发送方向键。你可以随时点击终端或输入接管，程序会继续运行。");self.state.model.conversation=log;self.state.model.busy=false;self.state.follow_bottom=false;self.scroll.set_offset(point(px(0.),px(0.)));self.state.tool_expanded.insert(self.tool_key("main","tui",false));cx.notify();
     }
     pub(super) fn message_context(
         &mut self,
@@ -404,6 +420,7 @@ impl Drawer {
                 .is_none_or(|s| s.started.is_none() != !a.started)
             {
                 let mut step = agent_ui::ActiveStep::new(a.call);
+                step.interaction=a.interaction;
                 step.source = a.source.clone();
                 step.redline = a.redline;
                 step.reply = a.reply;

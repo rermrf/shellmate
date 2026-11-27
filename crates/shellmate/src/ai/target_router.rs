@@ -221,11 +221,12 @@ impl Router {
     }
     pub async fn local(&self, request: Request) -> LocalResult {
         match request {
+            Request::Input(_) | Request::Wait(_) => LocalResult::error("终端交互需要带任务身份的执行器"),
             Request::List(args) => {
                 let scope = self.scope.lock().unwrap().clone();
                 let entries = self.catalog.list();
                 let matching: Vec<_> = entries.iter().filter(|e|args.query.is_empty()||e.target.label.contains(&args.query)||e.target.protocol.contains(&args.query)).collect();
-                let rows:Vec<_>=matching.iter().enumerate().skip(args.offset).take(50).map(|(index,e)|serde_json::json!({"number":index+1,"session_id":e.target.session_id,"name":e.target.label,"protocol":e.target.protocol,"window":e.window,"connected":e.connected,"cwd":e.target.cwd,"terminal_busy":e.binding.capabilities.terminal_busy,"terminal":e.binding.capabilities.terminal,"background":e.binding.capabilities.background,"default":scope.default.as_ref()==Some(&e.target.session_id)})).collect();
+                let rows:Vec<_>=matching.iter().enumerate().skip(args.offset).take(50).map(|(index,e)|serde_json::json!({"number":index+1,"session_id":e.target.session_id,"name":e.target.label,"protocol":e.target.protocol,"window":e.window,"connected":e.connected,"cwd":e.target.cwd,"terminal_busy":e.binding.capabilities.terminal_busy,"terminal":e.binding.capabilities.terminal,"background":e.binding.capabilities.background,"interactive":e.binding.capabilities.terminal&&(e.binding.local||e.binding.connection.is_some()),"default":scope.default.as_ref()==Some(&e.target.session_id)})).collect();
                 LocalResult::text(serde_json::json!({"sessions":rows,"sampled_at":super::now(),"offset":args.offset,"next_offset":(args.offset+rows.len()<matching.len()).then_some(args.offset+rows.len()),"note":"number 只对应本次列表。用户说第几个时按对话中对应列表映射 session_id，不能用最新列表位置替换。default 是对话默认终端，不是当前选中标签。terminal_busy=false 仅表示未检测到占用，不保证 shell 空闲。全部已连接终端均可按任务使用，无需加入。"}).to_string())
             }
             Request::Read(args) => {

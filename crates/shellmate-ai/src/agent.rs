@@ -333,6 +333,7 @@ pub trait ToolHost: Send + Sync {
         None
     }
 
+    fn local_tool_from(&self,tool:LocalTool,limits:ExecLimits,_source:Option<crate::SubagentRef>,_call_id:&str)->BoxFuture<'_,LocalResult>{self.local_tool(tool,limits)}
     fn local_tool(&self, _tool: LocalTool, _limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async {
             LocalResult {
@@ -1235,8 +1236,8 @@ fn stream<'a>(
                         let result = if let LocalTool::ViewImage {id}=&tool {
                             if let Some(a)=s.conversation.attachments().into_iter().find(|a|a.id==*id) {
                                 let mut r=LocalResult::text(a.label());r.attachments.push(a);r
-                            } else {s.host.local_tool(tool,s.limits.exec).await}
-                        } else {s.host.local_tool(tool, s.limits.exec).await};
+                            } else {s.host.local_tool_from(tool,s.limits.exec,None,&tool_id).await}
+                        } else {s.host.local_tool_from(tool,s.limits.exec,None,&tool_id).await};
                         s.entry(Entry::Step(crate::Step {
                             message_id: s.message_id,
                             call: crate::LoggedCall {
@@ -1898,7 +1899,7 @@ fn parse_local(
     }
     if matches!(
         name,
-        "list_sessions" | "read_terminal"
+        "list_sessions" | "read_terminal" | "terminal_input" | "wait_terminal"
     ) {
         if !sessions {
             return Err("终端目录不可用".into());

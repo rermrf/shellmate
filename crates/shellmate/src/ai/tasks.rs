@@ -119,6 +119,7 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    interaction:Mutex<Option<Arc<shellmate_core::terminal_interaction::Controller>>>,
     service_parent: std::sync::OnceLock<(Weak<Inner>, String)>,
     web: std::sync::OnceLock<Arc<super::web::Service>>,
     released_waits: Mutex<Vec<String>>,
@@ -134,6 +135,7 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        if let Some(owner)=self.interaction.get_mut().unwrap().take(){owner.release();}
         for child in self.state.get_mut().unwrap().services.values() {
             child.retire();
         }
@@ -157,8 +159,17 @@ impl Retained {
     }
 }
 impl Tasks {
+    pub fn interaction_owner(&self,label:String)->Arc<shellmate_core::terminal_interaction::Controller>{
+        let mut owner=self.0.interaction.lock().unwrap();
+        if owner.as_ref().is_none_or(|o|!o.active()){*owner=Some(Arc::new(shellmate_core::terminal_interaction::Controller::new(label)));}
+        if self.0.state.lock().unwrap().retired {owner.as_ref().unwrap().release();}
+        owner.as_ref().unwrap().clone()
+    }
+    pub fn release_interaction(&self){if let Some(owner)=self.0.interaction.lock().unwrap().take(){owner.release();}}
+
     /// Only service processes are retained after their child agent finishes.
     pub fn finish_agent_commands(&self) {
+        self.release_interaction();
         for task in self.0.state.lock().unwrap().tasks.values() {
             if task.info.service.is_none() && task.info.status == Status::Running {
                 let _ = task.cancel.send(Some(Stop::User));
@@ -276,6 +287,7 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            interaction:Default::default(),
             service_parent: Default::default(),
             web: Default::default(),
             released_waits: Default::default(),
@@ -568,6 +580,7 @@ impl Tasks {
             .map(|t| t.info.output_id.clone())
     }
     pub fn stop_all(&self) {
+        self.release_interaction();
         let services = self
             .0
             .state
@@ -582,6 +595,7 @@ impl Tasks {
         }
         for task in self.0.state.lock().unwrap().agents.values() {
             if let Some(child) = task.child_outputs.upgrade() {
+                if let Some(owner)=child.interaction.lock().unwrap().take(){owner.release();}
                 child.control.seal();
             }
             task.cancel.cancel();
@@ -604,6 +618,7 @@ impl Tasks {
             return state.agents.get(&number).is_some_and(|t| {
                 if t.view.status == shellmate_ai::SubagentStatus::Running {
                     if let Some(child) = t.child_outputs.upgrade() {
+                        if let Some(owner)=child.interaction.lock().unwrap().take(){owner.release();}
                         child.control.seal();
                     }
                     t.cancel.cancel();

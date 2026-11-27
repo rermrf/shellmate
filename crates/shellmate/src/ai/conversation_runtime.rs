@@ -28,6 +28,7 @@ use std::{
 };
 #[derive(Clone)]
 pub struct ApprovalView {
+    pub interaction:bool,
     pub call: shellmate_ai::ToolCall,
     pub source: Option<shellmate_ai::SubagentRef>,
     pub redline: bool,
@@ -145,6 +146,11 @@ impl Runtime {
                         };
                         let _ = reply.send(snapshot);
                     }
+                    Ui::TuiApproval {source,call,reply} => {
+                        let key=approval_key(source.as_ref(),&call.id);let mut d=r.data.lock().unwrap();
+                        let redline=call.class==shellmate_ai::policy::Class::RedLine;
+                        d.approvals.insert(key,ApprovalView{interaction:true,call,source,redline,reply:Some(Reply::new(reply)),started:false,automatic:false});d.revision+=1;
+                    }
                     Ui::Approval {
                         source,
                         call,
@@ -156,6 +162,7 @@ impl Runtime {
                         d.approvals.insert(
                             key,
                             ApprovalView {
+                                interaction:false,
                                 call,
                                 source,
                                 redline,
@@ -180,6 +187,7 @@ impl Runtime {
                             d.approvals.insert(
                                 key,
                                 ApprovalView {
+                                    interaction:false,
                                     call,
                                     source,
                                     redline: false,
@@ -237,6 +245,7 @@ impl Runtime {
         self.retired.load(Ordering::Acquire)
     }
     pub fn stop_reply(&self) {
+        self.tasks.release_interaction();
         self.control.request(Intent::StopReply);
         self.wake.notify_one();
     }
@@ -741,10 +750,12 @@ impl Runtime {
                             d.timing.accept_results(&ids);
                             match event {
                                 AgentEvent::Done(u) => {
+                                    self.tasks.release_interaction();
                                     d.model.event(Event::Done(u));
                                     d.timing.done(timing::Moment::now());
                                 }
                                 AgentEvent::Released(reason) => {
+                                    self.tasks.release_interaction();
                                     d.model.event(Event::Done(None));
                                     if reason == agent::ReleaseReason::Stopped {
                                         d.timing
@@ -758,6 +769,7 @@ impl Runtime {
                                     resume,
                                     steps: _,
                                 } => {
+                                    self.tasks.release_interaction();
                                     d.model.pause(reason);
                                     d.paused = true;
                                     continuation = Some(*resume);
@@ -766,6 +778,7 @@ impl Runtime {
                                     self.control.hold();
                                 }
                                 AgentEvent::Error(e) => {
+                                    self.tasks.release_interaction();
                                     d.model.event(Event::Error(e));
                                     d.timing.finish(
                                         if e == AiError::Cancelled {

@@ -520,6 +520,27 @@ fn event_mapping_has_steps_usage_report_and_tasks_share_existing_rows() {
     assert!(first.cancel.is_cancelled() && second.cancel.is_cancelled());
 }
 #[test]
+fn stopping_child_releases_terminal_control_before_worker_unwinds() {
+    for mode in 0..3 {
+        let root = tempfile::tempdir().unwrap();
+        let parent = Tasks::new(root.path().into(), "parent".into());
+        let child = Tasks::new(root.path().into(), "child".into());
+        let ticket = parent.reserve_agent("child", &request(false), &config(), 3).unwrap();
+        let id = format!("agent-{}", ticket.id);
+        parent.attach_child_outputs(&id, &child);
+        let owner = child.interaction_owner("Child".into());
+        let parent_owner = parent.interaction_owner("Parent".into());
+        match mode {
+            0 => assert!(parent.stop(&id)),
+            1 => assert!(parent.stop_foreground()),
+            _ => parent.stop_all(),
+        }
+        assert!(ticket.cancel.is_cancelled());
+        assert!(!owner.active(), "stopped child must reject already queued terminal input");
+        assert_eq!(parent_owner.active(), mode != 2);
+    }
+}
+#[test]
 fn background_gate_tracks_ssh_local_and_excludes_other_protocols() {
     for protocol in [
         None,

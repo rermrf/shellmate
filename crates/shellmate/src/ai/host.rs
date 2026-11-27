@@ -32,6 +32,11 @@ impl Reply {
     }
 }
 pub enum Ui {
+    TuiApproval {source:Option<shellmate_ai::SubagentRef>,call:ToolCall,reply:oneshot::Sender<Approval>},
+    TerminalInteraction {
+        session:usize,lease:Arc<AtomicBool>,owner:Arc<shellmate_core::terminal_interaction::Controller>,operation:super::terminal_interaction::Operation,
+        reply:oneshot::Sender<Result<super::terminal_interaction::Reply,String>>,
+    },
     ReadSession {
         session: usize,
         lease: Arc<AtomicBool>,
@@ -128,6 +133,7 @@ pub trait Executor: Send + Sync {
     fn output_id(&self, _call: &ToolCall) -> Option<String> {
         None
     }
+    fn local_tool_from(&self,tool:shellmate_ai::agent::LocalTool,limits:shellmate_ai::agent::ExecLimits,_source:Option<shellmate_ai::SubagentRef>,_call_id:&str)->BoxFuture<'_,shellmate_ai::agent::LocalResult>{self.local_tool(tool,limits)}
     fn local_tool(
         &self,
         _tool: shellmate_ai::agent::LocalTool,
@@ -232,6 +238,7 @@ impl ToolHost for Host {
     fn output_id(&self, call: &ToolCall) -> Option<String> {
         self.executor.output_id(call)
     }
+    fn local_tool_from(&self,tool:shellmate_ai::agent::LocalTool,limits:shellmate_ai::agent::ExecLimits,source:Option<shellmate_ai::SubagentRef>,call_id:&str)->BoxFuture<'_,shellmate_ai::agent::LocalResult>{self.executor.local_tool_from(tool,limits,source,call_id)}
     fn local_tool(
         &self,
         tool: shellmate_ai::agent::LocalTool,

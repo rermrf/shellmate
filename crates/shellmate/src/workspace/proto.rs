@@ -374,6 +374,11 @@ impl Workspace {
             }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
+            "ai-terminal-interaction"=>{
+                let screen=crate::proto::terminal_interaction::install(&self.sessions[0].terminal,cx);
+                self.open_ai(window,cx);
+                if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|d,cx|{d.scene("ai-chat",window,cx);d.terminal_interaction_fixture(screen,cx);});}
+            }
             "ai-agent" | "ai-agent-run" | "ai-new-confirm" | "ai-agent-redline"
             | "ai-agent-full" | "ai" | "ai-chat" | "ai-markdown" | "ai-markdown-wide"
             | "ai-tasks" | "ai-output-large" | "ai-input-multiline" | "ai-code-copy" | "ai-code-copied" | "ai-code-select" | "ai-context-popover" | "ai-context-amber" | "ai-compacted" | "ai-compacted-open"

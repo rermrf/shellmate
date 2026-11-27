@@ -12,6 +12,7 @@ test-support = []
 uuid = { workspace = true }
 zeroize.workspace = true
 libc.workspace = true
+serde = {version="1",features=["derive"]}
 
 [dev-dependencies]
 tempfile.workspace = true

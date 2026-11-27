@@ -275,7 +275,7 @@ impl Drawer {
         let id = self.tool_key(scope, &call.id, result.is_none());
         let task = self.tool_task(scope, &call.id, result.and_then(|r| r.output_id.as_deref()));
         let mut status = model::command_status(display, result);
-        if result.is_none() && call.name == "wait_tasks" {
+        if result.is_none() && matches!(call.name.as_str(),"wait_tasks"|"wait_terminal") {
             status = model::Status::Waiting;
         }
         let mut duration = display.filter(|d| d.duration_ms > 0).map(|d| d.duration_ms);
@@ -530,7 +530,7 @@ impl Drawer {
                     .child(self.web_content(&id, data, true, w, cx));
             } else if let Some(r) = result {
                 surface = surface.child(section("结果", &p));
-                if matches!(call.name.as_str(),"list_sessions"|"read_terminal") && let Some(content)=self.session_result_content(&id,&r.inline,w,cx){
+                if matches!(call.name.as_str(),"list_sessions"|"read_terminal"|"terminal_input"|"wait_terminal") && let Some(content)=self.session_result_content(&id,&r.inline,w,cx){
                     surface=surface.child(content);
                 } else if let Some(pane) = self.state.output_panes.get(&id) {
                     surface = surface.child(pane.clone());

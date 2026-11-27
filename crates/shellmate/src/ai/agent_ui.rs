@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 
 pub(super) struct ActiveStep {
+    pub interaction:bool,
     pub source: Option<shellmate_ai::SubagentRef>,
     pub call: ToolCall,
     pub reply: Option<crate::ai::host::Reply>,
@@ -26,6 +27,7 @@ impl ActiveStep {
     pub fn new(call: ToolCall) -> Self {
         let redline = call.class == Class::RedLine;
         Self {
+            interaction:false,
             source: None,
             call,
             reply: None,
@@ -152,17 +154,20 @@ impl Drawer {
             AgentEvent::Thinking => self.state.model.event(Event::Thinking),
             AgentEvent::TextDelta(_) | AgentEvent::Command(_) => self.state.model.thinking = false,
             AgentEvent::Done(u) => {
+                if let Some(tasks)=&self.tasks{tasks.release_interaction();}
                 self.state.active_tools.clear();
                 self.state.model.event(Event::Done(u));
                 self.state.model.manual_compaction = false;
                 // Retain the run configuration for queued input and background-result delivery.
             }
             AgentEvent::Released(_) => {
+                if let Some(tasks)=&self.tasks{tasks.release_interaction();}
                 self.state.active_tools.clear();
                 self.state.model.event(Event::Done(None));
                 self.state.model.manual_compaction = false;
             }
             AgentEvent::Error(e) => {
+                if let Some(tasks)=&self.tasks{tasks.release_interaction();}
                 self.state.active_tools.clear();
                 self.state.control.hold();self.state.control.release_claims();
                 self.state.model.event(Event::Error(e));
@@ -173,6 +178,7 @@ impl Drawer {
             AgentEvent::StepProposed(_) => self.state.model.thinking = false,
             AgentEvent::StepFinished { .. } => { self.state.active_steps.clear_main(); }
             AgentEvent::Paused { reason, steps, resume } => {
+                if let Some(tasks)=&self.tasks{tasks.release_interaction();}
                 self.state.active_tools.clear();
                 self.state.control.hold();
                 self.state.model.pause(reason);
@@ -253,6 +259,9 @@ impl Drawer {
                                 return;
                             }
                             match event {
+                                Ui::TuiApproval{call,source,reply}=>{
+                                    if reply.is_closed(){return;}let key=crate::ai::host::approval_key(source.as_ref(),&call.id);let redline=call.class==Class::RedLine;let mut step=ActiveStep::new(call);step.interaction=true;step.redline=redline;step.source=source.clone();step.reply=Some(crate::ai::host::Reply::new(reply));s.state.active_steps.insert(key,source.map(|s|s.id),step);cx.notify();
+                                }
                                 Ui::Approval {
                                     call,
                                     redline,
@@ -380,7 +389,7 @@ impl Drawer {
         let expanded=self.tool_open(&display_key,status);
         let detail=format!("{}执行{}{}{}",step.call.target.label(),if step.call.service.is_some(){" · 持续服务"}else{""},if step.automatic{" · 自动批准"}else{""},step.source.as_ref().map(|s|format!(" · 子任务：{}",s.description)).unwrap_or_default());
         let detail=if let Some(target)=&step.call.destination{format!("{} · {} · {} · {}",target.label,target.protocol,target.cwd.as_deref().unwrap_or("目录未知"),detail)}else{detail};
-        let model=super::tool_ui::Card{key:display_key.clone(),title:"执行命令".into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
+        let model=super::tool_ui::Card{key:display_key.clone(),title:if step.interaction{"终端交互"}else{"执行命令"}.into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
         let mut card=self.tool_shell(&model,cx);
         if red&&step.started.is_none(){
             card = card
@@ -435,7 +444,7 @@ impl Drawer {
             let caps = step.call.session_id.as_deref().and_then(|id| {
                 self.runtime.as_ref()?.router.catalog.resolve(id).ok().map(|e| e.binding.capabilities)
             }).unwrap_or_else(|| self.capabilities.clone());
-            if caps.terminal && caps.background {
+            if !step.interaction && caps.terminal && caps.background {
                 let mut track = div()
                     .flex()
                     .items_center()
@@ -500,7 +509,7 @@ impl Drawer {
                         .child(
                             dialogs::button(
                                 "ai-step-run",
-                                "运行",
+                                if step.interaction {"发送"}else{"运行"},
                                 if red { Tone::Danger } else { Tone::Primary },
                                 true,
                             )
@@ -510,7 +519,7 @@ impl Drawer {
                             .text_size(px(12.5))
                             .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, false, cx) })),
                         )
-                        .child(
+                        .when(!step.interaction, |d| d.child(
                             pill_action("ai-step-edit", "编辑", ActionTone::Card, cx)
                                 .h(px(32.))
                                 .px(px(12.))
@@ -533,7 +542,7 @@ impl Drawer {
                                     }
                                     cx.notify();
                                 } })),
-                        )
+                        ))
                         .child(
                             pill_action("ai-step-deny", "拒绝", ActionTone::Danger, cx)
                                 .h(px(32.))

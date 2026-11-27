@@ -33,3 +33,4 @@ pub use capture_output::RecordingResult;
 mod behavior;
 
 pub mod agent;
+mod interaction;

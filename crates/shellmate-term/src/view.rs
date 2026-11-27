@@ -395,7 +395,7 @@ impl TerminalView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
-        self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
+        self.terminal.update(cx,|t,cx|{t.take_over_interaction(cx);cx.emit(TerminalEvent::Focused);});
         self.left_press = LeftPress::Idle;
         let terminal = self.terminal.read(cx);
         let mode = terminal.mode();
@@ -403,7 +403,7 @@ impl TerminalView {
             if let Some(g) = self.geometry {
                 let (cell, _) = g.viewport_cell(event.position, usize::from(g.size.rows));
                 if let Some(bytes) = mouse::report(mode, ButtonEvent::LeftDown, event.modifiers, cell) {
-                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                    self.terminal.update(cx, |t, _| t.user_write_raw(&bytes));
                     self.left_press = LeftPress::Reported(cell);
                 }
             }
@@ -438,7 +438,7 @@ impl TerminalView {
                 let (cell, _) = g.viewport_cell(event.position, usize::from(g.size.rows));
                 let mode = self.terminal.read(cx).mode();
                 if cell != last && let Some(bytes) = mouse::report(mode, ButtonEvent::LeftDrag, event.modifiers, cell) {
-                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                    self.terminal.update(cx, |t, _| t.user_write_raw(&bytes));
                     self.left_press = LeftPress::Reported(cell);
                 }
                 return;
@@ -466,7 +466,7 @@ impl TerminalView {
                 // release a previously reported press if the pointer crossed that limit.
                 let release = |cell| mouse::report(mode, ButtonEvent::LeftUp, event.modifiers, cell);
                 if let Some(bytes) = release(cell).or_else(|| release(last)) {
-                    self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                    self.terminal.update(cx, |t, _| t.user_write_raw(&bytes));
                 }
                 return;
             }
@@ -480,7 +480,7 @@ impl TerminalView {
 
     fn right_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
-        self.terminal.update(cx,|_,cx|cx.emit(TerminalEvent::Focused));
+        self.terminal.update(cx,|t,cx|{t.take_over_interaction(cx);cx.emit(TerminalEvent::Focused);});
         if crate::behavior::right_paste(self.right_click_paste) {
             self.paste_clipboard(cx);
         }
@@ -509,7 +509,7 @@ impl TerminalView {
             }
             mouse::Action::Report(report) => {
                 let bytes = report.repeat(lines.unsigned_abs() as usize);
-                self.terminal.update(cx, |t, _| t.write_raw(&bytes));
+                self.terminal.update(cx, |t, _| t.user_write_raw(&bytes));
             }
             mouse::Action::Ignore => return,
         }
@@ -603,6 +603,7 @@ impl Render for TerminalView {
             matches,
             active,
         );
+        let interaction=self.terminal.read(cx).interaction_status();
         let search = self.search.as_ref().map(|s| self.render_search(s, cx));
         let content = if self.terminal.read(cx).is_replay() {
             self.render_replay(element, cx).into_any_element()
@@ -644,6 +645,8 @@ impl Render for TerminalView {
             .bg(to_hsla(self.style.palette.background))
             .child(content)
             .children(search)
+            .when_some(interaction,|d,(label,paused)|d.child(div().absolute().top(px(5.)).right(px(10.)).flex().items_center().gap(px(6.)).px(px(8.)).py(px(4.)).rounded(px(8.)).bg(to_hsla(self.style.palette.background)).text_color(to_hsla(self.style.palette.foreground)).text_size(px(11.)).child(format!("{label} · {}",if paused{"已接管"}else{"正在操作终端"}))
+                .child(div().id("terminal-agent-takeover").cursor_pointer().px(px(6.)).child(if paused{"允许继续"}else{"接管"}).on_mouse_down(MouseButton::Left,|_,_,cx|cx.stop_propagation()).on_click(cx.listener(move|s,_,_,cx|{cx.stop_propagation();s.terminal.update(cx,|t,cx|if paused{t.resume_interaction(cx)}else{t.take_over_interaction(cx)});cx.notify();})))) )
     }
 }
 

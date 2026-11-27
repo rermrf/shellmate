@@ -747,6 +747,7 @@ impl Drawer {
         );
     }
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(tasks)=&self.tasks{tasks.release_interaction();}
         if let Some(runtime)=&self.runtime{runtime.stop_reply();self.sync_runtime(cx);return;}
         if self.state.timing.finish(timing::Status::Stopped, timing::Moment::now()) { self.persist(); }
         self.state.control.hold();self.main_cancel.cancel();
@@ -1875,7 +1876,7 @@ impl Render for Drawer {
                 body = body.child(self.subagent_card(view,window,cx));
             }
             body=body.children(self.child_question_notices(cx));
-            for call in &self.state.active_tools{body=body.child(self.tool_card("main",call,None,None,window,cx));}
+            for call in &self.state.active_tools{if call.name=="terminal_input"&&self.state.active_steps.iter().any(|(_,s)|s.interaction&&s.call.id==call.id&&s.source.is_none()){continue;}body=body.child(self.tool_card("main",call,None,None,window,cx));}
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
             if let Some(runtime)=&self.runtime&&runtime.snapshot().paused {body=body.child(agent_ui::pill_action("runtime-resume","继续执行",agent_ui::ActionTone::Accent,cx).on_click(cx.listener(|s,_,_,cx|{if let Some(runtime)=&s.runtime{let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}}cx.notify();})));}
             if self.state.continuation.is_some() {
