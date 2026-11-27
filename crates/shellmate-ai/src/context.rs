@@ -259,25 +259,11 @@ pub(crate) fn char_excerpt(text: &str, limit: usize) -> String {
         .collect();
     format!("{head}\n…\n{tail}")
 }
-/// Only Resume owns these native assistant messages; they cannot reach persistence.
+/// In-memory wire messages. Responses can restore a sanitized replay subset from the log.
 pub(crate) type NativeMessages = BTreeMap<usize, AssistantMessage>;
 
 impl Conversation {
-    pub fn prepare(&self, capabilities: &Capabilities) -> Result<CompletionRequest, AiError> {
-        self.request(
-            capabilities,
-            &NativeMessages::new(),
-            false,
-            self.view_start(),
-        )
-    }
-    pub(crate) fn request(
-        &self,
-        caps: &Capabilities,
-        native: &NativeMessages,
-        summarizing: bool,
-        start: usize,
-    ) -> Result<CompletionRequest, AiError> {
+    pub(crate) fn system(&self, caps: &Capabilities) -> Result<String, AiError> {
         let newest = self.latest_user().ok_or(AiError::InvalidConfig)?;
         if newest.question.trim().is_empty() {
             return Err(AiError::InvalidConfig);
@@ -297,6 +283,25 @@ impl Conversation {
                 ""
             }
             + &memory.text();
+        Ok(system)
+    }
+    pub fn prepare(&self, capabilities: &Capabilities) -> Result<CompletionRequest, AiError> {
+        self.request(
+            capabilities,
+            &NativeMessages::new(),
+            false,
+            self.view_start(),
+        )
+    }
+    pub(crate) fn request(
+        &self,
+        caps: &Capabilities,
+        native: &NativeMessages,
+        summarizing: bool,
+        start: usize,
+    ) -> Result<CompletionRequest, AiError> {
+        let system = self.system(caps)?;
+        let memory = self.memory.clone().unwrap_or_default();
         let tool = if caps.available() {
             crate::conversation::run_command_tool(caps)
         } else {

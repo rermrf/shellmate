@@ -15,7 +15,7 @@ use gpui::{
     prelude::*,
     *,
 };
-use shellmate_ai::{Event, Provider, ReasoningLevel, RigClient};
+use shellmate_ai::{ApiProtocol, Event, ReasoningLevel, RigClient};
 use shellmate_store::{CredentialStore, SecretKey, SecretStore, SharedStore, ai::Settings};
 use std::sync::Arc;
 pub struct AiSettings {
@@ -25,7 +25,7 @@ pub struct AiSettings {
     workspace: WeakEntity<crate::workspace::Workspace>,
     db: SharedStore,
     credentials: Arc<CredentialStore>,
-    provider: bool,
+    provider: ApiProtocol,
     base: Entity<InputState>,
     model: Entity<InputState>,
     reasoning: ReasoningLevel,
@@ -47,7 +47,7 @@ impl AiSettings {
         cx: &mut Context<Self>,
     ) -> Self {
         let s = db.borrow().ai_settings().unwrap_or_default();
-        let anthropic = matches!(s.provider, Provider::Anthropic { .. });
+        let protocol = s.provider.protocol();
         let model = cx.new(|cx| InputState::new(w, cx).default_value(s.model.clone()).placeholder("gpt-4o-mini / deepseek-chat / qwen…"));
         let limits = limits::Fields::new(&s, w, cx);
         let mut subscriptions = vec![cx.subscribe_in(&model, w, |s: &mut Self, _, event: &gpui::component::input::InputEvent, w, cx| {
@@ -63,11 +63,11 @@ impl AiSettings {
             workspace,
             db,
             credentials,
-            provider: anthropic,
+            provider: protocol,
             base: cx.new(|cx| {
                 InputState::new(w, cx)
                     .default_value(s.provider.base_url())
-                    .placeholder(base_placeholder(anthropic))
+                    .placeholder(protocol.default_url())
             }),
             model,
             reasoning: s.reasoning,
@@ -93,20 +93,20 @@ impl AiSettings {
         self.replace = true;
         cx.notify();
     }
-    fn select_provider(&mut self, anthropic: bool, w: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.provider == anthropic { return; }
-        self.provider = anthropic;
-        let saved = self.db.borrow().ai_settings_for_provider(anthropic);
-        let (base, reasoning) = saved.map(|saved| (saved.provider.base_url().to_owned(), saved.reasoning))
-            .unwrap_or_else(|_| (base_placeholder(anthropic).into(), ReasoningLevel::Default));
+    fn select_provider(&mut self, protocol: ApiProtocol, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.provider == protocol { return; }
+        self.provider = protocol;
+        let saved = self.db.borrow().ai_settings_for_provider(protocol);
+        let (base, reasoning, model) = saved.map(|saved| (saved.provider.base_url().to_owned(), saved.reasoning, saved.model))
+            .unwrap_or_else(|_| (protocol.default_url().into(), ReasoningLevel::Default, String::new()));
         self.reasoning = reasoning;
         self.base.update(cx, |i, cx| {
             i.set_value(base, w, cx);
-            i.set_placeholder(base_placeholder(anthropic), w, cx);
+            i.set_placeholder(protocol.default_url(), w, cx);
         });
         self.key.update(cx, |i, cx| { i.take(cx); });
         self.replace = false;
-        self.model.update(cx, |i, cx| i.set_value("", w, cx));
+        self.model.update(cx, |i, cx| i.set_value(model, w, cx));
         self.reload_model_limits(w, cx);
         self.refresh_key(cx);
     }
@@ -125,11 +125,7 @@ impl AiSettings {
             .trim_end_matches('/')
             .to_owned();
         self.limits.apply(Settings {
-            provider: if self.provider {
-                Provider::Anthropic { base_url }
-            } else {
-                Provider::OpenAiCompatible { base_url }
-            },
+            provider: self.provider.provider(base_url),
             model: self.model.read(cx).value().trim().into(),
             reasoning: self.reasoning,
             save_conversations: self.save,
@@ -179,8 +175,8 @@ impl AiSettings {
         }
         let settings = self.values(cx);
         self.limits.normalize_inputs(&settings, w, cx);
-        if settings.provider.destination().is_err() {
-            self.result = Some("Base URL 无效，请使用完整的 http(s) 地址".into());
+        if settings.provider.validate_endpoint().is_err() {
+            self.result = Some("Base URL 无效，请填写对应协议的 http(s) 地址".into());
             cx.notify();
             return;
         }
@@ -378,13 +374,6 @@ impl AiSettings {
         );
     }
 }
-fn base_placeholder(anthropic: bool) -> &'static str {
-    if anthropic {
-        "https://api.anthropic.com"
-    } else {
-        "https://api.openai.com/v1"
-    }
-}
 impl Drop for AiSettings {
     fn drop(&mut self) {
         if let Some(abort) = self.abort.take() {
@@ -396,11 +385,11 @@ impl Render for AiSettings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette().clone();
         let this = cx.weak_entity();
-        let provider = crate::ui::segmented("ai-provider", [(false, "OpenAI 兼容"), (true, "Anthropic")]
-            .into_iter().map(|(value, label)| segment(label, self.provider == value, self.busy)).collect(),
-            move |index, w, cx| { this.update(cx, |s, cx| s.select_provider(index == 1, w, cx)).ok(); }, cx);
+        let provider = crate::ui::segmented("ai-provider", ApiProtocol::ALL
+            .into_iter().map(|protocol| segment(protocol.label(), self.provider == protocol, self.busy)).collect(),
+            move |index, w, cx| { this.update(cx, |s, cx| s.select_provider(ApiProtocol::ALL[index], w, cx)).ok(); }, cx);
         let mut form = settings_card(cx)
-            .child(settings_row("服务商", "选择 API 协议", provider, cx))
+            .child(settings_row("API 协议", "按服务提供的接口选择", provider.flex_wrap().max_w_full(), cx))
             .child(div().py(px(12.)).child(crate::dialogs::field("Base URL", &p, field_input(&self.base, Surface::Card, true))))
             .child(div().py(px(12.)).child(crate::dialogs::field("模型", &p, field_input(&self.model, Surface::Card, true))));
         if self.key_saved && !self.replace {

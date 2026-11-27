@@ -1457,3 +1457,23 @@ async fn child_can_choose_both_channels_with_async_task_on_both_providers() {
         assert_eq!(steps[1].display.as_ref().unwrap().target, Target::Background);
     }
 }
+
+#[tokio::test]
+async fn responses_child_inherits_protocol_and_replays_its_own_tools() {
+    use super::responses_tests::{responses_config, wire};
+    let http=SequencedHttpClient::new([
+        wire::reply(vec![wire::reasoning("child"),wire::call("child-call","run_command",json!({"command":"pwd","target":"background"}))]),
+        wire::reply(vec![wire::message("child-final","子任务完成","final_answer")]),
+    ]);
+    let client=RigClient::with_http(&responses_config(),http.clone()).unwrap();
+    let inner=Inner::new([]);
+    let out=subagent::run(&client,request(SubagentKind::General),context(),snapshot(),&inner,fast_limits(),|_|{}).await;
+    assert_eq!(out.status,SubagentStatus::Completed);
+    assert_eq!(inner.seen.lock().unwrap().len(),1);
+    let requests=bodies(&http);
+    assert!(http.requests().iter().all(|r|r.uri.ends_with("/responses")));
+    assert!(requests.iter().all(|r|r["store"]==false));
+    assert!(requests[1].to_string().contains("CIPHER_child"));
+    assert!(requests[1].to_string().contains("function_call_output"));
+    assert!(!serde_json::to_string(out.transcript.entries()).unwrap().contains("PRIVATE_REASONING"));
+}

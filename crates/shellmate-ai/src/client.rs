@@ -96,6 +96,12 @@ impl RigClient {
             anthropic: matches!(config.provider, Provider::Anthropic { .. }),
         });
         let model = match &config.provider {
+            Provider::OpenAiResponses { .. } => OpenAIConfig::new("shellmate-placeholder")
+                .with_base_url(config.provider.responses_base_url()?)
+                .connect(http)
+                .responses(&config.model)
+                .with_idle_timeout(None)
+                .erase(),
             Provider::OpenAiCompatible { base_url } => OpenAIConfig::new("shellmate-placeholder")
                 .with_base_url(base_url.trim_end_matches('/'))
                 .connect(http)
@@ -137,7 +143,21 @@ impl RigClient {
             .cache
             .load(Ordering::Relaxed)
             .then_some(CacheRetention::Short);
-        self.model.stream(request).map_err(Box::new)
+        self.model.stream(self.protocol_options(request)).map_err(Box::new)
+    }
+    fn protocol_options(&self, request: CompletionRequest) -> CompletionRequest {
+        if matches!(self.config.provider, Provider::OpenAiResponses { .. }) {
+            request.provider_option(rig_core::providers::openai::extension::OpenAiOptions::default().store(false))
+        } else { request }
+    }
+    pub(crate) fn map_error(&self, error: rig_core::ProviderError) -> AiError {
+        let report = error.report();
+        if matches!(self.config.provider, Provider::OpenAiResponses { .. })
+            && matches!(report.http_status, Some(404 | 405))
+            && !report.code.as_deref().unwrap_or_default().contains("model_not_found")
+            && !report.provider_response_body().unwrap_or_default().contains("model_not_found") {
+            AiError::UnsupportedProtocol
+        } else { map_error(error) }
     }
     /// Effective per-call allowance, including budget thinking and learned fallbacks.
     pub fn output_tokens(&self) -> u32 {
@@ -173,7 +193,7 @@ impl RigClient {
             match self.agent_open(request.clone()) {
                 Ok(stream) => return Ok(stream),
                 Err(error) if self.option_fallback(&error) => {}
-                Err(error) => return Err(map_error(*error)),
+                Err(error) => return Err(self.map_error(*error)),
             }
         }
     }
@@ -233,10 +253,10 @@ impl RigClient {
                 .cache
                 .load(Ordering::Relaxed)
                 .then_some(CacheRetention::Short);
-            let mut stream = match self.model.stream(request) {
+            let mut stream = match self.model.stream(self.protocol_options(request)) {
                 Ok(s) => s,
                 Err(e) if self.option_fallback(&e) => continue,
-                Err(e) => return Err(map_error(e)),
+                Err(e) => return Err(self.map_error(e)),
             };
             let mut first = true;
             let mut received = false;
@@ -257,7 +277,7 @@ impl RigClient {
                         retry = true;
                         break;
                     }
-                    Ok(Some(Err(e))) => return Err(map_error(e)),
+                    Ok(Some(Err(e))) => return Err(self.map_error(e)),
                     Ok(Some(Ok(Item::Event(_)))) => {
                         first = false;
                         received = true;
@@ -272,7 +292,7 @@ impl RigClient {
             let response = match tokio::time::timeout(self.timeouts.idle, stream.finish()).await {
                 Err(_) => return Err(AiError::Timeout),
                 Ok(Err(e)) if !received && self.option_fallback(&e) => continue,
-                Ok(Err(e)) => return Err(map_error(e)),
+                Ok(Err(e)) => return Err(self.map_error(e)),
                 Ok(Ok(r)) => r,
             };
             on_usage(Usage {
@@ -514,7 +534,8 @@ impl ResponseStream<'static> {
                             continue;
                         }
                         s.stream = None;
-                        return Some((Event::Error(map_error(e)), s));
+                        let error = match &s.fallback { Some((client, _)) => client.map_error(e), None => map_error(e) };
+                        return Some((Event::Error(error), s));
                     }
                     Ok(Some(Ok(Item::Event(
                         StreamEvent::Reasoning { .. }
@@ -578,6 +599,10 @@ impl ResponseStream<'static> {
                         let result = tokio::time::timeout(s.timeouts.idle, stream.finish()).await;
                         match result {
                             Ok(Ok(response)) => {
+                                if response.error.is_some() || response.aborted.is_some()
+                                    || response.finish_reason() == Some(rig_core::completion::FinishReason::Length) {
+                                    return Some((Event::Error(AiError::InvalidResponse), s));
+                                }
                                 if s.cards == 0 {
                                     for card in fenced_commands(&s.text) {
                                         s.queue.push_back(Event::Command(card));
@@ -592,7 +617,7 @@ impl ResponseStream<'static> {
                                 s.queue.push_back(Event::Done(usage));
                             }
                             Ok(Err(e)) if s.retry_option(&e) => continue,
-                            Ok(Err(e)) => s.queue.push_back(Event::Error(map_error(e))),
+                            Ok(Err(e)) => s.queue.push_back(Event::Error(match &s.fallback { Some((client, _)) => client.map_error(e), None => map_error(e) })),
                             Err(_) => s.queue.push_back(Event::Error(AiError::Timeout)),
                         }
                     }
@@ -700,6 +725,7 @@ pub(crate) fn map_error(error: rig_core::ProviderError) -> AiError {
             "thinking",
             "budget_tokens",
             "output_config",
+            "reasoning.effort",
         ]
         .iter()
         .any(|field| body.contains(field))

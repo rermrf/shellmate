@@ -2,9 +2,47 @@ use crate::AiError;
 use rig_core::serde::{Serialize, Deserialize};
 use std::{fmt, time::Duration};
 use zeroize::Zeroizing;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApiProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+    Anthropic,
+}
+impl ApiProtocol {
+    pub const ALL: [Self; 3] = [Self::ChatCompletions, Self::Responses, Self::Anthropic];
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "openai",
+            Self::Responses => "openai_responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.id() == id)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "OpenAI Chat Completions",
+            Self::Responses => "OpenAI Responses",
+            Self::Anthropic => "Anthropic Messages",
+        }
+    }
+    pub fn default_url(self) -> &'static str {
+        if self == Self::Anthropic { "https://api.anthropic.com" } else { "https://api.openai.com/v1" }
+    }
+    pub fn provider(self, base_url: String) -> Provider {
+        match self {
+            Self::ChatCompletions => Provider::OpenAiCompatible { base_url },
+            Self::Responses => Provider::OpenAiResponses { base_url },
+            Self::Anthropic => Provider::Anthropic { base_url },
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Provider {
     OpenAiCompatible { base_url: String },
+    OpenAiResponses { base_url: String },
     Anthropic { base_url: String },
 }
 impl Default for Provider {
@@ -15,16 +53,37 @@ impl Default for Provider {
     }
 }
 impl Provider {
-    pub fn id(&self) -> &'static str {
+    pub fn protocol(&self) -> ApiProtocol {
         match self {
-            Self::OpenAiCompatible { .. } => "openai",
-            Self::Anthropic { .. } => "anthropic",
+            Self::OpenAiCompatible { .. } => ApiProtocol::ChatCompletions,
+            Self::OpenAiResponses { .. } => ApiProtocol::Responses,
+            Self::Anthropic { .. } => ApiProtocol::Anthropic,
         }
+    }
+    pub fn id(&self) -> &'static str { self.protocol().id() }
+    pub fn catalog_id(&self) -> &'static str {
+        if matches!(self, Self::Anthropic { .. }) { "anthropic" } else { "openai" }
     }
     pub fn base_url(&self) -> &str {
         match self {
-            Self::OpenAiCompatible { base_url } | Self::Anthropic { base_url } => base_url,
+            Self::OpenAiCompatible { base_url } | Self::OpenAiResponses { base_url } | Self::Anthropic { base_url } => base_url,
         }
+    }
+    /// Accept a Responses base or full endpoint, preserving proxy path prefixes.
+    pub fn validate_endpoint(&self) -> Result<(), AiError> {
+        self.destination()?;
+        if matches!(self, Self::OpenAiResponses { .. }) { self.responses_base_url()?; }
+        Ok(())
+    }
+    pub fn responses_base_url(&self) -> Result<String, AiError> {
+        self.destination()?;
+        let base = self.base_url().trim_end_matches('/');
+        let base = base.strip_suffix("/responses").unwrap_or(base);
+        if base.ends_with("/chat/completions") || base.ends_with("/messages") {
+            return Err(AiError::InvalidConfig);
+        }
+        let uri: Uri = base.parse().map_err(|_| AiError::InvalidConfig)?;
+        Ok(if uri.path().is_empty() || uri.path() == "/" { format!("{base}/v1") } else { base.to_owned() })
     }
     pub fn destination(&self) -> Result<String, AiError> {
         let uri: Uri = self
@@ -101,7 +160,7 @@ impl ReasoningLevel {
     pub fn options(provider: &Provider) -> &'static [Self] {
         use ReasoningLevel::*;
         match provider {
-            Provider::OpenAiCompatible { .. } => &[Default, Off, Minimal, Low, Medium, High, XHigh, Max],
+            Provider::OpenAiCompatible { .. } | Provider::OpenAiResponses { .. } => &[Default, Off, Minimal, Low, Medium, High, XHigh, Max],
             Provider::Anthropic { .. } => &[Default, Off, Low, Medium, High, Max],
         }
     }
@@ -168,7 +227,7 @@ impl OutputTokens {
 pub fn catalog_spec(provider: &Provider, model: &str) -> Option<&'static rig_core::catalog::ModelSpec> {
     static FACTS: std::sync::OnceLock<rig_core::catalog::ModelFacts> = std::sync::OnceLock::new();
     let facts = FACTS.get_or_init(Default::default);
-    facts.for_model(provider.id(), model).or_else(|| {
+    facts.for_model(provider.catalog_id(), model).or_else(|| {
         rig_core::catalog::Catalog::builtin().iter().find(|spec| spec.id == model)
     })
 }
@@ -197,7 +256,7 @@ impl Config {
         if self.model.trim().is_empty() || self.api_key.is_empty() {
             return Err(AiError::NotConfigured);
         }
-        self.provider.destination()?;
+        self.provider.validate_endpoint()?;
         if self.model.chars().count() > 256
             || self.model.chars().any(char::is_control)
             || self.timeouts.first.is_zero()
@@ -212,6 +271,20 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn responses_uses_openai_model_facts_but_independent_protocol_identity() {
+        let chat = Provider::default();
+        let responses = ApiProtocol::Responses.provider("https://proxy.test/v1".into());
+        assert_ne!(chat.id(), responses.id());
+        assert_eq!(chat.catalog_id(), responses.catalog_id());
+        for model in ["gpt-5.4", "gpt-4o-2024-08-06"] {
+            assert_eq!(crate::resolve_window(&chat,model,Default::default()),crate::resolve_window(&responses,model,Default::default()));
+            assert_eq!(OutputTokens::Auto.resolve(&chat,model),OutputTokens::Auto.resolve(&responses,model));
+        }
+        for url in ["https://proxy.test/v1/chat/completions", "https://proxy.test/v1/messages"] {
+            assert!(ApiProtocol::Responses.provider(url.into()).responses_base_url().is_err());
+        }
+    }
     #[test]
     fn reasoning_ids_options_and_timeouts_are_stable() {
         use ReasoningLevel::*;

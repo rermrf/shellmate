@@ -2147,3 +2147,6 @@ mod interaction_tests;
 
 #[path = "agent/sessions.rs"]
 mod session_tests;
+
+#[path = "agent/responses.rs"]
+mod responses_tests;

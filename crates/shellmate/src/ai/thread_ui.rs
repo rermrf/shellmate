@@ -835,7 +835,7 @@ pub(super) fn grouped(entries: &[Entry]) -> Vec<Item> {
                 });
                 last_message = None;
             }
-            Entry::Assistant { text, message_id } => {
+            Entry::Assistant { text, message_id, .. } => {
                 if last_message == Some(*message_id)
                     && let Some(Item::Text { text: previous, .. }) = out.last_mut()
                 {
@@ -921,15 +921,18 @@ mod tests {
                 origin: Some(MessageOrigin::Delegation),
             },
             Entry::Assistant {
+                replay: None,
                 text: "a".into(),
                 message_id: 1,
             },
             Entry::Assistant {
+                replay: None,
                 text: "b".into(),
                 message_id: 1,
             },
             Entry::Step(step),
             Entry::Assistant {
+                replay: None,
                 text: "c".into(),
                 message_id: 1,
             },

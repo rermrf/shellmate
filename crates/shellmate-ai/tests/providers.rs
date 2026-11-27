@@ -1035,3 +1035,6 @@ async fn side_question_has_no_tools_and_does_not_modify_the_main_conversation() 
         assert!(body.to_string().contains("SIDE QUESTION"));
     }
 }
+
+#[path = "providers/responses.rs"]
+mod responses_tests;

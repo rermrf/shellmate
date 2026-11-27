@@ -3,7 +3,7 @@ use crate::{HostStore, Result, StoreError};
 use rusqlite::{OptionalExtension, params};
 use shellmate_ai::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, Conversation, PermissionMode, Provider,
-    ReasoningLevel, UserTurn,
+    ApiProtocol, ReasoningLevel, UserTurn,
 };
 #[path = "ai_settings.rs"]
 mod settings;
@@ -44,7 +44,7 @@ impl Settings {
         format!("ai:{}:api_key", self.provider.id())
     }
     pub fn configured(&self) -> bool {
-        !self.model.trim().is_empty() && self.provider.destination().is_ok()
+        !self.model.trim().is_empty() && self.provider.validate_endpoint().is_ok()
     }
 }
 #[derive(Clone)]
@@ -128,6 +128,13 @@ pub(crate) fn migrate_v10(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     }
     Ok(())
 }
+fn protocol_keys(protocol: ApiProtocol) -> (&'static str, &'static str) {
+    match protocol {
+        ApiProtocol::ChatCompletions => ("ai_base_url", "ai_openai_reasoning"),
+        ApiProtocol::Responses => ("ai_responses_base_url", "ai_responses_reasoning"),
+        ApiProtocol::Anthropic => ("ai_anthropic_base_url", "ai_anthropic_reasoning"),
+    }
+}
 impl HostStore {
     pub fn ai_permission(&self, host_key: &str) -> Result<PermissionMode> {
         Ok(PermissionMode::from_id(
@@ -141,37 +148,21 @@ impl HostStore {
     }
 
     pub fn ai_settings(&self) -> Result<Settings> {
-        self.ai_settings_for_provider(self.setting("ai_provider")?.as_deref() == Some("anthropic"))
+        let id = self.setting("ai_provider")?.unwrap_or_else(|| "openai".into());
+        let protocol = ApiProtocol::from_id(&id)
+            .ok_or(StoreError::Corrupt("未知的 AI 协议".into()))?;
+        self.ai_settings_for_provider(protocol)
     }
-    /// Read one provider's saved form without changing the active provider.
-    pub fn ai_settings_for_provider(&self, anthropic: bool) -> Result<Settings> {
-        let provider = if anthropic {
-            Provider::Anthropic {
-                base_url: self
-                    .setting("ai_anthropic_base_url")?
-                    .unwrap_or_else(|| "https://api.anthropic.com".into()),
-            }
-        } else {
-            Provider::OpenAiCompatible {
-                base_url: self
-                    .setting("ai_base_url")?
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            }
-        };
-        let reasoning = ReasoningLevel::from_id(
-            &self
-                .setting(if anthropic {
-                    "ai_anthropic_reasoning"
-                } else {
-                    "ai_openai_reasoning"
-                })?
-                .unwrap_or_default(),
-        )
-        .for_provider(&provider);
+    /// Read a protocol's saved form without changing the active selection.
+    pub fn ai_settings_for_provider(&self, protocol: ApiProtocol) -> Result<Settings> {
+        let (base_key, reasoning_key) = protocol_keys(protocol);
+        let provider = protocol.provider(self.setting(base_key)?.unwrap_or_else(|| protocol.default_url().into()));
+        let reasoning = ReasoningLevel::from_id(&self.setting(reasoning_key)?.unwrap_or_default()).for_provider(&provider);
+        let model = self.setting(&format!("ai_model:{}", protocol.id()))?
+            .or(if protocol != ApiProtocol::Responses && self.setting("ai_provider")?.as_deref() != Some("openai_responses") { self.setting("ai_model")? } else { None })
+            .unwrap_or_default();
         let mut settings = Settings {
-            provider,
-            reasoning,
-            model: self.setting("ai_model")?.unwrap_or_default(),
+            provider, reasoning, model,
             save_conversations: self.setting(SAVE_CONVERSATIONS)?.as_deref() != Some("0"),
             ..Settings::default()
         };
@@ -180,9 +171,16 @@ impl HostStore {
     }
     pub fn save_ai_settings(&mut self, s: &Settings) -> Result<()> {
         s.provider
-            .destination()
+            .validate_endpoint()
             .map_err(|_| StoreError::Corrupt("AI Base URL 无效".into()))?;
         let tx = self.conn.transaction()?;
+        // Preserve the legacy shared model before saving a different protocol.
+        for id in ["openai", "anthropic"] {
+            tx.execute(
+                "INSERT OR IGNORE INTO settings(key,value) SELECT ?1,value FROM settings WHERE key='ai_model' AND COALESCE((SELECT value FROM settings WHERE key='ai_provider'),'openai')<>'openai_responses'",
+                [format!("ai_model:{id}")],
+            )?;
+        }
         for (k, v) in [
             ("ai_provider", s.provider.id()),
             ("ai_model", s.model.trim()),
@@ -193,10 +191,9 @@ impl HostStore {
         ] {
             tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![k,v])?;
         }
-        let (base_key, reasoning_key) = match s.provider {
-            Provider::OpenAiCompatible { .. } => ("ai_base_url", "ai_openai_reasoning"),
-            Provider::Anthropic { .. } => ("ai_anthropic_base_url", "ai_anthropic_reasoning"),
-        };
+        let (base_key, reasoning_key) = protocol_keys(s.provider.protocol());
+        tx.execute("INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![format!("ai_model:{}", s.provider.id()), s.model.trim()])?;
         for (key, value) in [
             (base_key, s.provider.base_url()),
             (reasoning_key, s.reasoning.for_provider(&s.provider).id()),
@@ -448,10 +445,38 @@ mod tests {
         );
     }
     #[test]
+    fn responses_settings_are_independent_and_legacy_chat_settings_survive() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        db.set_setting("ai_provider", "openai").unwrap();
+        db.set_setting("ai_base_url", "https://legacy.test/v1").unwrap();
+        db.set_setting("ai_model", "legacy-model").unwrap();
+        let legacy = db.ai_settings().unwrap();
+        assert_eq!(legacy.provider.protocol(), ApiProtocol::ChatCompletions);
+        assert_eq!(legacy.model, "legacy-model");
+        assert_eq!(legacy.key_account(), "ai:openai:api_key");
+        let fresh = db.ai_settings_for_provider(ApiProtocol::Responses).unwrap();
+        assert_eq!(fresh.provider.base_url(), "https://api.openai.com/v1");
+        assert!(fresh.model.is_empty());
+        let responses = Settings {
+            provider: ApiProtocol::Responses.provider("https://responses.test/custom/v1".into()),
+            model: "gpt-5.4".into(), reasoning: ReasoningLevel::High,
+            max_output_tokens: shellmate_ai::OutputTokens::Tokens(8192),
+            ..Default::default()
+        };
+        db.save_ai_settings(&responses).unwrap();
+        assert_eq!(db.ai_settings().unwrap(),responses);
+        assert_eq!(db.ai_settings_for_provider(ApiProtocol::ChatCompletions).unwrap(),legacy);
+        assert_eq!(responses.key_account(),"ai:openai_responses:api_key");
+        db.save_ai_settings(&legacy).unwrap();
+        assert_eq!(db.ai_settings_for_provider(ApiProtocol::Responses).unwrap(),responses);
+        db.set_setting("ai_provider","future-protocol").unwrap();
+        assert!(db.ai_settings().is_err());
+    }
+    #[test]
     fn provider_urls_and_reasoning_round_trip_independently() {
         let mut db = HostStore::open_in_memory().unwrap();
         assert_eq!(db.ai_settings().unwrap().reasoning, ReasoningLevel::Default);
-        let default_anthropic = db.ai_settings_for_provider(true).unwrap();
+        let default_anthropic = db.ai_settings_for_provider(shellmate_ai::ApiProtocol::Anthropic).unwrap();
         assert_eq!(
             default_anthropic.provider.base_url(),
             "https://api.anthropic.com"
@@ -476,11 +501,11 @@ mod tests {
         assert_eq!(db.ai_settings().unwrap(), openai);
         db.save_ai_settings(&anthropic).unwrap();
         assert_eq!(db.ai_settings().unwrap(), anthropic);
-        assert_eq!(db.ai_settings_for_provider(false).unwrap(), openai);
+        assert_eq!(db.ai_settings_for_provider(shellmate_ai::ApiProtocol::ChatCompletions).unwrap(), openai);
         // Loading another provider's form must not change saved selection.
         assert_eq!(db.ai_settings().unwrap(), anthropic);
         db.save_ai_settings(&openai).unwrap();
-        assert_eq!(db.ai_settings_for_provider(true).unwrap(), anthropic);
+        assert_eq!(db.ai_settings_for_provider(shellmate_ai::ApiProtocol::Anthropic).unwrap(), anthropic);
         assert_eq!(anthropic.key_account(), "ai:anthropic:api_key");
         assert_eq!(default_anthropic.key_account(), anthropic.key_account());
     }
@@ -498,14 +523,14 @@ mod tests {
             for id in ids {
                 db.set_setting(key, id).unwrap();
                 assert_eq!(
-                    db.ai_settings_for_provider(anthropic).unwrap().reasoning,
+                    db.ai_settings_for_provider(if anthropic { ApiProtocol::Anthropic } else { ApiProtocol::ChatCompletions }).unwrap().reasoning,
                     ReasoningLevel::Default
                 );
             }
         }
         // Both providers offer the top level.
         db.set_setting("ai_openai_reasoning", "max").unwrap();
-        assert_eq!(db.ai_settings_for_provider(false).unwrap().reasoning, ReasoningLevel::Max);
+        assert_eq!(db.ai_settings_for_provider(shellmate_ai::ApiProtocol::ChatCompletions).unwrap().reasoning, ReasoningLevel::Max);
     }
     #[test]
     fn anthropic_proxy_disclosure_requires_each_destination() {

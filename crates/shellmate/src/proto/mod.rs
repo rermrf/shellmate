@@ -87,7 +87,7 @@ pub const SCENES: &[&str] = &[
     "ai-output-short", "ai-output-expanded", "ai-output-history", "ai-output-missing", "ai-output-retained", "ai-output-running", "ai-output-giant",
     "ai-slash", "ai-slash-filter", "ai-slash-context", "ai-slash-tasks", "set-ai-advanced",
     "ai-compacted", "ai-compacted-open", "ai-compacting", "ai-compacted-tier1",
-    "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "ai-explain",
+    "ai", "ai-chat", "ai-markdown", "ai-markdown-wide", "ai-history", "ai-error", "ai-unconfigured", "set-ai", "set-ai-anthropic", "set-ai-responses", "ai-explain",
     "main", "prompt-plain", "host-mosh", "mosh", "serial", "serial-hex", "telnet", "host-serial", "host-telnet",
     "files",
     "fwd",
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn fixtures_are_complete_and_deterministic() {
         assert_eq!(DATA["HOSTS"].a().len(), 11);
-        assert_eq!(SCENES.len(), 167 + PAGE_SCROLL_SCENES.len());
+        assert_eq!(SCENES.len(), 168 + PAGE_SCROLL_SCENES.len());
         for scene in ["drawer-mid", "drawer-swap-mid", "mon-ov-reflow-mid"] {
             assert!(SCENES.contains(&scene));
         }

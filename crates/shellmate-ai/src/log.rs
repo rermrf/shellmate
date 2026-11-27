@@ -1,6 +1,6 @@
 //! Durable semantic log. A Step atomically owns its call and result: no persisted
 //! or replayed half-pairs. Turn/Answer are read-only projections for the drawer.
-//! Provider-native reasoning deliberately lives in agent::Resume, never here.
+//! Plaintext reasoning is never persisted. Responses replay metadata is opaque.
 use crate::{
     Answer, AnswerItem, CommandCard, ContextSnapshot, PermissionMode, StepStatus, Turn, Usage,
     UserTurn, agent::Target, policy::Class,
@@ -199,6 +199,8 @@ pub enum Entry {
         origin: Option<MessageOrigin>,
     },
     Assistant {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<Box<crate::ResponseReplay>>,
         text: String,
         message_id: usize,
     },
@@ -239,6 +241,7 @@ impl Entry {
 }
 #[derive(Clone, Debug)]
 pub enum LogUpdate {
+    ResponseReplay { message_id: usize, replay: Box<crate::ResponseReplay> },
     SubagentResult {
         call_id: String,
         result: LoggedResult,
@@ -333,6 +336,7 @@ impl Conversation {
     pub fn push_text(&mut self, text: &str) {
         if !text.is_empty() {
             self.append(Entry::Assistant {
+                replay: None,
                 text: text.into(),
                 message_id: self.entries.len(),
             });
@@ -341,7 +345,7 @@ impl Conversation {
     pub fn push_item(&mut self, item: AnswerItem) {
         let message_id = self.entries.len();
         let entry = match item {
-            AnswerItem::Text(text) => Entry::Assistant { text, message_id },
+            AnswerItem::Text(text) => Entry::Assistant { text, message_id, replay: None },
             AnswerItem::Command(card) => Entry::CommandCard { card, message_id },
             AnswerItem::Compaction(c) => Entry::Compaction(c),
             AnswerItem::Subagent { display, report } => Entry::Step(Step {
@@ -400,6 +404,11 @@ impl Conversation {
     }
     pub fn apply(&mut self, update: LogUpdate) {
         match update {
+            LogUpdate::ResponseReplay { message_id, replay } => {
+                if let Some(Entry::Assistant { replay: slot, .. }) = self.entries.iter_mut().find(|e| matches!(e, Entry::Assistant { message_id: id, .. } if *id == message_id)) {
+                    *slot = Some(replay);
+                }
+            }
             LogUpdate::SubagentResult { call_id, result } => {
                 if let Some(Entry::Step(step)) = self.entries.iter_mut().find(
                     |e| matches!(e,Entry::Step(s) if s.call.id==call_id && matches!(s.call.name.as_str(),"agent"|"send_agent_message")),

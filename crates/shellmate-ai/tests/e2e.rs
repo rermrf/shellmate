@@ -9,11 +9,15 @@ fn config() -> Result<Config, &'static str> {
             base_url: std::env::var("SHELLMATE_AI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
         },
+        Ok("openai_responses") => Provider::OpenAiResponses {
+            base_url: std::env::var("SHELLMATE_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+        },
         Ok("anthropic") => Provider::Anthropic {
             base_url: std::env::var("SHELLMATE_AI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".into()),
         },
-        _ => return Err("set SHELLMATE_AI_PROVIDER to openai or anthropic"),
+        _ => return Err("set SHELLMATE_AI_PROVIDER to openai, openai_responses or anthropic"),
     };
     let model = std::env::var("SHELLMATE_AI_MODEL").map_err(|_| "set SHELLMATE_AI_MODEL")?;
     let path = std::env::var_os("SHELLMATE_AI_KEY_FILE").ok_or("set SHELLMATE_AI_KEY_FILE")?;

@@ -534,7 +534,7 @@ mod tests {
                 t,
                 &shellmate_ai::interaction::Phase::Idle
             ),
-            "结束 · 1 秒"
+            format!("{} 结束 · 运行 1 秒", timestamp(at(t, 11).wall_ms, t.wall_ms, false))
         );
     }
     #[test]

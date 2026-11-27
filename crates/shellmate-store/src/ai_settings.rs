@@ -207,7 +207,7 @@ mod tests {
         .unwrap();
         assert_eq!(db.ai_model_settings(&s).unwrap(), s);
         assert_eq!(
-            db.ai_settings_for_provider(true).unwrap().context_window,
+            db.ai_settings_for_provider(shellmate_ai::ApiProtocol::Anthropic).unwrap().context_window,
             ContextWindow::Auto
         );
         assert_eq!(db.ai_settings().unwrap().max_steps, Some(50));
@@ -275,7 +275,7 @@ mod memory_tests {
         store.save_ai_settings(&settings).unwrap();
         assert!(!store.ai_settings().unwrap().auto_memory);
         assert!(!store.ai_settings().unwrap().limits().auto_memory);
-        assert!(!store.ai_settings_for_provider(true).unwrap().auto_memory);
+        assert!(!store.ai_settings_for_provider(shellmate_ai::ApiProtocol::Anthropic).unwrap().auto_memory);
         store.save_ai_settings(&Settings::default()).unwrap();
         assert!(store.ai_settings().unwrap().auto_memory);
     }

@@ -3,6 +3,8 @@ pub mod agent;
 pub mod interaction;
 mod client;
 mod config;
+mod responses;
+pub use responses::ResponseReplay;
 mod conversation;
 mod log;
 pub mod context;
@@ -11,7 +13,7 @@ pub use context::{ContextWindow, WindowSource, resolve_window, ContextBudget, Co
 pub mod output;
 pub mod policy;
 pub use client::{Event, ProviderClient, ResponseStream, RigClient, Usage};
-pub use config::{ApiKey, Config, Provider, ReasoningLevel, Timeouts, OutputTokens, catalog_spec};
+pub use config::{ApiKey, ApiProtocol, Config, Provider, ReasoningLevel, Timeouts, OutputTokens, catalog_spec};
 pub use conversation::{
     Answer, AnswerItem, ContextSnapshot, estimate_tokens, recent_context, StepStatus, Turn,
     UserTurn,
@@ -53,6 +55,8 @@ pub enum AiError {
     Authentication,
     #[error("模型名称不存在")]
     ModelNotFound,
+    #[error("服务不支持所选 API 协议，请检查协议和 Base URL")]
+    UnsupportedProtocol,
     #[error("请求过于频繁 / 限流，请稍后重试")]
     RateLimited,
     #[error("余额不足，请检查服务商账户")]

@@ -418,6 +418,14 @@ impl Workspace {
                 if scene=="set-ai-web"{view.update(cx,|settings,_|settings.fixture_scroll_web(window));}
                 else if fixture.scroll_to_bottom { view.update(cx, |settings, _| settings.fixture_scroll_bottom(window)); }
             }
+            "set-ai-responses" => {
+                self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings {
+                    provider: shellmate_ai::Provider::OpenAiResponses {base_url: "https://api.openai.com/v1".into()},
+                    model: "gpt-5.4".into(), reasoning: shellmate_ai::ReasoningLevel::High,
+                    ..Default::default()
+                }).unwrap();
+                self.open_settings(5,window,cx);
+            },
             "set-ai-anthropic"=>{self.hub.store.borrow_mut().save_ai_settings(&shellmate_store::ai::Settings{provider:shellmate_ai::Provider::Anthropic{base_url:"https://anthropic-proxy.example.com/v1".into()},model:"claude-sonnet-4-6".into(),reasoning:shellmate_ai::ReasoningLevel::High,..Default::default()}).unwrap();self.open_settings(5,window,cx);},
             "set-cred" => self.open_settings(0, window, cx),
             "set-cred-master" | "set-cred-focus" | "set-cred-typed" => {

@@ -46,7 +46,7 @@
 | 监控 | Linux 服务器免安装监控：概览、进程、systemd 服务、Docker / Podman；本机 macOS：概览、进程、监听端口、launchd 服务、Docker |
 | 效率 | 命令面板（含 `user@host` 快速连接）、快捷命令、广播输入、跨主机命令历史、危险命令发送确认 |
 | 会话记录 | 录制回放（asciicast v2，可导出 `.cast`）与纯文本会话日志 |
-| AI 助手 | OpenAI 兼容接口与 Anthropic；多对话并行、子代理、跨终端任务、网页搜索与读取、记忆和长任务管理；按审批规则执行命令 |
+| AI 助手 | OpenAI Chat Completions、Responses 与 Anthropic Messages；多对话并行、子代理、跨终端任务、网页搜索与读取、记忆和长任务管理；按审批规则执行命令 |
 | 备份 | 加密配置包导出与导入（含导入前差异预览） |
 | 更新 | 应用内检查、下载并安装新版本；校验安装包的 SHA-256 与代码签名 |
 
@@ -188,7 +188,7 @@
 
 ### AI 助手
 
-- 支持 OpenAI 兼容接口（可自定义 Base URL）与 Anthropic，可选思考等级。
+- 支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages，均可配置 Base URL、模型、API Key 和思考等级。旧 OpenAI 兼容设置仍使用 Chat Completions；Responses 在设置中单独选择并保存，默认使用 `/v1/responses`。
 - 自动带上当前会话的最近终端输出作为上下文；终端出现报错时可以一键「解释报错」。
 - 可以在终端里或后台执行命令（远程会话通过 SSH，本机会话在本机），三档权限：
   - **每步审批**：每条命令都需要你确认；

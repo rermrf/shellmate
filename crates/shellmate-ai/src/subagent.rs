@@ -508,7 +508,7 @@ pub async fn run_from_history(
                     let durable = status.is_some()
                         || updates.iter().any(|u| match u {
                             LogUpdate::Append(e) => !matches!(&**e, Entry::Assistant { .. }),
-                            LogUpdate::ClearResults(_) => true,
+                            LogUpdate::ClearResults(_) | LogUpdate::ResponseReplay { .. } => true,
                             _ => false,
                         });
                     if durable {
@@ -612,7 +612,7 @@ pub fn prepare_history(
 }
 fn partial_report(log: &Conversation) -> String {
     if let Some(group) = log.entries().iter().rev().find_map(|e| {
-        if let Entry::Assistant { text, message_id } = e {
+        if let Entry::Assistant { text, message_id, .. } = e {
             (!text.trim().is_empty()).then_some(*message_id)
         } else {
             None
@@ -622,7 +622,7 @@ fn partial_report(log: &Conversation) -> String {
             .entries()
             .iter()
             .filter_map(|e| match e {
-                Entry::Assistant { text, message_id } if *message_id == group => {
+                Entry::Assistant { text, message_id, .. } if *message_id == group => {
                     Some(text.as_str())
                 }
                 _ => None,

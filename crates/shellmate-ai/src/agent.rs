@@ -4,7 +4,7 @@ use crate::{
     AiError, AnswerItem, CommandCard, CompactTrigger, Compaction, ContextSnapshot, Conversation,
     Entry, LogUpdate, PermissionMode, RetainedState, RigClient, StepStatus, ToolOutput, Usage,
     UserTurn,
-    client::{map_error, option_refusal},
+    client::option_refusal,
     context::{NativeMessages, ThrashGuard, request_tokens},
     policy::{self, Class},
 };
@@ -640,6 +640,7 @@ impl State<'_> {
     fn text(&mut self, text: &str) {
         if !text.is_empty() {
             self.entry(Entry::Assistant {
+                replay: None,
                 text: text.into(),
                 message_id: self.message_id,
             });
@@ -650,9 +651,11 @@ impl State<'_> {
         let mut capabilities = turn.capabilities.clone();
         capabilities.web = self.host.web_enabled();
         capabilities.sessions = self.host.sessions_enabled();
+        let responses = matches!(self.client.config.provider, crate::Provider::OpenAiResponses { .. });
+        let empty = NativeMessages::new();
         let mut request = self.conversation.request(
             &capabilities,
-            &turn.native,
+            if responses { &empty } else { &turn.native },
             false,
             self.conversation.view_start(),
         )?;
@@ -665,6 +668,17 @@ impl State<'_> {
                 &turn.capabilities,
                 self.limits.exec,
             ));
+        }
+        if responses {
+            let replay = self.conversation.responses_native(
+                &self.client.config, &self.conversation.system(&capabilities)?,
+                rig_core::message::Fingerprint::of(&request.tools),
+            );
+            if !replay.is_empty() {
+                request.chat_history = self.conversation.request(
+                    &capabilities, &replay, false, self.conversation.view_start(),
+                )?.chat_history;
+            }
         }
         if request
             .chat_history
@@ -748,7 +762,7 @@ impl State<'_> {
     }
     fn provider_failure(&mut self, error: rig_core::ProviderError) -> AgentEvent {
         let retry_after = error.report().retry_after(SystemTime::now());
-        self.failure(map_error(error), retry_after)
+        self.failure(self.client.map_error(error), retry_after)
     }
     fn retry_option(&mut self, error: &rig_core::ProviderError) -> bool {
         if self.received {
@@ -1646,18 +1660,26 @@ fn stream<'a>(
                         .any(|e| e.message_id() == Some(s.message_id))
                     {
                         s.entry(Entry::Assistant {
+                            replay: None,
                             text: String::new(),
                             message_id: s.message_id,
                         });
                     }
-                    if s.turn.as_ref().unwrap().capabilities.available()
-                        && let Some(Message::Assistant(message)) = message
-                    {
-                        s.turn
-                            .as_mut()
-                            .unwrap()
-                            .native
-                            .insert(s.message_id, message);
+                    if let Some(Message::Assistant(message)) = message {
+                        if matches!(s.client.config.provider, crate::Provider::OpenAiResponses { .. }) {
+                            let mut capabilities = s.turn.as_ref().unwrap().capabilities.clone();
+                            capabilities.web = s.host.web_enabled();
+                            capabilities.sessions = s.host.sessions_enabled();
+                            if let (Ok(instructions), Ok(request)) = (s.conversation.system(&capabilities), s.request())
+                                && let Some(replay) = crate::ResponseReplay::capture(
+                                    &s.client.config, s.conversation.response_prefix(s.message_id),
+                                    &instructions, rig_core::message::Fingerprint::of(&request.tools), &message,
+                                ) {
+                                s.record(LogUpdate::ResponseReplay { message_id: s.message_id, replay: Box::new(replay) });
+                            }
+                        } else if s.turn.as_ref().unwrap().capabilities.available() {
+                            s.turn.as_mut().unwrap().native.insert(s.message_id, message);
+                        }
                     }
                     let u = response.usage;
                     let usage =
