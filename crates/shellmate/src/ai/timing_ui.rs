@@ -104,21 +104,6 @@ pub(super) fn footer(
     copy: Option<AnyElement>,
     cx: &App,
 ) -> Stateful<Div> {
-    let started = timing::timestamp(record.started_at_ms, now.wall_ms, true);
-    let ended = record
-        .ended_at_ms
-        .map(|at| timing::timestamp(at, now.wall_ms, true))
-        .unwrap_or_else(|| {
-            if record.status == Status::Interrupted {
-                "未知".into()
-            } else {
-                "尚未结束".into()
-            }
-        });
-    let tip = format!(
-        "开始时间：{started}\n回复时间：{ended}\n用时：{}\n按本地时区显示；不含排队及手动暂停时间",
-        timing::duration(record.duration_ms)
-    );
     div()
         .id(SharedString::from(format!("run-timing-{}", record.id)))
         .flex_none()
@@ -140,8 +125,5 @@ pub(super) fn footer(
                         .child(timing::timestamp(at, now.wall_ms, false))
                 }))
                 .children(copy))
-        })
-        .tooltip(move |window, cx| {
-            gpui::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
         })
 }

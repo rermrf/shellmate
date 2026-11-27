@@ -31,7 +31,7 @@ impl State {
     }
 }
 fn time_label(sent_at: i64, now: i64) -> String {
-    // Same day: HH:mm; older messages also retain the date. The tooltip has seconds.
+    // Same day: HH:mm; older messages also retain the date.
     let full = super::timing::timestamp(sent_at, now, false);
     full.rsplit_once(':')
         .map_or(full.clone(), |(text, _)| text.to_owned())
@@ -57,7 +57,6 @@ pub(super) fn message(
         .h(px(24.));
     if let Some(sent_at) = sent_at_ms {
         let now = shellmate_ai::UserTurn::now_ms();
-        let tip = format!("发送于 {}", super::timing::timestamp(sent_at, now, true));
         meta = meta.child(
             div()
                 .id(SharedString::from(format!("{id}:time")))
@@ -65,10 +64,7 @@ pub(super) fn message(
                 .line_height(px(16.))
                 .text_color(p.tx3)
                 .when(!visible, |time| time.opacity(0.))
-                .child(time_label(sent_at, now))
-                .tooltip(move |w, cx| {
-                    gpui::component::tooltip::Tooltip::new(tip.clone()).build(w, cx)
-                }),
+                .child(time_label(sent_at, now)),
         );
     }
     // Keep the target's space reserved while hidden.
@@ -174,13 +170,12 @@ pub(super) fn reply_copy(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn timestamps_show_minutes_and_old_dates_with_full_seconds_in_tooltip() {
+    fn timestamps_show_minutes_and_old_dates() {
         let now = shellmate_ai::UserTurn::now_ms();
         let today = super::time_label(now, now);
         assert_eq!(today.len(), 5);
         assert_eq!(&today[2..3], ":");
         let yesterday = super::time_label(now - 172_800_000, now);
         assert_eq!(yesterday.len(), 16);
-        assert_eq!(super::super::timing::timestamp(now, now, true).len(), 19);
     }
 }
