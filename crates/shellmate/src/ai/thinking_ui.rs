@@ -26,7 +26,6 @@ impl Drawer {
         };
         let mut body = div()
             .id(id.clone())
-            .group(id.clone())
             .flex_none()
             .min_w_0()
             .w_full()
@@ -55,16 +54,7 @@ impl Drawer {
                         });
                         cx.notify();
                     })),
-            )
-            .child(super::message_ui::content_copy(
-                &id,
-                &block.text,
-                "复制思考内容",
-                &id,
-                self.selection_scroll.clone(),
-                w,
-                cx,
-            ));
+            );
         body = body.child(header);
         if expanded {
             body = body.child(
