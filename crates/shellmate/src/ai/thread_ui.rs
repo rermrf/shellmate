@@ -241,12 +241,14 @@ impl Drawer {
         self.release_context(cx);
         cx.notify();
     }
+    #[allow(clippy::too_many_arguments)]
     fn child_message(
         &self,
         id: &str,
         index: usize,
         text: &str,
         origin: Option<MessageOrigin>,
+        sent_at_ms: Option<i64>,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -301,7 +303,6 @@ impl Drawer {
                     .whitespace_normal()
                     .when(long && !expanded, |d| d.line_clamp(5).overflow_hidden()),
             );
-        let copy = text.to_owned();
         let target = id.to_owned();
         let mut actions = agent_ui::step_actions();
         if long {
@@ -325,15 +326,10 @@ impl Drawer {
                 })),
             );
         }
-        actions = actions.child(
-            agent_ui::step_action(SharedString::from(format!("{scope}:copy")), "复制", cx)
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                }),
-        );
-        message = message.child(actions);
-        message.into_any_element()
+        if long { message = message.child(actions); }
+        super::message_ui::message(scope, text, sent_at_ms, message, self.selection_scroll.clone(), w, cx).into_any_element()
     }
+
     pub(super) fn render_child(&mut self, w: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let id = self.state.child_page.selected.clone().unwrap();
         let resolved = self
@@ -512,8 +508,8 @@ impl Drawer {
                     Item::User {
                         index,
                         text,
-                        origin,
-                    } => body = body.child(self.child_message(&id, index, &text, origin, w, cx)),
+                        origin, sent_at_ms,
+                    } => body = body.child(self.child_message(&id, index, &text, origin, sent_at_ms, w, cx)),
                     Item::Text { index, text } => {
                         body = body.child(markdown::drawer_view(
                             SharedString::from(format!("{}:{scope}:text:{index}", self.state.id))
@@ -548,7 +544,7 @@ impl Drawer {
             }
         } else {
             if !view.prompt.is_empty() {
-                body = body.child(self.child_message(&id, 0, &view.prompt, None, w, cx));
+                body = body.child(self.child_message(&id, 0, &view.prompt, None, None, w, cx));
             }
             for step in &view.step_list {
                 body = body.child(
@@ -634,7 +630,7 @@ impl Drawer {
                         .text_color(p.tx3)
                         .child("待处理消息"),
                 )
-                .child(self.child_message(&id, usize::MAX - n, &input.text, input.origin, w, cx));
+                .child(self.child_message(&id, usize::MAX - n, &input.text, input.origin, input.sent_at_ms, w, cx));
         }
         let mut footer = div()
             .flex_none()
@@ -814,6 +810,7 @@ pub(super) enum Item {
         index: usize,
         text: String,
         origin: Option<MessageOrigin>,
+        sent_at_ms: Option<i64>,
     },
     Text {
         index: usize,
@@ -827,11 +824,12 @@ pub(super) fn grouped(entries: &[Entry]) -> Vec<Item> {
     let mut last_message = None;
     for (index, e) in entries.iter().enumerate() {
         match e {
-            Entry::User { text, origin, .. } => {
+            Entry::User { text, origin, sent_at_ms, .. } => {
                 out.push(Item::User {
                     index,
                     text: text.clone(),
                     origin: *origin,
+                    sent_at_ms: *sent_at_ms,
                 });
                 last_message = None;
             }
@@ -916,6 +914,7 @@ mod tests {
         };
         let entries = vec![
             Entry::User {
+                sent_at_ms: None,
                 text: "delegate".into(),
                 context: Default::default(),
                 origin: Some(MessageOrigin::Delegation),
@@ -937,6 +936,7 @@ mod tests {
                 message_id: 1,
             },
             Entry::User {
+                sent_at_ms: None,
                 text: "followup".into(),
                 context: Default::default(),
                 origin: Some(MessageOrigin::User),

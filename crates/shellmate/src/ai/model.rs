@@ -116,7 +116,7 @@ impl DrawerModel {
         if self.busy || question.trim().is_empty() {
             return false;
         }
-        self.conversation.push_user(UserTurn::new(question.trim(), context));
+        self.conversation.push_user(UserTurn::new(question.trim(), context).sent_now());
         self.busy = true;
         self.thinking = false;
         self.error = None;

@@ -193,6 +193,8 @@ pub struct Compaction {
 #[serde(crate = "rig_core::serde", tag = "entry", rename_all = "snake_case")]
 pub enum Entry {
     User {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_at_ms: Option<i64>,
         text: String,
         context: ContextSnapshot,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -328,6 +330,7 @@ impl Conversation {
     }
     pub fn push_user_from(&mut self, user: UserTurn, origin: Option<MessageOrigin>) {
         self.append(Entry::User {
+            sent_at_ms: user.sent_at_ms,
             origin,
             text: user.question,
             context: user.context,
@@ -471,8 +474,8 @@ impl Conversation {
                 crate::context::portable_id(&step.call.id, self.entries.len(), &mut used);
         }
         match &entry {
-            Entry::User { text, context, .. } => self.turns.push(Turn {
-                user: UserTurn::new(text, context.clone()),
+            Entry::User { text, context, sent_at_ms, .. } => self.turns.push(Turn {
+                user: UserTurn::new(text, context.clone()).sent_at(*sent_at_ms),
                 answer: None,
             }),
             _ => {

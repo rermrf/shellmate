@@ -135,6 +135,7 @@ mod tests {
         assert_eq!(saved.inbox.inputs.len(), 2);
         assert!(saved.inbox.inputs.iter().all(|i| !i.claimed));
         let entries = vec![shellmate_ai::Entry::User {
+            sent_at_ms: None,
             origin: None,
             text: "first instruction".into(),
             context: Default::default(),

@@ -120,6 +120,11 @@ pub(crate) fn prefix_start(start: usize) -> Fingerprint {
 }
 pub(crate) fn prefix_next(prefix: Fingerprint, entry: &Entry) -> Fingerprint {
     let value = match entry {
+        Entry::User { .. } => {
+            let mut value = serde_json::to_value(entry).expect("semantic entry serializes");
+            value.as_object_mut().unwrap().remove("sent_at_ms");
+            value
+        }
         Entry::Assistant {
             text, message_id, ..
         } => json!(["assistant", message_id, text]),

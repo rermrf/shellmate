@@ -185,6 +185,8 @@ pub struct SubagentOutcome {
 #[serde(crate = "rig_core::serde")]
 pub struct SubagentContext {
     #[serde(default)]
+    pub sent_at_ms: Option<i64>,
+    #[serde(default)]
     pub origin: Option<crate::MessageOrigin>,
     pub id: String,
     pub snapshot: ContextSnapshot,
@@ -444,6 +446,7 @@ pub async fn run_from_history(
         &request.prompt,
         context.snapshot,
         context.origin,
+        context.sent_at_ms,
     );
     let initial_entries = transcript.entries().len();
     let caps = Capabilities {
@@ -601,6 +604,7 @@ pub fn prepare_history(
     prompt: &str,
     context: ContextSnapshot,
     origin: Option<crate::MessageOrigin>,
+    sent_at_ms: Option<i64>,
 ) {
     if !log.entries().is_empty() {
         log.append(Entry::Notice {
@@ -608,7 +612,7 @@ pub fn prepare_history(
             text: "继续执行".into(),
         });
     }
-    log.push_user_from(UserTurn::new(prompt, context), origin);
+    log.push_user_from(UserTurn::new(prompt, context).sent_at(sent_at_ms), origin);
 }
 fn partial_report(log: &Conversation) -> String {
     if let Some(group) = log.entries().iter().rev().find_map(|e| {

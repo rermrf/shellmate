@@ -26,13 +26,28 @@ pub struct ContextSnapshot {
 pub struct UserTurn {
     pub question: String,
     pub context: ContextSnapshot,
+    /// Presentation metadata, never sent to the model. None for legacy history.
+    pub sent_at_ms: Option<i64>,
 }
 impl UserTurn {
     pub fn new(question: &str, context: ContextSnapshot) -> Self {
         Self {
             question: question.into(),
             context,
+            sent_at_ms: None,
         }
+    }
+    pub fn sent_now(mut self) -> Self {
+        self.sent_at_ms = Some(Self::now_ms());
+        self
+    }
+    pub fn sent_at(mut self, sent_at_ms: Option<i64>) -> Self {
+        self.sent_at_ms = sent_at_ms;
+        self
+    }
+    pub fn now_ms() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis().min(i64::MAX as u128) as i64
     }
     pub fn wire_text(&self) -> String {
         format!(

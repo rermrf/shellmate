@@ -22,6 +22,7 @@ fn delegation() -> Value {
 }
 fn context() -> SubagentContext {
     SubagentContext {
+        sent_at_ms: None,
         origin: None,
         id: "agent-test".into(),
         snapshot: ContextSnapshot {

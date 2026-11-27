@@ -1096,6 +1096,7 @@ async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint(
         .inbox
         .inputs
         .push_back(shellmate_ai::interaction::Input {
+            sent_at_ms: None,
             origin: None,
             id: "pending".into(),
             text: "RECOVERED-PENDING".into(),

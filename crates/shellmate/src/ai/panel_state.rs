@@ -133,7 +133,7 @@ impl<R> ConversationState<R> {
                 snapshot
                     .inputs
                     .front()
-                    .map(|i| UserTurn::new(&i.text, i.context.clone()))
+                    .map(|i| i.user_turn())
             });
         let Some(first) = first else {
             return;
@@ -156,7 +156,7 @@ impl<R> ConversationState<R> {
             updated_at: crate::ai::now(),
             conversation: self.model.conversation.clone(),
         };
-        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"timing":self.timing.snapshot(super::timing::Moment::now()),"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context}))});
+        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"timing":self.timing.snapshot(super::timing::Moment::now()),"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context,"sent_at_ms":u.sent_at_ms}))});
         match db.save_ai_conversation_with_runtime(&saved, Some(&runtime)) {
             Ok(true) => {
                 self.save_error = None;

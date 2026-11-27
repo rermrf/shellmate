@@ -95,6 +95,7 @@ impl State<'_> {
         let ids = inputs.iter().map(|i| i.id.clone()).collect();
         for input in inputs {
             self.entry(Entry::User {
+                sent_at_ms: input.sent_at_ms,
                 origin: input.origin,
                 text: input.text,
                 context: input.context,

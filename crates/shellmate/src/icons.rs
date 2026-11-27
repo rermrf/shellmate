@@ -33,6 +33,8 @@ prototype_icons! {
     Ai => ("ai", 14.),
     Shield => ("shield", 14.),
     History => ("history", 16.),
+    Copy => ("copy", 14.),
+    Check => ("check", 14.),
     Commands => ("commands", 14.),
     Moon => ("moon", 15.),
     Sun => ("sun", 16.),

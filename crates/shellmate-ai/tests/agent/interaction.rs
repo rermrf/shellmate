@@ -58,6 +58,7 @@ async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknow
                 reasoning: None,
             },
             SubagentContext {
+                sent_at_ms: None,
                 origin: None,
                 id: "agent-test".into(),
                 snapshot: Default::default(),
@@ -375,6 +376,7 @@ async fn web_tools_work_without_terminal_and_children_inherit_the_same_tools_on_
                 reasoning: None,
             },
             shellmate_ai::subagent::SubagentContext {
+                sent_at_ms: None,
                 id: "agent-1".into(),
                 snapshot: Default::default(),
                 cwd: None,

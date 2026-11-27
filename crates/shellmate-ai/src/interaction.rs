@@ -47,6 +47,8 @@ impl Phase {
 #[serde(crate = "rig_core::serde")]
 pub struct Input {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<crate::MessageOrigin>,
     pub id: String,
     pub text: String,
@@ -54,6 +56,11 @@ pub struct Input {
     pub claimed: bool,
     #[serde(default)]
     pub editing: bool,
+}
+impl Input {
+    pub fn user_turn(&self) -> crate::UserTurn {
+        crate::UserTurn::new(&self.text, self.context.clone()).sent_at(self.sent_at_ms)
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
@@ -142,7 +149,17 @@ impl Control {
         origin: Option<crate::MessageOrigin>,
         save: impl FnOnce(&Input) -> Result<(), E>,
     ) -> Result<bool, E> {
-        if text.trim().is_empty() {
+        self.enqueue_turn_from(id, crate::UserTurn::new(&text, context).sent_now(), origin, save)
+    }
+    /// Preserve the original send time when moving an already queued message.
+    pub fn enqueue_turn_from<E>(
+        &self,
+        id: String,
+        user: crate::UserTurn,
+        origin: Option<crate::MessageOrigin>,
+        save: impl FnOnce(&Input) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if user.question.trim().is_empty() {
             return Ok(false);
         }
         let mut state = self.state.lock().unwrap();
@@ -153,10 +170,11 @@ impl Control {
             return Ok(false);
         }
         let input = Input {
+            sent_at_ms: user.sent_at_ms,
             origin,
             id,
-            text,
-            context,
+            text: user.question,
+            context: user.context,
             claimed: false,
             editing: false,
         };
@@ -397,6 +415,28 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn send_time_survives_queue_edit_restore_and_claim() {
+        let control = Control::default();
+        let sent = 1_700_000_000_123;
+        let user = crate::UserTurn::new("first", Default::default()).sent_at(Some(sent));
+        control.enqueue_turn_from("message".into(), user, None, |_| Ok::<_, ()>(())).unwrap();
+        control.edit("message", Some("edited".into()));
+        let saved = serde_json::to_string(&control.snapshot()).unwrap();
+        let restored = Control::default();
+        restored.restore(serde_json::from_str(&saved).unwrap());
+        restored.resume();
+        let claimed = restored.claim_first().unwrap();
+        assert_eq!(claimed.sent_at_ms, Some(sent));
+        let mut log = crate::Conversation::default();
+        log.push_user(claimed.user_turn());
+        assert_eq!(log.turns()[0].user.sent_at_ms, Some(sent));
+        assert_eq!(log.turns()[0].user.question, "edited");
+        assert!(!log.turns()[0].user.wire_text().contains(&sent.to_string()));
+        let old = r#"{"id":"old","text":"old","context":{"text":"","label":"","protocol":""},"claimed":false}"#;
+        let old: Input = serde_json::from_str(old).unwrap();
+        assert!(old.sent_at_ms.is_none());
+    }
     #[test]
     fn failed_input_save_never_exposes_a_message_to_the_worker() {
         let c = Control::default();

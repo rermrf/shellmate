@@ -4,6 +4,8 @@ mod interaction_ui;
 mod btw_ui;
 #[path = "run_timing.rs"]
 mod timing;
+#[path = "message_ui.rs"]
+mod message_ui;
 #[path = "timing_ui.rs"]
 mod timing_ui;
 #[path="conversation_runtime.rs"]
@@ -356,7 +358,7 @@ impl Drawer {
             .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
         let context=self.message_context(context);
-        let user = UserTurn::new(&question, context);
+        let user = UserTurn::new(&question, context).sent_now();
         if user.question.trim().is_empty() {
             return;
         }
@@ -427,8 +429,8 @@ impl Drawer {
                                 let user=s.state.queued.take();
                                 let queued=s.state.control.snapshot().inputs;
                                 s.attach_runtime(runtime.clone(),cx);
-                                if let Some(user)=user{runtime.submit(user.question,user.context);}
-                                for input in queued{if !input.claimed{runtime.control.enqueue(input.id,input.text,input.context);}}
+                                if let Some(user)=user{runtime.submit_turn(user);}
+                                for input in queued{if !input.claimed{let _: Result<_, std::convert::Infallible> = runtime.control.enqueue_turn_from(input.id.clone(),input.user_turn(),input.origin,|_|Ok(()));}}
                                 let settings=s.db.borrow().ai_settings().unwrap_or_default();runtime.launch(config,settings.limits(),settings);s.sync_runtime(cx);return;
                             }
                             if let Some(user) = s.state.queued.take() {
@@ -439,7 +441,7 @@ impl Drawer {
                                 s.state.model.busy = true;
                             } else if s.state.model.conversation.turns().is_empty() {
                                 let Some(input)=s.state.control.claim_first() else{return;};
-                                s.state.model.conversation.push_user(UserTurn::new(&input.text,input.context));
+                                s.state.model.conversation.push_user(input.user_turn());
                                 s.state.accepted_inputs.push(input.id);s.state.model.busy=true;s.persist();
                             } else if !s.state.model.retry() {
                                 return;
@@ -857,7 +859,7 @@ impl Drawer {
                     if let Ok(records)=serde_json::from_value::<Vec<timing::Record>>(runtime["timing"].clone()) { self.state.timing.restore(records); }
                     if let Ok(mut queue)=serde_json::from_value::<shellmate_ai::interaction::Snapshot>(runtime["queue"].clone()) {
                         if self.state.model.conversation.turns().is_empty() && let Some(text)=runtime["preparing"]["text"].as_str() {
-                            queue.inputs.push_front(shellmate_ai::interaction::Input{origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
+                            queue.inputs.push_front(shellmate_ai::interaction::Input{sent_at_ms:runtime["preparing"]["sent_at_ms"].as_i64(),origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
                         }
                         self.state.control.restore(queue);
                     }
@@ -1437,36 +1439,14 @@ impl Render for Drawer {
             for (index, turn) in self.state.model.conversation.turns().iter().enumerate() {
                 body = body.children(self.local_cards_at(index, cx));
                 let message_id = format!("{}:main:user:{index}", self.state.id);
-                let copy = turn.user.question.clone();
-                body = body.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .gap(px(5.))
-                        .child(
-                            subagent_ui::selectable(
-                                message_id.clone(), &turn.user.question, window, cx,
-                            )
-                                .max_w_full()
-                                .px(px(12.))
-                                .py(px(9.))
-                                .rounded(px(13.))
-                                .bg(p.accs)
-                                .text_size(px(13.))
-                                .line_height(px(20.8))
-                                .whitespace_normal(),
-                        )
-                        .child(
-                            agent_ui::step_action(
-                                SharedString::from(format!("{message_id}:copy")), "复制", cx,
-                            )
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                            }),
-                        ),
-                );
+                let bubble = subagent_ui::selectable(
+                    message_id.clone(), &turn.user.question, window, cx,
+                ).max_w_full().px(px(12.)).py(px(9.)).rounded(px(13.))
+                    .bg(p.accs).text_size(px(13.)).line_height(px(20.8)).whitespace_normal();
+                body = body.child(message_ui::message(
+                    message_id, &turn.user.question, turn.user.sent_at_ms,
+                    bubble, self.selection_scroll.clone(), window, cx,
+                ));
                 if let Some(answer) = &turn.answer {
                     let commands: Vec<String> = answer
                         .items

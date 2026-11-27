@@ -161,7 +161,7 @@ impl Service {
             let mut transcript = shellmate_ai::Conversation::from_entries(transcript);
             for input in pending {
                 transcript.push_user_from(
-                    shellmate_ai::UserTurn::new(&input.text, input.context),
+                    input.user_turn(),
                     input.origin,
                 );
             }
@@ -209,6 +209,7 @@ impl Service {
         origin: shellmate_ai::MessageOrigin,
     ) -> BoxFuture<'_, LocalResult> {
         let call_id = call_id.to_owned();
+        let sent_at_ms = Some(shellmate_ai::UserTurn::now_ms());
         Box::pin(async move {
             if !self.supported() {
                 return LocalResult::error("当前会话不支持子任务");
@@ -305,6 +306,7 @@ impl Service {
                 self.memory_snapshot()
             };
             let context = SubagentContext {
+                sent_at_ms,
                 origin: Some(origin),
                 id: source.id.clone(),
                 snapshot: restored
@@ -341,6 +343,7 @@ impl Service {
                 &request.prompt,
                 context.snapshot.clone(),
                 context.origin,
+                context.sent_at_ms,
             );
             let saved = self.tasks.while_retained(|| {
                 super::subagent_files::checkpoint(

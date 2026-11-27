@@ -218,10 +218,14 @@ impl Runtime {
         d.model.busy || d.paused || self.tasks.has_running() || !d.approvals.is_empty()
     }
     pub fn submit(&self, text: String, context: ContextSnapshot) {
-        self.control.enqueue(
+        self.submit_turn(UserTurn::new(&text, context).sent_now());
+    }
+    pub fn submit_turn(&self, user: UserTurn) {
+        let _: Result<_, std::convert::Infallible> = self.control.enqueue_turn_from(
             shellmate_core::HostId::generate().to_string(),
-            text,
-            context,
+            user,
+            None,
+            |_| Ok(()),
         );
         self.control.resume();
         self.wake.notify_one();
@@ -307,7 +311,7 @@ impl Runtime {
                     .snapshot()
                     .inputs
                     .front()
-                    .map(|i| UserTurn::new(&i.text, i.context.clone()))
+                    .map(|i| i.user_turn())
             })
         else {
             return true;
@@ -457,7 +461,7 @@ impl Runtime {
                 let Some(i) = self.control.claim_first() else {
                     continue;
                 };
-                log.push_user(UserTurn::new(&i.text, i.context));
+                log.push_user(i.user_turn());
                 {
                     self.data.lock().unwrap().model.conversation = log.clone();
                 }

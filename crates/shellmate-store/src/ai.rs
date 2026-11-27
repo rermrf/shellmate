@@ -694,6 +694,23 @@ mod tests {
         assert_eq!(db.ai_conversation(&c.id).unwrap().unwrap().conversation.turns().last().unwrap().user.question, "TOKEN=unsafe");
         assert_eq!(db.ai_conversations().unwrap().len(), 1);
     }
+    #[test]
+    fn user_send_time_is_independent_of_save_time_and_legacy_history_stays_unknown() {
+        let mut db = HostStore::open_in_memory().unwrap();
+        let mut saved = saved();
+        let sent = 1_700_000_000_123;
+        saved.conversation.push_user(UserTurn::new("sent", Default::default()).sent_at(Some(sent)));
+        db.save_ai_conversation(&saved).unwrap();
+        saved.updated_at += 600;
+        saved.conversation.push_text("later reply");
+        db.save_ai_conversation(&saved).unwrap();
+        let loaded = db.ai_conversation(&saved.id).unwrap().unwrap();
+        assert_eq!(loaded.conversation.turns()[1].user.sent_at_ms, Some(sent));
+        assert!(loaded.conversation.turns()[0].user.sent_at_ms.is_none());
+        let original = loaded.conversation.turns()[1].user.wire_text();
+        let without_time = loaded.conversation.turns()[1].user.clone().sent_at(None).wire_text();
+        assert_eq!(original, without_time);
+    }
 }
 
 #[cfg(test)]
