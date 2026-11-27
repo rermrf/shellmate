@@ -7,6 +7,7 @@ use std::{
 };
 #[derive(Clone)]
 pub struct Endpoint {
+    pub independent: bool,
     pub target: Destination,
     pub binding: Binding,
     pub window: String,
@@ -23,6 +24,7 @@ pub struct Catalog {
     pub bridge: async_channel::Sender<Ui>,
 }
 struct State {
+    independent: BTreeMap<usize, Endpoint>,
     epoch: String,
     next: u64,
     entries: BTreeMap<usize, Endpoint>,
@@ -45,6 +47,7 @@ impl Catalog {
         let mut all = self
             .list()
             .into_iter()
+            .filter(|e| !e.independent)
             .filter(|e| e.window != window)
             .map(|e| {
                 (
@@ -65,6 +68,7 @@ impl Catalog {
             commands: Arc::new(tokio::sync::Semaphore::new(12)),
             models: Arc::new(tokio::sync::Semaphore::new(4)),
             inner: Arc::new(Mutex::new(State {
+                independent: BTreeMap::new(),
                 epoch: shellmate_core::HostId::generate().to_string(),
                 next: 0,
                 entries: BTreeMap::new(),
@@ -118,6 +122,7 @@ impl Catalog {
             next.insert(
                 binding.session,
                 Endpoint {
+                    independent: false,
                     target: Destination {
                         session_id: reference,
                         label,
@@ -144,17 +149,17 @@ impl Catalog {
         state.entries = next;
     }
     pub fn list(&self) -> Vec<Endpoint> {
-        self.inner
-            .lock()
-            .unwrap()
-            .entries
-            .values()
-            .cloned()
-            .collect()
+        let s=self.inner.lock().unwrap();s.entries.values().chain(s.independent.values()).cloned().map(|mut e|{e.connected=e.connected&&e.binding.alive.load(Ordering::Acquire);e}).collect()
     }
     pub fn session(&self, id: usize) -> Option<Endpoint> {
-        self.inner.lock().unwrap().entries.get(&id).cloned()
+        let s=self.inner.lock().unwrap();s.entries.get(&id).or_else(||s.independent.get(&id)).cloned()
     }
+    pub fn lookup(&self,reference:&str)->Result<Endpoint,String>{self.list().into_iter().find(|e|e.target.session_id==reference).ok_or_else(||"终端资源已关闭".into())}
+    pub fn insert_independent(&self,mut e:Endpoint)->Result<Endpoint,String>{
+        let mut s=self.inner.lock().unwrap();if s.independent.len()>=32{return Err("独立终端已达到 32 个，请关闭不再使用的终端".into());}
+        s.next+=1;e.independent=true;e.binding.session=usize::MAX-s.next as usize;e.target.session_id=format!("pty-{}-{}",s.epoch,s.next);e.lease=Arc::new(std::sync::atomic::AtomicBool::new(true));s.independent.insert(e.binding.session,e.clone());Ok(e)
+    }
+    pub fn remove_independent(&self,id:usize){if let Some(e)=self.inner.lock().unwrap().independent.remove(&id){e.lease.store(false,Ordering::Release);}}
     pub fn resolve(&self, reference: &str) -> Result<Endpoint, String> {
         self.list()
             .into_iter()
@@ -163,7 +168,8 @@ impl Catalog {
             .ok_or_else(|| "目标终端已关闭、断线或连接已变化；请重新选择终端".into())
     }
     pub async fn read(&self, reference: &str, lines: usize) -> Result<ContextSnapshot, String> {
-        let endpoint = self.resolve(reference)?;
+        let endpoint = self.lookup(reference)?;
+        if !endpoint.independent{self.resolve(reference)?;}
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.bridge
             .send(Ui::ReadSession {
@@ -175,7 +181,7 @@ impl Catalog {
             .await
             .map_err(|_| "终端桥接已关闭")?;
         let result = rx.await.map_err(|_| "终端读取已取消")?;
-        self.resolve(reference)?;
+        if endpoint.independent{self.lookup(reference)?;}else{self.resolve(reference)?;}
         result
     }
 }

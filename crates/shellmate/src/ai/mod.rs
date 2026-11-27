@@ -5,6 +5,9 @@ pub(crate) mod output_view;
 pub(crate) mod output_document;
 pub mod exec;
 pub(crate) mod terminal_interaction;
+pub(crate) mod pty_tasks;
+pub(crate) mod pty_ui;
+pub(crate) mod pty_tools;
 #[cfg(all(test, target_os = "macos"))]
 mod cwd_tests;
 pub mod host;

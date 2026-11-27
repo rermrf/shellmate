@@ -173,3 +173,20 @@ async fn closing_a_shell_closes_its_channel_silently() {
     assert!(!connection.is_closed());
     assert!(shell.write(b"x").is_err() || shell.write(b"y").is_err(), "a closed shell stops accepting input");
 }
+
+#[tokio::test]
+async fn independent_pty_exec_has_own_channel_and_cancelled_handoff_closes_it(){
+    use std::sync::Arc;
+    let server=TestServer::start(ServerOptions{exec:Some(Arc::new(|_,channel|{tokio::spawn(async move{channel.stdout(b"interactive ready\r\n".to_vec()).await;channel.wait_closed().await;});})),..Default::default()}).await;
+    let env=Env::new();let connection=connect(&server,&env).await;
+    let (original,mut original_shell)=shell(&connection,DIMS).await;
+    original.wait_for_text("fixture ready").await;
+    let pending=connection.open_pty_command(DIMS,"cd /tmp && vim example").await.unwrap();
+    assert_eq!(*lock(&server.state.execs),["cd /tmp && vim example"]);
+    assert_eq!(*lock(&server.state.shells),1);
+    assert_eq!(lock(&server.state.ptys).len(),2);
+    drop(pending);
+    eventually("cancelled PTY channel closes",||(*lock(&server.state.closed_channels)>=1).then_some(())).await;
+    original_shell.write(b"still here\r").unwrap();original.wait_for_text("still here").await;
+    assert!(!connection.is_closed());
+}

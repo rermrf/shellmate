@@ -83,7 +83,7 @@ impl Drawer {
                     .child(div().flex().flex_wrap().items_center().gap(px(6.))
                         .child(status_badge(task.target_label(), p.tx2, p.card, false))
                         .child(div().flex_1())
-                        .child(pill_action(SharedString::from(format!("task-output-{id}")), "查看输出", ActionTone::Card, cx)
+                        .child(pill_action(SharedString::from(format!("task-output-{id}")), if id.starts_with("pty-"){"查看终端"}else{"查看输出"}, ActionTone::Card, cx)
                             .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx))))
                         .child(pill_action(SharedString::from(format!("task-stop-{id}")), "停止", ActionTone::Danger, cx)
                             .on_click(cx.listener(move |s, _, _, cx| {

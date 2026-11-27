@@ -320,13 +320,13 @@ async fn interactive_terminal_tools_round_trip_on_all_three_protocols_and_child_
         fn run(&self,_:ToolCall)->BoxFuture<'_,ToolOutcome>{Box::pin(async{panic!("TUI input must not execute as a shell command")})}
         fn local_tool_from(&self,tool:LocalTool,_:ExecLimits,source:Option<SubagentRef>,id:&str)->BoxFuture<'_,LocalResult>{
             let id=id.to_owned();Box::pin(async move{
-                let name=match tool{LocalTool::Sessions(shellmate_ai::session_tools::Request::Read(r))=>{assert!(r.screen);assert_eq!(r.session_id,"target");"read"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Input(i))=>{assert_eq!(i.screen_id,"observed");"input"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Wait(w))=>{assert_eq!(w.text.as_deref(),Some("selected"));"wait"},_=>panic!("unexpected request")};
+                let name=match tool{LocalTool::Sessions(shellmate_ai::session_tools::Request::Create(r))=>{assert_eq!(r.command,"vim example");"create"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Manage(r))=>{assert_eq!(r.session_id,"target");"manage"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Read(r))=>{assert!(r.screen);assert_eq!(r.session_id,"target");"read"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Input(i))=>{assert_eq!(i.screen_id,"observed");"input"},LocalTool::Sessions(shellmate_ai::session_tools::Request::Wait(w))=>{assert_eq!(w.text.as_deref(),Some("selected"));"wait"},_=>panic!("unexpected request")};
                 self.requests.lock().unwrap().push((name.into(),source,id));LocalResult::text("observed selected")
             })
         }
     }
     for protocol in 0..3{for child in [false,true]{
-        let calls=[("read","read_terminal",json!({"session_id":"target","screen":true})),("input","terminal_input",json!({"session_id":"target","screen_id":"observed","purpose":"选择菜单项","actions":[{"type":"key","key":"down"}]})),("wait","wait_terminal",json!({"session_id":"target","text":"selected"}))];
+        let calls=[("create","create_terminal",json!({"session_id":"target","command":"vim example","purpose":"编辑"})),("manage","manage_terminal",json!({"session_id":"target","action":"resize","columns":100,"rows":30,"purpose":"调整画面"})),("read","read_terminal",json!({"session_id":"target","screen":true})),("input","terminal_input",json!({"session_id":"target","screen_id":"observed","purpose":"选择菜单项","actions":[{"type":"key","key":"down"}]})),("wait","wait_terminal",json!({"session_id":"target","text":"selected"}))];
         let cfg=if protocol==2{super::responses_tests::responses_config()}else{config(protocol==1)};
         let first=if protocol==2{super::responses_tests::wire::reply(calls.iter().map(|(id,name,args)|super::responses_tests::wire::call(id,name,args.clone())).collect())}else{response(protocol==1,&calls,"",false)};
         let last=if protocol==2{super::responses_tests::wire::reply(vec![super::responses_tests::wire::message("end","完成","final_answer")])}else{response(protocol==1,&[],"完成",false)};
@@ -337,7 +337,7 @@ async fn interactive_terminal_tools_round_trip_on_all_three_protocols_and_child_
             let context=shellmate_ai::subagent::SubagentContext{attachments:vec![],sent_at_ms:None,origin:None,id:"child".into(),snapshot:Default::default(),cwd:None};
             let out=shellmate_ai::subagent::run(&client,request,context,Default::default(),&host,fast_limits(),|_|{}).await;assert_eq!(out.status,SubagentStatus::Completed);
         }else{let events=agent::run(&client,&mut log,capabilities(),&host,fast_limits()).unwrap().collect::<Vec<_>>().await;assert!(matches!(events.last(),Some(AgentEvent::Done(_))));}
-        let calls=host.requests.lock().unwrap();assert_eq!(calls.len(),3);assert!(calls.iter().all(|(_,source,_)|source.is_some()==child));assert_eq!(calls.iter().map(|(_,_,id)|id.as_str()).collect::<Vec<_>>(),["read","input","wait"]);
+        let calls=host.requests.lock().unwrap();assert_eq!(calls.len(),5);assert!(calls.iter().all(|(_,source,_)|source.is_some()==child));assert_eq!(calls.iter().map(|(_,_,id)|id.as_str()).collect::<Vec<_>>(),["create","manage","read","input","wait"]);
         let requests=bodies(&http);assert!(requests[0]["tools"].to_string().contains("terminal_input"));assert!(requests[0]["tools"].to_string().contains("wait_terminal"));assert!(requests[1].to_string().contains("observed selected"));
     }}
 }

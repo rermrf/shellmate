@@ -35,6 +35,14 @@ pub enum Reply {
     Input(InputResult),
     Released,
 }
+pub fn apply(t:&mut shellmate_term::Terminal,op:Operation,owner:Arc<Controller>,cx:&mut gpui::Context<shellmate_term::Terminal>)->Result<Reply,String>{
+    match op {
+        Operation::Read{region}=>{let owned=t.interaction_owned(&owner);t.interaction_snapshot(region.as_ref()).map(|screen|Reply::Screen{screen,owned})},
+        Operation::Check{screen_id}=>{let owned=t.interaction_owned(&owner);t.interaction_check(&screen_id,&owner).map(|screen|Reply::Screen{screen,owned})},
+        Operation::Input{screen_id,actions}=>t.interaction_input(&screen_id,&actions,owner,cx).map(Reply::Input),
+        Operation::Release=>t.interaction_release(&owner,cx).map(|_|Reply::Released),
+    }
+}
 pub fn handles(request: &Request) -> bool {
     matches!(
         request,
@@ -44,7 +52,7 @@ pub fn handles(request: &Request) -> bool {
     )
 }
 fn endpoint(router: &Router, id: &str) -> Result<Endpoint, String> {
-    let e = router.resolve(Some(id))?;
+    let e = if let Ok(e)=router.catalog.lookup(id) && e.independent {e}else{router.resolve(Some(id))?};
     if !e.binding.capabilities.terminal || (!e.binding.local && e.binding.connection.is_none()) {
         return Err("当前只支持已连接的本机和 SSH 交互终端".into());
     }
@@ -288,15 +296,15 @@ async fn wait(router: &Router, e: &Endpoint, owner: Arc<Controller>, args: Wait)
             && args
                 .stable_ms
                 .is_none_or(|ms| stable.elapsed() >= Duration::from_millis(ms));
-        if matched || start.elapsed() >= Duration::from_millis(args.timeout_ms) {
-            return LocalResult::text(serde_json::json!({"target":e.target,"matched":matched,"timed_out":!matched,"screen":screen}).to_string());
+        if screen.ended || matched || start.elapsed() >= Duration::from_millis(args.timeout_ms) {
+            return LocalResult::text(serde_json::json!({"target":e.target,"matched":matched,"timed_out":!matched&&!screen.ended,"screen":screen}).to_string());
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::ai::{exec::Binding, host::Executor, session_catalog::Catalog, tasks::Tasks};
     use std::sync::{
@@ -305,6 +313,7 @@ mod tests {
     };
     fn screen() -> Screen {
         Screen {
+            ended: false,
             screen_id: "observed".into(),
             fingerprint: "before".into(),
             rows: 24,
@@ -331,7 +340,7 @@ mod tests {
             paused: false,
         }
     }
-    fn fixture() -> (
+    pub(crate) fn fixture() -> (
         tempfile::TempDir,
         AppExecutor,
         async_channel::Receiver<Ui>,
@@ -524,12 +533,12 @@ mod tests {
     }
     #[tokio::test]
     async fn bounded_wait_matches_text_or_returns_timeout_with_screen() {
-        for matched in [false, true] {
+        for (matched,ended) in [(false,false),(true,false),(false,true)] {
             let (_dir, executor, rx, id) = fixture();
             let bridge = tokio::spawn(async move {
                 while let Ok(Ui::TerminalInteraction { reply, .. }) = rx.recv().await {
                     let _ = reply.send(Ok(Reply::Screen {
-                        screen: screen(),
+                        screen: Screen{ended,..screen()},
                         owned: false,
                     }));
                 }
@@ -552,7 +561,8 @@ mod tests {
             assert!(!out.is_error);
             let result: serde_json::Value = serde_json::from_str(&out.inline).unwrap();
             assert_eq!(result["matched"], matched);
-            assert_eq!(result["timed_out"], !matched);
+            assert_eq!(result["timed_out"], !matched&&!ended);
+            assert_eq!(result["screen"]["ended"],ended);
             assert_eq!(result["screen"]["text"], "menu");
             bridge.abort();
         }

@@ -53,6 +53,8 @@ impl PtyOptions {
 }
 
 pub struct LocalPty {
+    owned_program: bool,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pid: Option<u32>,
     #[cfg(target_os = "macos")]
     initial_program: String,
@@ -108,6 +110,10 @@ impl LocalPty {
         }
         Self::spawn_builder(cmd, dims, on_output, on_exit)
     }
+    /// An Agent-owned program is terminated with its PTY process group when closed.
+    pub fn spawn_owned_program(program:&shellmate_core::Program,dims:PtyDims,on_output:impl FnMut(&[u8])+Send+'static,on_exit:impl FnOnce(Option<u32>)+Send+'static)->Result<Self>{
+        let mut pty=Self::spawn_program(program,dims,on_output,on_exit)?;pty.owned_program=true;Ok(pty)
+    }
 
     fn spawn_builder(
         cmd: CommandBuilder,
@@ -136,6 +142,8 @@ impl LocalPty {
             .map_err(|_| anyhow::anyhow!("无法启动终端进程，请检查程序路径和权限"))?;
         drop(pair.slave);
         let pid = child.process_id();
+        let running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let child_running=running.clone();
         let mut killer = child.clone_killer();
         let (read_done, drained) = std::sync::mpsc::channel();
         if let Err(e) = thread::Builder::new()
@@ -161,6 +169,7 @@ impl LocalPty {
             .name("pty-wait".into())
             .spawn(move || {
                 let code = child.wait().ok().map(|s| s.exit_code());
+                child_running.store(false,std::sync::atomic::Ordering::Release);
                 // Drain the final command/error output before announcing exit. A
                 // descendant holding a slave open must not hang the wait forever.
                 let _ = drained.recv_timeout(std::time::Duration::from_millis(500));
@@ -171,6 +180,8 @@ impl LocalPty {
             return Err(e.into());
         }
         Ok(Self {
+            owned_program:false,
+            running,
             pid,
             #[cfg(target_os = "macos")]
             initial_program,
@@ -228,6 +239,18 @@ impl TerminalBackend for LocalPty {
     }
 
     fn close(&mut self) {
+        if !self.running.swap(false,std::sync::atomic::Ordering::AcqRel){return;}
+        if self.owned_program && let Some(pid)=self.pid {
+            // portable-pty creates a new session for this child. Never signal a
+            // process group outside that owned session (including our own UI).
+            let pid=pid as i32;
+            unsafe {
+                if libc::getsid(pid)==pid {
+                    if let Some(foreground)=self.master.process_group_leader() && foreground!=pid && libc::getsid(foreground)==pid{libc::kill(-foreground,libc::SIGKILL);}
+                    libc::kill(-pid,libc::SIGKILL);
+                }
+            }
+        }
         let _ = self.killer.kill();
     }
 
@@ -249,7 +272,7 @@ impl TerminalBackend for LocalPty {
 
 impl Drop for LocalPty {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        self.close();
     }
 }
 
@@ -399,5 +422,20 @@ mod tests {
             assert!(output.contains("arg:60001"));
             assert!(!output.contains("fixture-secret-never-output"));
         }
+    }
+}
+
+#[cfg(test)]
+mod owned_tests{
+    use super::*;
+    #[test]
+    fn owned_program_close_terminates_a_process_group_ignoring_hangup(){
+        let dir=tempfile::tempdir().unwrap();let (ready_tx,ready)=std::sync::mpsc::channel();let (exit_tx,exit)=std::sync::mpsc::channel();
+        let program=shellmate_core::Program{executable:"/bin/sh".into(),args:vec!["-c".into(),"trap '' HUP; sleep 30 & printf ready; wait".into()],cwd:Some(dir.path().into()),env:Default::default()};
+        let mut pty=LocalPty::spawn_owned_program(&program,PtyDims::default(),move|_|{let _=ready_tx.send(());},move|code|{let _=exit_tx.send(code);}).unwrap();
+        ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();let group=pty.child_pid().unwrap() as i32;
+        pty.close();exit.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+        while unsafe{libc::kill(-group,0)}==0{assert!(std::time::Instant::now()<deadline,"owned process group remained alive");std::thread::sleep(std::time::Duration::from_millis(10));}
     }
 }

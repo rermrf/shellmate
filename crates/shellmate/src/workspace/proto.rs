@@ -374,6 +374,10 @@ impl Workspace {
             }
             "host-new" | "host-new-focus" | "host-serial" | "host-telnet" | "host-mosh" => self.new_host(window, cx),
             "hostkey-new" | "hostkey-changed" => self.proto_hostkey(scene, window, cx),
+            "ai-independent-terminal"=>{
+                self.open_ai(window,cx);
+                if let Some(drawer)=&self.ai_drawer{drawer.update(cx,|d,cx|{d.scene("ai-chat",window,cx);d.independent_terminal_fixture(cx);});}
+            }
             "ai-terminal-interaction"=>{
                 let screen=crate::proto::terminal_interaction::install(&self.sessions[0].terminal,cx);
                 self.open_ai(window,cx);

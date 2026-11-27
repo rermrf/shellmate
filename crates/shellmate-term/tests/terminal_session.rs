@@ -353,13 +353,28 @@ async fn agent_interaction(cx:&mut AsyncApp,harness:Harness) {
     let before=calls.lock().unwrap().writes.clone();terminal.update(cx,|t,cx|t.interaction_release(&owner,cx).unwrap());assert_eq!(calls.lock().unwrap().writes,before);assert!(!calls.lock().unwrap().closed);
     let old=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());attach(terminal,cx);assert!(terminal.update(cx,|t,cx|t.interaction_input(&old.screen_id,&[Action::Text{text:"x".into()}],owner,cx)).is_err());
 }
+async fn managed_exit(cx:&mut AsyncApp,harness:Harness){
+    let terminal=&harness.terminal;let (_,sink)=attach(terminal,cx);
+    terminal.update(cx,|t,_|t.set_managed_program());
+    let controller=Arc::new(shellmate_core::terminal_interaction::Controller::new("Creator".into()));
+    terminal.update(cx,|t,cx|t.claim_interaction(controller,cx).unwrap());
+    assert!(terminal.read_with(cx,|t,_|t.interaction_status().is_some()));
+    terminal.update(cx,|t,_|t.input(b"human"));assert!(terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap()).paused);
+    sink.output(b"last frame");harness.wait_for_text(cx,"last frame").await;
+    terminal.update(cx,|t,cx|t.stop_interactive_program(cx));sink.exited(Some(9));harness.settle(cx).await;
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());assert!(screen.ended);assert!(screen.text.contains("last frame"));assert!(!screen.text.contains("重新连接"));
+    harness.take_events();terminal.update(cx,|t,cx|t.restart(cx));assert!(harness.take_events().is_empty());
+}
 async fn real_tui(cx:&mut AsyncApp,harness:Harness) {
     use shellmate_core::{Program,Secret,terminal_interaction::{Action,Controller}};
     let dir=tempfile::tempdir().unwrap();let file=dir.path().join("editable.txt");std::fs::write(&file,"original\n").unwrap();
-    let program=Program{executable:"/usr/bin/vim".into(),args:vec!["-Nu".into(),"NONE".into(),"-n".into(),file.to_string_lossy().into()],cwd:Some(dir.path().into()),env:[("HOME".into(),Secret::new(dir.path().to_str().unwrap())),("TERM".into(),Secret::new("xterm-256color"))].into()};
+    let program=Program{executable:"/usr/bin/vim".into(),args:vec!["-Nu".into(),"NONE".into(),"-n".into(),"--cmd".into(),"set mouse=a ttymouse=sgr".into(),file.to_string_lossy().into()],cwd:Some(dir.path().into()),env:[("HOME".into(),Secret::new(dir.path().to_str().unwrap())),("TERM".into(),Secret::new("xterm-256color"))].into()};
     let terminal=&harness.terminal;terminal.update(cx,|t,cx|{assert!(t.attach(move|sink,size|{let exit=sink.clone();Ok(Box::new(shellmate_term::LocalPty::spawn_program(&program,size,move|b|sink.output(b),move|code|exit.exited(code))?))},cx));});
     harness.wait_for_text(cx,"original").await;harness.settle(cx).await;
     let owner=Arc::new(Controller::new("Editor test".into()));
+    let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());
+    assert!(screen.mouse_reporting);
+    terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Click{row:0,column:0,button:Default::default()}],owner.clone(),cx).unwrap());harness.settle(cx).await;
     let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());
     terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"i".into()}],owner.clone(),cx).unwrap());harness.settle(cx).await;
     let screen=terminal.update(cx,|t,_|t.interaction_snapshot(None).unwrap());terminal.update(cx,|t,cx|t.interaction_input(&screen.screen_id,&[Action::Text{text:"edited ".into()},Action::Key{key:"escape".into(),repeat:1}],owner.clone(),cx).unwrap());harness.wait_for_text(cx,"edited original").await;harness.settle(cx).await;
@@ -395,7 +410,7 @@ fn main() {
         let title = Harness::new(cx);
         let closing = Harness::new(cx);
         let focusing = Harness::new(cx);
-        let interacting=Harness::new(cx);let real=Harness::new(cx);
+        let interacting=Harness::new(cx);let real=Harness::new(cx);let managed=Harness::new(cx);
         cx.spawn(async move |cx| {
             run(cx, lifecycle).await;
             connecting(cx, progress).await;
@@ -404,6 +419,7 @@ fn main() {
             focus_and_notifications(cx, focusing).await;
             agent_interaction(cx,interacting).await;
             real_tui(cx,real).await;
+            managed_exit(cx,managed).await;
             println!("terminal_session: ok");
             cx.update(|cx| cx.quit());
         })

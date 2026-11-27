@@ -32,6 +32,9 @@ impl Reply {
     }
 }
 pub enum Ui {
+    CreatePty{request:Box<super::pty_tools::CreateRequest>,reply:oneshot::Sender<Result<shellmate_ai::session_tools::Destination,String>>},
+    ManagePty{spec:shellmate_ai::session_tools::Manage,owner:Arc<shellmate_core::terminal_interaction::Controller>,lease:Arc<AtomicBool>,reply:oneshot::Sender<Result<(),String>>},
+    StopPty{session:usize,close:bool},
     TuiApproval {source:Option<shellmate_ai::SubagentRef>,call:ToolCall,reply:oneshot::Sender<Approval>},
     TerminalInteraction {
         session:usize,lease:Arc<AtomicBool>,owner:Arc<shellmate_core::terminal_interaction::Controller>,operation:super::terminal_interaction::Operation,

@@ -17,12 +17,17 @@ impl Drawer {
             .gap(px(8.))
             .text_size(px(12.))
             .whitespace_normal();
+        if value["target"]["session_id"].as_str().is_some_and(|id|id.starts_with("pty-")) && value["screen"].is_null(){
+            let id=value["target"]["session_id"].as_str().unwrap().to_owned();
+            if !crate::ai::pty_ui::available(&id,cx){return Some(body.child("终端已关闭"));}
+            return Some(body.child(value["target"]["label"].as_str().unwrap_or("独立终端").to_owned()).child(super::agent_ui::pill_action(SharedString::from(format!("{key}:pty-view")),"查看终端",super::agent_ui::ActionTone::Accent,cx).on_click(move|_,_,cx|{crate::ai::pty_ui::show(&id,cx);})));}
         if let Ok(screen)=serde_json::from_value::<shellmate_core::terminal_interaction::Screen>(value["screen"].clone()) {
             let target=value["target"]["label"].as_str().unwrap_or("终端");
             let rows=screen.lines.iter().map(|r|format!("{:>3} │ {}",r.row,r.text)).collect::<Vec<_>>().join("\n");
             let metadata=format!("{target} · {} × {} · 光标 {}, {}{}",screen.columns,screen.rows,screen.cursor.row,screen.cursor.column,if screen.alternate_screen{" · 备用屏幕"}else{""});
             body=body.child(div().text_color(p.tx3).child(metadata))
                 .child(div().id(SharedString::from(format!("{key}:screen-scroll"))).max_h(px(260.)).overflow_scroll().bg(p.card2).rounded(px(10.)).p(px(8.)).child(super::subagent_ui::selectable(format!("{key}:screen"),&rows,w,cx).font_family(MONO_FONT).whitespace_nowrap().text_size(px(11.5))));
+            if screen.ended {body=body.child(div().text_color(p.tx3).child("程序已结束，以上为最后画面"));}
             if value["timed_out"]==true {body=body.child(div().text_color(p.tx3).child("等待已到时，以上为当前画面"));}
             if let Some(error)=value["error"].as_str(){body=body.child(div().text_color(p.err).child(error.to_owned()));}
             return Some(body);
@@ -73,6 +78,13 @@ impl Drawer {
         let mut log=shellmate_ai::Conversation::default();log.push_user(UserTurn::new("帮我在这个终端菜单中选择配置检查",Default::default()).sent_now());
         log.append(shellmate_ai::Entry::Step(shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:"tui".into(),name:"terminal_input".into(),args_json:serde_json::json!({"session_id":"fixture","purpose":"选择配置检查","actions":[{"type":"key","key":"down"}]})},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:serde_json::json!({"target":{"label":"当前终端"},"actions_sent":1,"screen":screen}).to_string(),output_id:None,cleared:false,is_error:false},display:None}));
         log.push_text("已发送方向键。你可以随时点击终端或输入接管，程序会继续运行。");self.state.model.conversation=log;self.state.model.busy=false;self.state.follow_bottom=false;self.scroll.set_offset(point(px(0.),px(0.)));self.state.tool_expanded.insert(self.tool_key("main","tui",false));cx.notify();
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn independent_terminal_fixture(&mut self,cx:&mut Context<Self>){
+        self.ensure_tasks();let tasks=self.tasks.as_ref().unwrap();let target=crate::ai::pty_ui::fixture(tasks.ptys(),cx);self.fixture_tasks=tasks.list();self.fixture=false;
+        let mut log=shellmate_ai::Conversation::default();log.push_user(UserTurn::new("在独立终端中启动交互程序，保留我当前的终端。",Default::default()).sent_now());
+        log.append(shellmate_ai::Entry::Step(shellmate_ai::Step{message_id:1,call:shellmate_ai::LoggedCall{id:"pty-fixture".into(),name:"create_terminal".into(),args_json:serde_json::json!({"session_id":"fixture","purpose":"检查独立交互终端","command":"cat"})},result:shellmate_ai::LoggedResult{attachments:vec![],subagent:None,inline:serde_json::json!({"target":target,"running":true}).to_string(),output_id:None,cleared:false,is_error:false},display:None}));
+        log.push_text("独立终端已启动，可以查看和接管；收起后程序继续运行。");self.state.model.conversation=log;self.state.model.busy=false;self.state.follow_bottom=false;self.scroll.set_offset(point(px(0.),px(0.)));self.state.tool_expanded.insert(self.tool_key("main","pty-fixture",false));cx.notify();
     }
     pub(super) fn message_context(
         &mut self,

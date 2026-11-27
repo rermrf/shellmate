@@ -160,6 +160,7 @@ impl Drawer {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if id.starts_with("pty-"){crate::ai::pty_ui::show(id,cx);return;}
         let tasks = if self.fixture {
             self.fixture_tasks.clone()
         } else {

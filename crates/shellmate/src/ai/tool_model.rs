@@ -86,6 +86,8 @@ pub fn label(call: &LoggedCall) -> String {
         "run_command" => "执行命令",
         "list_sessions" => "查看终端列表",
         "terminal_input" => "终端交互",
+        "create_terminal" => "创建独立终端",
+        "manage_terminal" => "管理独立终端",
         "wait_terminal" => "等待终端画面",
         "read_terminal" => "读取终端",
         // Display-only compatibility for saved calls; this tool is no longer offered.
@@ -107,7 +109,7 @@ pub fn summary(call: &LoggedCall) -> String {
     match call.name.as_str() {
         "view_image" => return "读取会话中的图片".into(),
         "list_sessions" => return "查看已打开的终端与连接状态".into(),
-        "terminal_input" => return call.args_json["purpose"].as_str().unwrap_or("操作终端交互程序").into(),
+        "create_terminal" | "manage_terminal" | "terminal_input" => return call.args_json["purpose"].as_str().unwrap_or("操作终端交互程序").into(),
         "wait_terminal" => return call.args_json["text"].as_str().map(|s|format!("等待画面出现：{s}")).unwrap_or_else(||"等待终端画面变化".into()),
         "read_terminal" if call.args_json["screen"]==true => return "读取程序当前画面".into(),
         "read_terminal" => {

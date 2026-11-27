@@ -349,6 +349,8 @@ impl Tasks {
     }
     pub fn child_tasks(&self) -> Self {
         let mut child = Self::new(self.0.root.clone(), self.0.conversation.clone());
+        Arc::get_mut(&mut child.0).unwrap().ptys=self.0.ptys.clone();
+        Arc::get_mut(&mut child.0).unwrap().pty_root=false;
         Arc::get_mut(&mut child.0).unwrap().discarded = self.0.discarded.clone();
         if let Some(web) = self.0.web.get() {
             let _ = child.0.web.set(web.clone());
@@ -460,6 +462,7 @@ impl Tasks {
         self.retire();
     }
     pub fn retire(&self) {
+        if self.0.pty_root{self.0.ptys.retire();}
         self.0.state.lock().unwrap().retired = true;
         let children = self.0.state.lock().unwrap().services.values().cloned().collect::<Vec<_>>();
         for child in children { child.retire(); }

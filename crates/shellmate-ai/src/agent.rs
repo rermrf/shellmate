@@ -1899,7 +1899,7 @@ fn parse_local(
     }
     if matches!(
         name,
-        "list_sessions" | "read_terminal" | "terminal_input" | "wait_terminal"
+        "list_sessions" | "read_terminal" | "terminal_input" | "wait_terminal" | "create_terminal" | "manage_terminal"
     ) {
         if !sessions {
             return Err("终端目录不可用".into());

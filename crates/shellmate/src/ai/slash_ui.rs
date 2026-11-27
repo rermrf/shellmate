@@ -389,18 +389,14 @@ impl Drawer {
                                             .flex()
                                             .items_center()
                                             .gap(px(6.))
-                                            .child(div().flex_1().child(format!(
-                                                "任务 #{} · {}",
-                                                task.id,
-                                                task.target_label()
-                                            )))
+                                            .child(div().flex_1().child(if task.id.starts_with("pty-"){"独立终端".to_owned()}else{format!("任务 #{} · {}",task.id,task.target_label())}))
                                             .when(
                                                 task.kind == crate::ai::tasks::Kind::Command,
                                                 |d| {
                                                     d.child(
                                                         super::agent_ui::step_action(
                                                             ("local-output", i * 1000 + n),
-                                                            "查看输出",
+                                                            if id.starts_with("pty-"){"查看终端"}else{"查看输出"},
                                                             cx,
                                                         )
                                                         .on_click(cx.listener(

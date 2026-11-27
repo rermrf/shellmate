@@ -273,6 +273,7 @@ impl OutputHandler for GridSink {
 /// A terminal session: the alacritty grid plus the backend feeding it. Create
 /// one with [`Terminal::local`] or [`Terminal::new`] + [`Terminal::attach`].
 pub struct Terminal {
+    managed_program: bool,
     interaction:crate::interaction::State,
     interaction_watch:Option<Task<()>>,
     term: Arc<FairMutex<Term<Listener>>>,
@@ -350,6 +351,7 @@ impl Terminal {
         });
 
         Self {
+            managed_program:false,
             interaction:Default::default(),
             interaction_watch:None,
             term: Arc::new(FairMutex::new(term)),
@@ -491,7 +493,7 @@ impl Terminal {
     fn end_disconnected(&mut self, reason: String, cx: &mut Context<Self>) {
         self.close_backend();
         self.ended = Some(SessionEnd::Disconnected(reason.clone()));
-        self.print_end(&format!("\x1b[31m[{reason}]\x1b[0m"));
+        if !self.managed_program{self.print_end(&format!("\x1b[31m[{reason}]\x1b[0m"));}
         cx.emit(TerminalEvent::Disconnected(reason));
     }
 
@@ -591,13 +593,13 @@ impl Terminal {
                     output = true;
                 }
                 Msg::Alac { generation, event } if generation == self.current_generation() => self.handle_alac_event(event, cx),
-                Msg::Exited { generation, code } if generation == self.current_generation() => {
+                Msg::Exited { generation, code } if generation == self.current_generation() && (!self.managed_program || self.ended.is_none()) => {
                     self.close_backend();
                     self.ended = Some(SessionEnd::Exited(code));
                     let code_text = code.map_or_else(|| "未知".to_string(), |c| c.to_string());
                     let what = if self.local.is_some() { "进程" } else { "远程会话" };
                     let hint = if self.local.is_some() { "按回车重新启动" } else { "按回车重新连接" };
-                    self.inject(&format!("\r\n\x1b[2m[{what}已退出，代码 {code_text}] {hint}\x1b[0m\r\n"));
+                    if !self.managed_program{self.inject(&format!("\r\n\x1b[2m[{what}已退出，代码 {code_text}] {hint}\x1b[0m\r\n"));}
                     cx.emit(TerminalEvent::Exited(code));
                     output = true;
                 }
@@ -806,11 +808,27 @@ impl Terminal {
     pub fn resume_interaction(&mut self,cx:&mut Context<Self>){self.interaction.resume();cx.notify();}
     pub fn user_write_raw(&mut self,bytes:&[u8]){self.interaction.takeover();self.write_raw(bytes);}
     pub fn interaction_snapshot(&mut self,region:Option<&shellmate_core::terminal_interaction::Region>)->Result<shellmate_core::terminal_interaction::Screen,String>{
-        if !self.agent_connected(){return Err("终端未连接".into());}
+        if !self.agent_connected() && self.ended.is_none(){return Err("终端未连接".into());}
         let mut screen=crate::interaction::snapshot(&*self.term.lock(),region)?;
+        screen.ended = !self.agent_connected();
         screen.controller=self.interaction.owner().map(|o|o.label.clone());screen.paused=self.interaction.paused&&self.interaction.owner().is_some();self.interaction.record(&mut screen);Ok(screen)
     }
     pub fn interaction_owned(&self,owner:&shellmate_core::terminal_interaction::Controller)->bool{self.interaction.owner().is_some_and(|o|o.id==owner.id)}
+    pub fn claim_interaction(&mut self,owner:Arc<shellmate_core::terminal_interaction::Controller>,cx:&mut Context<Self>)->Result<(),String>{
+        if !owner.active()||!self.agent_connected()||self.interaction.owner().is_some(){return Err("终端不能取得控制权".into());}
+        self.interaction.owner=Some(owner);self.interaction.paused=false;self.watch_interaction(cx);cx.notify();Ok(())
+    }
+    fn watch_interaction(&mut self,cx:&mut Context<Self>){
+        self.interaction_watch=Some(cx.spawn(async move|this,cx|loop {
+            cx.background_executor().timer(Duration::from_millis(250)).await;
+            if !this.update(cx,|t,cx|{
+                let keep=t.agent_connected() && t.interaction.owner().is_some();
+                if !keep{t.interaction.owner=None;t.interaction.invalidate();cx.notify();}keep
+            }).unwrap_or(false){break;}
+        }));
+    }
+    pub fn set_managed_program(&mut self){self.managed_program=true;}
+    pub fn stop_interactive_program(&mut self,cx:&mut Context<Self>){self.close_backend();self.interaction=Default::default();self.ended=Some(SessionEnd::Exited(None));cx.emit(TerminalEvent::Exited(None));cx.notify();}
     pub fn interaction_check(&self,id:&str,owner:&shellmate_core::terminal_interaction::Controller)->Result<shellmate_core::terminal_interaction::Screen,String>{
         if !self.agent_connected(){return Err("终端未连接".into());}
         let region=self.interaction.observations.iter().find(|o|o.id==id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
@@ -828,21 +846,19 @@ impl Terminal {
         if self.agent.lock().active.as_ref().is_some_and(|(_,s)|s.running()){return Err("此终端正在执行已捕获的命令，请先等待命令结束或使用另一个终端".into());}
         let region=self.interaction.observations.iter().find(|o|o.id==screen_id).map(|o|o.region.clone()).ok_or("画面引用已失效，请重新读屏")?;
         let term=self.term.lock();let screen=crate::interaction::snapshot(&*term,Some(&region))?;self.interaction.validate(screen_id,&owner,&screen)?;
+        crate::interaction::validate_pointer(actions,&region)?;
         let mode=*term.mode();let frames=actions.iter().map(|a|crate::interaction::encode(a,&mode)).collect::<Result<Vec<_>,_>>()?;
         self.interaction.owner=Some(owner);self.interaction.paused=false;
-        self.interaction_watch=Some(cx.spawn(async move|this,cx|loop {
-            cx.background_executor().timer(Duration::from_millis(250)).await;
-            if !this.update(cx,|t,cx|{
-                let keep=t.agent_connected() && t.interaction.owner().is_some();
-                if !keep{t.interaction.owner=None;t.interaction.invalidate();cx.notify();}keep
-            }).unwrap_or(false){break;}
-        }));
         let mut sent=0;let mut error=None;
-        for frame in frames {
-            if let Err(e)=self.backend.as_mut().ok_or("终端未连接")?.write(&frame){error=Some(format!("输入写入失败：{e}；请重新观察，勿自动重发"));break;}
+        for (action,frame) in actions.iter().zip(frames) {
+            if let Err(e)=self.backend.as_mut().ok_or("终端未连接")?.write(&frame){
+                // A failed write may have delivered the press but not the release.
+                if let Some(release)=crate::interaction::release_pointer(action,&mode){let _=self.backend.as_mut().unwrap().write(&release);}
+                error=Some(format!("输入写入失败：{e}；请重新观察，勿自动重发"));break;
+            }
             self.capture.lock().input(&*term,&frame);sent+=1;
         }
-        drop(term);self.interaction.invalidate();let screen=self.interaction_snapshot(Some(&region))?;cx.notify();Ok(InputResult{screen,actions_sent:sent,error})
+        drop(term);self.watch_interaction(cx);self.interaction.invalidate();let screen=self.interaction_snapshot(Some(&region))?;cx.notify();Ok(InputResult{screen,actions_sent:sent,error})
     }
     pub fn paste(&mut self, text: &str) {
         let mode = self.paste_mode();
@@ -936,6 +952,7 @@ impl Terminal {
     /// respawns its shell in place, keeping the scrollback; any other terminal
     /// emits [`TerminalEvent::RestartRequested`] for its owner to handle.
     pub fn restart(&mut self, cx: &mut Context<Self>) {
+        if self.managed_program{return;}
         if self.ended.is_none() {
             return;
         }

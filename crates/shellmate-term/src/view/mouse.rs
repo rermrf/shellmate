@@ -34,15 +34,19 @@ pub(super) enum Action {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ButtonEvent {
+pub(crate) enum ButtonEvent {
     LeftDown,
     LeftUp,
     LeftDrag,
+    MiddleDown,
+    MiddleUp,
+    RightDown,
+    RightUp,
     WheelUp,
     WheelDown,
 }
 
-pub(super) fn report(
+pub(crate) fn report(
     mode: TermMode,
     event: ButtonEvent,
     modifiers: Modifiers,
@@ -58,8 +62,10 @@ pub(super) fn report(
     }
     let sgr = mode.contains(TermMode::SGR_MOUSE);
     let button = match event {
-        ButtonEvent::LeftUp if !sgr => 3,
+        ButtonEvent::LeftUp | ButtonEvent::MiddleUp | ButtonEvent::RightUp if !sgr => 3,
         ButtonEvent::LeftDown | ButtonEvent::LeftUp => 0,
+        ButtonEvent::MiddleDown | ButtonEvent::MiddleUp => 1,
+        ButtonEvent::RightDown | ButtonEvent::RightUp => 2,
         ButtonEvent::LeftDrag => 32,
         ButtonEvent::WheelUp => 64,
         ButtonEvent::WheelDown => 65,
@@ -68,7 +74,7 @@ pub(super) fn report(
         + 16 * u8::from(modifiers.control);
     let (x, y) = (cell.column.0 + 1, cell.line + 1);
     if sgr {
-        let suffix = if event == ButtonEvent::LeftUp {
+        let suffix = if matches!(event,ButtonEvent::LeftUp|ButtonEvent::MiddleUp|ButtonEvent::RightUp) {
             'm'
         } else {
             'M'

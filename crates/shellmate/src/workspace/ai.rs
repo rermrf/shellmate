@@ -25,22 +25,24 @@ pub(super) fn refresh_catalog(cx: &App) {
 pub(super) fn session_catalog(cx: &mut App) -> crate::ai::session_catalog::Catalog {
     let (tx, rx) = async_channel::unbounded();
     let catalog = crate::ai::session_catalog::Catalog::new(tx);
+    crate::ai::pty_ui::init(catalog.clone(),cx);
+    let bridge_catalog=catalog.clone();
     cx.spawn(async move |cx| {
         while let Ok(event) = rx.recv().await {
             cx.update(|cx| match event {
+                crate::ai::host::Ui::CreatePty{request,reply}=>{
+                    if reply.is_closed(){return;}let result=crate::ai::pty_ui::create(*request,cx);
+                    if let Err(Ok(target))=reply.send(result) && let Ok(e)=bridge_catalog.lookup(&target.session_id){crate::ai::pty_ui::stop(e.binding.session,true,cx);}
+                }
+                crate::ai::host::Ui::ManagePty{spec,owner,lease,reply}=>{if !reply.is_closed(){let _=reply.send(crate::ai::pty_ui::manage(spec,&owner,&lease,cx));}}
+                crate::ai::host::Ui::StopPty{session,close}=>crate::ai::pty_ui::stop(session,close,cx),
                 crate::ai::host::Ui::TerminalInteraction{session,lease,owner:controller,operation,reply}=>{
                     if reply.is_closed(){return;}
+                    if crate::ai::pty_ui::contains(session,cx){let _=reply.send(crate::ai::pty_ui::interaction(session,&lease,controller,operation,cx));return;}
                     let result=hub::Route::Session(session).target(cx).and_then(|owner|owner.update(cx,|ws,_,cx|{
                         let Some(s)=ws.sessions.iter().find(|s|s.id==session)else{return Err("终端不存在".into());};
                         if !Arc::ptr_eq(&lease,&s.terminal.read(cx).agent_liveness())||!lease.load(std::sync::atomic::Ordering::Acquire)||!controller.active(){return Err("终端连接或任务状态已变化".into());}
-                        s.terminal.update(cx,|t,cx|{use crate::ai::terminal_interaction::{Operation,Reply};
-                            match operation {
-                                Operation::Read{region}=>{let owned=t.interaction_owned(&controller);t.interaction_snapshot(region.as_ref()).map(|screen|Reply::Screen{screen,owned})},
-                                Operation::Check{screen_id}=>{let owned=t.interaction_owned(&controller);t.interaction_check(&screen_id,&controller).map(|screen|Reply::Screen{screen,owned})},
-                                Operation::Input{screen_id,actions}=>t.interaction_input(&screen_id,&actions,controller,cx).map(Reply::Input),
-                                Operation::Release=>t.interaction_release(&controller,cx).map(|_|Reply::Released),
-                            }
-                        })
+                        s.terminal.update(cx,|t,cx|crate::ai::terminal_interaction::apply(t,operation,controller,cx))
                     })).unwrap_or_else(||Err("终端所在窗口已关闭".into()));let _=reply.send(result);
                 }
                 crate::ai::host::Ui::ReadSession {
@@ -49,6 +51,7 @@ pub(super) fn session_catalog(cx: &mut App) -> crate::ai::session_catalog::Catal
                     lines,
                     reply,
                 } => {
+                    if crate::ai::pty_ui::contains(session,cx){let _=reply.send(crate::ai::pty_ui::read(session,&lease,lines,cx));return;}
                     let result = hub::Route::Session(session)
                         .target(cx)
                         .and_then(|owner| {
@@ -88,6 +91,7 @@ pub(super) fn session_catalog(cx: &mut App) -> crate::ai::session_catalog::Catal
                     lease,
                     reply,
                 } => {
+                    if crate::ai::pty_ui::contains(session,cx){let _=reply.send(Err(Box::new(shellmate_ai::ToolOutcome::Failed("独立交互终端使用 terminal_input 输入；普通后台命令请选择独立通道".into()))));return;}
                     let result = hub::Route::Session(session)
                         .target(cx)
                         .and_then(|owner| {

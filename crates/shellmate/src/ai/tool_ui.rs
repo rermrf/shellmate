@@ -530,7 +530,7 @@ impl Drawer {
                     .child(self.web_content(&id, data, true, w, cx));
             } else if let Some(r) = result {
                 surface = surface.child(section("结果", &p));
-                if matches!(call.name.as_str(),"list_sessions"|"read_terminal"|"terminal_input"|"wait_terminal") && let Some(content)=self.session_result_content(&id,&r.inline,w,cx){
+                if matches!(call.name.as_str(),"list_sessions"|"read_terminal"|"terminal_input"|"wait_terminal"|"create_terminal"|"manage_terminal") && let Some(content)=self.session_result_content(&id,&r.inline,w,cx){
                     surface=surface.child(content);
                 } else if let Some(pane) = self.state.output_panes.get(&id) {
                     surface = surface.child(pane.clone());

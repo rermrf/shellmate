@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 mod replay;
-mod mouse;
+pub(crate) mod mouse;
 use mouse::ButtonEvent;
 
 use alacritty_terminal::grid::Dimensions;

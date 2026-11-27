@@ -67,6 +67,7 @@ pub struct TaskInfo {
 }
 impl TaskInfo {
     pub fn target_label(&self) -> &'static str {
+        if self.id.starts_with("pty-"){return "独立终端";}
         if self.kind == Kind::Agent {
             "子任务"
         } else {
@@ -119,6 +120,8 @@ struct State {
     remembered: Vec<(String, String)>,
 }
 struct Inner {
+    ptys:Arc<super::pty_tasks::Pool>,
+    pty_root:bool,
     interaction:Mutex<Option<Arc<shellmate_core::terminal_interaction::Controller>>>,
     service_parent: std::sync::OnceLock<(Weak<Inner>, String)>,
     web: std::sync::OnceLock<Arc<super::web::Service>>,
@@ -135,6 +138,7 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        if self.pty_root{self.ptys.retire();}
         if let Some(owner)=self.interaction.get_mut().unwrap().take(){owner.release();}
         for child in self.state.get_mut().unwrap().services.values() {
             child.retire();
@@ -159,6 +163,7 @@ impl Retained {
     }
 }
 impl Tasks {
+    pub fn ptys(&self)->Arc<super::pty_tasks::Pool>{self.0.ptys.clone()}
     pub fn interaction_owner(&self,label:String)->Arc<shellmate_core::terminal_interaction::Controller>{
         let mut owner=self.0.interaction.lock().unwrap();
         if owner.as_ref().is_none_or(|o|!o.active()){*owner=Some(Arc::new(shellmate_core::terminal_interaction::Controller::new(label)));}
@@ -287,6 +292,7 @@ impl Tasks {
         control: shellmate_ai::interaction::Control,
     ) -> Self {
         Self(Arc::new(Inner {
+            ptys:Default::default(),pty_root:true,
             interaction:Default::default(),
             service_parent: Default::default(),
             web: Default::default(),
@@ -335,6 +341,7 @@ impl Tasks {
                 list.push(task);
             }
         }
+        list.extend(self.0.ptys.list());
         list.sort_by_key(|t| t.started);
         list
     }
@@ -404,6 +411,7 @@ impl Tasks {
                 .iter()
                 .filter(|t| t.status != Status::Running)
                 .count();
+            if selected.iter().any(|t|t.id.starts_with("pty-")){return LocalResult::error("交互终端请用 wait_terminal 等待画面，read_terminal 查看当前内容");}
             if selected
                 .iter()
                 .any(|t| t.service.is_some() && t.status == Status::Running)
@@ -580,6 +588,7 @@ impl Tasks {
             .map(|t| t.info.output_id.clone())
     }
     pub fn stop_all(&self) {
+        if self.0.pty_root{self.0.ptys.stop_all();}
         self.release_interaction();
         let services = self
             .0
@@ -607,6 +616,7 @@ impl Tasks {
         }
     }
     pub fn stop(&self, id: &str) -> bool {
+        if id.starts_with("pty-"){return self.0.ptys.stop(id);}
         if let Some((child, local)) = self.service_task(id) {
             return child.stop(&local);
         }
@@ -650,6 +660,8 @@ impl Tasks {
             };
             return Box::pin(child.local_tool(tool, limits)).await;
         }
+        if let LocalTool::StopTask{id}=&tool && id.starts_with("pty-") {return if self.0.ptys.stop(id){LocalResult::text("已请求停止独立终端程序，画面保留供查看")}else{LocalResult::error("本会话中没有此终端")};}
+        if let LocalTool::ReadOutput(a)=&tool && a.id.starts_with("pty-") {return LocalResult::error("独立终端使用 read_terminal(session_id=此引用, screen=true) 读取画面");}
         if let Some(result) = self.agent_tool(&tool).await {
             return result;
         }

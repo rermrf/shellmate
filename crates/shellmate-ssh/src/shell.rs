@@ -20,16 +20,25 @@ pub const TERM: &str = "xterm-256color";
 /// been connected to a terminal yet. Data the server sends meanwhile is kept.
 pub struct PendingShell {
     connection: Connection,
-    channel: Channel<Msg>,
+    channel: PendingChannel,
     dims: PtyDims,
     /// Messages that arrived before the shell request was answered.
     backlog: Vec<ChannelMsg>,
 }
+/// Opening or handing a PTY to the UI may be cancelled after the server started it.
+struct PendingChannel {channel:Option<Channel<Msg>>,connection:Connection}
+impl std::ops::Deref for PendingChannel{type Target=Channel<Msg>;fn deref(&self)->&Self::Target{self.channel.as_ref().unwrap()}}
+impl std::ops::DerefMut for PendingChannel{fn deref_mut(&mut self)->&mut Self::Target{self.channel.as_mut().unwrap()}}
+impl Drop for PendingChannel{fn drop(&mut self){if let Some(channel)=self.channel.take(){self.connection.inner.runtime.spawn(async move{let _=tokio::time::timeout(std::time::Duration::from_secs(2),channel.close()).await;});}}}
 
 impl PendingShell {
     pub(crate) async fn open(connection: Connection, dims: PtyDims) -> Result<Self, SshError> {
-        let mut channel =
+        Self::open_command(connection,dims,None).await
+    }
+    pub(crate) async fn open_command(connection:Connection,dims:PtyDims,command:Option<&str>)->Result<Self,SshError>{
+        let channel =
             connection.inner.handle.channel_open_session().await.map_err(|err| SshError::Channel(err.to_string()))?;
+        let mut channel=PendingChannel{channel:Some(channel),connection:connection.clone()};
         let mut backlog = Vec::new();
 
         channel
@@ -46,7 +55,7 @@ impl PendingShell {
             .map_err(|err| SshError::Channel(err.to_string()))?;
         expect_reply(&mut channel, &mut backlog, "分配终端 (PTY)").await?;
 
-        channel.request_shell(true).await.map_err(|err| SshError::Channel(err.to_string()))?;
+        if let Some(command)=command {channel.exec(true,command).await} else {channel.request_shell(true).await}.map_err(|err| SshError::Channel(err.to_string()))?;
         expect_reply(&mut channel, &mut backlog, "启动 shell").await?;
 
         Ok(Self { connection, channel, dims, backlog })
@@ -57,8 +66,8 @@ impl PendingShell {
     /// size the PTY was opened with. May be called from any thread: the pumping
     /// tasks are spawned on the connection's runtime.
     pub fn start(self, sink: OutputSink, dims: PtyDims) -> ShellChannel {
-        let Self { connection, channel, dims: opened, backlog } = self;
-        let (read, write) = channel.split();
+        let Self { connection, mut channel, dims: opened, backlog } = self;
+        let (read, write) = channel.channel.take().unwrap().split();
         let (tx, rx) = mpsc::unbounded_channel();
         let closing = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(Notify::new());

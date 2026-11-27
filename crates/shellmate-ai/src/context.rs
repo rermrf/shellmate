@@ -335,7 +335,7 @@ impl Conversation {
         }
         if !summarizing {offered.push("ask_user");}
         if caps.sessions && !summarizing {
-            offered.extend(["list_sessions", "read_terminal", "terminal_input", "wait_terminal"]);
+            offered.extend(["list_sessions", "read_terminal", "terminal_input", "wait_terminal", "create_terminal", "manage_terminal"]);
         }
         if caps.web && !summarizing {
             offered.extend(["web_search", "web_fetch"]);

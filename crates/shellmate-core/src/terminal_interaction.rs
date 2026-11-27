@@ -44,6 +44,31 @@ pub enum Action {
         #[serde(default = "one")]
         repeat: u8,
     },
+    Click {
+        row: u16,
+        column: u16,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    Scroll {
+        row: u16,
+        column: u16,
+        lines: i16,
+    },
+    Drag {
+        row: u16,
+        column: u16,
+        to_row: u16,
+        to_column: u16,
+    },
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Middle,
+    Right,
 }
 fn one() -> u8 {
     1
@@ -51,6 +76,20 @@ fn one() -> u8 {
 impl Action {
     pub fn summary(&self) -> String {
         match self {
+            Self::Click {
+                row,
+                column,
+                button,
+            } => format!("点击第 {row} 行、第 {column} 列（{button:?}）"),
+            Self::Scroll { row, column, lines } => {
+                format!("在 {row},{column} 滚动 {lines} 行（正数向下）")
+            }
+            Self::Drag {
+                row,
+                column,
+                to_row,
+                to_column,
+            } => format!("从 {row},{column} 拖动至 {to_row},{to_column}"),
             Self::Text { text } => format!("输入文字：{text}"),
             Self::Paste { text } => format!("粘贴文字：{text}"),
             Self::Key { key, repeat } => {
@@ -73,6 +112,24 @@ pub fn validate_actions(actions: &[Action]) -> Result<(), String> {
     let mut total = 0;
     for a in actions {
         match a {
+            Action::Click { .. } => total += 1,
+            Action::Drag {
+                row,
+                column,
+                to_row,
+                to_column,
+            } => {
+                if row.abs_diff(*to_row).max(column.abs_diff(*to_column)) > 80 {
+                    return Err("拖动距离超过 80 个单元格，请分步操作".into());
+                }
+                total += 1;
+            }
+            Action::Scroll { lines, .. } => {
+                if *lines == 0 || lines.unsigned_abs() > 20 {
+                    return Err("每次滚动 1–20 行".into());
+                }
+                total += usize::from(lines.unsigned_abs());
+            }
             Action::Text { text } | Action::Paste { text } => {
                 if text.is_empty()
                     || text.len() > 4096
@@ -167,6 +224,8 @@ pub struct Cursor {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Screen {
+    #[serde(default)]
+    pub ended: bool,
     pub screen_id: String,
     pub fingerprint: String,
     pub rows: u16,

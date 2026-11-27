@@ -197,6 +197,7 @@ pub(crate) fn snapshot<T>(term: &Term<T>, region: Option<&Region>) -> Result<Scr
         (cursor.row, cursor.column, cursor.visible).hash(&mut hash);
     }
     Ok(Screen {
+        ended: false,
         screen_id: String::new(),
         fingerprint: format!("{:016x}", hash.finish()),
         rows,
@@ -220,6 +221,58 @@ pub(crate) fn snapshot<T>(term: &Term<T>, region: Option<&Region>) -> Result<Scr
 }
 pub(crate) fn encode(action: &Action, mode: &TermMode) -> Result<Vec<u8>, String> {
     match action {
+        Action::Click {
+            row,
+            column,
+            button,
+        } => {
+            use crate::view::mouse::ButtonEvent::*;
+            let (down, up) = match button {
+                shellmate_core::terminal_interaction::MouseButton::Left => (LeftDown, LeftUp),
+                shellmate_core::terminal_interaction::MouseButton::Middle => (MiddleDown, MiddleUp),
+                shellmate_core::terminal_interaction::MouseButton::Right => (RightDown, RightUp),
+            };
+            let mut bytes = pointer(mode, down, *row, *column)?;
+            bytes.extend(pointer(mode, up, *row, *column)?);
+            Ok(bytes)
+        }
+        Action::Scroll { row, column, lines } => {
+            use crate::view::mouse::ButtonEvent::*;
+            Ok(pointer(
+                mode,
+                if *lines > 0 { WheelDown } else { WheelUp },
+                *row,
+                *column,
+            )?
+            .repeat(usize::from(lines.unsigned_abs())))
+        }
+        Action::Drag {
+            row,
+            column,
+            to_row,
+            to_column,
+        } => {
+            use crate::view::mouse::ButtonEvent::*;
+            let steps = row
+                .abs_diff(*to_row)
+                .max(column.abs_diff(*to_column))
+                .max(1);
+            let mut bytes = pointer(mode, LeftDown, *row, *column)?;
+            for n in 1..=steps {
+                let at = |a: u16, b: u16| {
+                    (i32::from(a) + (i32::from(b) - i32::from(a)) * i32::from(n) / i32::from(steps))
+                        as u16
+                };
+                bytes.extend(pointer(
+                    mode,
+                    LeftDrag,
+                    at(*row, *to_row),
+                    at(*column, *to_column),
+                )?);
+            }
+            bytes.extend(pointer(mode, LeftUp, *to_row, *to_column)?);
+            Ok(bytes)
+        }
         Action::Text { text } => Ok(text.as_bytes().to_vec()),
         Action::Paste { text } => {
             if text.contains('\n') && !mode.contains(TermMode::BRACKETED_PASTE) {
@@ -264,6 +317,70 @@ pub(crate) fn encode(action: &Action, mode: &TermMode) -> Result<Vec<u8>, String
             Err("该按键属于应用快捷键，不能发送给终端".into())
         }
     }
+}
+fn pointer(
+    mode: &TermMode,
+    event: crate::view::mouse::ButtonEvent,
+    row: u16,
+    column: u16,
+) -> Result<Vec<u8>, String> {
+    crate::view::mouse::report(
+        *mode,
+        event,
+        gpui::Modifiers::default(),
+        alacritty_terminal::index::Point::new(usize::from(row), Column(usize::from(column))),
+    )
+    .ok_or_else(|| "程序未启用所需鼠标模式，或坐标超出协议范围；请使用键盘操作".into())
+}
+pub(crate) fn release_pointer(action: &Action, mode: &TermMode) -> Option<Vec<u8>> {
+    use crate::view::mouse::ButtonEvent::*;
+    use shellmate_core::terminal_interaction::MouseButton;
+    let (event, row, column) = match action {
+        Action::Click {
+            row,
+            column,
+            button,
+        } => (
+            match button {
+                MouseButton::Left => LeftUp,
+                MouseButton::Middle => MiddleUp,
+                MouseButton::Right => RightUp,
+            },
+            *row,
+            *column,
+        ),
+        Action::Drag {
+            to_row, to_column, ..
+        } => (LeftUp, *to_row, *to_column),
+        _ => return None,
+    };
+    pointer(mode, event, row, column).ok()
+}
+pub(crate) fn validate_pointer(actions: &[Action], region: &Region) -> Result<(), String> {
+    let contains = |r: u16, c: u16| {
+        r >= region.row
+            && u32::from(r) < u32::from(region.row) + u32::from(region.rows)
+            && c >= region.column
+            && u32::from(c) < u32::from(region.column) + u32::from(region.columns)
+    };
+    for a in actions {
+        let valid = match a {
+            Action::Click { row, column, .. } | Action::Scroll { row, column, .. } => {
+                contains(*row, *column)
+            }
+            Action::Drag {
+                row,
+                column,
+                to_row,
+                to_column,
+            } => contains(*row, *column) && contains(*to_row, *to_column),
+            _ => true,
+        };
+        if !valid {
+            return Err("鼠标动作必须位于刚读取的画面区域内".into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -406,6 +523,63 @@ mod tests {
         assert_eq!(
             encode(&paste, &TermMode::BRACKETED_PASTE).unwrap(),
             b"\x1b[200~hello\nworld\x1b[201~"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+    use shellmate_core::terminal_interaction::MouseButton;
+    #[test]
+    fn mouse_gestures_are_balanced_mode_aware_and_bounded_by_observed_region() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        let click = Action::Click {
+            row: 2,
+            column: 3,
+            button: MouseButton::Right,
+        };
+        assert_eq!(encode(&click, &mode).unwrap(), b"\x1b[<2;4;3M\x1b[<2;4;3m");
+        assert!(encode(&click, &TermMode::SGR_MOUSE).is_err());
+        assert_eq!(
+            encode(
+                &Action::Scroll {
+                    row: 2,
+                    column: 3,
+                    lines: -2
+                },
+                &mode
+            )
+            .unwrap(),
+            b"\x1b[<64;4;3M\x1b[<64;4;3M"
+        );
+        let drag = Action::Drag {
+            row: 2,
+            column: 3,
+            to_row: 2,
+            to_column: 5,
+        };
+        assert!(encode(&drag, &mode).is_err());
+        assert_eq!(
+            encode(&drag, &(mode | TermMode::MOUSE_DRAG)).unwrap(),
+            b"\x1b[<0;4;3M\x1b[<32;5;3M\x1b[<32;6;3M\x1b[<0;6;3m"
+        );
+        let region = Region {
+            row: 2,
+            column: 3,
+            rows: 1,
+            columns: 3,
+        };
+        assert!(validate_pointer(&[click.clone(), drag], &region).is_ok());
+        assert!(
+            validate_pointer(
+                &[click],
+                &Region {
+                    column: 4,
+                    ..region
+                }
+            )
+            .is_err()
         );
     }
 }

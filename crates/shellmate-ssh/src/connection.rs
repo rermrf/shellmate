@@ -150,6 +150,10 @@ impl Connection {
     pub async fn open_shell(&self, dims: PtyDims) -> Result<PendingShell, SshError> {
         Watchdog::new(self.inner.watchdog_limit).guard(PendingShell::open(self.clone(), dims)).await
     }
+    /// Start a program on an independent PTY channel of this authenticated transport.
+    pub async fn open_pty_command(&self,dims:PtyDims,command:&str)->Result<PendingShell,SshError>{
+        Watchdog::new(self.inner.watchdog_limit).guard(PendingShell::open_command(self.clone(),dims,Some(command))).await
+    }
 
     /// A handle that does not keep the connection open: it closes with its last channel (and
     /// the last [`Connection`] clone), like a pool entry.
