@@ -138,6 +138,7 @@ impl Drawer {
         } else {
             card.status.label().into()
         };
+        let (badge_bg, badge_fg) = card.status.badge_colors(&p);
         agent_ui::step_surface(&p)
             .id(SharedString::from(card.key.clone()))
             .flex_none()
@@ -145,29 +146,50 @@ impl Drawer {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(7.))
+            .gap(px(8.))
+            .when(attention, |d| d.border_1().border_color(p.warn.opacity(0.32)))
             .child(
                 div()
                     .id(SharedString::from(format!("{}:header", card.key)))
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .cursor_pointer()
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(90.))
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("{} {}", if open { "▾" } else { "▸" }, card.title)),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .w(px(10.))
+                                    .h(px(15.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(crate::icons::group_chevron(open).text_color(p.tx2)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(13.))
+                                    .line_height(px(18.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.tx)
+                                    .child(card.title.clone()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(card.status.color(&p))
-                            .child(status),
-                    )
+                    .child(agent_ui::status_badge(
+                        status,
+                        badge_fg,
+                        badge_bg,
+                        card.status.has_dot(),
+                    ))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if attention {
                             return;
@@ -190,7 +212,8 @@ impl Drawer {
                 d.child(
                     div()
                         .text_size(px(12.5))
-                        .line_height(px(19.))
+                        .line_height(px(18.))
+                        .text_color(p.tx)
                         .whitespace_normal()
                         .child(model::compact(&card.summary, 120)),
                 )
@@ -199,6 +222,7 @@ impl Drawer {
                 d.child(
                     div()
                         .text_size(px(11.5))
+                        .line_height(px(16.))
                         .text_color(p.tx3)
                         .whitespace_normal()
                         .child(model::compact(&card.detail, 150)),
@@ -454,33 +478,47 @@ impl Drawer {
             }
             let raw = id.clone();
             surface = surface.child(
-                agent_ui::step_action(
-                    SharedString::from(format!("{id}:raw")),
-                    if self.state.tool_raw.contains(&id) {
-                        "收起原始参数"
-                    } else {
-                        "原始参数"
-                    },
-                    cx,
-                )
-                .on_click(cx.listener(move |s, _, _, cx| {
-                    if !s.state.tool_raw.remove(&raw) {
-                        s.state.tool_raw.insert(raw.clone());
-                    }
-                    cx.notify();
-                })),
+                div().flex().child(
+                    agent_ui::pill_action(
+                        SharedString::from(format!("{id}:raw")),
+                        if self.state.tool_raw.contains(&id) {
+                            "收起原始参数"
+                        } else {
+                            "原始参数"
+                        },
+                        agent_ui::ActionTone::Quiet,
+                        cx,
+                    )
+                    .h(px(22.))
+                    .px(px(6.))
+                    .text_size(px(11.))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if !s.state.tool_raw.remove(&raw) {
+                            s.state.tool_raw.insert(raw.clone());
+                        }
+                        cx.notify();
+                    })),
+                ),
             );
             if self.state.tool_raw.contains(&id) {
                 surface = surface.child(
-                    super::subagent_ui::selectable(
-                        format!("{id}:args"),
-                        &serde_json::to_string_pretty(&call.args_json).unwrap_or_default(),
-                        w,
-                        cx,
-                    )
-                    .text_size(px(12.))
-                    .font_family(MONO_FONT)
-                    .whitespace_normal(),
+                    div()
+                        .p(px(10.))
+                        .rounded(px(10.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.line)
+                        .child(
+                            super::subagent_ui::selectable(
+                                format!("{id}:args"),
+                                &serde_json::to_string_pretty(&call.args_json).unwrap_or_default(),
+                                w,
+                                cx,
+                            )
+                            .text_size(px(12.))
+                            .font_family(MONO_FONT)
+                            .whitespace_normal(),
+                        ),
                 );
             }
             if let Some(r)=result && !r.attachments.is_empty() {
@@ -497,9 +535,22 @@ impl Drawer {
                     surface = surface.child(pane.clone());
                 } else {
                     surface = surface.child(
-                        super::subagent_ui::selectable(format!("{id}:result"), &r.inline, w, cx)
-                            .text_size(px(12.))
-                            .whitespace_normal(),
+                        div()
+                            .p(px(10.))
+                            .rounded(px(10.))
+                            .bg(p.card)
+                            .border_1()
+                            .border_color(p.line)
+                            .child(
+                                super::subagent_ui::selectable(
+                                    format!("{id}:result"),
+                                    &r.inline,
+                                    w,
+                                    cx,
+                                )
+                                .text_size(px(12.))
+                                .whitespace_normal(),
+                            ),
                     );
                 }
             } else if let Some(pane) = self.state.output_panes.get(&id) {
@@ -564,7 +615,12 @@ impl Drawer {
         {
             let scope = scope.to_owned();
             actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{id}:stop")), "停止任务", cx)
+                agent_ui::pill_action(
+                    SharedString::from(format!("{id}:stop")),
+                    "停止任务",
+                    agent_ui::ActionTone::Danger,
+                    cx,
+                )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         let tasks = if task.owner.is_some() { s.tasks.clone() } else { s.tool_tasks(&scope) };
                         if let Some(tasks) = tasks { tasks.stop(&task.id); }
@@ -576,7 +632,12 @@ impl Drawer {
         if result.is_none() && matches!(call.name.as_str(), "web_search" | "web_fetch") {
             let scope = scope.to_owned();
             actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{id}:cancel")), "取消请求", cx)
+                agent_ui::pill_action(
+                    SharedString::from(format!("{id}:cancel")),
+                    "取消请求",
+                    agent_ui::ActionTone::Danger,
+                    cx,
+                )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(tasks) = s.tool_tasks(&scope) {
                             tasks
@@ -589,14 +650,17 @@ impl Drawer {
             has_action = true;
         }
         if has_action {
-            surface = surface.child(actions);
+            surface = surface.child(actions.pt(px(8.)).border_t_1().border_color(p.line));
         }
         surface.into_any_element()
     }
 }
 pub(super) fn section(label: &str, p: &crate::theme::Palette) -> Div {
     div()
+        .pt(px(2.))
         .text_size(px(11.))
+        .line_height(px(15.))
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.tx3)
         .child(label.to_owned())
 }

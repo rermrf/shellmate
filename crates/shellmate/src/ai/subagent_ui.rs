@@ -131,10 +131,18 @@ impl Drawer {
         let target = view.id.clone();
         let message = view.id.clone();
         let mut actions = agent_ui::step_actions()
+            .pt(px(8.))
+            .border_t_1()
+            .border_color(p.line)
             .flex_wrap()
             .child(
-                agent_ui::step_action(SharedString::from(format!("{key}:open")), "查看对话 →", cx)
-                    .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx))),
+                agent_ui::pill_action(
+                    SharedString::from(format!("{key}:open")),
+                    "查看对话 →",
+                    agent_ui::ActionTone::Accent,
+                    cx,
+                )
+                .on_click(cx.listener(move |s, _, w, cx| s.open_child(&target, w, cx))),
             )
             .child(
                 agent_ui::step_action(SharedString::from(format!("{key}:message")), "追加消息", cx)
@@ -159,7 +167,12 @@ impl Drawer {
         if running && !self.state.readonly {
             let id = view.id.clone();
             actions = actions.child(
-                agent_ui::step_action(SharedString::from(format!("{key}:stop")), "停止任务", cx)
+                agent_ui::pill_action(
+                    SharedString::from(format!("{key}:stop")),
+                    "停止任务",
+                    agent_ui::ActionTone::Danger,
+                    cx,
+                )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(t) = &s.tasks {
                             t.stop(&id);

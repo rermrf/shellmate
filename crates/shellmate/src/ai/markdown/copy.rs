@@ -96,10 +96,10 @@ pub(super) fn overlay(
                         .px(px(8.))
                         .rounded(px(8.))
                         .text_size(px(11.5))
-                        .bg(p.card2)
-                        .text_color(p.tx2)
+                        .bg(if copied { p.accs } else { p.card })
+                        .text_color(if copied { p.acc } else { p.tx2 })
                         .border_1()
-                        .border_color(p.line)
+                        .border_color(if copied { p.acc.opacity(0.28) } else { p.line })
                         .when(!visible, |b| b.opacity(0.))
                         .on_mouse_down(MouseButton::Left, move |event, w, cx| {
                             if !hits_copy(button_bounds.get(), event.position) {

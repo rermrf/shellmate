@@ -555,19 +555,25 @@ impl Drawer {
             let id = input.id.clone();
             let edit = id.clone();
             let copy = input.text.clone();
+            let (state_label, state_fg, state_bg) = if input.claimed {
+                ("已接收", p.acc, p.accs)
+            } else if input.editing {
+                ("编辑中", p.warn, p.warns)
+            } else if snapshot.held {
+                ("待恢复", p.warn, p.warns)
+            } else {
+                ("待处理", p.tx2, p.card3)
+            };
             let text = div()
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(div().flex_none().child(if input.claimed {
-                    "已接收"
-                } else if input.editing {
-                    "编辑中"
-                } else if snapshot.held {
-                    "待恢复"
-                } else {
-                    "待处理"
-                }))
+                .child(div().flex_none().child(agent_ui::status_badge(
+                    state_label,
+                    state_fg,
+                    state_bg,
+                    false,
+                )))
                 .child(
                     super::subagent_ui::selectable(
                         format!("{}:queued:{id}", self.state.id), &input.text, window, cx,
@@ -628,17 +634,31 @@ impl Drawer {
                     })),
                 );
             }
-            bar = bar.child(div().flex().flex_col().gap(px(2.)).children(self.message_images(&format!("queue-{}",input.id),&input.attachments,cx)).child(text).child(actions));
+            bar = bar.child(
+                div()
+                    .p(px(8.))
+                    .rounded(px(10.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.line)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .children(self.message_images(&format!("queue-{}", input.id), &input.attachments, cx))
+                    .child(text)
+                    .child(actions),
+            );
         }
         if snapshot.inputs.len() > 4 {
             bar = bar.child(
-                agent_ui::step_action(
+                agent_ui::pill_action(
                     "queue-expand",
                     if self.state.queue_expanded {
                         "收起队列"
                     } else {
                         "展开队列"
                     },
+                    agent_ui::ActionTone::Quiet,
                     cx,
                 )
                 .on_click(cx.listener(|s, _, _, cx| {
@@ -650,19 +670,27 @@ impl Drawer {
         let mut actions = agent_ui::step_actions();
         if !snapshot.inputs.is_empty() {
             actions = actions.child(
-                agent_ui::step_action("input-now", "立即处理", cx)
-                    .on_click(cx.listener(|s, _, w, cx| s.send_now(w, cx))),
+                agent_ui::pill_action(
+                    "input-now",
+                    "立即处理",
+                    agent_ui::ActionTone::Accent,
+                    cx,
+                )
+                .on_click(cx.listener(|s, _, w, cx| s.send_now(w, cx))),
             );
         }
         if running {
             let phase = self.state.control.phase();
-            bar = bar.child(div().text_color(p.tx3).child(
-                if self.state.model.busy || self.state.pending {
-                    phase.label()
-                } else {
-                    "等待异步任务"
-                },
-            ));
+            bar = bar.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(p.tx3)
+                    .child(if self.state.model.busy || self.state.pending {
+                        phase.label()
+                    } else {
+                        "等待异步任务"
+                    }),
+            );
             if matches!(phase, Phase::Executing | Phase::Waiting(_)) {
                 actions = actions.child(
                     agent_ui::step_action("input-detach", "结束等待", cx).on_click(cx.listener(
@@ -676,15 +704,22 @@ impl Drawer {
                 );
             }
             actions = actions.child(
-                agent_ui::step_action("input-stop-reply", "停止回复", cx)
-                    .on_click(cx.listener(|s, _, _, cx| s.stop_reply(cx))),
+                agent_ui::pill_action(
+                    "input-stop-reply",
+                    "停止回复",
+                    agent_ui::ActionTone::Danger,
+                    cx,
+                )
+                .on_click(cx.listener(|s, _, _, cx| s.stop_reply(cx))),
             );
         }
         Some(
-            div()
+            agent_ui::step_surface(&p)
+                .border_1()
+                .border_color(p.line)
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(8.))
                 .child(
                     div()
                         .id("input-queue-scroll")

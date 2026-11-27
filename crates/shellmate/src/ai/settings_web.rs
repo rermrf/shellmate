@@ -141,17 +141,25 @@ impl AiSettings {
                             .child("Tavily API Key · 已保存"),
                     )
                     .child(
-                        Button::new("web-key-replace")
-                            .label("替换")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.web.replace = true;
-                                cx.notify();
-                            })),
+                        crate::dialogs::button(
+                            "web-key-replace",
+                            "替换",
+                            crate::dialogs::Tone::Plain,
+                            true,
+                        )
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.web.replace = true;
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        Button::new("web-key-remove")
-                            .label("移除")
-                            .on_click(cx.listener(|s, _, w, cx| s.save_web_key(true, w, cx))),
+                        crate::dialogs::button(
+                            "web-key-remove",
+                            "移除",
+                            crate::dialogs::Tone::Danger,
+                            true,
+                        )
+                        .on_click(cx.listener(|s, _, w, cx| s.save_web_key(true, w, cx))),
                     ),
             );
         } else {
@@ -173,7 +181,15 @@ impl AiSettings {
                     ),
                 );
         }
-        card.child(settings_row("DuckDuckGo 备用搜索","Tavily 限流、额度受限或网络失败时使用；可能受验证码限制",crate::ui::Toggle::new("ai-web-fallback").checked(fallback).color(p.ok).on_click(cx.listener(|s,on:&bool,_,cx|{if s.db.borrow_mut().set_setting(web::FALLBACK,if *on{"1"}else{"0"}).is_err(){s.result=Some("备用搜索设置保存失败".into());}cx.notify();})),cx))
-            .child(div().py(px(8.)).text_size(px(11.5)).text_color(p.tx3).child("使用 Tavily Basic Search。额度与计费由 Tavily 账户决定，Shellmate 不自动充值。"))
+        let card = card.child(settings_row("DuckDuckGo 备用搜索","Tavily 限流、额度受限或网络失败时使用；可能受验证码限制",crate::ui::Toggle::new("ai-web-fallback").checked(fallback).color(p.ok).on_click(cx.listener(|s,on:&bool,_,cx|{if s.db.borrow_mut().set_setting(web::FALLBACK,if *on{"1"}else{"0"}).is_err(){s.result=Some("备用搜索设置保存失败".into());}cx.notify();})),cx))
+            .child(div().py(px(8.)).text_size(px(11.5)).text_color(p.tx3).child("使用 Tavily Basic Search。额度与计费由 Tavily 账户决定，Shellmate 不自动充值。"));
+        div()
+            .flex_none()
+            .mt(px(4.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(section_title("网页搜索", &p))
+            .child(card)
     }
 }

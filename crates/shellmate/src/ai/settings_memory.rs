@@ -28,8 +28,7 @@ impl AiSettings {
             .child(settings_row(
                 "全局说明",
                 "对所有主机生效的 AI 说明（AGENTS.md）",
-                Button::new("ai-memory-global")
-                    .label("编辑")
+                crate::dialogs::button("ai-memory-global", "编辑", crate::dialogs::Tone::Plain, true)
                     .on_click(cx.listener(|s, _, w, cx| {
                         s.open_memory(
                             Some(crate::ai::memory_model::Focus::global_instructions()),
@@ -42,16 +41,14 @@ impl AiSettings {
             .child(settings_row(
                 "记忆管理",
                 "查看和编辑 AI 说明与主题笔记",
-                Button::new("ai-memory-manage")
-                    .label("打开")
+                crate::dialogs::button("ai-memory-manage", "打开", crate::dialogs::Tone::Plain, true)
                     .on_click(cx.listener(|s, _, w, cx| s.open_memory(None, w, cx))),
                 cx,
             ))
             .child(settings_row(
                 "在 Finder 中打开",
                 "查看本机保存的记忆文件",
-                Button::new("ai-memory-folder")
-                    .label("打开")
+                crate::dialogs::button("ai-memory-folder", "打开", crate::dialogs::Tone::Plain, true)
                     .on_click(cx.listener(|s, _, _, cx| {
                         let result = s
                             .workspace
@@ -71,25 +68,27 @@ impl AiSettings {
                         }
                     })),
                 cx,
+            ))
+            .child(settings_row(
+                "清除所有记忆",
+                "删除所有全局、主机说明和记忆笔记，保留对话记录",
+                crate::dialogs::button(
+                    "ai-memory-clear",
+                    "清除所有记忆",
+                    crate::dialogs::Tone::Danger,
+                    true,
+                )
+                .on_click(cx.listener(|s, _, w, cx| s.clear_memory(w, cx))),
+                cx,
             ));
         div()
             .flex_none()
+            .mt(px(4.))
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(8.))
+            .child(section_title("记忆与说明", &p))
             .child(card)
-            .child(
-                div().flex().justify_end().child(
-                    crate::dialogs::button(
-                        "ai-memory-clear",
-                        "清除所有记忆",
-                        crate::dialogs::Tone::Plain,
-                        true,
-                    )
-                    .text_color(p.err)
-                    .on_click(cx.listener(|s, _, w, cx| s.clear_memory(w, cx))),
-                ),
-            )
     }
     fn open_memory(
         &mut self,

@@ -140,9 +140,10 @@ fn base_view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> Te
     let mut code = StyleRefinement::default()
         .bg(code_bg)
         .text_color(code_fg)
-        .border_0()
-        .rounded(px(10.))
-        .p(px(11.))
+        .border_1()
+        .border_color(p.line)
+        .rounded(px(12.))
+        .p(px(12.))
         .font_family(MONO_FONT)
         .text_size(px(12.5))
         .line_height(px(18.))
@@ -151,7 +152,7 @@ fn base_view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> Te
     code.overflow.y = Some(Overflow::Visible);
     let mut table = StyleRefinement::default()
         .border_color(p.line)
-        .rounded(px(8.));
+        .rounded(px(12.));
     table.overflow.x = Some(Overflow::Scroll);
     let style = TextViewStyle {
         paragraph_gap: rems(8. / f32::from(window.rem_size())),
@@ -200,8 +201,9 @@ fn base_view(id: ElementId, text: SharedString, window: &Window, cx: &App) -> Te
         )
         .blockquote_style(
             StyleRefinement::default()
-                .border_l_1()
-                .border_color(p.line)
+                .border_l_2()
+                .border_color(p.acc.opacity(0.45))
+                .pl(px(10.))
                 .text_color(p.tx2),
         )
         .image_source(|_| blocked_image())

@@ -50,6 +50,7 @@ use gpui::{
         Disableable, Sizable, Size,
         button::Button,
         input::{self, InputEvent, InputState, RopeExt, Textarea, TextareaState},
+        tooltip::Tooltip,
     },
     prelude::*,
     *,
@@ -1238,11 +1239,16 @@ impl Render for Drawer {
         let context = div()
             .flex()
             .items_center()
+            .gap(px(6.))
             .min_w_0()
-            .mt(px(2.))
+            .mt(px(4.))
             .text_size(px(11.5))
             .line_height(px(15.))
             .text_color(p.tx2)
+            .child(crate::ui::dot(
+                if self.session.is_some() { p.ok } else { p.tx3 },
+                6.,
+            ))
             .child(div().flex_none().child("上下文："))
             .when(self.session.is_some(), |d| {
                 d.child(
@@ -1250,22 +1256,31 @@ impl Render for Drawer {
                         .min_w_0()
                         .flex_shrink_1()
                         .text_ellipsis()
+                        .text_color(p.tx)
+                        .font_weight(FontWeight::MEDIUM)
                         .child(self.label.clone()),
                 )
                 .child(div().flex_none().child(self.state.model.context_hint(true)))
             })
             .when(self.session.is_none(), |d| d.child(self.state.model.context_hint(false)));
+        let new_disabled =
+            self.fixture && self.state.new_conversation_action(self.history) == NewConversation::Disabled;
+        let new_tip = new_conversation_tooltip(
+            self.save_conversations,
+            self.state.save_error.is_some(),
+        );
         let header = div()
             .flex_none()
             .flex()
             .flex_col()
-            .pt(px(14.))
-            .pb(px(10.))
-            .pl(px(16.))
-            .pr(px(12.))
+            .px(px(16.))
+            .pt(px(16.))
+            .pb(px(12.))
+            .border_b_1()
+            .border_color(p.line)
             .child(
                 div()
-                    .min_h(px(26.))
+                    .min_h(px(28.))
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -1273,53 +1288,98 @@ impl Render for Drawer {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(64.))
-                            .whitespace_nowrap()
-                            .text_size(px(15.))
-                            .line_height(px(20.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("AI 助手"),
-                    )
-                    .child(
-                        div().flex_none().flex().items_center().gap(px(8.)).ml_auto().child(
-                        Button::new("ai-history")
-                            .icon(crate::icons::AppIcon::History.at(14.))
-                            .w(px(26.))
-                            .h(px(26.))
-                            .p_0()
-                            .rounded(px(8.))
-                            .tooltip("历史对话")
-                            .on_click(cx.listener(|s, _, _, cx| s.history(cx))))
-                    .child(
-                        Button::new("ai-new")
-                            .icon(crate::icons::AppIcon::Plus.at(14.))
-                            .label("新对话")
-                            .h(px(26.))
-                            .px(px(8.))
-                            .rounded(px(8.))
-                            .text_size(px(12.))
-                            .disabled(
-                                self.fixture && self.state.new_conversation_action(self.history)
-                                    == NewConversation::Disabled,
+                            .min_w(px(84.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .size(px(24.))
+                                    .flex_none()
+                                    .rounded(px(8.))
+                                    .bg(p.accs)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(crate::icons::AppIcon::Ai.at(14.).text_color(p.acc)),
                             )
-                            .tooltip(new_conversation_tooltip(
-                                self.save_conversations,
-                                self.state.save_error.is_some(),
-                            ))
-                            .on_click(cx.listener(|s, _, w, cx| s.new_conversation(w, cx))),
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_size(px(15.))
+                                    .line_height(px(20.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(p.tx)
+                                    .child("AI 助手"),
+                            ),
                     )
                     .child(
-                        Button::new("ai-close")
-                            .label("×")
-                            .w(px(26.))
-                            .h(px(26.))
-                            .rounded(px(8.))
-                            .on_click(cx.listener(|s, _, w, cx| {
-                                let ws = s.workspace.clone();
-                                w.defer(cx, move |_, cx| {
-                                    ws.update(cx, |s, cx| s.close_ai(cx)).ok();
-                                });
-                            }))),
+                        div().flex_none().flex().items_center().gap(px(6.)).ml_auto()
+                        .child(
+                            div()
+                                .id("ai-history")
+                                .size(px(28.))
+                                .rounded(px(9.))
+                                .bg(if self.history { p.accs } else { p.card2 })
+                                .text_color(if self.history { p.acc } else { p.tx2 })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(p.card3).text_color(p.tx))
+                                .child(crate::icons::AppIcon::History.at(14.))
+                                .tooltip(|window, cx| Tooltip::new("历史对话").build(window, cx))
+                                .on_click(cx.listener(|s, _, _, cx| s.history(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("ai-new")
+                                .h(px(28.))
+                                .px(px(10.))
+                                .rounded(px(9.))
+                                .bg(if new_disabled { p.card2 } else { p.accs })
+                                .text_color(if new_disabled { p.tx3 } else { p.acc })
+                                .when(new_disabled, |d| d.opacity(0.5).cursor_not_allowed())
+                                .when(!new_disabled, |d| {
+                                    d.cursor_pointer().hover(|d| d.bg(p.acc.opacity(0.18)))
+                                })
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(crate::icons::AppIcon::Plus.at(13.))
+                                .child("新对话")
+                                .tooltip(move |window, cx| Tooltip::new(new_tip).build(window, cx))
+                                .on_click(cx.listener(move |s, _, w, cx| {
+                                    if !new_disabled {
+                                        s.new_conversation(w, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ai-close")
+                                .size(px(28.))
+                                .rounded(px(9.))
+                                .bg(p.card2)
+                                .text_color(p.tx2)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_size(px(15.))
+                                .line_height(px(15.))
+                                .hover(|d| d.bg(p.card3).text_color(p.tx))
+                                .child("×")
+                                .tooltip(|window, cx| Tooltip::new("关闭 AI 助手").build(window, cx))
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    let ws = s.workspace.clone();
+                                    w.defer(cx, move |_, cx| {
+                                        ws.update(cx, |s, cx| s.close_ai(cx)).ok();
+                                    });
+                                })),
+                        ),
                     ),
             )
             .child(context).children(self.conversation_controls(cx));
@@ -1348,34 +1408,101 @@ impl Render for Drawer {
                         .ok();
                 });
             }))
-            .px(px(14.))
-            .pt(px(4.))
-            .pb(px(10.))
+            .px(px(16.))
+            .pt(px(12.))
+            .pb(px(12.))
             .flex()
             .flex_col()
             .gap(px(12.));
         if self.chooser { body = body.child(self.conversation_picker(cx)); }
         if self.target_picker { body = body.child(self.targets_panel(cx)); }
         if self.history {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.tx)
+                                    .child("历史对话"),
+                            )
+                            .child(agent_ui::status_badge(
+                                self.history_rows.len().to_string(),
+                                p.tx2,
+                                p.card2,
+                                false,
+                            )),
+                    )
+                    .child(
+                        agent_ui::pill_action("ai-history-back", "返回对话", agent_ui::ActionTone::Surface, cx)
+                            .h(px(24.))
+                            .px(px(8.))
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.history = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+            if self.history_rows.is_empty() {
+                body = body.child(
+                    div()
+                        .p(px(16.))
+                        .rounded(px(14.))
+                        .bg(p.card2)
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.tx)
+                                .child("暂无历史对话"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(p.tx2)
+                                .child("对话会自动保存在本机，随时可在此回看。"),
+                        ),
+                );
+            }
             for row in self.history_rows.clone() {
                 let id = row.id.clone();
                 let del = row.id;
                 body = body.child(
                     div()
                         .flex_none()
-                        .py(px(10.))
-                        .border_b_1()
-                        .border_color(p.line)
+                        .p(px(12.))
+                        .rounded(px(14.))
+                        .bg(p.card2)
+                        .hover(|d| d.bg(p.card3.opacity(0.65)))
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(10.))
                         .child(
                             div()
                                 .id(SharedString::from(format!("conversation-{id}")))
                                 .flex_1()
                                 .min_w_0()
                                 .cursor_pointer()
-                                .child(div().text_size(px(13.)).text_ellipsis().child(row.title))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.tx)
+                                        .text_ellipsis()
+                                        .child(row.title),
+                                )
                                 .child(
                                     div()
                                         .mt(px(4.))
@@ -1386,55 +1513,127 @@ impl Render for Drawer {
                                 .on_click(cx.listener(move |s, _, _, cx| s.load(&id, cx))),
                         )
                         .child(
-                            Button::new(SharedString::from(format!("delete-{del}")))
-                                .label("删除")
-                                .h(px(26.))
-                                .text_size(px(11.5))
-                                .on_click(cx.listener(move |s, _, _, cx| s.delete(&del, cx))),
+                            agent_ui::pill_action(
+                                SharedString::from(format!("delete-{del}")),
+                                "删除",
+                                agent_ui::ActionTone::Danger,
+                                cx,
+                            )
+                            .on_click(cx.listener(move |s, _, _, cx| s.delete(&del, cx))),
                         ),
                 );
             }
         } else if !self.configured {
-            body = body
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .line_height(px(21.))
-                        .text_color(p.tx2)
-                        .child("尚未配置 AI 助手。设置服务商、模型和 API Key 后即可提问。"),
-                )
-                .child(
-                    Button::new("ai-settings")
-                        .label("去设置")
-                        .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
-                );
+            body = body.child(
+                div()
+                    .p(px(16.))
+                    .rounded(px(14.))
+                    .bg(p.card2)
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .size(px(40.))
+                            .rounded(px(12.))
+                            .bg(p.accs)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::icons::AppIcon::Ai.at(20.).text_color(p.acc)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.tx)
+                                    .child("尚未配置 AI 助手"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .line_height(px(19.))
+                                    .text_color(p.tx2)
+                                    .child("设置服务商、模型和 API Key 后，即可分析终端报错、执行命令或协作排查。"),
+                            ),
+                    )
+                    .child(
+                        crate::dialogs::button("ai-settings", "前往设置", crate::dialogs::Tone::Primary, true)
+                            .h(px(34.))
+                            .px(px(16.))
+                            .rounded(px(11.))
+                            .on_click(cx.listener(|s, _, w, cx| s.settings(w, cx))),
+                    ),
+            );
         } else if self.state.model.conversation.turns().is_empty() {
             body = body.child(
                 div()
                     .flex_none()
-                    .pt(px(6.))
                     .flex()
                     .flex_col()
                     .gap(px(8.))
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .line_height(px(20.8))
-                            .text_color(p.tx2)
-                            .child("用自然语言描述想做的事，或让我解释终端里的报错。"),
+                            .p(px(12.))
+                            .rounded(px(14.))
+                            .bg(p.card2)
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .size(px(32.))
+                                    .flex_none()
+                                    .rounded(px(10.))
+                                    .bg(p.accs)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(crate::icons::AppIcon::Ai.at(16.).text_color(p.acc)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.5))
+                                    .line_height(px(18.))
+                                    .text_color(p.tx2)
+                                    .whitespace_normal()
+                                    .child("用自然语言描述想做的事，或让我解释终端里的报错。"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pt(px(4.))
+                            .px(px(4.))
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.tx3)
+                            .child("快速开始"),
                     )
                     .children(SUGGESTIONS.into_iter().enumerate().map(|(i, label)| {
                         div()
                             .id(("ai-suggestion", i))
-                            .py(px(10.))
-                            .px(px(12.))
-                            .rounded(px(12.))
+                            .py(px(12.))
+                            .px(px(14.))
+                            .rounded(px(14.))
                             .bg(p.card2)
                             .cursor_pointer()
                             .hover(|d| d.bg(p.card3))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
                             .text_size(px(13.))
-                            .line_height(px(17.))
-                            .child(label)
+                            .line_height(px(18.))
+                            .text_color(p.tx)
+                            .child(div().flex_1().min_w_0().child(label))
+                            .child(crate::icons::group_chevron(false).text_color(p.tx3))
                             .on_click(cx.listener(move |s, _, w, cx| s.ask(label.into(), w, cx)))
                     })),
             );
@@ -1447,8 +1646,9 @@ impl Render for Drawer {
                 let message_id = format!("{}:main:user:{index}", self.state.id);
                 let bubble = subagent_ui::selectable(
                     message_id.clone(), &turn.user.question, window, cx,
-                ).max_w_full().px(px(12.)).py(px(9.)).rounded(px(13.))
-                    .bg(p.accs).text_size(px(13.)).line_height(px(20.8)).whitespace_normal();
+                ).max_w_full().px(px(14.)).py(px(10.)).rounded(px(14.))
+                    .bg(p.accs).border_1().border_color(p.acc.opacity(0.14))
+                    .text_size(px(13.)).line_height(px(20.8)).whitespace_normal();
                 body = body.child(message_ui::message(
                     message_id.clone(), &turn.user.question, turn.user.sent_at_ms,
                     div().flex().flex_col().gap(px(6.)).children(self.message_images(&message_id,&turn.user.attachments,cx)).when(!turn.user.question.is_empty(),|d|d.child(bubble)), self.selection_scroll.clone(), window, cx,
@@ -1492,12 +1692,42 @@ impl Render for Drawer {
                                 let expanded = self.state.expanded_summaries.contains(&key);
                                 let mut divider = div().flex_none().flex().flex_col().gap(px(8.))
                                     .py(px(8.)).border_t_1().border_color(p.line).text_size(px(11.)).text_color(p.tx3)
-                                    .child(div().flex().flex_wrap().items_center().gap(px(6.)).child(super::model::compaction_label(c))
-                                        .when(c.summary.is_some(), |d| d.child("·").child(Button::new(("ai-summary", index * 1000 + n))
-                                            .label(if expanded { "收起摘要" } else { "查看摘要" }).h(px(24.)).text_size(px(11.5))
-                                            .on_click(cx.listener(move |s, _, _, cx| { s.state.toggle_summary(key); cx.notify(); })) )));
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(agent_ui::status_badge(
+                                                super::model::compaction_label(c),
+                                                p.tx2,
+                                                p.card2,
+                                                false,
+                                            ))
+                                            .when(c.summary.is_some(), |d| {
+                                                d.child(
+                                                    agent_ui::pill_action(
+                                                        ("ai-summary", index * 1000 + n),
+                                                        if expanded { "收起摘要" } else { "查看摘要" },
+                                                        agent_ui::ActionTone::Quiet,
+                                                        cx,
+                                                    )
+                                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                                        s.state.toggle_summary(key);
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            }),
+                                    );
                                 if expanded && let Some(summary) = &c.summary {
-                                    divider = divider.child(agent_ui::step_surface(&p).text_size(px(12.)).text_color(p.tx2).whitespace_normal().child(summary.clone()));
+                                    divider = divider.child(
+                                        agent_ui::step_surface(&p)
+                                            .text_size(px(12.))
+                                            .line_height(px(19.))
+                                            .text_color(p.tx2)
+                                            .whitespace_normal()
+                                            .child(summary.clone()),
+                                    );
                                 }
                                 reply = reply.child(divider);
                                 continue;
@@ -1508,7 +1738,7 @@ impl Render for Drawer {
                                 let label = output_ui::notice_label(text, self.state.model.conversation.displayed_step(index,n));
                                 let line = div().min_w_0().w_full().whitespace_normal().text_size(px(11.)).text_color(p.tx3).child(label);
                                 reply = reply.child(if let Some(action)=action {
-                                    line.flex().items_center().flex_wrap().gap(px(5.)).child("·").child(agent_ui::step_action(("ai-memory-view",index*1000+n),"查看",cx).on_click(cx.listener(move|s,_,w,cx|s.open_memory(Some(action.clone()),w,cx))))
+                                    line.flex().items_center().flex_wrap().gap(px(6.)).child(agent_ui::pill_action(("ai-memory-view",index*1000+n),"查看",agent_ui::ActionTone::Quiet,cx).on_click(cx.listener(move|s,_,w,cx|s.open_memory(Some(action.clone()),w,cx))))
                                 } else { line });
                                 continue;
                             }
@@ -1540,13 +1770,17 @@ impl Render for Drawer {
                         let risk = card.risk;
                         reply = reply.child(
                             div()
-                                .rounded(px(12.))
+                                .rounded(px(14.))
                                 .bg(p.card2)
+                                .border_1()
+                                .border_color(p.line)
                                 .overflow_hidden()
                                 .child(
                                     div()
-                                        .px(px(11.))
-                                        .py(px(9.))
+                                        .px(px(12.))
+                                        .py(px(10.))
+                                        .border_b_1()
+                                        .border_color(p.line)
                                         .bg(shellmate_term::colors::to_hsla(
                                             cx.terminal_style().palette.background,
                                         ))
@@ -1561,56 +1795,55 @@ impl Render for Drawer {
                                 )
                                 .child(
                                     div()
-                                        .px(px(10.))
-                                        .py(px(7.))
+                                        .p(px(12.))
                                         .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap(px(6.))
+                                        .flex_col()
+                                        .gap(px(8.))
                                         .child(
                                             div()
                                                 .w_full()
-                                                .text_size(px(12.))
+                                                .text_size(px(12.5))
+                                                .line_height(px(18.))
                                                 .text_color(p.tx2)
+                                                .whitespace_normal()
                                                 .child(card.explanation),
                                         )
                                         .child(
                                             div()
-                                                .px(px(6.))
-                                                .py(px(1.))
-                                                .rounded(px(5.))
-                                                .text_size(px(10.5))
-                                                .text_color(if risk == Risk::High {
-                                                    p.err
-                                                } else {
-                                                    p.warn
-                                                })
-                                                .bg(if risk == Risk::High {
-                                                    p.errs
-                                                } else {
-                                                    p.warns
-                                                })
-                                                .child(risk.label()),
-                                        )
-                                        .child(
-                                            Button::new(("ai-copy", index * 1000 + n))
-                                                .label("复制")
-                                                .h(px(24.))
-                                                .text_size(px(11.5))
-                                                .on_click(move |_, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(copy.clone()),
+                                                .flex()
+                                                .flex_wrap()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .child(agent_ui::status_badge(
+                                                    risk.label(),
+                                                    if risk == Risk::High { p.err } else { p.warn },
+                                                    if risk == Risk::High { p.errs } else { p.warns },
+                                                    true,
+                                                ))
+                                                .child(div().flex_1())
+                                                .child(
+                                                    agent_ui::step_action(
+                                                        ("ai-copy", index * 1000 + n),
+                                                        "复制",
+                                                        cx,
                                                     )
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new(("ai-insert", index * 1000 + n))
-                                                .label("插入")
-                                                .h(px(24.))
-                                                .text_size(px(11.5))
-                                                .on_click(cx.listener(move |s, _, w, cx| {
-                                                    s.insert(insert.clone(), w, cx)
-                                                })),
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(copy.clone()),
+                                                        )
+                                                    }),
+                                                )
+                                                .child(
+                                                    agent_ui::pill_action(
+                                                        ("ai-insert", index * 1000 + n),
+                                                        "插入",
+                                                        agent_ui::ActionTone::Accent,
+                                                        cx,
+                                                    )
+                                                    .on_click(cx.listener(move |s, _, w, cx| {
+                                                        s.insert(insert.clone(), w, cx)
+                                                    })),
+                                                ),
                                         ),
                                 ),
                         );
@@ -1641,7 +1874,7 @@ impl Render for Drawer {
             }
             for call in &self.state.active_tools{body=body.child(self.tool_card("main",call,None,None,window,cx));}
             body = body.children(self.local_cards_at(self.state.model.conversation.turns().len(), cx));
-            if let Some(runtime)=&self.runtime&&runtime.snapshot().paused {body=body.child(agent_ui::step_action("runtime-resume","继续执行",cx).on_click(cx.listener(|s,_,_,cx|{if let Some(runtime)=&s.runtime{let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}}cx.notify();})));}
+            if let Some(runtime)=&self.runtime&&runtime.snapshot().paused {body=body.child(agent_ui::pill_action("runtime-resume","继续执行",agent_ui::ActionTone::Accent,cx).on_click(cx.listener(|s,_,_,cx|{if let Some(runtime)=&s.runtime{let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);}}cx.notify();})));}
             if self.state.continuation.is_some() {
                 body = body.child(
                     crate::dialogs::button(
@@ -1676,9 +1909,11 @@ impl Render for Drawer {
                 body = body.child(
                     div()
                         .flex_none()
-                        .p(px(10.))
-                        .rounded(px(12.))
+                        .p(px(12.))
+                        .rounded(px(14.))
                         .bg(p.errs)
+                        .border_1()
+                        .border_color(p.err.opacity(0.25))
                         .text_color(p.err)
                         .text_size(px(12.5))
                         .flex()
@@ -1693,10 +1928,9 @@ impl Render for Drawer {
                                 .child(error.to_string()),
                         )
                         .when(self.state.continuation.is_none(), |d| d.child(
-                            Button::new("ai-retry")
-                                .label("重试")
+                            agent_ui::pill_action("ai-retry", "重试", agent_ui::ActionTone::Card, cx)
                                 .flex_none()
-                                .h(px(34.))
+                                .h(px(30.))
                                 .px(px(12.))
                                 .rounded(px(10.))
                                 .on_click(cx.listener(|s, _, w, cx| s.begin(None, w, cx))),
@@ -1729,18 +1963,19 @@ impl Render for Drawer {
                 .child(self.media_textarea(cx).xsmall().appearance(false).p_0()
                     .h(field_height - inset * 2.).min_h_0().max_h(field_height - inset * 2.).text_size(px(13.)))
         );
+        let composer_focused = self.input.focus_handle(cx).is_focused(window);
         let footer = div()
             .on_drop(cx.listener(|s,paths: &ExternalPaths,_,cx|s.drop_images(paths,cx)))
             .relative()
             .flex_none()
             .pt(px(10.))
-            .px(px(12.))
-            .pb(px(12.))
+            .px(px(16.))
+            .pb(px(14.))
             .border_t_1()
             .border_color(p.line)
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(8.))
             .children(self.task_strip(cx))
             .child(div().flex().items_start().justify_between().gap(px(8.))
                 .child(div().flex_1().min_w_0().when(!self.capabilities.available(), |d| d.whitespace_nowrap().overflow_hidden()).child(self.permission_chip(cx)))
@@ -1756,12 +1991,13 @@ impl Render for Drawer {
                     .flex_none()
                     .h(px(layout.height))
                     .items_end()
-                    .gap(px(8.))
-                    .pl(px(12.))
-                    .pr(px(4.))
+                    .gap(px(6.))
+                    .px(px(4.))
                     .py(px(composer_layout::VERTICAL_PADDING))
-                    .rounded(px(13.))
+                    .rounded(px(14.))
                     .bg(p.card2)
+                    .border_1()
+                    .border_color(if composer_focused { p.acc } else { p.line })
                     .child(self.image_picker(cx))
                     .child(
                         div().flex_1().min_w_0().child(
@@ -1776,6 +2012,8 @@ impl Render for Drawer {
                             true,
                         )
                         .h(px(composer_layout::ACTION_HEIGHT))
+                        .px(px(14.))
+                        .rounded(px(10.))
                         .on_click(cx.listener(|s, _, w, cx| {
                             s.send_input(w,cx)
                         })),

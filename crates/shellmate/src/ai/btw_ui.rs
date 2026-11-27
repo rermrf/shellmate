@@ -138,6 +138,8 @@ impl Drawer {
         let question = side.question.as_ref()?;
         let p = cx.palette().clone();
         let mut card = agent_ui::step_surface(&p)
+            .border_1()
+            .border_color(p.line)
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -146,13 +148,16 @@ impl Drawer {
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .child(agent_ui::status_badge("侧问", p.acc, p.accs, false))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .whitespace_normal()
-                            .text_size(px(12.))
-                            .child(format!("侧问 · {question}")),
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.tx)
+                            .child(question.clone()),
                     )
                     .child(
                         agent_ui::step_action("btw-close", "关闭", cx)
@@ -180,6 +185,11 @@ impl Drawer {
             card = card.child(
                 div()
                     .id("btw-answer")
+                    .p(px(10.))
+                    .rounded(px(10.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.line)
                     .max_h(px(if w.viewport_size().height < px(720.) {
                         90.
                     } else {

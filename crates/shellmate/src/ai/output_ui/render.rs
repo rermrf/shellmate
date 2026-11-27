@@ -239,14 +239,25 @@ impl Render for OutputPane {
                         cx.notify();
                     }))
                     .child(
-                        ScrollArea::new(
-                            "output-viewport",
-                            div().flex_none().child(canvas),
-                            p.card2,
-                        )
-                        .retained(self.viewport.clone())
-                        .selection(self.selection_scroll.clone())
-                        .height_limit(if expanded { 320. } else { 144. }, expanded),
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .pt(px(8.))
+                            .px(px(10.))
+                            .rounded(px(10.))
+                            .bg(p.card)
+                            .border_1()
+                            .border_color(p.line)
+                            .child(
+                                ScrollArea::new(
+                                    "output-viewport",
+                                    div().flex_none().child(canvas),
+                                    p.card,
+                                )
+                                .retained(self.viewport.clone())
+                                .selection(self.selection_scroll.clone())
+                                .height_limit(if expanded { 320. } else { 144. }, expanded),
+                            ),
                     ),
             );
         } else {
@@ -260,15 +271,26 @@ impl Render for OutputPane {
                     },
                 ));
             } else {
-                body = body.child(agent_ui::output_scroll(
-                    "output-preview".into(),
+                body = body.child(
                     div()
-                        .flex_none()
-                        .child(markdown::plain("output-preview-text", preview)),
-                    false,
-                    self.selection_scroll.clone(),
-                    &p,
-                ));
+                        .w_full()
+                        .min_w_0()
+                        .pt(px(8.))
+                        .px(px(10.))
+                        .rounded(px(10.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.line)
+                        .child(agent_ui::output_scroll(
+                            "output-preview".into(),
+                            div()
+                                .flex_none()
+                                .child(markdown::plain("output-preview-text", preview)),
+                            false,
+                            self.selection_scroll.clone(),
+                            &p,
+                        )),
+                );
             }
         }
         let note = if self.copy_error {

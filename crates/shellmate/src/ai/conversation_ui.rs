@@ -87,11 +87,14 @@ impl Drawer {
                 .unwrap_or_else(|_| "终端已失效".into());
             let id = id.clone();
             row = row.child(
-                agent_ui::step_action(
+                agent_ui::pill_action(
                     SharedString::from(format!("mention-{id}")),
                     SharedString::from(format!("@{label} ×")),
+                    agent_ui::ActionTone::Accent,
                     cx,
                 )
+                .h(px(24.))
+                .px(px(8.))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     s.composer_targets.remove(&id);
                     cx.notify();
@@ -450,6 +453,7 @@ impl Drawer {
         if self.fixture && !self.multi_fixture {
             return None;
         }
+        let p = cx.palette().clone();
         let all = crate::workspace::hub::Hub::ai_services(cx).1.list();
         let pending = all
             .iter()
@@ -457,22 +461,30 @@ impl Drawer {
             .count();
         let count = self.runtime.as_ref().map(|r| r.router.catalog.list().len())
             .unwrap_or_else(|| crate::workspace::hub::Hub::ai_services(cx).0.list().len());
+        let conversations_btn = agent_ui::pill_action(
+            "ai-conversations",
+            if pending > 0 {
+                "对话 · 待处理"
+            } else {
+                "切换对话"
+            },
+            if pending > 0 {
+                agent_ui::ActionTone::Warn
+            } else if self.chooser {
+                agent_ui::ActionTone::Accent
+            } else {
+                agent_ui::ActionTone::Surface
+            },
+            cx,
+        );
         let mut row = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(px(6.))
-            .mt(px(6.))
+            .mt(px(8.))
             .child(
-                agent_ui::step_action(
-                    "ai-conversations",
-                    if pending > 0 {
-                        "对话 · 待处理"
-                    } else {
-                        "切换对话"
-                    },
-                    cx,
-                )
+                conversations_btn
                 .on_click(cx.listener(|s, _, _, cx| {
                     s.chooser = !s.chooser;
                     s.target_picker = false;
@@ -483,9 +495,14 @@ impl Drawer {
                 })),
             )
             .child(
-                agent_ui::step_action(
+                agent_ui::pill_action(
                     "ai-targets",
                     SharedString::from(format!("可用终端 · {count}")),
+                    if self.target_picker {
+                        agent_ui::ActionTone::Accent
+                    } else {
+                        agent_ui::ActionTone::Surface
+                    },
                     cx,
                 )
                 .on_click(cx.listener(|s, _, _, cx| {
@@ -499,15 +516,14 @@ impl Drawer {
             );
         if let Some(session) = self.session {
             row = row.child(
-                agent_ui::step_action("locate-default", "定位", cx).on_click(cx.listener(
-                    move |s, _, w, cx| {
+                agent_ui::pill_action("locate-default", "定位", agent_ui::ActionTone::Surface, cx)
+                    .on_click(cx.listener(move |s, _, w, cx| {
                         let ws = s.workspace.clone();
                         w.defer(cx, move |w, cx| {
                             ws.update(cx, |s, cx| s.locate_ai_terminal(session, w, cx))
                                 .ok();
                         });
-                    },
-                )),
+                    })),
             );
         }
         if let Some(next) = &self.next_context
@@ -517,35 +533,93 @@ impl Drawer {
                 div()
                     .w_full()
                     .min_w_0()
+                    .mt(px(4.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(10.))
+                    .bg(p.card2)
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_ellipsis()
-                            .text_size(px(11.))
-                            .text_color(cx.palette().tx3)
+                            .text_size(px(11.5))
+                            .text_color(p.tx2)
                             .child(format!("当前标签：{}", next.label)),
                     )
                     .child(
-                        agent_ui::step_action("new-current-target", "为此新建", cx)
-                            .on_click(cx.listener(|s, _, w, cx| s.new_conversation(w, cx))),
+                        agent_ui::pill_action(
+                            "new-current-target",
+                            "为此新建",
+                            agent_ui::ActionTone::Accent,
+                            cx,
+                        )
+                        .h(px(24.))
+                        .px(px(8.))
+                        .on_click(cx.listener(|s, _, w, cx| s.new_conversation(w, cx))),
                     ),
             );
         }
         Some(row)
     }
     pub(super) fn conversation_picker(&self, cx: &mut Context<Self>) -> Div {
-        let p = cx.palette();
+        let p = cx.palette().clone();
         let mut list = div()
-            .p(px(10.))
-            .rounded(px(12.))
+            .p(px(12.))
+            .rounded(px(14.))
             .bg(p.card2)
+            .border_1()
+            .border_color(p.line)
             .flex()
             .flex_col()
-            .gap(px(8.));
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.tx)
+                            .child("切换对话"),
+                    )
+                    .child(
+                        agent_ui::pill_action("all-history", "历史对话", agent_ui::ActionTone::Card, cx)
+                            .h(px(24.))
+                            .px(px(8.))
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.chooser = false;
+                                s.history(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("chooser-close")
+                            .size(px(24.))
+                            .rounded(px(8.))
+                            .bg(p.card)
+                            .border_1()
+                            .border_color(p.line)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(14.))
+                            .text_color(p.tx2)
+                            .hover(|d| d.bg(p.card3).text_color(p.tx))
+                            .child("×")
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.chooser = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
         let mut all = crate::workspace::hub::Hub::ai_services(cx).1.list();
         all.sort_by_key(|r| {
             let s = r.snapshot();
@@ -571,121 +645,214 @@ impl Drawer {
                 .and_then(|id| scope.targets.get(id))
                 .map(|t| t.label.as_str())
                 .unwrap_or("无默认终端");
-            let status = if snap.approvals.values().any(|a| a.reply.is_some()) {
-                "等待批准"
+            let (status, badge_fg, badge_bg, has_dot) = if snap.approvals.values().any(|a| a.reply.is_some()) {
+                ("等待批准", p.warn, p.warns, true)
             } else if snap.model.busy || runtime.tasks.has_running() {
-                "运行中"
+                ("运行中", p.acc, p.accs, true)
             } else if snap.paused {
-                "已暂停"
+                ("已暂停", p.warn, p.warns, true)
             } else {
-                "已结束"
+                ("已结束", p.tx3, p.card2, false)
             };
             let unread = snap.revision > runtime.seen.load(std::sync::atomic::Ordering::Acquire);
+            let current = self.runtime.as_ref().is_some_and(|r| r.id == runtime.id);
             let id = runtime.id.clone();
             let close_id = id.clone();
             let stop = runtime.clone();
             let active = runtime.active();
+            let secs = snap
+                .timing
+                .snapshot(timing::Moment::now())
+                .last()
+                .map_or(0, |t| t.duration_ms / 1000);
             list = list.child(
                 div()
-                    .id(SharedString::from(format!("choose-{id}")))
-                    .p(px(6.))
-                    .rounded(px(8.))
-                    .hover(|s| s.bg(p.card3))
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .whitespace_normal()
-                    .child(format!(
-                        "{}{title}\n{target} · {status} · {}s",
-                        if unread { "● " } else { "" },
-                        snap.timing
-                            .snapshot(timing::Moment::now())
-                            .last()
-                            .map_or(0, |t| t.duration_ms / 1000)
-                    ))
-                    .on_click(cx.listener(move |s, _, w, cx| {
-                        s.chooser = false;
-                        let ws = s.workspace.clone();
-                        let id = id.clone();
-                        w.defer(cx, move |w, cx| {
-                            ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
-                                .ok();
-                        });
-                    })),
-            );
-            list = list.child(
-                div()
+                    .p(px(10.))
+                    .rounded(px(12.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(if current { p.acc.opacity(0.32) } else { p.line })
                     .flex()
-                    .gap(px(6.))
-                    .when(active, |d| {
-                        d.child(
-                            agent_ui::step_action(
-                                SharedString::from(format!("stop-{close_id}")),
-                                "停止回复",
-                                cx,
-                            )
-                            .on_click(move |_, _, _| stop.stop_reply()),
-                        )
-                    })
+                    .flex_col()
+                    .gap(px(8.))
                     .child(
-                        agent_ui::step_action(
-                            SharedString::from(format!("close-{close_id}")),
-                            if active {
-                                "停止并关闭"
-                            } else {
-                                "关闭此对话"
-                            },
-                            cx,
-                        )
-                        .on_click(cx.listener(move |s, _, w, cx| {
-                            let ws = s.workspace.clone();
-                            let id = close_id.clone();
-                            w.defer(cx, move |w, cx| {
-                                ws.update(cx, |s, cx| s.close_ai_conversation(&id, w, cx))
-                                    .ok();
-                            });
-                        })),
+                        div()
+                            .id(SharedString::from(format!("choose-{id}")))
+                            .cursor_pointer()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .when(unread, |d| d.child(crate::ui::dot(p.acc, 6.)))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(p.tx)
+                                            .child(title),
+                                    )
+                                    .child(agent_ui::status_badge(status, badge_fg, badge_bg, has_dot)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(p.tx2)
+                                    .truncate()
+                                    .child(format!("{target} · {secs}s")),
+                            )
+                            .on_click(cx.listener(move |s, _, w, cx| {
+                                s.chooser = false;
+                                let ws = s.workspace.clone();
+                                let id = id.clone();
+                                w.defer(cx, move |w, cx| {
+                                    ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
+                                        .ok();
+                                });
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(6.))
+                            .when(active, |d| {
+                                d.child(
+                                    agent_ui::pill_action(
+                                        SharedString::from(format!("stop-{close_id}")),
+                                        "停止回复",
+                                        agent_ui::ActionTone::Surface,
+                                        cx,
+                                    )
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .on_click(move |_, _, _| stop.stop_reply()),
+                                )
+                            })
+                            .child(
+                                agent_ui::pill_action(
+                                    SharedString::from(format!("close-{close_id}")),
+                                    if active { "停止并关闭" } else { "关闭此对话" },
+                                    if active {
+                                        agent_ui::ActionTone::Danger
+                                    } else {
+                                        agent_ui::ActionTone::Surface
+                                    },
+                                    cx,
+                                )
+                                .h(px(24.))
+                                .px(px(8.))
+                                .on_click(cx.listener(move |s, _, w, cx| {
+                                    let ws = s.workspace.clone();
+                                    let id = close_id.clone();
+                                    w.defer(cx, move |w, cx| {
+                                        ws.update(cx, |s, cx| s.close_ai_conversation(&id, w, cx))
+                                            .ok();
+                                    });
+                                })),
+                            ),
                     ),
             );
         }
         if let Some(ws) = self.workspace.upgrade() {
             for (id, title) in ws.read(cx).ai_drafts(cx) {
                 list = list.child(
-                    agent_ui::step_action(
-                        SharedString::from(format!("draft-{id}")),
-                        SharedString::from(format!("草稿 · {title}")),
-                        cx,
-                    )
-                    .on_click(cx.listener(move |s, _, w, cx| {
-                        let ws = s.workspace.clone();
-                        let id = id.clone();
-                        w.defer(cx, move |w, cx| {
-                            ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
-                                .ok();
-                        });
-                    })),
+                    div()
+                        .id(SharedString::from(format!("draft-{id}")))
+                        .p(px(10.))
+                        .rounded(px(12.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.line)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.card3.opacity(0.4)))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(agent_ui::status_badge("草稿", p.tx2, p.card2, false))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .text_color(p.tx)
+                                .child(title),
+                        )
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            let ws = s.workspace.clone();
+                            let id = id.clone();
+                            w.defer(cx, move |w, cx| {
+                                ws.update(cx, |s, cx| s.select_ai_conversation(&id, w, cx))
+                                    .ok();
+                            });
+                        })),
                 );
             }
         }
-        list.child(
-            agent_ui::step_action("all-history", "打开历史对话", cx).on_click(cx.listener(
-                |s, _, _, cx| {
-                    s.chooser = false;
-                    s.history(cx);
-                },
-            )),
-        )
+        list
     }
     pub(super) fn targets_panel(&self, cx: &mut Context<Self>) -> Div {
-        let p = cx.palette();
+        let p = cx.palette().clone();
         let mut list = div()
-            .p(px(10.))
-            .rounded(px(12.))
+            .p(px(12.))
+            .rounded(px(14.))
             .bg(p.card2)
+            .border_1()
+            .border_color(p.line)
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(div().text_size(px(12.)).child("可用终端"))
-            .child(div().text_size(px(11.)).text_color(p.tx3).whitespace_normal().child("AI 会按任务选择终端。引用可明确指向某个终端，默认终端用于未指定目标的操作。"));
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.tx)
+                            .child("可用终端"),
+                    )
+                    .child(
+                        div()
+                            .id("targets-close")
+                            .size(px(24.))
+                            .rounded(px(8.))
+                            .bg(p.card)
+                            .border_1()
+                            .border_color(p.line)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(14.))
+                            .text_color(p.tx2)
+                            .hover(|d| d.bg(p.card3).text_color(p.tx))
+                            .child("×")
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.target_picker = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .line_height(px(16.))
+                    .text_color(p.tx2)
+                    .whitespace_normal()
+                    .child("AI 会按任务选择终端。引用可明确指向某个终端，默认终端用于未指定目标的操作。"),
+            );
         let entries = self
             .runtime
             .as_ref()
@@ -701,46 +868,55 @@ impl Drawer {
                 let remove = id.clone();
                 list = list.child(
                     div()
+                        .p(px(10.))
+                        .rounded(px(12.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.line)
                         .flex()
                         .items_center()
                         .gap(px(6.))
+                        .child(crate::ui::dot(p.tx3, 6.))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .text_size(px(12.))
                                 .text_ellipsis()
+                                .text_color(p.tx2)
                                 .child(format!("{} · 已失效", target.label)),
                         )
                         .child(
-                            agent_ui::step_action(
+                            agent_ui::pill_action(
                                 SharedString::from(format!("rebind-{id}")),
                                 "重新关联",
+                                agent_ui::ActionTone::Accent,
                                 cx,
                             )
-                            .on_click(cx.listener(
-                                move |s, _, _, cx| {
-                                    s.rebind_target = Some(old.clone());
-                                    cx.notify();
-                                },
-                            )),
+                            .h(px(24.))
+                            .px(px(8.))
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                s.rebind_target = Some(old.clone());
+                                cx.notify();
+                            })),
                         )
                         .child(
-                            agent_ui::step_action(
+                            agent_ui::pill_action(
                                 SharedString::from(format!("forget-{id}")),
                                 "忘记关联",
+                                agent_ui::ActionTone::Surface,
                                 cx,
                             )
-                            .on_click(cx.listener(
-                                move |s, _, _, cx| {
-                                    if let Some(r) = &s.runtime {
-                                        r.router.remove(&remove);
-                                        r.data.lock().unwrap().revision += 1;
-                                        r.save(&[], &[]);
-                                    }
-                                    cx.notify();
-                                },
-                            )),
+                            .h(px(24.))
+                            .px(px(8.))
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                if let Some(r) = &s.runtime {
+                                    r.router.remove(&remove);
+                                    r.data.lock().unwrap().revision += 1;
+                                    r.save(&[], &[]);
+                                }
+                                cx.notify();
+                            })),
                         ),
                 );
             }
@@ -748,8 +924,12 @@ impl Drawer {
         if self.rebind_target.is_some() {
             list = list.child(
                 div()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(10.))
+                    .bg(p.accs)
                     .text_size(px(12.))
-                    .text_color(cx.palette().acc)
+                    .text_color(p.acc)
                     .child("请选择下方终端作为原目标的新关联"),
             );
         }
@@ -767,21 +947,45 @@ impl Drawer {
             } else {
                 endpoint.target.host_id.as_deref().unwrap_or("temporary")
             }).unwrap_or_default();
-            let state = if !endpoint.connected { "已断开" }
-                else if endpoint.binding.capabilities.terminal_busy { "终端占用中" }
-                else { "已连接" };
+            let (state, dot_color) = if !endpoint.connected {
+                ("已断开", p.tx3)
+            } else if endpoint.binding.capabilities.terminal_busy {
+                ("终端占用中", p.warn)
+            } else {
+                ("已连接", p.ok)
+            };
             let metadata = format!("{} · {} · {}{}", endpoint.target.protocol, state, permission.label(),
                 if multiple_windows {format!(" · {}", endpoint.window)} else {String::new()});
             let session = endpoint.binding.session;
             let mut actions = agent_ui::step_actions().flex_wrap()
-                .child(agent_ui::step_action(SharedString::from(format!("locate-{id}")), "定位", cx)
+                .child(
+                    agent_ui::pill_action(
+                        SharedString::from(format!("locate-{id}")),
+                        "定位",
+                        agent_ui::ActionTone::Surface,
+                        cx,
+                    )
+                    .h(px(24.))
+                    .px(px(8.))
                     .on_click(cx.listener(move |s, _, w, cx| {
                         let ws = s.workspace.clone();
                         w.defer(cx, move |w, cx| { ws.update(cx, |s, cx| s.locate_ai_terminal(session, w, cx)).ok(); });
-                    })));
+                    })),
+                );
             if endpoint.connected {
-                actions = actions.child(agent_ui::step_action(
-                    SharedString::from(format!("default-{id}")), if is_default {"默认 ✓"} else {"设为默认"}, cx)
+                actions = actions.child(
+                    agent_ui::pill_action(
+                        SharedString::from(format!("default-{id}")),
+                        if is_default { "默认 ✓" } else { "设为默认" },
+                        if is_default {
+                            agent_ui::ActionTone::Accent
+                        } else {
+                            agent_ui::ActionTone::Surface
+                        },
+                        cx,
+                    )
+                    .h(px(24.))
+                    .px(px(8.))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if let Some(r) = &s.runtime {
                             if r.active() {
@@ -803,9 +1007,21 @@ impl Drawer {
                             s.context_bound = true;
                         }
                         cx.notify();
-                    })))
-                    .child(agent_ui::step_action(SharedString::from(format!("mention-{id}")),
-                        if self.rebind_target.is_some() {"关联到此"} else {"引用"}, cx)
+                    })),
+                )
+                .child(
+                    agent_ui::pill_action(
+                        SharedString::from(format!("mention-{id}")),
+                        if self.rebind_target.is_some() { "关联到此" } else { "引用" },
+                        if self.rebind_target.is_some() {
+                            agent_ui::ActionTone::Accent
+                        } else {
+                            agent_ui::ActionTone::Surface
+                        },
+                        cx,
+                    )
+                    .h(px(24.))
+                    .px(px(8.))
                     .on_click(cx.listener(move |s, _, w, cx| {
                         if let Some(old) = s.rebind_target.take() {
                             if let Some(r) = &s.runtime {
@@ -823,15 +1039,45 @@ impl Drawer {
                             s.target_picker = false;
                         }
                         cx.notify();
-                    })));
+                    })),
+                );
             }
-            list = list.child(div().py(px(8.)).border_b_1().border_color(p.line)
-                .flex().flex_col().gap(px(5.)).min_w_0()
-                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).whitespace_normal().child(endpoint.target.label))
-                .child(div().text_size(px(11.)).text_color(p.tx3).whitespace_normal().child(metadata))
-                .child(div().text_size(px(11.)).text_color(p.tx2).whitespace_normal()
-                    .child(endpoint.target.cwd.unwrap_or_else(|| "目录未知".into())))
-                .child(actions));
+            list = list.child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(12.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(if is_default { p.acc.opacity(0.28) } else { p.line })
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(crate::ui::dot(dot_color, 6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.tx)
+                                    .whitespace_normal()
+                                    .child(endpoint.target.label),
+                            )
+                            .when(is_default, |d| {
+                                d.child(agent_ui::status_badge("默认", p.acc, p.accs, false))
+                            }),
+                    )
+                    .child(div().text_size(px(11.)).text_color(p.tx3).whitespace_normal().child(metadata))
+                    .child(div().text_size(px(11.)).font_family(crate::theme::MONO_FONT).text_color(p.tx2).whitespace_normal()
+                        .child(endpoint.target.cwd.unwrap_or_else(|| "目录未知".into())))
+                    .child(actions),
+            );
         }
         list
     }

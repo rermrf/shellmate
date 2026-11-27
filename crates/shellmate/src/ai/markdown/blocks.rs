@@ -114,7 +114,9 @@ pub(super) fn render(
                 super::code_selection::overlay(id.clone(), code.clone(), window, cx);
             let block = div()
                 .w_full()
-                .rounded(px(10.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(p.line)
                 .bg(bg)
                 .overflow_hidden()
                 .child(
@@ -230,7 +232,7 @@ pub(super) fn render(
                 .min_w_0()
                 .border_1()
                 .border_color(p.line)
-                .rounded(px(8.))
+                .rounded(px(12.))
                 .bg(p.card)
                 .overflow_hidden()
                 .child(

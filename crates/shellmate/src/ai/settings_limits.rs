@@ -1,4 +1,4 @@
-use super::{AiSettings, segment, settings_card, settings_row};
+use super::{AiSettings, section_title, segment, settings_card, settings_row};
 use crate::{
     theme::ActivePalette,
     ui::{Surface, field_input},
@@ -259,14 +259,6 @@ impl AiSettings {
         let s = self.values(cx);
         let p = cx.palette().clone();
         let context = settings_card(cx)
-            .child(
-                div()
-                    .pt(px(12.))
-                    .pb(px(4.))
-                    .text_size(px(13.5))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("上下文与执行"),
-            )
             .child(self.limit_row(
                 0,
                 "上下文窗口",
@@ -315,17 +307,24 @@ impl AiSettings {
                     .id("ai-advanced")
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .py(px(12.))
+                    .gap(px(8.))
+                    .py(px(14.))
                     .cursor_pointer()
-                    .text_size(px(12.))
-                    .line_height(px(15.))
+                    .text_size(px(13.))
+                    .line_height(px(18.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.tx2)
                     .child(
-                        div().w(px(10.)).h(px(15.)).flex_none().child(
-                            crate::icons::group_chevron(self.limits.advanced).text_color(p.tx2),
-                        ),
+                        div()
+                            .size(px(16.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                crate::icons::group_chevron(self.limits.advanced)
+                                    .text_color(p.tx2),
+                            ),
                     )
                     .child("高级")
                     .on_click(cx.listener(|s, _, _, cx| {
@@ -388,8 +387,17 @@ impl AiSettings {
         div()
             .flex()
             .flex_col()
+            .mt(px(4.))
             .gap(px(12.))
-            .child(context)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(section_title("上下文与执行", &p))
+                    .child(context),
+            )
             .child(advanced)
             .into_any_element()
     }

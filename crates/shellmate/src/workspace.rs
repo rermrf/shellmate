@@ -1269,7 +1269,7 @@ impl Workspace {
             .shadow(crate::ui::terminal_shadow(&p))
             .child(self.render_panes(session,ai_width,cx))
             .when(crate::ai::model::error_line(&focused.terminal.read(cx).recent_displayed_text(size.rows as usize)).is_some(),|d|d.child(div().absolute().top(px(if focused.host().is_some_and(|h|h.protocol==shellmate_core::Protocol::Serial){56.}else{12.})).right(px(14.))
-                .child(toolbar_button("ai-explain",AppIcon::Ai,Some("AI 解释这个报错"),"解释当前终端报错",true,cx).bg(p.card).text_color(p.acc).on_click(cx.listener(|s,_,w,cx|s.explain_ai(w,cx))))))
+                .child(toolbar_button("ai-explain",AppIcon::Ai,Some("AI 解释这个报错"),"解释当前终端报错",true,cx).bg(p.card).text_color(p.acc).rounded(px(12.)).border_1().border_color(p.line).shadow(crate::ui::card_shadow(&p)).on_click(cx.listener(|s,_,w,cx|s.explain_ai(w,cx))))))
             .when(self.broadcast.enabled,|d|d.child(self.broadcast_bar.clone()))
             .child(
                 div()

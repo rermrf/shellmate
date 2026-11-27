@@ -38,6 +38,22 @@ impl Status {
             _ => p.tx3,
         }
     }
+    pub fn badge_colors(self, p: &crate::theme::Palette) -> (gpui::Hsla, gpui::Hsla) {
+        let bg = match self {
+            Self::Approval | Self::Paused => p.warns,
+            Self::Running | Self::Waiting => p.accs,
+            Self::Completed => p.oks,
+            Self::Failed => p.errs,
+            _ => p.card3,
+        };
+        (bg, self.color(p))
+    }
+    pub fn has_dot(self) -> bool {
+        matches!(
+            self,
+            Self::Approval | Self::Running | Self::Waiting | Self::Completed | Self::Failed
+        )
+    }
     pub fn attention(self) -> bool {
         matches!(self, Self::Approval | Self::Failed | Self::Denied)
     }

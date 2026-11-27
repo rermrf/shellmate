@@ -7,7 +7,7 @@ use crate::{
     theme::ActivePalette,
 };
 use gpui::{
-    component::{button::Button, input},
+    component::{input, tooltip::Tooltip},
     prelude::*,
     *,
 };
@@ -208,7 +208,12 @@ impl Drawer {
                                 .items_center()
                                 .gap(px(8.))
                                 .text_size(px(12.5))
-                                .child(format!("/{}", c.name))
+                                .child(
+                                    div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(if i == self.popup.selected { p.acc } else { p.tx })
+                                        .child(format!("/{}", c.name)),
+                                )
                                 .child(
                                     div()
                                         .text_size(px(11.))
@@ -264,17 +269,33 @@ impl Drawer {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().flex_1().child(title))
-                            .child(div().text_size(px(10.)).text_color(p.tx3).child("仅本地"))
                             .child(
-                                Button::new(("local-dismiss", i))
-                                    .label("×")
-                                    .p_0()
+                                div()
+                                    .flex_1()
+                                    .text_size(px(12.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.tx)
+                                    .child(title),
+                            )
+                            .child(super::agent_ui::status_badge("仅本地", p.tx3, p.card3, false))
+                            .child(
+                                div()
+                                    .id(("local-dismiss", i))
+                                    .cursor_pointer()
                                     .flex_none()
-                                    .w(px(22.))
-                                    .h(px(22.))
-                                    .rounded(px(6.))
-                                    .tooltip("关闭本地卡片")
+                                    .size(px(22.))
+                                    .rounded(px(8.))
+                                    .bg(p.card)
+                                    .border_1()
+                                    .border_color(p.line)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.))
+                                    .text_color(p.tx2)
+                                    .hover(|d| d.bg(p.card3))
+                                    .tooltip(|window, cx| Tooltip::new("关闭本地卡片").build(window, cx))
+                                    .child("×")
                                     .on_click(cx.listener(move |s, _, _, cx| {
                                         s.state.local_cards.remove(i);
                                         cx.notify();
@@ -286,13 +307,46 @@ impl Drawer {
                     LocalBody::Help => {
                         for c in COMMANDS {
                             card = card.child(
-                                div().child(format!("/{} {}", c.name, c.args_hint)).child(
-                                    div()
-                                        .mt(px(3.))
-                                        .text_size(px(11.))
-                                        .text_color(p.tx3)
-                                        .child(c.description),
-                                ),
+                                div()
+                                    .p(px(8.))
+                                    .rounded(px(10.))
+                                    .bg(p.card)
+                                    .border_1()
+                                    .border_color(p.line)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .px(px(6.))
+                                                    .py(px(1.))
+                                                    .rounded(px(6.))
+                                                    .bg(p.accs)
+                                                    .font_family(crate::theme::MONO_FONT)
+                                                    .text_size(px(11.5))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(p.acc)
+                                                    .child(format!("/{}", c.name)),
+                                            )
+                                            .when(!c.args_hint.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(p.tx3)
+                                                        .child(c.args_hint),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt(px(4.))
+                                            .text_size(px(11.))
+                                            .text_color(p.tx2)
+                                            .child(c.description),
+                                    ),
                             );
                         }
                     }
@@ -300,9 +354,10 @@ impl Drawer {
                         if self.has_running_tasks() {
                             card = card.child(
                                 super::agent_ui::step_actions().child(
-                                    super::agent_ui::step_action(
+                                    super::agent_ui::pill_action(
                                         "stop-all-tasks",
                                         "停止全部任务",
+                                        super::agent_ui::ActionTone::Danger,
                                         cx,
                                     )
                                     .on_click(cx.listener(|s, _, _, cx| s.stop_all_tasks(cx))),
@@ -357,26 +412,28 @@ impl Drawer {
                                             )
                                             .when(running, |d| {
                                                 d.child(
-                                                    Button::new(("local-stop", i * 1000 + n))
-                                                        .label("停止任务")
-                                                        .h(px(24.))
-                                                        .text_size(px(11.))
-                                                        .on_click(cx.listener(
-                                                            move |s, _, _, cx| {
-                                                                if s.fixture {
-                                                                    if let Some(t) = s
-                                                                        .fixture_tasks
-                                                                        .iter_mut()
-                                                                        .find(|t| t.id == id)
-                                                                    {
-                                                                        t.status = Status::Stopped;
-                                                                    }
-                                                                } else if let Some(t) = &s.tasks {
-                                                                    t.stop(&id);
+                                                    super::agent_ui::pill_action(
+                                                        ("local-stop", i * 1000 + n),
+                                                        "停止任务",
+                                                        super::agent_ui::ActionTone::Danger,
+                                                        cx,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |s, _, _, cx| {
+                                                            if s.fixture {
+                                                                if let Some(t) = s
+                                                                    .fixture_tasks
+                                                                    .iter_mut()
+                                                                    .find(|t| t.id == id)
+                                                                {
+                                                                    t.status = Status::Stopped;
                                                                 }
-                                                                cx.notify();
-                                                            },
-                                                        )),
+                                                            } else if let Some(t) = &s.tasks {
+                                                                t.stop(&id);
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
                                                 )
                                             }),
                                     )

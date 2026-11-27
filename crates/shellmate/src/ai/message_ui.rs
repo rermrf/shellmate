@@ -53,8 +53,8 @@ pub(super) fn message(
         .flex()
         .items_center()
         .justify_end()
-        .gap(px(4.))
-        .h(px(24.));
+        .gap(px(2.))
+        .h(px(20.));
     if let Some(sent_at) = sent_at_ms {
         let now = shellmate_ai::UserTurn::now_ms();
         meta = meta.child(

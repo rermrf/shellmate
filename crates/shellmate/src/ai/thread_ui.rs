@@ -282,21 +282,25 @@ impl Drawer {
             text.to_owned()
         };
         let scope = format!("{}:{id}:user:{index}", self.state.id);
+        let badge_fg = if user { p.acc } else { p.tx2 };
+        let badge_bg = if user { p.card } else { p.card3 };
         let mut message = div()
             .min_w_0()
             .w_full()
-            .p(px(10.))
-            .rounded(px(13.))
+            .p(px(12.))
+            .rounded(px(14.))
             .bg(if user { p.accs } else { p.card2 })
+            .border_1()
+            .border_color(if user { p.acc.opacity(0.14) } else { p.line })
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(p.tx3)
-                    .child(origin_label),
-            )
+            .gap(px(8.))
+            .child(div().flex().items_center().child(agent_ui::status_badge(
+                origin_label,
+                badge_fg,
+                badge_bg,
+                false,
+            )))
             .child(
                 super::subagent_ui::selectable(format!("{scope}:text"), &preview, w, cx)
                     .text_size(px(13.))
@@ -308,13 +312,14 @@ impl Drawer {
         let mut actions = agent_ui::step_actions();
         if long {
             actions = actions.child(
-                agent_ui::step_action(
+                agent_ui::pill_action(
                     SharedString::from(format!("{scope}:expand")),
                     if expanded {
                         "收起说明"
                     } else {
                         "展开完整说明"
                     },
+                    agent_ui::ActionTone::Card,
                     cx,
                 )
                 .on_click(cx.listener(move |s, _, _, cx| {
@@ -346,16 +351,36 @@ impl Drawer {
             .get(&resolved)
             .or_else(|| self.state.subagents.get(&id))
             .cloned();
+        let p = cx.palette().clone();
         let Some(view) = view else {
             return div()
-                .child("子任务记录不可用")
+                .w_full()
+                .h_full()
+                .rounded(px(18.))
+                .bg(p.card)
+                .p(px(24.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
                 .child(
-                    agent_ui::step_action("child-back-missing", "返回主对话", cx)
-                        .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
+                    div()
+                        .text_size(px(13.))
+                        .text_color(p.tx2)
+                        .child("子任务记录不可用"),
+                )
+                .child(
+                    agent_ui::pill_action(
+                        "child-back-missing",
+                        "返回主对话",
+                        agent_ui::ActionTone::Surface,
+                        cx,
+                    )
+                    .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
                 )
                 .into_any_element();
         };
-        let p = cx.palette().clone();
         let running = view.status == shellmate_ai::SubagentStatus::Running;
         let page = self.state.child_page.pages.entry(id.clone()).or_default();
         let unseen = !self.state.follow_bottom && page.seen != view.revision;
@@ -371,27 +396,37 @@ impl Drawer {
         } else {
             view.duration_ms / 1000
         };
+        let child_status = crate::ai::tool_model::child_status(&view.status);
+        let (badge_bg, badge_fg) = child_status.badge_colors(&p);
         let status = format!(
-            "{} · {} 步 · {}",
-            crate::ai::tool_model::child_status(&view.status).label(),
+            "{} 步 · {}",
             view.steps,
             crate::ai::tool_model::elapsed(secs * 1000)
         );
         let mut header = div()
             .flex_none()
-            .p(px(12.))
+            .px(px(16.))
+            .pt(px(14.))
+            .pb(px(12.))
+            .border_b_1()
+            .border_color(p.line)
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(8.))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .child(
-                        agent_ui::step_action("child-back", "← 主对话", cx)
-                            .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
+                        agent_ui::pill_action(
+                            "child-back",
+                            "← 主对话",
+                            agent_ui::ActionTone::Surface,
+                            cx,
+                        )
+                        .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
                     )
                     .child(
                         div()
@@ -399,43 +434,66 @@ impl Drawer {
                             .min_w(px(80.))
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.tx)
                             .child(view.description.clone()),
-                    ),
+                    )
+                    .child(agent_ui::status_badge(
+                        child_status.label(),
+                        badge_fg,
+                        badge_bg,
+                        child_status.has_dot(),
+                    )),
             )
             .child(div().text_size(px(11.5)).text_color(p.tx3).child(status))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
-                    .gap(px(12.))
+                    .gap(px(6.))
                     .child(
-                        agent_ui::step_action("child-prompt", "任务说明", cx).on_click(
-                            cx.listener(|s, _, _, cx| {
-                                s.state.follow_bottom = false;
-                                s.scroll.set_offset(point(px(0.), px(0.)));
-                                cx.notify();
-                            }),
-                        ),
+                        agent_ui::pill_action(
+                            "child-prompt",
+                            "任务说明",
+                            agent_ui::ActionTone::Surface,
+                            cx,
+                        )
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.state.follow_bottom = false;
+                            s.scroll.set_offset(point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        agent_ui::step_action("child-details", "运行信息", cx).on_click(
-                            cx.listener(|s, _, _, cx| {
-                                if let Some(id) = s.state.child_page.selected.clone() {
-                                    let p = s.state.child_page.pages.entry(id).or_default();
-                                    p.details = !p.details;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        agent_ui::pill_action(
+                            "child-details",
+                            "运行信息",
+                            if details {
+                                agent_ui::ActionTone::Accent
+                            } else {
+                                agent_ui::ActionTone::Surface
+                            },
+                            cx,
+                        )
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            if let Some(id) = s.state.child_page.selected.clone() {
+                                let p = s.state.child_page.pages.entry(id).or_default();
+                                p.details = !p.details;
+                            }
+                            cx.notify();
+                        })),
                     )
                     .when(!running, |d| {
                         let report = crate::ai::subagent_card::copy_report(&view);
                         d.child(
-                            agent_ui::step_action("child-copy-report", "复制报告", cx).on_click(
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(report.clone()))
-                                },
-                            ),
+                            agent_ui::pill_action(
+                                "child-copy-report",
+                                "复制报告",
+                                agent_ui::ActionTone::Surface,
+                                cx,
+                            )
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(report.clone()))
+                            }),
                         )
                     }),
             );
@@ -449,31 +507,42 @@ impl Drawer {
                     }
                 })
             });
-            header = header
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(p.tx2)
-                        .whitespace_normal()
-                        .child(format!(
-                            "{} · {}\n目录：{}\n模型：{} · 思考 {}",
-                            context
-                                .map(|c| c.label.as_str())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(&self.label),
-                            context
-                                .map(|c| c.protocol.as_str())
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(&self.protocol),
-                            view.cwd.as_deref().unwrap_or("历史记录未保存"),
-                            view.model,
-                            view.reasoning.label()
-                        )),
-                )
-                .children(
-                    crate::ai::subagent_card::meta(&view)
-                        .map(|meta| div().text_size(px(11.)).text_color(p.tx3).child(meta)),
-                );
+            header = header.child(
+                div()
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(p.card2)
+                    .border_1()
+                    .border_color(p.line)
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .line_height(px(18.))
+                            .text_color(p.tx2)
+                            .whitespace_normal()
+                            .child(format!(
+                                "{} · {}\n目录：{}\n模型：{} · 思考 {}",
+                                context
+                                    .map(|c| c.label.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&self.label),
+                                context
+                                    .map(|c| c.protocol.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(&self.protocol),
+                                view.cwd.as_deref().unwrap_or("历史记录未保存"),
+                                view.model,
+                                view.reasoning.label()
+                            )),
+                    )
+                    .children(
+                        crate::ai::subagent_card::meta(&view)
+                            .map(|meta| div().text_size(px(11.)).text_color(p.tx3).child(meta)),
+                    ),
+            );
         }
         let scope = format!("child:{}", view.id);
         let mut body = div()
@@ -641,12 +710,14 @@ impl Drawer {
         let mut footer = div()
             .on_drop(cx.listener(|s,paths: &ExternalPaths,_,cx|s.drop_images(paths,cx)))
             .flex_none()
-            .p(px(12.))
+            .pt(px(10.))
+            .px(px(16.))
+            .pb(px(14.))
             .border_t_1()
             .border_color(p.line)
             .flex()
             .flex_col()
-            .gap(px(6.));
+            .gap(px(8.));
         let other_approvals = self
             .state
             .active_steps
@@ -656,19 +727,44 @@ impl Drawer {
         if other_approvals > 0 {
             footer = footer.child(
                 div()
-                    .text_size(px(11.5))
-                    .text_color(p.warn)
-                    .child(format!("其他任务有 {other_approvals} 项待批准"))
+                    .p(px(10.))
+                    .rounded(px(12.))
+                    .bg(p.warns)
+                    .border_1()
+                    .border_color(p.warn.opacity(0.25))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .child(
-                        agent_ui::step_action("child-other-approvals", "返回查看", cx)
-                            .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.5))
+                            .text_color(p.warn)
+                            .child(format!("其他任务有 {other_approvals} 项待批准")),
+                    )
+                    .child(
+                        agent_ui::pill_action(
+                            "child-other-approvals",
+                            "返回查看",
+                            agent_ui::ActionTone::Card,
+                            cx,
+                        )
+                        .on_click(cx.listener(|s, _, w, cx| s.back_to_main(w, cx))),
                     ),
             );
         }
         if let Some(error) = error {
             footer = footer.child(
                 div()
+                    .p(px(10.))
+                    .rounded(px(12.))
+                    .bg(p.errs)
+                    .border_1()
+                    .border_color(p.err.opacity(0.25))
                     .text_size(px(12.))
+                    .line_height(px(18.))
                     .text_color(p.err)
                     .whitespace_normal()
                     .child(error),
@@ -678,16 +774,33 @@ impl Drawer {
             let target = id.clone();
             footer = footer.child(
                 div()
-                    .text_size(px(11.5))
-                    .text_color(p.tx2)
-                    .child(format!(
-                        "未发送：{}",
-                        text.question.chars().take(70).collect::<String>()
-                    ))
+                    .px(px(10.))
+                    .py(px(8.))
+                    .rounded(px(12.))
+                    .bg(p.card2)
+                    .border_1()
+                    .border_color(p.line)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .child(
-                        agent_ui::step_action(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(p.tx2)
+                            .child(format!(
+                                "未发送：{}",
+                                text.question.chars().take(70).collect::<String>()
+                            )),
+                    )
+                    .child(
+                        agent_ui::pill_action(
                             SharedString::from(format!("child-restore-{index}")),
                             "恢复消息",
+                            agent_ui::ActionTone::Card,
                             cx,
                         )
                         .on_click(cx.listener(move |s, _, w, cx| {
@@ -710,12 +823,16 @@ impl Drawer {
         }
         if unseen {
             footer = footer.child(
-                agent_ui::step_action("child-latest", "有新进展 · 回到最新", cx).on_click(
-                    cx.listener(|s, _, _, cx| {
-                        s.state.follow_bottom = true;
-                        cx.notify();
-                    }),
-                ),
+                agent_ui::pill_action(
+                    "child-latest",
+                    "有新进展 · 回到最新",
+                    agent_ui::ActionTone::Accent,
+                    cx,
+                )
+                .on_click(cx.listener(|s, _, _, cx| {
+                    s.state.follow_bottom = true;
+                    cx.notify();
+                })),
             );
         }
         if !queued.is_empty() {
@@ -735,33 +852,45 @@ impl Drawer {
         let mut actions = agent_ui::step_actions();
         if running {
             let stop = view.id.clone();
-            actions =
-                actions
-                    .child(agent_ui::step_action("child-now", "立即处理", cx).on_click(
-                        cx.listener(|s, _, w, cx| {
-                            let text = s.input.read(cx).value().to_string();
-                            s.send_to_child(text, true, w, cx);
-                        }),
-                    ))
-                    .child(
-                        agent_ui::step_action("child-stop", "停止任务", cx).on_click(cx.listener(
-                            move |s, _, _, cx| {
-                                if let Some(t) = &s.tasks {
-                                    t.stop(&stop);
-                                }
-                                cx.notify();
-                            },
-                        )),
-                    );
+            actions = actions
+                .child(
+                    agent_ui::pill_action(
+                        "child-now",
+                        "立即处理",
+                        agent_ui::ActionTone::Accent,
+                        cx,
+                    )
+                    .on_click(cx.listener(|s, _, w, cx| {
+                        let text = s.input.read(cx).value().to_string();
+                        s.send_to_child(text, true, w, cx);
+                    })),
+                )
+                .child(
+                    agent_ui::pill_action(
+                        "child-stop",
+                        "停止任务",
+                        agent_ui::ActionTone::Danger,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if let Some(t) = &s.tasks {
+                            t.stop(&stop);
+                        }
+                        cx.notify();
+                    })),
+                );
         }
+        let focused = self.input.focus_handle(cx).is_focused(w);
         footer = footer.children(self.media_composer(cx)).child(actions).child(
             div()
                 .flex()
                 .items_end()
-                .gap(px(6.))
-                .p(px(8.))
-                .rounded(px(13.))
+                .gap(px(8.))
+                .p(px(4.))
+                .rounded(px(14.))
                 .bg(p.card2)
+                .border_1()
+                .border_color(if focused { p.acc } else { p.line })
                 .child(self.image_picker(cx))
                 .child(
                     div()
@@ -783,6 +912,8 @@ impl Drawer {
                         crate::dialogs::Tone::Primary,
                         true,
                     )
+                    .px(px(14.))
+                    .rounded(px(10.))
                     .on_click(cx.listener(|s, _, w, cx| s.send_input(w, cx))),
                 ),
         );

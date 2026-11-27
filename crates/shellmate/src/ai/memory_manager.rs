@@ -11,7 +11,6 @@ use crate::{
 use gpui::{
     component::{
         Sizable, Size,
-        button::Button,
         input::{InputEvent, InputState, Textarea, TextareaState},
     },
     prelude::*,
@@ -355,8 +354,11 @@ impl MemoryManager {
                     .justify_between()
                     .child(section("记忆", p))
                     .child(
-                        Button::new("memory-new")
-                            .label("新建记忆")
+                        dialogs::button("memory-new", "新建记忆", dialogs::Tone::Primary, true)
+                            .h(px(28.))
+                            .px(px(12.))
+                            .rounded(px(9.))
+                            .text_size(px(12.))
                             .on_click(cx.listener(|s, _, w, cx| s.new_file(w, cx))),
                     ),
             );
@@ -781,11 +783,12 @@ fn grouped_card(p: &crate::theme::Palette) -> Div {
 fn neutral_chip(label: impl Into<SharedString>, p: &crate::theme::Palette) -> Div {
     div()
         .flex_none()
-        .px(px(5.))
+        .px(px(7.))
         .py(px(2.))
-        .rounded(px(5.))
+        .rounded(px(8.))
         .bg(p.card3)
-        .text_size(px(10.))
+        .text_size(px(10.5))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(p.tx2)
         .child(label.into())
 }

@@ -1,6 +1,5 @@
 //! A shared, quiet disclosure for provider-exposed reasoning in either transcript.
 use super::*;
-use gpui::component::button::ButtonVariants as _;
 use shellmate_ai::ThinkingBlock;
 #[derive(Default)]
 struct Disclosure {
@@ -35,17 +34,25 @@ impl Drawer {
         let header = div()
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(px(6.))
             .child(
-                Button::new(SharedString::from(format!("{id}:toggle")))
-                    .ghost()
+                div()
+                    .id(SharedString::from(format!("{id}:toggle")))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
                     .h(px(28.))
-                    .px(px(6.))
-                    .rounded(px(8.))
+                    .px(px(10.))
+                    .rounded(px(10.))
+                    .bg(p.card2)
+                    .hover(|d| d.bg(p.card3))
                     .text_size(px(12.))
-                    .text_color(p.tx3)
-                    .icon(crate::icons::group_chevron(expanded))
-                    .label(label)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(p.tx2)
+                    .child(crate::icons::group_chevron(expanded).text_color(p.tx3))
+                    .when(live, |d| d.child(crate::ui::dot(p.acc, 6.)))
+                    .child(label)
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.state.follow_bottom = false;
                         state.update(cx, |state, cx| {
@@ -62,16 +69,37 @@ impl Drawer {
                     .flex_none()
                     .min_w_0()
                     .w_full()
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(10.))
+                    .p(px(12.))
+                    .rounded(px(14.))
                     .bg(p.card2)
+                    .border_1()
+                    .border_color(p.line)
+                    .flex()
+                    .items_stretch()
+                    .gap(px(10.))
                     .child(
-                        super::subagent_ui::selectable(format!("{id}:body"), &block.text, w, cx)
-                            .text_size(px(12.))
-                            .line_height(px(19.))
-                            .text_color(p.tx2)
-                            .whitespace_normal(),
+                        div()
+                            .flex_none()
+                            .w(px(2.))
+                            .rounded_full()
+                            .bg(p.acc.opacity(0.45)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                super::subagent_ui::selectable(
+                                    format!("{id}:body"),
+                                    &block.text,
+                                    w,
+                                    cx,
+                                )
+                                .text_size(px(12.))
+                                .line_height(px(19.))
+                                .text_color(p.tx2)
+                                .whitespace_normal(),
+                            ),
                     ),
             );
         }

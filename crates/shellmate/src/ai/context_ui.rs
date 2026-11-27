@@ -117,16 +117,32 @@ impl Drawer {
                     .h(px(if self.capabilities.available() {
                         26.
                     } else {
-                        17.
+                        22.
                     }))
                     .line_height(px(15.))
                     .flex()
                     .items_center()
                     .gap(px(5.))
-                    .px(px(4.))
+                    .px(px(8.))
+                    .rounded(px(9.))
+                    .bg(if meter.amber() { p.warns } else { p.card2 })
+                    .border_1()
+                    .border_color(if meter.amber() {
+                        p.warn.opacity(0.28)
+                    } else {
+                        p.line
+                    })
                     .text_size(px(11.5))
-                    .text_color(p.tx2)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(if meter.amber() { p.warn } else { p.tx2 })
                     .cursor_pointer()
+                    .hover(|d| {
+                        d.bg(if meter.amber() {
+                            p.warn.opacity(0.18)
+                        } else {
+                            p.card3
+                        })
+                    })
                     .child(ring(
                         fraction,
                         if meter.amber() { p.warn } else { p.acc },
@@ -289,8 +305,16 @@ impl Drawer {
                     .child(
                         Button::new("ai-context-compact")
                             .label("立即压缩")
-                            .h(px(24.))
-                            .text_size(px(11.))
+                            .h(px(26.))
+                            .px(px(10.))
+                            .rounded(px(8.))
+                            .text_size(px(11.5))
+                            .when(action != CompactAction::Disabled, |b| {
+                                b.bg(p.accs)
+                                    .text_color(p.acc)
+                                    .border_1()
+                                    .border_color(p.acc.opacity(0.28))
+                            })
                             .disabled(action == CompactAction::Disabled)
                             .on_click(cx.listener(|s, _, w, cx| {
                                 let action = context_view::compact_action(

@@ -8,10 +8,7 @@ use crate::{security::password::PasswordInput, theme::ActivePalette};
 use crate::ui::{Surface, field_input};
 use futures::StreamExt;
 use gpui::{
-    component::{
-        button::Button,
-        input::InputState,
-    },
+    component::input::InputState,
     prelude::*,
     *,
 };
@@ -401,14 +398,22 @@ impl Render for AiSettings {
                     .gap(px(8.))
                     .child(div().flex_1().text_size(px(13.)).child("API Key · 已保存"))
                     .child(
-                        Button::new("ai-key-replace")
-                            .label("替换")
-                            .on_click(cx.listener(|s, _, _, cx| s.replace_key(cx))),
+                        crate::dialogs::button(
+                            "ai-key-replace",
+                            "替换",
+                            crate::dialogs::Tone::Plain,
+                            true,
+                        )
+                        .on_click(cx.listener(|s, _, _, cx| s.replace_key(cx))),
                     )
                     .child(
-                        Button::new("ai-key-remove")
-                            .label("移除")
-                            .on_click(cx.listener(|s, _, w, cx| s.remove_key(w, cx))),
+                        crate::dialogs::button(
+                            "ai-key-remove",
+                            "移除",
+                            crate::dialogs::Tone::Danger,
+                            true,
+                        )
+                        .on_click(cx.listener(|s, _, w, cx| s.remove_key(w, cx))),
                     ),
             );
         } else {
@@ -454,61 +459,68 @@ impl Render for AiSettings {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .child(form)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(section_title("模型与接口", &p))
+                    .child(form),
+            )
             .child(self.limit_fields(cx))
             .child(self.web_card(cx))
             .child(
                 div()
-                    .p(px(18.))
-                    .rounded(px(18.))
-                    .bg(p.card)
+                    .flex_none()
+                    .mt(px(4.))
                     .flex()
-                    .items_center()
-                    .gap(px(12.))
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(section_title("对话记录", &p))
                     .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("保存对话"),
-                    )
-                    .child(
-                        crate::ui::Toggle::new("ai-save-history")
-                            .checked(self.save)
-                            .color(p.ok)
-                            .on_click(cx.listener(|s, v: &bool, _, cx| {
-                                if s.db
-                                    .borrow_mut()
-                                    .set_setting(
-                                        shellmate_store::ai::SAVE_CONVERSATIONS,
-                                        if *v { "1" } else { "0" },
-                                    )
-                                    .is_ok()
-                                {
-                                    s.save = *v;
-                                    s.notify_configuration(cx);
-                                }
-                                cx.notify();
-                            })),
+                        settings_card(cx)
+                            .child(settings_row(
+                                "保存对话",
+                                "在本地保留历史对话与摘要记录",
+                                crate::ui::Toggle::new("ai-save-history")
+                                    .checked(self.save)
+                                    .color(p.ok)
+                                    .on_click(cx.listener(|s, v: &bool, _, cx| {
+                                        if s.db
+                                            .borrow_mut()
+                                            .set_setting(
+                                                shellmate_store::ai::SAVE_CONVERSATIONS,
+                                                if *v { "1" } else { "0" },
+                                            )
+                                            .is_ok()
+                                        {
+                                            s.save = *v;
+                                            s.notify_configuration(cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                                cx,
+                            ))
+                            .child(settings_row(
+                                "清除全部对话",
+                                "删除本机保存的所有 AI 对话记录，无法撤销",
+                                crate::dialogs::button(
+                                    "ai-clear-all",
+                                    "清除全部对话",
+                                    crate::dialogs::Tone::Danger,
+                                    true,
+                                )
+                                .on_click(cx.listener(|s, _, w, cx| s.clear_all(w, cx))),
+                                cx,
+                            )),
                     ),
-            )
-            .child(
-                div().flex().justify_end().child(
-                    crate::dialogs::button(
-                        "ai-clear-all",
-                        "清除全部对话",
-                        crate::dialogs::Tone::Plain,
-                        true,
-                    )
-                    .text_color(p.err)
-                    .on_click(cx.listener(|s, _, w, cx| s.clear_all(w, cx))),
-                ),
             )
             .child(self.memory_card(cx))
             .children(
                 self.result
                     .clone()
-                    .map(|text| crate::dialogs::hint(text, &p)),
+                    .map(|text| crate::dialogs::notice(result_notice(&text), text, &p)),
             )
     }
 }
@@ -516,6 +528,29 @@ impl Render for AiSettings {
 fn segment(label: impl Into<SharedString>, active: bool, busy: bool) -> crate::ui::SegmentItem {
     let item = crate::ui::SegmentItem::new(label, active);
     if busy { item.disabled("正在处理，请稍候") } else { item }
+}
+fn section_title(title: &'static str, p: &crate::theme::Palette) -> Div {
+    div()
+        .flex_none()
+        .px(px(2.))
+        .text_size(px(14.))
+        .line_height(px(20.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(p.tx)
+        .child(title)
+}
+fn result_notice(text: &str) -> crate::dialogs::Notice {
+    if text.contains("成功")
+        || text.contains("已保存")
+        || text.contains("已清除")
+        || text.contains("已移除")
+    {
+        crate::dialogs::Notice::Info
+    } else if text.contains("失败") || text.contains("无效") || text.contains("错误") {
+        crate::dialogs::Notice::Error
+    } else {
+        crate::dialogs::Notice::Warn
+    }
 }
 fn settings_card(cx: &App) -> Div {
     div().flex_none().px(px(18.)).py(px(4.)).rounded(px(18.)).bg(cx.palette().card).flex().flex_col()

@@ -109,8 +109,12 @@ impl Drawer {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(3.))
-                        .py(px(4.))
+                        .gap(px(4.))
+                        .p(px(10.))
+                        .rounded(px(10.))
+                        .bg(p.card)
+                        .border_1()
+                        .border_color(p.line)
                         .child(div().text_size(px(11.)).text_color(p.tx3).child(domain));
                     row = row.child(
                         div()

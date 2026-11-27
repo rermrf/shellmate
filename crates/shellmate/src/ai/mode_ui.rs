@@ -43,18 +43,30 @@ impl Drawer {
                         .flex_none()
                         .flex()
                         .items_center()
-                        .gap(px(5.))
+                        .gap(px(6.))
                         .h(px(26.))
-                        .px(px(8.))
-                        .rounded(px(7.))
+                        .px(px(10.))
+                        .rounded(px(9.))
                         .bg(if full { p.errs } else { p.card2 })
+                        .border_1()
+                        .border_color(if full {
+                            p.err.opacity(0.28)
+                        } else {
+                            p.line
+                        })
                         .text_color(if full { p.err } else { p.tx2 })
                         .text_size(px(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .cursor_pointer()
                         .hover(|d| d.bg(if full { p.err.opacity(0.2) } else { p.card3 }))
                         .child(crate::icons::AppIcon::Shield.icon())
                         .child(if multiple {format!("默认：{}", current.label())} else {current.label().into()})
-                        .child("▾")
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(if full { p.err } else { p.tx3 })
+                                .child("▾"),
+                        )
                         .on_click(cx.listener(|s, _, w, cx| {
                             mode_popover::toggle(
                                 &mut s.permission_menu,
@@ -122,15 +134,24 @@ impl Drawer {
                                 .text_size(px(12.5))
                                 .child(
                                     div()
+                                        .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(if mode == PermissionMode::Full {
                                             p.err
+                                        } else if mode == current {
+                                            p.acc
                                         } else {
                                             p.tx
                                         })
                                         .child(mode.label()),
                                 )
                                 .when(mode == current, |d| {
-                                    d.child(div().text_size(px(11.)).text_color(p.tx2).child("✓"))
+                                    d.child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(p.acc)
+                                            .child("✓"),
+                                    )
                                 }),
                         )
                         .child(

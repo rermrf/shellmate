@@ -2,7 +2,6 @@ use super::*;
 use crate::ai::host::{Approval, Ui};
 use crate::ai::scroll::ScrollArea;
 use crate::dialogs::{self, DialogBody, Tone};
-use gpui::component::button::ButtonVariants;
 use gpui::component::input::{Textarea, TextareaState};
 use shellmate_ai::{
     Answer, AnswerItem, StepStatus,
@@ -58,14 +57,13 @@ impl Drawer {
             .id("running-command-list")
             .max_h(px(144.))
             .overflow_y_scroll()
+            .p(px(10.))
+            .rounded(px(12.))
+            .bg(p.card2)
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .pb(px(6.))
-            .mb(px(2.))
-            .border_b_1()
-            .border_color(p.line);
-        for task in running {
+            .gap(px(8.));
+        for (ix, task) in running.into_iter().enumerate() {
             let id = task.id.clone();
             let stop_id = id.clone();
             let output_id = task.output_id.clone();
@@ -73,15 +71,19 @@ impl Drawer {
                 task.destination.as_ref().map(|d| format!(" · {}", d.label)).unwrap_or_default(),
                 task.service.map(|s| format!(" · {}", s.label())).unwrap_or_default());
             strip = strip.child(
-                div().flex().flex_col().gap(px(3.)).min_w_0().text_size(px(11.5)).text_color(p.tx2)
+                div()
+                    .when(ix > 0, |d| d.pt(px(8.)).border_t_1().border_color(p.line))
+                    .flex().flex_col().gap(px(6.)).min_w_0().text_size(px(12.)).text_color(p.tx)
                     .child(div().flex().items_center().gap(px(6.)).min_w_0()
-                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(summary))
-                        .child(div().flex_none().text_color(p.tx3).child(format!("{}s", task.started.elapsed().as_secs()))))
-                    .child(div().flex().flex_wrap().items_center().gap(px(5.))
-                        .child(div().flex_none().px(px(5.)).py(px(2.)).rounded(px(5.)).bg(p.card3).child(task.target_label()))
-                        .child(step_action(SharedString::from(format!("task-output-{id}")), "查看输出", cx)
+                        .child(crate::ui::dot(p.acc, 6.))
+                        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(MONO_FONT).text_size(px(11.5)).child(summary))
+                        .child(div().flex_none().text_size(px(11.)).text_color(p.tx3).child(format!("{}s", task.started.elapsed().as_secs()))))
+                    .child(div().flex().flex_wrap().items_center().gap(px(6.))
+                        .child(status_badge(task.target_label(), p.tx2, p.card, false))
+                        .child(div().flex_1())
+                        .child(pill_action(SharedString::from(format!("task-output-{id}")), "查看输出", ActionTone::Card, cx)
                             .on_click(cx.listener(move |s, _, w, cx| s.reveal_output(&output_id, w, cx))))
-                        .child(Button::new(SharedString::from(format!("task-stop-{id}"))).label("停止").h(px(24.)).text_size(px(11.5))
+                        .child(pill_action(SharedString::from(format!("task-stop-{id}")), "停止", ActionTone::Danger, cx)
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 if s.fixture {
                                     if let Some(task) = s.fixture_tasks.iter_mut().find(|t| t.id == stop_id) {
@@ -380,13 +382,41 @@ impl Drawer {
         let detail=if let Some(target)=&step.call.destination{format!("{} · {} · {} · {}",target.label,target.protocol,target.cwd.as_deref().unwrap_or("目录未知"),detail)}else{detail};
         let model=super::tool_ui::Card{key:display_key.clone(),title:"执行命令".into(),status,duration:step.started.map(|t|t.elapsed().as_millis().min(u64::MAX as u128)as u64),summary:step.call.command.clone(),detail};
         let mut card=self.tool_shell(&model,cx);
-        if red&&step.started.is_none(){card=card.child(div().text_size(px(12.)).text_color(p.err).font_weight(FontWeight::SEMIBOLD).child("高危命令，需要确认"));}
+        if red&&step.started.is_none(){
+            card = card
+                .border_color(p.err.opacity(0.45))
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(10.))
+                        .bg(p.errs)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .text_color(p.err)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(crate::ui::dot(p.err, 6.))
+                        .child("高危命令，需要确认"),
+                );
+        }
         if expanded {card=card.child(super::tool_ui::section("输入",&p));
         card = if let Some(edit) = &step.edit {
             card.child(
-                Textarea::new(edit)
-                    .text_size(px(12.5))
-                    .font_family(MONO_FONT),
+                div()
+                    .p(px(8.))
+                    .rounded(px(12.))
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.acc)
+                    .child(
+                        Textarea::new(edit)
+                            .appearance(false)
+                            .p_0()
+                            .text_size(px(12.5))
+                            .font_family(MONO_FONT),
+                    ),
             )
         } else {
             card.child(command_block(
@@ -400,52 +430,73 @@ impl Drawer {
         if step.started.is_some() {
             if expanded && let Some(output)=self.state.output_panes.get(&display_key){card=card.child(super::tool_ui::section("输出",&p)).child(output.clone());}
             let scope=scope.clone();let call_id=step.call.id.clone();
-            card=card.child(step_actions().child(step_action(SharedString::from(format!("{display_key}:stop")),"停止任务",cx).on_click(cx.listener(move|s,_,_,cx|{if let Some(tasks)=s.tool_tasks(&scope)&&let Some(task)=s.tool_task(&scope,&call_id,None){tasks.stop(&task.id);}cx.notify();}))));
+            card=card.child(step_actions().pt(px(8.)).border_t_1().border_color(p.line).child(pill_action(SharedString::from(format!("{display_key}:stop")),"停止任务",ActionTone::Danger,cx).on_click(cx.listener(move|s,_,_,cx|{if let Some(tasks)=s.tool_tasks(&scope)&&let Some(task)=s.tool_task(&scope,&call_id,None){tasks.stop(&task.id);}cx.notify();}))));
         } else {
             let caps = step.call.session_id.as_deref().and_then(|id| {
                 self.runtime.as_ref()?.router.catalog.resolve(id).ok().map(|e| e.binding.capabilities)
             }).unwrap_or_else(|| self.capabilities.clone());
             if caps.terminal && caps.background {
-                let mut row = div().flex().gap(px(4.));
+                let mut track = div()
+                    .flex()
+                    .items_center()
+                    .self_start()
+                    .gap(px(2.))
+                    .p(px(2.))
+                    .rounded(px(10.))
+                    .bg(p.card3);
                 for target in [Target::Terminal, Target::Background] {
-                    row = row.child(
-                        dialogs::button(
-                            if target == Target::Terminal {
+                    let active = target == step.call.target;
+                    track = track.child(
+                        div()
+                            .id(if target == Target::Terminal {
                                 "ai-target-terminal"
                             } else {
                                 "ai-target-background"
-                            },
-                            target.label(),
-                            if target == step.call.target {
-                                Tone::Primary
-                            } else {
-                                Tone::Plain
-                            },
-                            true,
-                        )
-                        .h(px(25.))
-                        .text_size(px(11.))
-                        .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| {
-                            if let Some(step) = s.state.active_steps.get_mut(&key) {
-                                step.call.target = target;
-                            }
-                            cx.notify();
-                        } })),
+                            })
+                            .h(px(26.))
+                            .px(px(12.))
+                            .rounded(px(8.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(11.5))
+                            .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                            .text_color(if active { p.tx } else { p.tx2 })
+                            .when(active, |d| d.bg(p.card).shadow(crate::ui::item_shadow(&p)))
+                            .when(!active, |d| d.hover(|d| d.text_color(p.tx)))
+                            .child(target.label())
+                            .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| {
+                                if let Some(step) = s.state.active_steps.get_mut(&key) {
+                                    step.call.target = target;
+                                }
+                                cx.notify();
+                            } })),
                     );
                 }
-                card = card.child(row);
+                card = card.child(track);
             }
             if let Some(reason) = &step.reason {
                 card = card.child(crate::ui::field_input(reason, crate::ui::Surface::Card2, false)).child(
-                    dialogs::button("ai-step-deny-confirm", "确认拒绝", Tone::Plain, true)
-                        .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, true, cx) })),
+                    div().flex().justify_end().child(
+                        pill_action("ai-step-deny-confirm", "确认拒绝", ActionTone::Danger, cx)
+                            .h(px(32.))
+                            .px(px(14.))
+                            .rounded(px(10.))
+                            .text_size(px(12.5))
+                            .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, true, cx) })),
+                    ),
                 );
             } else {
                 card = card.child(
                     div()
+                        .pt(px(8.))
+                        .border_t_1()
+                        .border_color(p.line)
                         .flex()
                         .flex_wrap()
-                        .gap(px(6.))
+                        .items_center()
+                        .gap(px(8.))
                         .child(
                             dialogs::button(
                                 "ai-step-run",
@@ -453,11 +504,20 @@ impl Drawer {
                                 if red { Tone::Danger } else { Tone::Primary },
                                 true,
                             )
+                            .h(px(32.))
+                            .px(px(14.))
+                            .rounded(px(10.))
+                            .text_size(px(12.5))
                             .on_click(cx.listener({ let key=key.clone(); move |s, _, _, cx| s.approve(&key, false, cx) })),
                         )
                         .child(
-                            dialogs::button("ai-step-edit", "编辑", Tone::Plain, true).on_click(
-                                cx.listener({ let key=key.clone(); move |s, _, w, cx| {
+                            pill_action("ai-step-edit", "编辑", ActionTone::Card, cx)
+                                .h(px(32.))
+                                .px(px(12.))
+                                .rounded(px(10.))
+                                .text_size(px(12.5))
+                                .text_color(p.tx)
+                                .on_click(cx.listener({ let key=key.clone(); move |s, _, w, cx| {
                                     if let Some(step) = s.state.active_steps.get_mut(&key) {
                                         let command = step.call.command.clone();
                                         let edit = cx.new(|cx| {
@@ -472,20 +532,22 @@ impl Drawer {
                                         step.edit = Some(edit);
                                     }
                                     cx.notify();
-                                } }),
-                            ),
+                                } })),
                         )
                         .child(
-                            dialogs::button("ai-step-deny", "拒绝", Tone::Plain, true).on_click(
-                                cx.listener({ let key=key.clone(); move |s, _, w, cx| {
+                            pill_action("ai-step-deny", "拒绝", ActionTone::Danger, cx)
+                                .h(px(32.))
+                                .px(px(12.))
+                                .rounded(px(10.))
+                                .text_size(px(12.5))
+                                .on_click(cx.listener({ let key=key.clone(); move |s, _, w, cx| {
                                     if let Some(step) = s.state.active_steps.get_mut(&key) {
                                         step.reason = Some(cx.new(|cx| {
                                             InputState::new(w, cx).placeholder("拒绝原因（可选）")
                                         }));
                                     }
                                     cx.notify();
-                                } }),
-                            ),
+                                } })),
                         ),
                 );
             }
@@ -494,8 +556,92 @@ impl Drawer {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActionTone {
+    Surface,
+    Card,
+    Accent,
+    Warn,
+    Danger,
+    Quiet,
+}
+
+pub(super) fn status_badge(
+    label: impl Into<SharedString>,
+    fg: Hsla,
+    bg: Hsla,
+    with_dot: bool,
+) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(8.))
+        .py(px(2.))
+        .rounded(px(8.))
+        .bg(bg)
+        .text_size(px(11.))
+        .line_height(px(15.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
+        .when(with_dot, |d| d.child(crate::ui::dot(fg, 5.)))
+        .child(label.into())
+}
+
+pub(super) fn pill_action(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    tone: ActionTone,
+    cx: &App,
+) -> Stateful<Div> {
+    let p = cx.palette();
+    let base = div()
+        .id(id.into())
+        .flex_none()
+        .h(px(26.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(4.))
+        .text_size(px(11.5))
+        .line_height(px(15.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child(label.into());
+    match tone {
+        ActionTone::Surface => base
+            .bg(p.card2)
+            .text_color(p.tx2)
+            .hover(|d| d.bg(p.card3).text_color(p.tx)),
+        ActionTone::Card => base
+            .bg(p.card)
+            .border_1()
+            .border_color(p.line)
+            .text_color(p.tx2)
+            .hover(|d| d.bg(p.card3).text_color(p.tx)),
+        ActionTone::Accent => base
+            .bg(p.accs)
+            .text_color(p.acc)
+            .hover(|d| d.bg(p.acc.opacity(0.18))),
+        ActionTone::Warn => base
+            .bg(p.warns)
+            .text_color(p.warn)
+            .hover(|d| d.bg(p.warn.opacity(0.2))),
+        ActionTone::Danger => base
+            .bg(p.errs)
+            .text_color(p.err)
+            .hover(|d| d.bg(p.err.opacity(0.18))),
+        ActionTone::Quiet => base
+            .text_color(p.tx2)
+            .hover(|d| d.bg(p.card2).text_color(p.acc)),
+    }
+}
+
 pub(super) fn step_surface(p: &crate::theme::Palette) -> Div {
-    div().p(px(10.)).rounded(px(12.)).bg(p.card2)
+    div().p(px(12.)).rounded(px(14.)).bg(p.card2)
 }
 
 pub(super) fn step_actions() -> Div {
@@ -505,28 +651,11 @@ pub(super) fn step_actions() -> Div {
         .flex()
         .items_center()
         .justify_end()
-        .gap(px(12.))
+        .gap(px(6.))
 }
 
-pub(super) fn step_action(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Button {
-    let label = label.into();
-    let p = cx.palette();
-    Button::new(id)
-        .text()
-        .h(px(24.))
-        .accessibility_label(label.clone())
-        // Button's built-in label applies its own size and hover foreground.
-        // Style the content directly to keep these controls at 12.5 px / tx2.
-        .child(
-            div()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .text_size(px(12.5))
-                .text_color(p.tx2)
-                .hover(|style| style.text_color(p.acc))
-                .child(label),
-        )
+pub(super) fn step_action(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Stateful<Div> {
+    pill_action(id, label, ActionTone::Card, cx)
 }
 
 pub(super) fn command_block(command: &str, id: SharedString, selection: Entity<crate::ai::selection_scroll::SelectionScroll>, cx: &App) -> Div {
@@ -543,16 +672,19 @@ pub(super) fn command_block(command: &str, id: SharedString, selection: Entity<c
     ).selection(selection))
 }
 pub(super) fn output_scroll(id:SharedString,content:Div,expanded:bool,selection:Entity<crate::ai::selection_scroll::SelectionScroll>,p:&crate::theme::Palette)->ScrollArea{
-    ScrollArea::new(id,div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content),p.card2).selection(selection).height_limit(if expanded{320.}else{8.*18.},expanded)
+    ScrollArea::new(id,div().flex().flex_col().items_start().text_size(px(12.5)).line_height(px(18.)).font_family(MONO_FONT).whitespace_nowrap().text_color(p.tx2).child(content),p.card).selection(selection).height_limit(if expanded{320.}else{8.*18.},expanded)
 }
 pub(super) fn command_surface(cx: &App) -> Div {
+    let p = cx.palette();
     div()
         .min_w_0()
-        .p(px(11.))
-        .rounded(px(10.))
+        .p(px(12.))
+        .rounded(px(12.))
         .bg(shellmate_term::colors::to_hsla(
             cx.terminal_style().palette.background,
         ))
+        .border_1()
+        .border_color(p.line)
         .text_color(shellmate_term::colors::to_hsla(
             cx.terminal_style().palette.foreground,
         ))
