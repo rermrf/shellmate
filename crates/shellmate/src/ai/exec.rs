@@ -267,10 +267,11 @@ impl Executor for AppExecutor {
         text: &str,
         immediate: bool,
         resume: bool,
+        image_ids: Vec<String>,
         call_id: &str,
     ) -> futures::future::BoxFuture<'_, shellmate_ai::agent::LocalResult> {
         match &self.subagents {
-            Some(service) => service.message(id, text, immediate, resume, call_id),
+            Some(service) => service.message_images(id, text, immediate, resume, call_id, image_ids, shellmate_ai::MessageOrigin::Parent),
             None => Box::pin(async {
                 shellmate_ai::agent::LocalResult::error("当前会话不支持追加子任务消息")
             }),
@@ -378,7 +379,7 @@ impl Executor for AppExecutor {
             return Box::pin(async move {
                 self.memory.as_ref().map_or_else(
                     || shellmate_ai::agent::LocalResult {
-                        subagent: None,
+                        attachments: Vec::new(), subagent: None,
                         inline: "记忆存储不可用".into(),
                         output_id: None,
                         is_error: true,

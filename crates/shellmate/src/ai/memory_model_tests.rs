@@ -178,7 +178,7 @@ fn memory_command_is_local_while_busy_and_focus_uses_scope_not_notice_text() {
                 args_json: args,
             },
             result: LoggedResult {
-                subagent: None,
+                attachments: Vec::new(), subagent: None,
                 inline: "unrelated result text".into(),
                 output_id: None,
                 cleared: false,

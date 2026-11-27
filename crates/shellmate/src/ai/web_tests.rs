@@ -278,7 +278,7 @@ async fn child_uses_shared_web_service_and_fetch_output_survives_history_reopen(
             args_json: serde_json::json!({"url":"https://example.com/docs"}),
         },
         result: LoggedResult {
-            inline: result.inline,
+            attachments: Vec::new(), inline: result.inline,
             output_id: Some(id.clone()),
             is_error: false,
             cleared: false,

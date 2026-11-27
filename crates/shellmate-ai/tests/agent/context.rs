@@ -107,7 +107,7 @@ fn logged_step(n: usize, text: String, output_id: Option<String>) -> Entry {
             args_json: args(&format!("echo {n}")),
         },
         result: LoggedResult {
-            subagent: None,
+            attachments: Vec::new(), subagent: None,
             inline: text.clone(),
             output_id,
             cleared: false,

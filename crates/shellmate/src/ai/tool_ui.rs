@@ -53,7 +53,7 @@ impl Drawer {
             message_id: 1,
             call,
             result: LoggedResult {
-                inline: display.output.clone(),
+                attachments: Vec::new(), inline: display.output.clone(),
                 output_id: None,
                 is_error: false,
                 cleared: false,
@@ -73,7 +73,7 @@ impl Drawer {
             cached: false,
             note: None,
         };
-        self.state.model.conversation.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"search".into(),name:"web_search".into(),args_json:serde_json::json!({"query":"nginx upstream timed out 官方文档","max_results":5})},result:LoggedResult{inline:serde_json::to_string(&search).unwrap(),output_id:None,is_error:false,cleared:false,subagent:None},display:None}));
+        self.state.model.conversation.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"search".into(),name:"web_search".into(),args_json:serde_json::json!({"query":"nginx upstream timed out 官方文档","max_results":5})},result:LoggedResult{attachments: Vec::new(), inline:serde_json::to_string(&search).unwrap(),output_id:None,is_error:false,cleared:false,subagent:None},display:None}));
         let mut view = crate::proto::subagents::view("agent-1", "检查应用连接池");
         view.background = true;
         view.duration_ms = 138_000;
@@ -89,7 +89,7 @@ impl Drawer {
                 args_json: serde_json::json!({"description":view.description,"prompt":view.prompt}),
             },
             result: LoggedResult {
-                inline: view.report.clone(),
+                attachments: Vec::new(), inline: view.report.clone(),
                 output_id: view.output_id.clone(),
                 is_error: false,
                 cleared: false,
@@ -314,7 +314,7 @@ impl Drawer {
         let web = result
             .filter(|r| !r.is_error)
             .and_then(|r| serde_json::from_str::<shellmate_ai::web::ResultData>(&r.inline).ok());
-        let summary = if call.name == "run_command" {
+        let summary = if call.name == "view_image" { result.and_then(|r|r.attachments.first()).map(|a|a.name.clone()).unwrap_or_else(||"读取会话中的图片".into()) } else if call.name == "run_command" {
             model::command(call, display).to_owned()
         } else {
             model::summary(call)
@@ -355,6 +355,7 @@ impl Drawer {
             } else {
                 match call.name.as_str() {
                     "read_output" => "已读取执行输出",
+                    "view_image" => "已读取图片",
                     "memory" => "记忆操作已完成",
                     "wait_tasks" => "等待已返回，展开查看任务结果",
                     "stop_task" => "停止请求已处理",
@@ -482,7 +483,9 @@ impl Drawer {
                     .whitespace_normal(),
                 );
             }
-            if let Some(data) = &web {
+            if let Some(r)=result && !r.attachments.is_empty() {
+                surface=surface.children(self.message_images(&id,&r.attachments,cx));
+            } else if let Some(data) = &web {
                 surface = surface
                     .child(section("结果", &p))
                     .child(self.web_content(&id, data, true, w, cx));

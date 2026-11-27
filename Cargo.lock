@@ -7631,9 +7631,12 @@ dependencies = [
 name = "shellmate-ai"
 version = "0.4.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
+ "image",
  "rig-core",
  "serde_json",
+ "sha2 0.11.1",
  "shellmate-core",
  "tempfile",
  "thiserror 2.0.21",

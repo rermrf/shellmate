@@ -60,7 +60,7 @@ impl Command {
         match result {
             Ok(text) => LocalResult::text(text),
             Err(error) => LocalResult {
-                subagent: None,
+                attachments: Vec::new(), subagent: None,
                 inline: format!("memory：{error}"),
                 output_id: None,
                 is_error: true,

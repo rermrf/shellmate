@@ -79,7 +79,7 @@ pub fn scene(name: &str, conversation: &str) -> Option<Fixture> {
             args_json: serde_json::json!({"command":command,"target":"background","service":if running {serde_json::json!({"ready_pattern":"Local:"})} else {serde_json::Value::Null}}),
         },
         result: LoggedResult {
-            inline: out.wire_text(),
+            attachments: Vec::new(), inline: out.wire_text(),
             output_id: Some("fixture-output".into()),
             is_error: false,
             cleared: false,

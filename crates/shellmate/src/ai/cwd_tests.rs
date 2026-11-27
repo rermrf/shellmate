@@ -322,7 +322,7 @@ async fn no_osc7_pty_directory_is_shared_by_main_and_child_and_pinned_for_the_tu
     };
     // Changing the visible shell after the turn starts must not silently retarget its child.
     shell.cd(&other).await;
-    let request = shellmate_ai::SubagentRequest {
+    let request = shellmate_ai::SubagentRequest { image_ids: Vec::new(),
         session_ids: vec![],
         default_session_id: None,
         description: "inspect project".into(),

@@ -1038,3 +1038,6 @@ async fn side_question_has_no_tools_and_does_not_modify_the_main_conversation() 
 
 #[path = "providers/responses.rs"]
 mod responses_tests;
+
+#[path = "providers/images.rs"]
+mod image_tests;

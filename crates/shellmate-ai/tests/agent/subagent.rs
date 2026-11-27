@@ -6,7 +6,7 @@ use shellmate_ai::{
 use std::sync::atomic::AtomicBool;
 
 fn request(kind: SubagentKind) -> SubagentRequest {
-    SubagentRequest {
+    SubagentRequest { image_ids: Vec::new(),
         session_ids: vec![],
         default_session_id: None,
         description: "检查入口服务".into(),
@@ -21,7 +21,7 @@ fn delegation() -> Value {
     json!({"description":"检查入口服务","prompt":"检查 nginx 状态","run_in_background":false})
 }
 fn context() -> SubagentContext {
-    SubagentContext {
+    SubagentContext { attachments: Vec::new(),
         sent_at_ms: None,
         origin: None,
         id: "agent-test".into(),
@@ -1297,7 +1297,7 @@ async fn main_agent_steps_are_cleared_by_tier_one_and_background_is_host_schedul
         fn subagent(&self, request: SubagentRequest, _: &str) -> BoxFuture<'_, LocalResult> {
             assert!(request.background);
             Box::pin(async {
-                LocalResult {
+                LocalResult { attachments: Vec::new(),
                     // Leave room for system/tool guidance after retaining the newest five reports.
                     inline: "report\n".repeat(5000),
                     output_id: Some("saved-report".into()),

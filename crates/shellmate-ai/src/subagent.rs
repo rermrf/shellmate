@@ -33,6 +33,8 @@ pub struct SubagentRef {
 #[serde(crate = "rig_core::serde")]
 pub struct SubagentRequest {
     #[serde(default)]
+    pub image_ids: Vec<String>,
+    #[serde(default)]
     pub session_ids: Vec<String>,
     #[serde(default)]
     pub default_session_id: Option<String>,
@@ -49,6 +51,8 @@ impl SubagentRequest {
         #[serde(crate = "rig_core::serde", deny_unknown_fields)]
         struct Args {
             #[serde(default)]
+            image_ids: Vec<String>,
+            #[serde(default)]
             session_ids: Vec<String>,
             default_session_id: Option<String>,
             description: String,
@@ -60,6 +64,7 @@ impl SubagentRequest {
             model: Option<String>,
             reasoning: Option<String>,
         }
+        crate::media::parse_ids(args.get("image_ids"))?;
         let args: Args = serde_json::from_value(args)
             .map_err(|_| "子任务参数无效：需要 description、prompt，其他参数类型也必须正确")?;
         let description = args.description.trim();
@@ -98,6 +103,7 @@ impl SubagentRequest {
             })
             .transpose()?;
         Ok(Self {
+            image_ids: args.image_ids,
             session_ids: args.session_ids,
             default_session_id: args.default_session_id,
             description,
@@ -116,7 +122,7 @@ pub fn message_tool() -> ToolDefinition {
     ToolDefinition::new(
         ToolName::new("send_agent_message").unwrap(),
         "向本会话已有子任务追加消息。运行中会排队，immediate=true 尽快处理并让它等待中的命令继续运行；已结束时 resume=true 用原上下文继续。用户停止的任务只有用户明确要求继续时才可 resume。",
-        serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"},"immediate":{"type":"boolean","default":false},"resume":{"type":"boolean","default":false}},"required":["id","message"],"additionalProperties":false}),
+        serde_json::json!({"type":"object","properties":{"image_ids":{"type":"array","items":{"type":"string"},"maxItems":8,"description":"本会话图片引用，将实际图片传给子任务"},"id":{"type":"string"},"message":{"type":"string"},"immediate":{"type":"boolean","default":false},"resume":{"type":"boolean","default":false}},"required":["id","message"],"additionalProperties":false}),
     )
 }
 pub fn agent_tool(main: &Config) -> ToolDefinition {
@@ -132,6 +138,7 @@ pub fn agent_tool(main: &Config) -> ToolDefinition {
             reasoning.join(", ")
         ),
         serde_json::json!({"type":"object","properties":{
+            "image_ids":{"type":"array","items":{"type":"string"},"maxItems":8,"description":"需要子任务查看的图片引用；实际图片随委派消息传入"},
             "session_ids":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"供子任务参考的终端引用；不是资源白名单。省略继承父任务上下文，子任务仍可发现其他终端。"},"default_session_id":{"type":"string"},"description":{"type":"string","description":"一句话标题，最多 30 字"},"prompt":{"type":"string","description":"完整、自包含的任务说明"},
             "run_in_background":{"type":"boolean","default":true,"description":"默认异步启动子任务，让主代理继续工作；不限制子任务命令执行通道。需要结果时用 wait_tasks 等待，用户仍可补充指令"},
             "model":{"type":"string","description":"仅用户要求时指定同一服务商下的模型 ID","maxLength":256},
@@ -184,6 +191,8 @@ pub struct SubagentOutcome {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct SubagentContext {
+    #[serde(default)]
+    pub attachments: Vec<crate::Attachment>,
     #[serde(default)]
     pub sent_at_ms: Option<i64>,
     #[serde(default)]
@@ -300,6 +309,7 @@ impl ToolHost for ChildHost<'_> {
     fn local_tool(&self, tool: LocalTool, limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async move {
             let allowed = match &tool {
+                LocalTool::ViewImage { .. } => true,
                 LocalTool::Web(_) => self.inner.web_enabled(),
                 LocalTool::Sessions(_) => self.inner.sessions_enabled(),
                 LocalTool::Memory(_) | LocalTool::ScopedMemory { .. } => self.snapshot.auto_memory,
@@ -447,6 +457,7 @@ pub async fn run_from_history(
         context.snapshot,
         context.origin,
         context.sent_at_ms,
+        context.attachments,
     );
     let initial_entries = transcript.entries().len();
     let caps = Capabilities {
@@ -605,6 +616,7 @@ pub fn prepare_history(
     context: ContextSnapshot,
     origin: Option<crate::MessageOrigin>,
     sent_at_ms: Option<i64>,
+    attachments: Vec<crate::Attachment>,
 ) {
     if !log.entries().is_empty() {
         log.append(Entry::Notice {
@@ -612,7 +624,7 @@ pub fn prepare_history(
             text: "继续执行".into(),
         });
     }
-    log.push_user_from(UserTurn::new(prompt, context).sent_at(sent_at_ms), origin);
+    log.push_user_from(UserTurn::new(prompt, context).with_attachments(attachments).sent_at(sent_at_ms), origin);
 }
 fn partial_report(log: &Conversation) -> String {
     if let Some(group) = log.entries().iter().rev().find_map(|e| {
@@ -707,7 +719,7 @@ pub fn subagent_result(
         outcome.model
     );
     LocalResult {
-        inline: format!("{failure}{report}{id}\n{footer}"),
+        attachments: Vec::new(), inline: format!("{failure}{report}{id}\n{footer}"),
         output_id: output_id.clone(),
         is_error: matches!(
             outcome.status,

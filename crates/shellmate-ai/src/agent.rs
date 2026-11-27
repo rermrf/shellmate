@@ -187,6 +187,7 @@ pub struct ReadOutput {
 }
 #[derive(Clone, Debug)]
 pub enum LocalTool {
+    ViewImage { id: String },
     Sessions(crate::session_tools::Request),
     ScopedMemory {
         session_id: String,
@@ -205,6 +206,7 @@ pub enum LocalTool {
 }
 #[derive(Clone, Debug)]
 pub struct LocalResult {
+    pub attachments: Vec<crate::Attachment>,
     pub subagent: Option<Box<crate::SubagentDisplay>>,
     pub inline: String,
     pub output_id: Option<String>,
@@ -220,6 +222,7 @@ impl LocalResult {
 
     pub fn text(inline: impl Into<String>) -> Self {
         Self {
+            attachments: Vec::new(),
             subagent: None,
             inline: inline.into(),
             output_id: None,
@@ -303,6 +306,7 @@ pub trait ToolHost: Send + Sync {
         _text: &str,
         _immediate: bool,
         _resume: bool,
+        _image_ids: Vec<String>,
         _call_id: &str,
     ) -> BoxFuture<'_, LocalResult> {
         Box::pin(async { LocalResult::error("当前主机不支持追加子任务消息") })
@@ -332,7 +336,7 @@ pub trait ToolHost: Send + Sync {
     fn local_tool(&self, _tool: LocalTool, _limits: ExecLimits) -> BoxFuture<'_, LocalResult> {
         Box::pin(async {
             LocalResult {
-                subagent: None,
+                attachments: Vec::new(), subagent: None,
                 inline: "此主机不支持输出工具".into(),
                 output_id: None,
                 is_error: true,
@@ -1076,7 +1080,7 @@ fn stream<'a>(
                         },
                     },
                     result: crate::LoggedResult {
-                        subagent: None,
+                        attachments: Vec::new(), subagent: None,
                         inline: wire,
                         output_id,
                         cleared: false,
@@ -1126,7 +1130,7 @@ fn stream<'a>(
                         let tool_id = raw.id.to_string();
                         let result = s
                             .host
-                            .send_agent_message(&id, &text, immediate, resume, &raw.id.to_string())
+                            .send_agent_message(&id, &text, immediate, resume, crate::media::parse_ids(raw.function.arguments.get("image_ids")).unwrap_or_default(), &raw.id.to_string())
                             .await;
                         s.entry(Entry::Step(crate::Step {
                             message_id: s.message_id,
@@ -1136,7 +1140,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
-                                inline: result.inline,
+                                attachments: result.attachments, inline: result.inline,
                                 output_id: result.output_id,
                                 subagent: result.subagent,
                                 cleared: false,
@@ -1184,7 +1188,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
-                                inline: result.inline,
+                                attachments: result.attachments, inline: result.inline,
                                 output_id: result.output_id,
                                 cleared: false,
                                 is_error: result.is_error,
@@ -1203,7 +1207,11 @@ fn stream<'a>(
                             s.phase(crate::interaction::Phase::Executing);
                         }
                         let tool_id = raw.id.to_string();
-                        let result = s.host.local_tool(tool, s.limits.exec).await;
+                        let result = if let LocalTool::ViewImage {id}=&tool {
+                            if let Some(a)=s.conversation.attachments().into_iter().find(|a|a.id==*id) {
+                                let mut r=LocalResult::text(a.label());r.attachments.push(a);r
+                            } else {s.host.local_tool(tool,s.limits.exec).await}
+                        } else {s.host.local_tool(tool, s.limits.exec).await};
                         s.entry(Entry::Step(crate::Step {
                             message_id: s.message_id,
                             call: crate::LoggedCall {
@@ -1212,7 +1220,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
-                                subagent: None,
+                                attachments: result.attachments, subagent: None,
                                 inline: result.inline,
                                 output_id: result.output_id,
                                 cleared: false,
@@ -1239,7 +1247,7 @@ fn stream<'a>(
                                 args_json: serde_json::Value::Object(raw.function.arguments),
                             },
                             result: crate::LoggedResult {
-                                subagent: None,
+                                attachments: Vec::new(), subagent: None,
                                 inline: error,
                                 output_id: None,
                                 cleared: false,
@@ -1338,6 +1346,7 @@ fn stream<'a>(
                     };
                 }
                 s.phase(crate::interaction::Phase::Generating);
+                let request = match s.client.materialize(request).await { Ok(r) => r, Err(e) => return Some((s.fail(e), s)) };
                 match s.client.agent_open(request) {
                     Ok(model) => s.model = Some(model),
                     Err(e) => {
@@ -1503,6 +1512,7 @@ fn stream<'a>(
                         && !s.turn.as_ref().unwrap().capabilities.available()
                         && !s.turn.as_ref().unwrap().capabilities.web
                         && !s.host.sessions_enabled()
+                        && s.conversation.attachments().is_empty()
                     {
                         return Some((s.fail(AiError::InvalidResponse), s));
                     }
@@ -1522,7 +1532,7 @@ fn stream<'a>(
                                     && !s.host.sessions_enabled()
                                     && !matches!(
                                         raw.function.name.as_str(),
-                                        "web_search" | "web_fetch"
+                                        "web_search" | "web_fetch" | "view_image"
                                     )
                                 {
                                     if raw.function.name.as_str() == "propose_command" {
@@ -1567,6 +1577,8 @@ fn stream<'a>(
                                         parsed.map(|(id, text)| (id.to_owned(), text.to_owned()));
                                     pending.push_back(if s.conversation.agent_tool.is_none() {
                                         Pending::Invalid(raw, "当前会话不支持追加子任务消息".into())
+                                    } else if let Err(e)=crate::media::parse_ids(args.get("image_ids")) {
+                                        Pending::Invalid(raw,e)
                                     } else if let Some((id, text)) = message {
                                         Pending::AgentMessage(
                                             raw,
@@ -1636,6 +1648,7 @@ fn stream<'a>(
                     if !s.turn.as_ref().unwrap().capabilities.available()
                         && !s.turn.as_ref().unwrap().capabilities.web
                         && !s.host.sessions_enabled()
+                        && s.conversation.attachments().is_empty()
                     {
                         while let Some(pending) = pending.pop_front() {
                             if let Pending::Text(text) = pending {
@@ -1836,6 +1849,10 @@ fn parse_local(
     sessions: bool,
 ) -> Result<Option<LocalTool>, String> {
     let name = raw.function.name.as_str();
+    if name == "view_image" {
+        if raw.function.invalid_arguments.is_some() || raw.function.arguments.len()!=1 { return Err("图片参数无效".into()); }
+        return raw.function.arguments.get("id").and_then(|v|v.as_str()).map(|id|Some(LocalTool::ViewImage{id:id.into()})).ok_or_else(||"需要图片引用".into());
+    }
     if matches!(
         name,
         "list_sessions" | "read_terminal" | "compare_directories"

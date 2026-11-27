@@ -340,7 +340,7 @@ mod tests {
                 args_json: args,
             },
             result: LoggedResult {
-                inline: "result".into(),
+                attachments: Vec::new(), inline: "result".into(),
                 output_id: None,
                 is_error: false,
                 cleared: false,

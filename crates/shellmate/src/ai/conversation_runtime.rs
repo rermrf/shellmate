@@ -10,7 +10,7 @@ use crate::ai::{
 };
 use futures::StreamExt;
 use shellmate_ai::{
-    AiError, Config, ContextSnapshot, Conversation, Entry, Event, UserTurn,
+    AiError, Config, Conversation, Entry, Event, UserTurn,
     interaction::{Control, Intent},
 };
 use shellmate_store::{
@@ -217,7 +217,8 @@ impl Runtime {
         let d = self.data.lock().unwrap();
         d.model.busy || d.paused || self.tasks.has_running() || !d.approvals.is_empty()
     }
-    pub fn submit(&self, text: String, context: ContextSnapshot) {
+    #[cfg(test)]
+    pub fn submit(&self, text: String, context: shellmate_ai::ContextSnapshot) {
         self.submit_turn(UserTurn::new(&text, context).sent_now());
     }
     pub fn submit_turn(&self, user: UserTurn) {
@@ -325,7 +326,7 @@ impl Runtime {
             label: target
                 .map(|t| t.label.clone())
                 .unwrap_or_else(|| first.context.label.clone()),
-            title: first.question.chars().take(48).collect(),
+            title: first.title(48),
             provider: config.map(|c| c.provider.id()).unwrap_or("openai").into(),
             model: config.map(|c| c.model.clone()).unwrap_or_default(),
             created_at: self.created,
@@ -566,7 +567,7 @@ impl Runtime {
                 continue;
             }
             let client = match (self.factory.lock().unwrap())(&config) {
-                Ok(c) => c,
+                Ok(c) => c.with_image_root(self.tasks.root()),
                 Err(e) => {
                     {
                         let mut d = self.data.lock().unwrap();

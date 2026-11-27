@@ -47,7 +47,7 @@ async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknow
         let mut failed_once = false;
         let outcome = subagent::run_with_cancel(
             &client,
-            shellmate_ai::SubagentRequest {
+            shellmate_ai::SubagentRequest { image_ids: Vec::new(),
                 session_ids: vec![],
                 default_session_id: None,
                 description: "test".into(),
@@ -57,7 +57,7 @@ async fn child_input_ack_waits_for_checkpoint_and_cancellation_keeps_it_unacknow
                 model: None,
                 reasoning: None,
             },
-            SubagentContext {
+            SubagentContext { attachments: Vec::new(),
                 sent_at_ms: None,
                 origin: None,
                 id: "agent-test".into(),
@@ -365,7 +365,7 @@ async fn web_tools_work_without_terminal_and_children_inherit_the_same_tools_on_
         let client = RigClient::with_http(&config(a), http.clone()).unwrap();
         let out = shellmate_ai::subagent::run(
             &client,
-            shellmate_ai::SubagentRequest {
+            shellmate_ai::SubagentRequest { image_ids: Vec::new(),
                 session_ids: vec![],
                 default_session_id: None,
                 description: "search".into(),
@@ -375,7 +375,7 @@ async fn web_tools_work_without_terminal_and_children_inherit_the_same_tools_on_
                 model: None,
                 reasoning: None,
             },
-            shellmate_ai::subagent::SubagentContext {
+            shellmate_ai::subagent::SubagentContext { attachments: Vec::new(),
                 sent_at_ms: None,
                 id: "agent-1".into(),
                 snapshot: Default::default(),

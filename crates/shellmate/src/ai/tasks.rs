@@ -642,6 +642,13 @@ impl Tasks {
             return result;
         }
         match tool {
+            LocalTool::ViewImage {id} => {
+                let root=self.root(); let conversation=self.conversation_id().to_owned();
+                match tokio::task::spawn_blocking(move || shellmate_ai::media::lookup(&root,&conversation,&id)).await {
+                    Ok(Ok(a)) => {let mut result=LocalResult::text(a.label()); result.attachments.push(a); result},
+                    _ => LocalResult::error("图片不可用，请重新添加"),
+                }
+            }
             LocalTool::Web(request) => {
                 let Some(web) = self.0.web.get() else {
                     return LocalResult::error("网页工具不可用");
@@ -680,7 +687,7 @@ impl Tasks {
             LocalTool::WaitTasks { ids, all } => self.wait_tasks(ids, all).await,
             LocalTool::Memory(_) | LocalTool::ScopedMemory { .. } | LocalTool::Sessions(_) => {
                 LocalResult {
-                    subagent: None,
+                    attachments: Vec::new(), subagent: None,
                     inline: "记忆工具必须由会话主机处理".into(),
                     output_id: None,
                     is_error: true,
@@ -696,7 +703,7 @@ impl Tasks {
                 };
                 let Some((cancel, result, oid)) = task else {
                     return LocalResult {
-                        subagent: None,
+                        attachments: Vec::new(), subagent: None,
                         inline: format!("未找到任务 #{id}"),
                         output_id: None,
                         is_error: true,
@@ -708,7 +715,7 @@ impl Tasks {
                     wait_result(&mut result).await;
                 }
                 LocalResult {
-                    subagent: None,
+                    attachments: Vec::new(), subagent: None,
                     inline: format!(
                         "{} #{id} · 输出 id {oid}",
                         if running {
@@ -771,7 +778,7 @@ impl Tasks {
                             preview.push_str("\n完整输出已保存，用 read_output 查看或搜索");
                         }
                         LocalResult {
-                            subagent: None,
+                            attachments: Vec::new(), subagent: None,
                             inline: format!("输出 id {oid} · 总计 {} 字节 · 日志读取成功 · 原命令：{status}\n{preview}", w.total),
                             output_id: Some(oid),
                             is_error: false,
@@ -781,7 +788,7 @@ impl Tasks {
                         LocalResult::text(ai_output::CLEARED)
                     }
                     Err(e) => LocalResult {
-                        subagent: None,
+                        attachments: Vec::new(), subagent: None,
                         inline: format!("读取输出失败：{e}"),
                         output_id: Some(oid),
                         is_error: true,
@@ -1188,7 +1195,7 @@ mod tests {
                 args_json: serde_json::json!({"command":"pwd"}),
             },
             result: shellmate_ai::LoggedResult {
-                subagent: None,
+                attachments: Vec::new(), subagent: None,
                 inline: out.wire_text(),
                 output_id: out.output_id,
                 cleared: true,
@@ -1204,7 +1211,7 @@ mod tests {
                 args_json: serde_json::json!({"id":"old-output"}),
             },
             result: shellmate_ai::LoggedResult {
-                subagent: None,
+                attachments: Vec::new(), subagent: None,
                 inline: "old output".into(),
                 output_id: Some("old-output".into()),
                 cleared: false,

@@ -96,7 +96,7 @@ pub fn view(id: &str, description: &str) -> crate::ai::subagent_view::View {
         autocompact_window: Default::default(),
         timeouts: Default::default(),
     };
-    let request = shellmate_ai::SubagentRequest {
+    let request = shellmate_ai::SubagentRequest { image_ids: Vec::new(),
         session_ids: vec![],
         default_session_id: None,
         description: description.into(),
@@ -272,7 +272,7 @@ pub fn cards(scene: &str) -> Option<Cards> {
                 args_json: serde_json::json!({"run_in_background":v.background}),
             },
             result: shellmate_ai::LoggedResult {
-                subagent: Some(Box::new(display)),
+                attachments: Vec::new(), subagent: Some(Box::new(display)),
                 inline: v.report.clone(),
                 output_id: v.output_id.clone(),
                 cleared: false,

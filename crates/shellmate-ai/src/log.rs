@@ -17,6 +17,8 @@ pub struct LoggedCall {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct LoggedResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::Attachment>,
     /// UI metadata only; never included in provider tool results. Absent in pre-P13 logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<Box<crate::SubagentDisplay>>,
@@ -29,7 +31,7 @@ pub struct LoggedResult {
 impl LoggedResult {
     /// Registry completions must not undo tier-1 output clearing on later request boundaries.
     pub fn same_content(&self, other: &Self) -> bool {
-        self.inline == other.inline
+        self.attachments == other.attachments && self.inline == other.inline
             && self.output_id == other.output_id
             && self.is_error == other.is_error
             && self.subagent == other.subagent
@@ -193,6 +195,8 @@ pub struct Compaction {
 #[serde(crate = "rig_core::serde", tag = "entry", rename_all = "snake_case")]
 pub enum Entry {
     User {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sent_at_ms: Option<i64>,
         text: String,
@@ -328,8 +332,17 @@ impl Conversation {
     pub fn push_user(&mut self, user: UserTurn) {
         self.push_user_from(user, None);
     }
+    pub fn attachments(&self) -> Vec<crate::Attachment> {
+        let mut found=std::collections::BTreeMap::new();
+        for entry in self.entries() {
+            let images=match entry {Entry::User{attachments,..}=>attachments,Entry::Step(s)=>&s.result.attachments,_=>continue};
+            for a in images {found.entry((&a.conversation,&a.id)).or_insert_with(||a.clone());}
+        }
+        found.into_values().collect()
+    }
     pub fn push_user_from(&mut self, user: UserTurn, origin: Option<MessageOrigin>) {
         self.append(Entry::User {
+            attachments: user.attachments,
             sent_at_ms: user.sent_at_ms,
             origin,
             text: user.question,
@@ -359,7 +372,7 @@ impl Conversation {
                     args_json: serde_json::json!({"description":display.description,"type":display.kind}),
                 },
                 result: LoggedResult {
-                    inline: report,
+                    attachments: Vec::new(), inline: report,
                     output_id: display.output_id.clone(),
                     cleared: false,
                     is_error: matches!(
@@ -390,7 +403,7 @@ impl Conversation {
                         args_json: serde_json::json!({"command":display.command,"purpose":display.purpose,"target":display.target.id()}),
                     },
                     result: LoggedResult {
-                        subagent: None,
+                        attachments: Vec::new(), subagent: None,
                         inline,
                         output_id: None,
                         cleared: true,
@@ -474,8 +487,8 @@ impl Conversation {
                 crate::context::portable_id(&step.call.id, self.entries.len(), &mut used);
         }
         match &entry {
-            Entry::User { text, context, sent_at_ms, .. } => self.turns.push(Turn {
-                user: UserTurn::new(text, context.clone()).sent_at(*sent_at_ms),
+            Entry::User { text, context, sent_at_ms, attachments, .. } => self.turns.push(Turn {
+                user: UserTurn::new(text, context.clone()).with_attachments(attachments.clone()).sent_at(*sent_at_ms),
                 answer: None,
             }),
             _ => {
@@ -578,7 +591,7 @@ mod display_source_tests {
         let mut c=Conversation::default();c.push_user(UserTurn::new("inspect",Default::default()));
         c.push_text("first ");c.push_text("second");
         let step=|id:&str,name:&str,display|Entry::Step(Step{message_id:1,call:LoggedCall{id:id.into(),name:name.into(),args_json:serde_json::json!({"id":"output"})},
-            result:LoggedResult{inline:"body".into(),output_id:Some(format!("out-{id}")),is_error:false,cleared:false,subagent:None},display});
+            result:LoggedResult{attachments: Vec::new(), inline:"body".into(),output_id:Some(format!("out-{id}")),is_error:false,cleared:false,subagent:None},display});
         c.append(step("invalid","invalid",None));
         c.append(step("read","read_output",None));
         let display=StepDisplay{command:"pwd".into(),target:Target::Background,purpose:"inspect".into(),class:crate::policy::Class::ReadOnly,status:StepStatus::Completed,exit_code:Some(0),duration_ms:1,automatic:true,output:"/tmp".into()};

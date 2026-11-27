@@ -312,7 +312,7 @@ mod subagent_tests {
             autocompact_window: Default::default(),
             timeouts: Default::default(),
         };
-        let request = shellmate_ai::SubagentRequest {
+        let request = shellmate_ai::SubagentRequest { image_ids: Vec::new(),
             session_ids: vec![],
             default_session_id: None,
             description: "test".into(),

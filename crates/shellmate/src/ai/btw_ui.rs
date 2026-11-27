@@ -102,8 +102,9 @@ impl Drawer {
         let question = self.state.btw.question.clone().unwrap();
         let id = self.state.id.clone();
         let alive = self.binding.as_ref().map(|b| b.alive.clone());
+        let image_root=self.data_root.clone();
         let job = runtime.spawn(async move {
-            let client = RigClient::new(&config)?;
+            let client = RigClient::new(&config)?.with_image_root(image_root);
             tokio::select!{biased;
                 ()=async{match alive{Some(alive)=>crate::ai::exec::disconnected(&alive).await,None=>std::future::pending().await}}=>Err(AiError::Disconnected),
                 result=client.side_question(&log,&question)=>result,

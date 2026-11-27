@@ -67,6 +67,7 @@ pub fn label(call: &LoggedCall) -> String {
         "agent" => "委派子任务",
         "send_agent_message" => "追加子任务消息",
         "read_output" => "读取输出",
+        "view_image" => "查看图片",
         "wait_tasks" => "等待任务",
         "stop_task" => "停止任务",
         "memory" => "记忆操作",
@@ -76,6 +77,7 @@ pub fn label(call: &LoggedCall) -> String {
 }
 pub fn summary(call: &LoggedCall) -> String {
     match call.name.as_str() {
+        "view_image" => return "读取会话中的图片".into(),
         "list_sessions" => return "查看已打开的终端与连接状态".into(),
         "read_terminal" => {
             return format!(

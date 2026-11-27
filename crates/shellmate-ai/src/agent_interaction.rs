@@ -31,7 +31,7 @@ impl State<'_> {
                 args_json: serde_json::Value::Object(raw.function.arguments),
             },
             result: crate::LoggedResult {
-                inline: reason.into(),
+                attachments: Vec::new(), inline: reason.into(),
                 output_id: None,
                 is_error: true,
                 cleared: false,
@@ -95,6 +95,7 @@ impl State<'_> {
         let ids = inputs.iter().map(|i| i.id.clone()).collect();
         for input in inputs {
             self.entry(Entry::User {
+                attachments: input.attachments,
                 sent_at_ms: input.sent_at_ms,
                 origin: input.origin,
                 text: input.text,

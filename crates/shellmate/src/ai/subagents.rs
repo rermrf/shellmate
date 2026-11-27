@@ -36,6 +36,11 @@ pub fn supported(background: bool, local: bool, ssh: bool) -> bool {
     background && (local || ssh)
 }
 impl Service {
+    fn resolve_images(&self, ids: &[String]) -> Result<Vec<shellmate_ai::Attachment>,String> {
+        if ids.len()>shellmate_ai::media::MAX_IMAGES {return Err("最多传递 8 张图片".into());}
+        ids.iter().map(|id|shellmate_ai::media::lookup(&self.tasks.root(),self.tasks.conversation_id(),id)).collect()
+    }
+    #[cfg(test)]
     pub fn message(
         &self,
         id: &str,
@@ -53,6 +58,7 @@ impl Service {
             shellmate_ai::MessageOrigin::Parent,
         )
     }
+    #[cfg(test)]
     pub fn message_from(
         &self,
         id: &str,
@@ -62,13 +68,18 @@ impl Service {
         call_id: &str,
         origin: shellmate_ai::MessageOrigin,
     ) -> BoxFuture<'_, LocalResult> {
+        self.message_images(id, text, immediate, resume, call_id, vec![], origin)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn message_images(&self, id: &str, text: &str, immediate: bool, resume: bool, call_id: &str, image_ids: Vec<String>, origin: shellmate_ai::MessageOrigin) -> BoxFuture<'_, LocalResult> {
         let id = id.to_owned();
         let text = text.to_owned();
         let call_id = call_id.to_owned();
         Box::pin(async move {
-            if text.trim().is_empty() {
+            if text.trim().is_empty() && image_ids.is_empty() {
                 return LocalResult::error("追加消息不能为空");
             }
+            let attachments=match self.resolve_images(&image_ids) {Ok(a)=>a,Err(e)=>return LocalResult::error(e)};
             let Some((view, stable, children)) = self.tasks.latest_agent(&id) else {
                 return LocalResult::error("未找到本会话的子任务");
             };
@@ -78,10 +89,9 @@ impl Service {
                 };
                 let control = children.control();
                 let accepted = self.tasks.while_retained(|| {
-                    control.enqueue_from(
+                    control.enqueue_turn_from(
                         call_id.clone(),
-                        text,
-                        self.context.clone(),
+                        shellmate_ai::UserTurn::new(&text,self.context.clone()).with_attachments(attachments).sent_now(),
                         Some(origin),
                         |input| {
                             super::subagent_files::append_input(
@@ -167,6 +177,7 @@ impl Service {
             }
             let mut request = record.request;
             request.prompt = text;
+            request.image_ids = image_ids;
             request.background = true;
             request.model = Some(record.model);
             request.reasoning = Some(record.reasoning);
@@ -227,6 +238,7 @@ impl Service {
                 },
                 None => None,
             };
+            let attachments=match self.resolve_images(&request.image_ids) {Ok(a)=>a,Err(e)=>return LocalResult::error(e)};
             let ticket = match self.tasks.reserve_agent_family(
                 &call_id,
                 &request,
@@ -238,7 +250,7 @@ impl Service {
                 Err(e) => return LocalResult::error(e),
             };
             let client = match (self.factory)(&config) {
-                Ok(c) => c,
+                Ok(c) => c.with_image_root(self.tasks.root()),
                 Err(error) => {
                     return ticket.fail(error, self.limits.exec);
                 }
@@ -305,7 +317,9 @@ impl Service {
             } else {
                 self.memory_snapshot()
             };
+            if !attachments.is_empty() && let Err(error)=client.validate_images() {return ticket.fail(error,self.limits.exec);}
             let context = SubagentContext {
+                attachments,
                 sent_at_ms,
                 origin: Some(origin),
                 id: source.id.clone(),
@@ -344,6 +358,7 @@ impl Service {
                 context.snapshot.clone(),
                 context.origin,
                 context.sent_at_ms,
+                context.attachments.clone(),
             );
             let saved = self.tasks.while_retained(|| {
                 super::subagent_files::checkpoint(
@@ -421,7 +436,7 @@ impl Service {
                 let _ = ui.try_send(Ui::CancelSource(source_id));
                 let result = ticket.finish(out, limits.exec);
                 let logged = shellmate_ai::LoggedResult {
-                    inline: result.inline,
+                    attachments: Vec::new(), inline: result.inline,
                     output_id: result.output_id,
                     subagent: result.subagent,
                     cleared: false,

@@ -27,7 +27,7 @@ impl Drawer {
                 args_json: serde_json::json!({"query":"nginx upstream timeout"}),
             },
             result: LoggedResult {
-                inline: if scene == "ai-web-error" {
+                attachments: Vec::new(), inline: if scene == "ai-web-error" {
                     "Tavily API Key 无效或无权限，请检查设置".into()
                 } else {
                     serde_json::to_string(&data).unwrap()

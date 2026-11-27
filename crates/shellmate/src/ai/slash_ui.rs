@@ -32,6 +32,7 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn dispatch_input(&mut self, text: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.draft_images().is_empty() {self.ask(text.into(),w,cx);return;}
         if text.trim().is_empty() {
             return;
         }

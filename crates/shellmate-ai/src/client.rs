@@ -65,6 +65,7 @@ pub trait ProviderClient: Send + Sync {
 }
 #[derive(Clone)]
 pub struct RigClient {
+    image_root: Option<std::path::PathBuf>,
     pub(crate) config: Config,
     model: Arc<DynModel<Completion>>,
     timeouts: Timeouts,
@@ -119,6 +120,7 @@ impl RigClient {
         };
         let (reasoning, max_tokens) = reasoning_options(config)?;
         Ok(Self {
+            image_root: None,
             config: config.clone(),
             model: Arc::new(model),
             timeouts: config.timeouts.clone(),
@@ -130,6 +132,16 @@ impl RigClient {
                 cache: AtomicBool::new(matches!(config.provider, Provider::Anthropic { .. })),
             }),
         })
+    }
+    pub fn with_image_root(mut self, root: impl Into<std::path::PathBuf>) -> Self { self.image_root=Some(root.into()); self }
+    pub fn validate_images(&self) -> Result<(), AiError> {
+        if self.model.spec().is_some_and(|s| !s.input.image) || !crate::media::supports_images(&self.config.provider,&self.config.model) {Err(AiError::UnsupportedImages)} else {Ok(())}
+    }
+    pub(crate) async fn materialize(&self, request: CompletionRequest) -> Result<CompletionRequest, AiError> {
+        if !request.chat_history.iter().any(|m|m.images().next().is_some()) {return Ok(request);}
+        self.validate_images()?;
+        let root=self.image_root.clone().ok_or(AiError::ImageUnavailable)?;
+        tokio::task::spawn_blocking(move ||crate::media::hydrate(request,&root)).await.map_err(|_|AiError::ImageUnavailable)?
     }
     pub(crate) fn agent_open(
         &self,
@@ -243,6 +255,7 @@ impl RigClient {
         request: CompletionRequest,
         mut on_usage: impl FnMut(Usage),
     ) -> Result<String, AiError> {
+        let request=self.materialize(request).await?;
         loop {
             let mut request = request
                 .clone()
@@ -390,7 +403,7 @@ impl rig_core::http_client::HttpMiddleware for AuthHeader {
 impl ProviderClient for RigClient {
     fn start<'a>(&'a self, c: &'a mut Conversation) -> Result<ResponseStream<'a>, AiError> {
         // Validate provider encoding synchronously; streams are lazy and no I/O occurs.
-        drop(self.open_with_fallback(&c.prepare(&crate::Capabilities::default())?)?);
+        if c.attachments().is_empty() {drop(self.open_with_fallback(&c.prepare(&crate::Capabilities::default())?)?);} else { self.validate_images()?; }
         let mut stream = crate::agent::run(
             self,
             c,

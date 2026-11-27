@@ -1,3 +1,5 @@
+#[path = "media_ui.rs"]
+mod media_ui;
 #[path = "interaction_ui.rs"]
 mod interaction_ui;
 #[path = "btw_ui.rs"]
@@ -327,6 +329,7 @@ impl Drawer {
         self.input.update(cx, |input, cx| input.marked_text_range(w, cx).is_some())
     }
     fn send_input(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.validate_draft_images(cx){return;}
         let text = self.input.read(cx).value().to_string();
         if let Some(id)=self.state.child_page.selected.clone(){self.state.message_target=Some(id);self.send_to_child(text,false,w,cx);return;}
         if self.state.message_target.is_some(){self.send_to_child(text,false,w,cx);return;}
@@ -335,10 +338,12 @@ impl Drawer {
 
     pub fn ask(&mut self, question: String, w: &mut Window, cx: &mut Context<Self>) {
         if self.state.child_page.selected.is_some(){self.back_to_main(w,cx);}
-        if question.trim().is_empty(){return;}
+        if !self.validate_draft_images(cx){return;}
+        if question.trim().is_empty() && self.draft_images().is_empty(){return;}
+        if self.state.editing_message.is_some(){self.queue_message(question,w,cx);return;}
         if self.runtime.is_none() && !self.fixture && let Some(runtime)=crate::workspace::hub::Hub::ai_services(cx).1.get(&self.state.id){self.attach_runtime(runtime,cx);}
         if let Some(runtime)=self.runtime.clone(){
-            let context=self.message_context(runtime.router.context());runtime.submit(question,context);self.input.update(cx,|i,cx|i.set_value("",w,cx));
+            let context=self.message_context(runtime.router.context());runtime.submit_turn(UserTurn::new(&question,context).with_attachments(self.take_images()).sent_now());self.input.update(cx,|i,cx|i.set_value("",w,cx));
             let snap=runtime.snapshot();if let Some(config)=snap.config{runtime.launch(config,snap.limits,snap.settings);self.sync_runtime(cx);}else{self.begin(None,w,cx);}return;
         }
         if self.state.pending || self.state.model.busy {
@@ -358,8 +363,8 @@ impl Drawer {
             .update(cx, |s, cx| s.ai_context(self.session, cx))
             .unwrap_or_default();
         let context=self.message_context(context);
-        let user = UserTurn::new(&question, context).sent_now();
-        if user.question.trim().is_empty() {
+        let user = UserTurn::new(&question, context).with_attachments(self.take_images()).sent_now();
+        if user.is_empty() {
             return;
         }
         if !self.fixture {
@@ -610,9 +615,10 @@ impl Drawer {
         self.state.run_limits = Some(limits);
         self.state.run_budget = None;
         self.state.run_config = Some(config.clone());
+        let image_root=self.data_root.clone();
         let join = runtime.spawn(async move {
             let client = match RigClient::new(&config) {
-                Ok(client) => client,
+                Ok(client) => client.with_image_root(image_root),
                 Err(e) => {
                     let _ = worker_event(&tx, AgentEvent::Error(e)).await;
                     return;
@@ -709,13 +715,14 @@ impl Drawer {
         if let Some(tasks) = self.tasks.take() { tasks.retire(); }
     }
     fn close_outputs(&mut self) {
+        self.state.media.retire();
         if !saving_enabled(&self.db) && let Some(tasks)=&self.tasks {tasks.discard();}
         self.retire_tasks();
         if !self.fixture
             && let Err(e) = shellmate_core::ai_output::close_conversation(
                 &self.data_root,
                 &self.state.id,
-                saving_enabled(&self.db),
+                saving_enabled(&self.db) && (!self.state.model.conversation.entries().is_empty() || self.state.queued.is_some() || !self.state.control.snapshot().inputs.is_empty()),
             )
         {
             log::warn!("remove AI outputs: {e}");
@@ -769,7 +776,7 @@ impl Drawer {
             self.state.model.conversation.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
                 message_id: self.state.model.conversation.entries().len(),
                 call: shellmate_ai::LoggedCall { id: step.call.id, name: "run_command".into(), args_json: serde_json::json!({"command":step.call.command,"target":step.call.target.id(),"run_in_background":step.call.run_in_background}) },
-                result: shellmate_ai::LoggedResult { subagent: None, inline, output_id, cleared: false, is_error: true },
+                result: shellmate_ai::LoggedResult { attachments: Vec::new(), subagent: None, inline, output_id, cleared: false, is_error: true },
                 display,
             }));
         }
@@ -783,6 +790,7 @@ impl Drawer {
         cx.notify();
     }
     pub(crate) fn discard_and_clear(&mut self, cx: &mut Context<Self>) {
+        self.state.media.retire();
         if let Some(runtime)=self.runtime.take(){runtime.tasks.discard();runtime.retire();self.tasks=None;}
         if let Some(tasks)=&self.tasks {tasks.discard();}
         self.clear(cx);
@@ -859,7 +867,7 @@ impl Drawer {
                     if let Ok(records)=serde_json::from_value::<Vec<timing::Record>>(runtime["timing"].clone()) { self.state.timing.restore(records); }
                     if let Ok(mut queue)=serde_json::from_value::<shellmate_ai::interaction::Snapshot>(runtime["queue"].clone()) {
                         if self.state.model.conversation.turns().is_empty() && let Some(text)=runtime["preparing"]["text"].as_str() {
-                            queue.inputs.push_front(shellmate_ai::interaction::Input{sent_at_ms:runtime["preparing"]["sent_at_ms"].as_i64(),origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
+                            queue.inputs.push_front(shellmate_ai::interaction::Input{attachments:serde_json::from_value(runtime["preparing"]["attachments"].clone()).unwrap_or_default(),sent_at_ms:runtime["preparing"]["sent_at_ms"].as_i64(),origin:None,id:"restored-preparing".into(),text:text.into(),context:serde_json::from_value(runtime["preparing"]["context"].clone()).unwrap_or_default(),claimed:false,editing:false});
                         }
                         self.state.control.restore(queue);
                     }
@@ -1179,6 +1187,7 @@ enum Worker {
 }
 impl Drop for Drawer {
     fn drop(&mut self) {
+        self.state.media.retire();
         if self.runtime.is_some(){return;}
         if self.state.timing.finish(timing::Status::Interrupted, timing::Moment::now()) { self.persist(); }
         self.close_outputs();
@@ -1444,8 +1453,8 @@ impl Render for Drawer {
                 ).max_w_full().px(px(12.)).py(px(9.)).rounded(px(13.))
                     .bg(p.accs).text_size(px(13.)).line_height(px(20.8)).whitespace_normal();
                 body = body.child(message_ui::message(
-                    message_id, &turn.user.question, turn.user.sent_at_ms,
-                    bubble, self.selection_scroll.clone(), window, cx,
+                    message_id.clone(), &turn.user.question, turn.user.sent_at_ms,
+                    div().flex().flex_col().gap(px(6.)).children(self.message_images(&message_id,&turn.user.attachments,cx)).when(!turn.user.question.is_empty(),|d|d.child(bubble)), self.selection_scroll.clone(), window, cx,
                 ));
                 let reply_group = SharedString::from(format!("{}:reply:{index}", self.state.id));
                 let mut reply_surface = div().id(reply_group.clone()).group(reply_group.clone())
@@ -1716,10 +1725,11 @@ impl Render for Drawer {
         let inset = px(layout.text_inset);
         let composer = div().relative().w_full().h(field_height).overflow_hidden().child(
             div().absolute().left(-Size::XSmall.input_px()).right(-Size::XSmall.input_px()).top(inset).bottom(inset)
-                .child(Textarea::new(&self.input).xsmall().appearance(false).p_0()
+                .child(self.media_textarea(cx).xsmall().appearance(false).p_0()
                     .h(field_height - inset * 2.).min_h_0().max_h(field_height - inset * 2.).text_size(px(13.)))
         );
         let footer = div()
+            .on_drop(cx.listener(|s,paths: &ExternalPaths,_,cx|s.drop_images(paths,cx)))
             .relative()
             .flex_none()
             .pt(px(10.))
@@ -1738,6 +1748,7 @@ impl Render for Drawer {
             .children(self.interaction_bar(window,cx))
             .children(self.btw_card(window,cx))
             .children(self.composer_target_chips(cx))
+            .children(self.media_composer(cx))
             .child(
                 div()
                     .flex()
@@ -1750,6 +1761,7 @@ impl Render for Drawer {
                     .py(px(composer_layout::VERTICAL_PADDING))
                     .rounded(px(13.))
                     .bg(p.card2)
+                    .child(self.image_picker(cx))
                     .child(
                         div().flex_1().min_w_0().child(
                             composer,

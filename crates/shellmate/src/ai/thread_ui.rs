@@ -4,7 +4,7 @@ use shellmate_ai::{Entry, MessageOrigin};
 use std::collections::{BTreeMap, HashSet};
 pub(super) struct Page {
     pub error: Option<String>,
-    pub unsent: Vec<String>,
+    pub unsent: Vec<UserTurn>,
     pub draft: String,
     pub scroll: ScrollHandle,
     pub follow: bool,
@@ -107,7 +107,7 @@ impl Drawer {
                     args_json: args,
                 },
                 result: LoggedResult {
-                    inline: result.into(),
+                    attachments: Vec::new(), inline: result.into(),
                     output_id: None,
                     is_error: error,
                     cleared: false,
@@ -249,6 +249,7 @@ impl Drawer {
         text: &str,
         origin: Option<MessageOrigin>,
         sent_at_ms: Option<i64>,
+        attachments: &[shellmate_ai::Attachment],
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -326,6 +327,7 @@ impl Drawer {
                 })),
             );
         }
+        message=message.children(self.message_images(&scope,attachments,cx));
         if long { message = message.child(actions); }
         super::message_ui::message(scope, text, sent_at_ms, message, self.selection_scroll.clone(), w, cx).into_any_element()
     }
@@ -508,8 +510,8 @@ impl Drawer {
                     Item::User {
                         index,
                         text,
-                        origin, sent_at_ms,
-                    } => body = body.child(self.child_message(&id, index, &text, origin, sent_at_ms, w, cx)),
+                        origin, sent_at_ms, attachments,
+                    } => body = body.child(self.child_message(&id, index, &text, origin, sent_at_ms, &attachments, w, cx)),
                     Item::Text { index, text } => {
                         body = body.child(markdown::drawer_view(
                             SharedString::from(format!("{}:{scope}:text:{index}", self.state.id))
@@ -544,7 +546,7 @@ impl Drawer {
             }
         } else {
             if !view.prompt.is_empty() {
-                body = body.child(self.child_message(&id, 0, &view.prompt, None, None, w, cx));
+                body = body.child(self.child_message(&id, 0, &view.prompt, None, None, &[], w, cx));
             }
             for step in &view.step_list {
                 body = body.child(
@@ -630,9 +632,10 @@ impl Drawer {
                         .text_color(p.tx3)
                         .child("待处理消息"),
                 )
-                .child(self.child_message(&id, usize::MAX - n, &input.text, input.origin, input.sent_at_ms, w, cx));
+                .child(self.child_message(&id, usize::MAX - n, &input.text, input.origin, input.sent_at_ms, &input.attachments, w, cx));
         }
         let mut footer = div()
+            .on_drop(cx.listener(|s,paths: &ExternalPaths,_,cx|s.drop_images(paths,cx)))
             .flex_none()
             .p(px(12.))
             .border_t_1()
@@ -675,7 +678,7 @@ impl Drawer {
                     .text_color(p.tx2)
                     .child(format!(
                         "未发送：{}",
-                        text.chars().take(70).collect::<String>()
+                        text.question.chars().take(70).collect::<String>()
                     ))
                     .child(
                         agent_ui::step_action(
@@ -685,15 +688,17 @@ impl Drawer {
                         )
                         .on_click(cx.listener(move |s, _, w, cx| {
                             let draft = s.input.read(cx).value().to_string();
+                            let draft_images=s.take_images();
                             let page = s.state.child_page.pages.entry(target.clone()).or_default();
                             if index >= page.unsent.len() {
                                 return;
                             }
                             let text = page.unsent.remove(index);
-                            if !draft.is_empty() {
-                                page.unsent.push(draft);
+                            if !draft.is_empty() || !draft_images.is_empty() {
+                                page.unsent.push(UserTurn::new(&draft,Default::default()).with_attachments(draft_images));
                             }
-                            s.set_composer_text(text, w, cx);
+                            s.restore_images(text.attachments);
+                            s.set_composer_text(text.question, w, cx);
                             cx.notify();
                         })),
                     ),
@@ -745,7 +750,7 @@ impl Drawer {
                         )),
                     );
         }
-        footer = footer.child(actions).child(
+        footer = footer.children(self.media_composer(cx)).child(actions).child(
             div()
                 .flex()
                 .items_end()
@@ -753,6 +758,7 @@ impl Drawer {
                 .p(px(8.))
                 .rounded(px(13.))
                 .bg(p.card2)
+                .child(self.image_picker(cx))
                 .child(
                     div()
                         .flex_1()
@@ -760,7 +766,7 @@ impl Drawer {
                         .max_h(px(120.))
                         .overflow_hidden()
                         .child(
-                            Textarea::new(&self.input)
+                            self.media_textarea(cx)
                                 .xsmall()
                                 .appearance(false)
                                 .text_size(px(13.)),
@@ -807,6 +813,7 @@ impl Drawer {
 }
 pub(super) enum Item {
     User {
+        attachments: Vec<shellmate_ai::Attachment>,
         index: usize,
         text: String,
         origin: Option<MessageOrigin>,
@@ -824,8 +831,9 @@ pub(super) fn grouped(entries: &[Entry]) -> Vec<Item> {
     let mut last_message = None;
     for (index, e) in entries.iter().enumerate() {
         match e {
-            Entry::User { text, origin, sent_at_ms, .. } => {
+            Entry::User { text, origin, sent_at_ms, attachments, .. } => {
                 out.push(Item::User {
+                    attachments:attachments.clone(),
                     index,
                     text: text.clone(),
                     origin: *origin,
@@ -904,7 +912,7 @@ mod tests {
                 args_json: serde_json::json!({"path":"/srv/app"}),
             },
             result: shellmate_ai::LoggedResult {
-                inline: "complete result".into(),
+                attachments: Vec::new(), inline: "complete result".into(),
                 output_id: None,
                 is_error: false,
                 cleared: false,
@@ -913,7 +921,7 @@ mod tests {
             display: None,
         };
         let entries = vec![
-            Entry::User {
+            Entry::User { attachments: Vec::new(),
                 sent_at_ms: None,
                 text: "delegate".into(),
                 context: Default::default(),
@@ -935,7 +943,7 @@ mod tests {
                 text: "c".into(),
                 message_id: 1,
             },
-            Entry::User {
+            Entry::User { attachments: Vec::new(),
                 sent_at_ms: None,
                 text: "followup".into(),
                 context: Default::default(),

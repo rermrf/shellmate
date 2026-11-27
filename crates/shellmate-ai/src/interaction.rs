@@ -46,6 +46,8 @@ impl Phase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub struct Input {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,7 +61,7 @@ pub struct Input {
 }
 impl Input {
     pub fn user_turn(&self) -> crate::UserTurn {
-        crate::UserTurn::new(&self.text, self.context.clone()).sent_at(self.sent_at_ms)
+        crate::UserTurn::new(&self.text, self.context.clone()).with_attachments(self.attachments.clone()).sent_at(self.sent_at_ms)
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -159,7 +161,7 @@ impl Control {
         origin: Option<crate::MessageOrigin>,
         save: impl FnOnce(&Input) -> Result<(), E>,
     ) -> Result<bool, E> {
-        if user.question.trim().is_empty() {
+        if user.is_empty() {
             return Ok(false);
         }
         let mut state = self.state.lock().unwrap();
@@ -170,6 +172,7 @@ impl Control {
             return Ok(false);
         }
         let input = Input {
+            attachments: user.attachments,
             sent_at_ms: user.sent_at_ms,
             origin,
             id,
@@ -196,7 +199,8 @@ impl Control {
         self.notify();
         input
     }
-    pub fn edit(&self, id: &str, text: Option<String>) -> Option<String> {
+    pub fn edit(&self, id: &str, text: Option<String>) -> Option<String> {self.edit_images(id,text,None)}
+    pub fn edit_images(&self, id: &str, text: Option<String>, attachments: Option<Vec<crate::Attachment>>) -> Option<String> {
         let mut s = self.state.lock().unwrap();
         let i = s
             .saved
@@ -204,9 +208,10 @@ impl Control {
             .iter_mut()
             .find(|i| i.id == id && !i.claimed)?;
         if let Some(text) = text {
-            if text.trim().is_empty() {
+            if text.trim().is_empty() && attachments.as_ref().unwrap_or(&i.attachments).is_empty() {
                 return None;
             }
+            if let Some(attachments)=attachments {i.attachments=attachments;}
             i.text = text;
             i.editing = false;
         } else {

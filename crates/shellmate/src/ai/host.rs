@@ -89,6 +89,7 @@ pub trait Executor: Send + Sync {
         _text: &str,
         _immediate: bool,
         _resume: bool,
+        _image_ids: Vec<String>,
         _call_id: &str,
     ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
         Box::pin(async {
@@ -192,10 +193,11 @@ impl ToolHost for Host {
         text: &str,
         immediate: bool,
         resume: bool,
+        image_ids: Vec<String>,
         call_id: &str,
     ) -> BoxFuture<'_, shellmate_ai::agent::LocalResult> {
         self.executor
-            .send_agent_message(id, text, immediate, resume, call_id)
+            .send_agent_message(id, text, immediate, resume, image_ids, call_id)
     }
     fn control(&self) -> Option<shellmate_ai::interaction::Control> {
         self.executor.control()

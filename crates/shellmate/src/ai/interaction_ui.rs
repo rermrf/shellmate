@@ -11,6 +11,13 @@ pub(super) fn init(cx: &mut App) {
 impl Drawer {
     #[cfg(debug_assertions)]
     pub(super) fn live_fixture(&mut self, scene: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if scene=="ai-images" {
+            let a=shellmate_ai::media::import(&self.data_root,&self.state.id,"界面截图.png",include_bytes!("../../assets/app-icon/dock-light.png")).unwrap();
+            self.state.model.conversation=shellmate_ai::Conversation::default();
+            self.state.model.conversation.push_user(UserTurn::new("帮我看看这张截图",Default::default()).with_attachments(vec![a.clone()]).sent_now());
+            self.state.model.conversation.push_text("可以继续粘贴或拖入截图，点击图片可打开预览。");
+            self.state.model.busy=false;self.restore_images(vec![a]);cx.notify();return;
+        }
         if scene.starts_with("ai-multi-"){self.multi_fixture(scene,cx);return;}
         if scene.starts_with("ai-tools-") {
             self.unified_fixture(scene, cx);
@@ -40,7 +47,7 @@ impl Drawer {
             log.append(shellmate_ai::Entry::Step(shellmate_ai::Step {
                 message_id: 1,
                 call: shellmate_ai::LoggedCall { id: view.call_id.clone(), name: "agent".into(), args_json:serde_json::json!({"prompt":view.prompt}) },
-                result: shellmate_ai::LoggedResult { inline:view.report.clone(), output_id:view.output_id.clone(), subagent:Some(Box::new(view.display())), cleared:false, is_error:false },
+                result: shellmate_ai::LoggedResult { attachments: Vec::new(), inline:view.report.clone(), output_id:view.output_id.clone(), subagent:Some(Box::new(view.display())), cleared:false, is_error:false },
                 display: None,
             }));
             log.push_text("服务已交由当前会话管理，可以继续操作。");
@@ -94,8 +101,10 @@ impl Drawer {
         cx.notify();
     }
     pub(super) fn queue_message(&mut self, text: String, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.validate_draft_images(cx){return;}
         if let Some(id) = self.state.editing_message.clone() {
-            if self.state.control.edit(&id, Some(text)).is_some() {
+            if self.state.control.edit_images(&id, Some(text),Some(self.draft_images())).is_some() {
+                self.take_images();
                 self.state.editing_message = None;
                 self.input.update(cx, |i, cx| i.set_value("", w, cx));
                 self.persist();
@@ -109,7 +118,9 @@ impl Drawer {
             .unwrap_or_default();
         let context=self.message_context(context);
         let id = shellmate_core::HostId::generate().to_string();
-        if self.state.control.enqueue(id, text, context) {
+        let accepted: Result<bool,std::convert::Infallible> = self.state.control.enqueue_turn_from(id,UserTurn::new(&text,context).with_attachments(self.draft_images()).sent_now(),None,|_|Ok(()));
+        if accepted==Ok(true) {
+            self.take_images();
             self.input.update(cx, |i, cx| i.set_value("", w, cx));
             self.persist();
             cx.notify();
@@ -122,10 +133,11 @@ impl Drawer {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.validate_draft_images(cx){return;}
         let Some(id) = self.state.message_target.clone() else {
             return;
         };
-        if text.trim().is_empty() && immediate {
+        if text.trim().is_empty() && self.draft_images().is_empty() && immediate {
             if let Some(children) = self
                 .tasks
                 .as_ref()
@@ -194,13 +206,16 @@ impl Drawer {
         let Some(runtime) = crate::runtime::get(cx) else {
             return;
         };
-        if text.trim().is_empty() {
+        if self.media_loading() || (text.trim().is_empty() && self.draft_images().is_empty()) {
             return;
         }
         let call_id = shellmate_core::HostId::generate().to_string();
         let saved_call = call_id.clone();
         let conversation = self.state.id.clone();
         let label = text.clone();
+        let images=self.take_images();
+        let restore_images=images.clone();
+        let image_ids=images.iter().map(|a|a.id.clone()).collect();
         let target = id.clone();
         let child_page = self.state.child_page.selected.clone();
         if let Some(id) = &child_page {
@@ -217,12 +232,13 @@ impl Drawer {
         self.state.control.resume();
         let job = runtime.spawn(async move {
             service
-                .message_from(
+                .message_images(
                     &id,
                     &text,
                     immediate,
                     true,
                     &call_id,
+                    image_ids,
                     shellmate_ai::MessageOrigin::User,
                 )
                 .await
@@ -234,11 +250,11 @@ impl Drawer {
                 if result.is_error{
                     if let Some(id)=&child_page{
                         let same=s.state.child_page.selected.as_ref()==Some(id);
-                        if same&&s.input.read(cx).value().trim().is_empty(){s.set_composer_text(label.clone(),w,cx);}
-                        else{s.state.child_page.pages.entry(id.clone()).or_default().unsent.push(label.clone());}
+                        if same&&s.input.read(cx).value().trim().is_empty()&&s.draft_images().is_empty(){s.restore_images(restore_images.clone());s.set_composer_text(label.clone(),w,cx);}
+                        else{s.state.child_page.pages.entry(id.clone()).or_default().unsent.push(UserTurn::new(&label,Default::default()).with_attachments(restore_images.clone()));}
                         s.state.child_page.pages.entry(id.clone()).or_default().error=Some(result.inline);cx.notify();return;
                     }
-                    if s.input.read(cx).value().trim().is_empty(){s.state.message_target=Some(target.clone());s.set_composer_text(label.clone(),w,cx);}
+                    if s.input.read(cx).value().trim().is_empty()&&s.draft_images().is_empty(){s.state.message_target=Some(target.clone());s.restore_images(restore_images);s.set_composer_text(label.clone(),w,cx);}else{s.state.child_page.pages.entry(target.clone()).or_default().unsent.push(UserTurn::new(&label,Default::default()).with_attachments(restore_images));}
                     s.local(slash_ui::LocalBody::Hint(result.inline),cx);return;
                 }
                 s.state.timing.start(s.state.model.conversation.turns().len().saturating_sub(1),s.state.model.conversation.entries().len(),timing_started);
@@ -246,7 +262,7 @@ impl Drawer {
                 if result.subagent.is_some(){
                     let step=shellmate_ai::Step{
                         message_id:s.state.model.conversation.entries().len(),call:shellmate_ai::LoggedCall{id:saved_call,name:"send_agent_message".into(),args_json:serde_json::json!({"id":target,"message":label,"resume":true})},
-                        result:shellmate_ai::LoggedResult{inline:result.inline,output_id:result.output_id,subagent:result.subagent,is_error:false,cleared:false},display:None,
+                        result:shellmate_ai::LoggedResult{attachments: Vec::new(), inline:result.inline,output_id:result.output_id,subagent:result.subagent,is_error:false,cleared:false},display:None,
                     };
                     if s.runtime.is_some()||s.state.model.busy {if let Some(tasks)=&s.tasks{tasks.external_step(step);}}
                     else{s.state.model.conversation.append(shellmate_ai::Entry::Step(step));}
@@ -342,6 +358,7 @@ impl Drawer {
         self.send_now(w, cx);
     }
     fn send_now(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.validate_draft_images(cx){return;}
         let text = self.input.read(cx).value().to_string();
         if let Some(id) = self.state.child_page.selected.clone() {
             self.state.message_target = Some(id);
@@ -350,7 +367,7 @@ impl Drawer {
             self.send_to_child(text, true, w, cx);
             return;
         }
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() || !self.draft_images().is_empty() {
             self.queue_message(text, w, cx);
         }
         if self.state.control.snapshot().inputs.is_empty() {
@@ -578,9 +595,11 @@ impl Drawer {
                     .on_click(cx.listener(move |s, _, w, cx| {
                         if let Some(text) = s.state.control.edit(&edit, None) {
                             let draft = s.input.read(cx).value().to_string();
-                            if !draft.trim().is_empty() {
+                            if !draft.trim().is_empty() || !s.draft_images().is_empty() {
                                 s.queue_message(draft, w, cx);
                             }
+                            let images=s.state.control.snapshot().inputs.iter().find(|i|i.id==edit).map(|i|i.attachments.clone()).unwrap_or_default();
+                            s.restore_images(images);
                             s.state.editing_message = Some(edit.clone());
                             s.set_composer_text(text, w, cx);
                             s.persist();
@@ -594,17 +613,21 @@ impl Drawer {
                         "撤回",
                         cx,
                     )
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.state.control.withdraw(&id);
-                        if s.state.editing_message.as_deref() == Some(&id) {
-                            s.state.editing_message = None;
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        if let Some(input)=s.state.control.withdraw(&id) {
+                            if s.state.editing_message.as_deref()==Some(&id) {s.state.editing_message=None;}
+                            else {
+                                let draft=s.input.read(cx).value().to_string();
+                                if !draft.trim().is_empty() || !s.draft_images().is_empty(){s.queue_message(draft,w,cx);}
+                                s.restore_images(input.attachments);s.set_composer_text(input.text,w,cx);
+                            }
                         }
                         s.persist();
                         cx.notify();
                     })),
                 );
             }
-            bar = bar.child(div().flex().flex_col().gap(px(2.)).child(text).child(actions));
+            bar = bar.child(div().flex().flex_col().gap(px(2.)).children(self.message_images(&format!("queue-{}",input.id),&input.attachments,cx)).child(text).child(actions));
         }
         if snapshot.inputs.len() > 4 {
             bar = bar.child(

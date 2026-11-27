@@ -45,6 +45,12 @@ pub struct CommandCard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(crate = "rig_core::serde")]
 pub enum AiError {
+    #[error("当前模型不支持图片，请选择支持视觉的模型；图片仍保留在消息中")]
+    UnsupportedImages,
+    #[error("图片无法读取或已损坏，请重新添加图片")]
+    ImageUnavailable,
+    #[error("本次请求的图片总量超过 32 MB，请压缩上下文或减少图片")]
+    ImagesTooLarge,
     #[error("尚未配置 AI 助手，请先设置服务商、模型和 API Key")]
     NotConfigured,
     #[error("AI 配置无效，请检查 Base URL 和模型名称")]
@@ -87,6 +93,8 @@ pub use agent::{
 pub use output::{ToolOutput, shape};
 pub use policy::PermissionMode;
 
+pub mod media;
+pub use media::Attachment;
 pub mod memory;
 pub mod web;
 pub mod session_tools;

@@ -24,6 +24,7 @@ pub struct ContextSnapshot {
 }
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct UserTurn {
+    pub attachments: Vec<crate::Attachment>,
     pub question: String,
     pub context: ContextSnapshot,
     /// Presentation metadata, never sent to the model. None for legacy history.
@@ -32,11 +33,17 @@ pub struct UserTurn {
 impl UserTurn {
     pub fn new(question: &str, context: ContextSnapshot) -> Self {
         Self {
+            attachments: Vec::new(),
             question: question.into(),
             context,
             sent_at_ms: None,
         }
     }
+    pub fn with_attachments(mut self, attachments: Vec<crate::Attachment>) -> Self { self.attachments = attachments; self }
+    pub fn title(&self, limit: usize) -> String {
+        if self.question.trim().is_empty() {self.attachments.first().map(|a|a.name.chars().take(limit).collect()).unwrap_or_default()}else{self.question.chars().take(limit).collect()}
+    }
+    pub fn is_empty(&self) -> bool { self.question.trim().is_empty() && self.attachments.is_empty() }
     pub fn sent_now(mut self) -> Self {
         self.sent_at_ms = Some(Self::now_ms());
         self

@@ -119,7 +119,7 @@ fn pending_card_becomes_the_same_projected_step_and_history_gets_its_scope() {
             args_json: serde_json::json!({"run_in_background":true}),
         },
         result: shellmate_ai::LoggedResult {
-            subagent: Some(Box::new(live.display())),
+            attachments: Vec::new(), subagent: Some(Box::new(live.display())),
             inline: "inline".into(),
             output_id: live.output_id.clone(),
             cleared: false,
@@ -154,7 +154,7 @@ fn interrupted_history_is_stopped_without_changing_live_tasks_or_the_saved_log()
             args_json: serde_json::json!({"run_in_background":true}),
         },
         result: shellmate_ai::LoggedResult {
-            subagent: Some(Box::new(live.display())),
+            attachments: Vec::new(), subagent: Some(Box::new(live.display())),
             inline: "partial report".into(),
             output_id: live.output_id.clone(),
             cleared: false,

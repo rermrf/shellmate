@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 // Resume is opaque. Keeping its ownership generic lets tests use a drop-tracked marker.
 pub(super) struct ConversationState<R = Box<agent::Resume>> {
+    pub(super) media: super::media_ui::Drafts,
     pub(super) model: DrawerModel,
     pub(super) context_popover: crate::ai::context_view::Popover,
     pub(super) local_cards: Vec<super::slash_ui::LocalCard>,
@@ -53,6 +54,7 @@ pub(super) struct ConversationState<R = Box<agent::Resume>> {
 impl<R> Default for ConversationState<R> {
     fn default() -> Self {
         Self {
+            media: Default::default(),
             model: Default::default(),
             context_popover: Default::default(),
             local_cards: Vec::new(),
@@ -149,14 +151,14 @@ impl<R> ConversationState<R> {
                 .context
                 .label
                 .clone(),
-            title: first.question.chars().take(48).collect(),
+            title: first.title(48),
             provider: provider.into(),
             model: model.into(),
             created_at: self.created,
             updated_at: crate::ai::now(),
             conversation: self.model.conversation.clone(),
         };
-        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"timing":self.timing.snapshot(super::timing::Moment::now()),"preparing":self.queued.as_ref().map(|u|serde_json::json!({"text":u.question,"context":u.context,"sent_at_ms":u.sent_at_ms}))});
+        let runtime = serde_json::json!({"queue":self.control.delivery_snapshot(&self.accepted_inputs,&self.accepted_events),"scope":self.interaction_scope,"timing":self.timing.snapshot(super::timing::Moment::now()),"preparing":self.queued.as_ref().map(|u|serde_json::json!({"attachments":u.attachments,"text":u.question,"context":u.context,"sent_at_ms":u.sent_at_ms}))});
         match db.save_ai_conversation_with_runtime(&saved, Some(&runtime)) {
             Ok(true) => {
                 self.save_error = None;
@@ -176,7 +178,7 @@ impl<R> ConversationState<R> {
         }
     }
     pub fn new_conversation_action(&self, history_open: bool) -> NewConversation {
-        let has_content = !self.model.conversation.turns().is_empty()
+        let has_content = self.media.values().any(|d|!d.images.is_empty()||d.loading) || !self.model.conversation.turns().is_empty()
             || !self.control.snapshot().inputs.is_empty()
             || self.queued.is_some()
             || self.model.error.is_some()

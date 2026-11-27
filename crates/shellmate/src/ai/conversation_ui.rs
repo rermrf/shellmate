@@ -168,7 +168,7 @@ impl Drawer {
                 "任务正在处理，切换到其他对话不会停止本任务。"
             });
             if session == 2 && scene == "ai-multi-compare" {
-                log.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"compare".into(),name:"compare_directories".into(),args_json:serde_json::json!({"left":{"session_id":"local","path":"/Users/demo/project"},"right":{"session_id":"remote","path":"/srv/app"}})},result:LoggedResult{inline:serde_json::json!({"left":{"label":"本地终端 1"},"right":{"label":"prod-web-01"},"left_path":"/Users/demo/project","right_path":"/srv/app","scan_complete":true,"summary":{"内容不同":2,"仅左侧存在":1,"内容相同":126},"differences":[{"path":"config/app.toml","status":"内容不同"},{"path":"src/main.rs","status":"内容不同"},{"path":"README.local.md","status":"仅左侧存在"}]}).to_string(),output_id:None,subagent:None,cleared:false,is_error:false},display:None}));
+                log.append(Entry::Step(Step{message_id:1,call:LoggedCall{id:"compare".into(),name:"compare_directories".into(),args_json:serde_json::json!({"left":{"session_id":"local","path":"/Users/demo/project"},"right":{"session_id":"remote","path":"/srv/app"}})},result:LoggedResult{attachments: Vec::new(), inline:serde_json::json!({"left":{"label":"本地终端 1"},"right":{"label":"prod-web-01"},"left_path":"/Users/demo/project","right_path":"/srv/app","scan_complete":true,"summary":{"内容不同":2,"仅左侧存在":1,"内容相同":126},"differences":[{"path":"config/app.toml","status":"内容不同"},{"path":"src/main.rs","status":"内容不同"},{"path":"README.local.md","status":"仅左侧存在"}]}).to_string(),output_id:None,subagent:None,cleared:false,is_error:false},display:None}));
             }
             let r = conversation_runtime::Runtime::new(
                 format!("multi-fixture-{session}"),
@@ -214,11 +214,11 @@ impl Drawer {
             .conversation
             .turns()
             .first()
-            .map(|t| t.user.question.chars().take(28).collect())
+            .map(|t| t.user.title(28))
             .unwrap_or_else(|| {
                 let text = self.input.read(cx).value();
                 if text.trim().is_empty() {
-                    "新对话".into()
+                    self.draft_images().first().map(|a|a.name.clone()).unwrap_or_else(||"新对话".into())
                 } else {
                     text.chars().take(28).collect()
                 }
@@ -231,6 +231,7 @@ impl Drawer {
     }
     pub(crate) fn empty_draft(&self, cx: &App) -> bool {
         self.runtime.is_none()
+            && self.state.media.values().all(|d| d.images.is_empty() && !d.loading)
             && self.input.read(cx).value().trim().is_empty()
             && self.state.model.conversation.turns().is_empty()
             && !self.state.pending

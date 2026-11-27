@@ -66,7 +66,7 @@ impl Ticket {
     }
     pub fn start_result(&self) -> LocalResult {
         LocalResult {
-            inline: format!(
+            attachments: Vec::new(), inline: format!(
                 "子任务已异步启动：{}（{}）",
                 self.initial.id, self.initial.description
             ),
@@ -410,7 +410,7 @@ impl Tasks {
                     (
                         task.call_id.clone(),
                         shellmate_ai::LoggedResult {
-                            inline: r.inline,
+                            attachments: Vec::new(), inline: r.inline,
                             output_id: r.output_id,
                             is_error: r.is_error,
                             cleared: false,
@@ -513,7 +513,7 @@ impl Tasks {
                     .join("\n")
             };
             return Some(LocalResult {
-                inline: text,
+                attachments: Vec::new(), inline: text,
                 output_id: view.output_id,
                 is_error: false,
                 subagent: None,

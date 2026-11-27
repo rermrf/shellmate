@@ -49,7 +49,7 @@ fn config() -> Config {
     }
 }
 fn request(background: bool) -> SubagentRequest {
-    SubagentRequest {
+    SubagentRequest { image_ids: Vec::new(),
         session_ids: vec![],
         default_session_id: None,
         description: "inspect".into(),
@@ -265,7 +265,7 @@ async fn background_completion_updates_original_log_spools_transcript_and_reopen
             args_json: json!({"run_in_background":true}),
         },
         result: LoggedResult {
-            inline: initial.inline,
+            attachments: Vec::new(), inline: initial.inline,
             output_id: initial.output_id,
             subagent: initial.subagent,
             cleared: false,
@@ -747,7 +747,7 @@ async fn completion_after_retiring_saved_conversation_persists_and_cannot_be_rep
             args_json: json!({"run_in_background":true}),
         },
         result: LoggedResult {
-            inline: initial.inline,
+            attachments: Vec::new(), inline: initial.inline,
             output_id: initial.output_id,
             subagent: initial.subagent,
             cleared: false,
@@ -1077,7 +1077,7 @@ async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint(
             args_json: json!({"run_in_background":false}),
         },
         result: LoggedResult {
-            inline: first.inline,
+            attachments: Vec::new(), inline: first.inline,
             output_id: first.output_id,
             subagent: first.subagent,
             cleared: false,
@@ -1095,7 +1095,7 @@ async fn restored_child_uses_saved_family_context_and_queued_message_checkpoint(
     checkpoint
         .inbox
         .inputs
-        .push_back(shellmate_ai::interaction::Input {
+        .push_back(shellmate_ai::interaction::Input { attachments: Vec::new(),
             sent_at_ms: None,
             origin: None,
             id: "pending".into(),
@@ -1456,4 +1456,27 @@ async fn child_finishes_while_service_stays_managed_and_accepts_parent_stop() {
             .is_error
     );
     settled(&service.tasks).await;
+}
+
+#[tokio::test]
+async fn delegated_and_direct_followup_images_reach_child_wire_and_checkpoints() {
+    let (root,service,ui,http)=fixture(vec![response(true,"checking image"),response(false,"finished")]);
+    let a=shellmate_ai::media::import(root.path(),"conversation","截图.png",include_bytes!("../../assets/app-icon/dock-light.png")).unwrap();
+    let mut req=request(true);req.image_ids=vec![a.id.clone()];
+    let result=service.start(req,"initial-image").await;assert!(!result.is_error);
+    let (_,approval)=approval(&ui).await;
+    let result=service.message_images("agent-1","",false,false,"image-followup",vec![a.id.clone()],shellmate_ai::MessageOrigin::User).await;assert!(!result.is_error);
+    let checkpoint=super::super::subagent_files::read_checkpoint(root.path(),"conversation","agent-1").unwrap();
+    assert!(checkpoint.inbox.inputs.iter().any(|i|i.attachments==vec![a.clone()]));
+    assert!(approval.send(Approval::Deny{reason:None}).is_ok());settled(&service.tasks).await;
+    let view=service.tasks.agent_views().remove(0);let transcript=view.transcript.unwrap();
+    assert_eq!(transcript.iter().filter(|e|matches!(e,Entry::User{attachments,..}if attachments==&vec![a.clone()])).count(),2);
+    for request in http.requests() {
+        let body=String::from_utf8(request.body.to_vec()).unwrap();assert!(body.contains("data:image/png;base64,"));assert!(!body.contains("shellmate-image:"));
+    }
+    assert!(!serde_json::to_string(&transcript).unwrap().contains("base64"));
+    service.tasks.discard();
+    shellmate_core::ai_output::delete_conversation(root.path(),"conversation").unwrap();
+    assert!(service.tasks.retained().while_retained(||panic!("discarded owner must not import again")).is_none());
+    assert!(!a.path(root.path(),false).unwrap().exists());
 }

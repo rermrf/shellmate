@@ -1,6 +1,6 @@
 use super::*;
 #[path = "../support/responses.rs"]
-mod wire;
+pub(super) mod wire;
 fn responses_config() -> Config {
     let mut c = config(false);
     c.provider = Provider::OpenAiResponses {

@@ -62,7 +62,7 @@ impl Manager {
                     .conversation
                     .turns()
                     .first()
-                    .map(|t| t.user.question.chars().take(36).collect())
+                    .map(|t| t.user.title(36))
                     .unwrap_or_else(|| "新对话".into());
                 (r.id.clone(), title)
             })
