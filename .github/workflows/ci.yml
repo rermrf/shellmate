@@ -32,7 +32,9 @@ jobs:
       - name: Finder extension (Swift)
         run: |
           scripts/build-finder-extension.sh "$RUNNER_TEMP/ShellmateFinder" arm64 x86_64
-          lipo "$RUNNER_TEMP/ShellmateFinder" -verify_arch arm64 x86_64
+          for arch in arm64 x86_64; do
+            lipo "$RUNNER_TEMP/ShellmateFinder" -verify_arch "$arch"
+          done
           plutil -lint macos/FinderExtension/Info.plist macos/FinderExtension/ShellmateFinder.entitlements
 
       - name: Clippy

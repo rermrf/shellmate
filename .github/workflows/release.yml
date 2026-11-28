@@ -91,10 +91,14 @@ jobs:
         run: |
           app=target/release/Shellmate.app
           lipo -info "$app/Contents/MacOS/Shellmate"
-          lipo "$app/Contents/MacOS/Shellmate" -verify_arch arm64 x86_64
+          for arch in arm64 x86_64; do
+            lipo "$app/Contents/MacOS/Shellmate" -verify_arch "$arch"
+          done
           appex="$app/Contents/PlugIns/ShellmateFinder.appex"
           test -d "$appex"
-          lipo "$appex/Contents/MacOS/ShellmateFinder" -verify_arch arm64 x86_64
+          for arch in arm64 x86_64; do
+            lipo "$appex/Contents/MacOS/ShellmateFinder" -verify_arch "$arch"
+          done
           codesign --verify --strict "$appex"
           for arch in arm64 x86_64; do
             test "$(codesign -d --xml --arch "$arch" --entitlements - "$appex" | plutil -extract 'com\.apple\.security\.app-sandbox' raw -expect bool -)" = true
